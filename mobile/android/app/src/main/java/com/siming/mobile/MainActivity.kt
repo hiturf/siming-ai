@@ -2,6 +2,7 @@ package com.siming.mobile
 
 import android.app.Activity
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -11,12 +12,14 @@ import androidx.lifecycle.lifecycleScope
 import com.google.zxing.client.android.Intents
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import com.siming.mobile.data.MAX_NOVEL_IMPORT_BYTES
 import com.siming.mobile.data.MobileExportFile
+import com.siming.mobile.data.MobileNovelImportFile
 import com.siming.mobile.ui.MainViewModel
 import com.siming.mobile.ui.PortraitCaptureActivity
 import com.siming.mobile.ui.SimingApp
 import com.siming.mobile.ui.SimingTheme
-import java.io.InputStreamReader
+import java.io.ByteArrayOutputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -57,33 +60,38 @@ private fun saveExport(file: MobileExportFile) {
     )
 }
 
-private var importCallback: ((String, String) -> Unit)? = null
+private var importCallback: ((MobileNovelImportFile) -> Unit)? = null
+
+    private suspend fun readImportFile(uri: Uri): MobileNovelImportFile = withContext(Dispatchers.IO) {
+        val name = contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
+        } ?: "导入作品.txt"
+        val bytes = contentResolver.openInputStream(uri)?.use { input ->
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(32 * 1024)
+            var total = 0
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                total += count
+                require(total <= MAX_NOVEL_IMPORT_BYTES) {
+                    "单个导入文件不能超过 20 MiB"
+                }
+                output.write(buffer, 0, count)
+            }
+            output.toByteArray()
+        } ?: error("无法读取选择的文件")
+        MobileNovelImportFile(name, bytes)
+    }
+
     private val textPicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         val callback = importCallback
         importCallback = null
         if (uri == null || callback == null) return@registerForActivityResult
         lifecycleScope.launch {
-            runCatching {
-                withContext(Dispatchers.IO) {
-                    val name = contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                        val index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                        if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
-                    } ?: "导入作品.txt"
-                    val text = contentResolver.openInputStream(uri)?.use { input ->
-                        val reader = InputStreamReader(input, Charsets.UTF_8)
-                        val buffer = CharArray(8_192)
-                        val builder = StringBuilder()
-                        while (true) {
-                            val count = reader.read(buffer)
-                            if (count < 0) break
-                            builder.append(buffer, 0, count)
-                            require(builder.length <= 20_000_000) { "单个导入文件不能超过 2000 万字符" }
-                        }
-                        builder.toString()
-                    } ?: error("无法读取选择的文件")
-                    name to text
-                }
-            }.onSuccess { (name, text) -> callback(name, text) }
+            runCatching { readImportFile(uri) }
+                .onSuccess(callback)
                 .onFailure { viewModel.reportError(it.message ?: "无法读取选择的文件") }
         }
     }

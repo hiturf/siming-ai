@@ -110,6 +110,7 @@ import com.siming.mobile.data.local.LocalConflict
 import com.siming.mobile.data.local.ReplicaEntity
 import com.siming.mobile.data.AssistantModelRoute
 import com.siming.mobile.data.MobileExportFile
+import com.siming.mobile.data.MobileNovelImportFile
 import com.siming.mobile.data.network.DirectApiConfig
 import com.siming.mobile.data.network.DirectApiSummary
 import com.siming.mobile.data.network.PcAuthoringContract
@@ -146,7 +147,7 @@ private val entitySections = listOf(
 fun SimingApp(
     viewModel: MainViewModel,
     onScanQr: () -> Unit,
-    onPickText: (((String, String) -> Unit) -> Unit),
+    onPickText: (((MobileNovelImportFile) -> Unit) -> Unit),
     onSaveExport: (MobileExportFile) -> Unit,
 ) {
     val connection by viewModel.connection.collectAsStateWithLifecycle()
@@ -331,7 +332,7 @@ private fun LibraryScreen(
     viewModel: MainViewModel,
     onOpenProject: (String) -> Unit,
     onScanQr: () -> Unit,
-    onPickText: (((String, String) -> Unit) -> Unit),
+    onPickText: (((MobileNovelImportFile) -> Unit) -> Unit),
     onStartAiCreation: () -> Unit,
 ) {
     var showCreate by rememberSaveable { mutableStateOf(false) }
@@ -371,8 +372,8 @@ private fun LibraryScreen(
                     onStartAiCreation = onStartAiCreation,
                     onCreateBlank = { showCreate = true },
                     onImportNovel = {
-                        onPickText { name, text ->
-                            viewModel.importNovel(name, text, onOpenProject)
+                        onPickText { file ->
+                            viewModel.importNovel(file, onOpenProject)
                         }
                     },
                 )
