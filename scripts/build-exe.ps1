@@ -19,6 +19,8 @@ $DistDir = if ($OutputDirectory) {
 }
 $AppName = "Siming"
 $DefaultUpdateRepo = "teangtang1122/siming-ai"
+$ToolchainPath = Join-Path $Root "build-toolchain.json"
+$PythonBuildLock = Join-Path $BackendDir "requirements-windows-build.lock"
 
 function Write-Step {
   param([string]$Message)
@@ -32,6 +34,38 @@ function Require-Command {
     if ($Command) { return $Command.Source }
   }
   throw $Hint
+}
+
+function Read-BuildToolchain {
+  param([Parameter(Mandatory=$true)][string]$Path)
+
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    throw "Pinned build toolchain is missing: $Path"
+  }
+  try {
+    $Toolchain = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+  } catch {
+    throw "Unable to parse pinned build toolchain $Path. $($_.Exception.Message)"
+  }
+  foreach ($Property in @("python", "python_implementation", "python_architecture", "pip", "setuptools", "pyinstaller", "node", "npm", "inno_setup")) {
+    if ([string]::IsNullOrWhiteSpace([string]$Toolchain.$Property)) {
+      throw "Pinned build toolchain is missing '$Property': $Path"
+    }
+  }
+  return $Toolchain
+}
+
+function Read-NativeVersion {
+  param(
+    [Parameter(Mandatory=$true)][string]$FilePath,
+    [string[]]$Arguments = @("--version")
+  )
+
+  $Output = & $FilePath @Arguments
+  if ($LASTEXITCODE -ne 0 -or -not $Output) {
+    throw "Unable to read tool version: $FilePath $($Arguments -join ' ')"
+  }
+  return ([string]($Output | Select-Object -Last 1)).Trim()
 }
 
 function Test-PackagingPython {
@@ -84,11 +118,102 @@ function Resolve-BuildPython {
 
 function Get-PythonRuntimeIdentity {
   param([Parameter(Mandatory=$true)][string]$PythonPath)
-  $IdentityJson = & $PythonPath -c "import json,sys; print(json.dumps({'version': f'{sys.version_info.major}.{sys.version_info.minor}', 'base_executable': sys._base_executable}))"
+  $IdentityJson = & $PythonPath -c "import json,platform,sys; print(json.dumps({'version': platform.python_version(), 'implementation': platform.python_implementation(), 'architecture': platform.architecture()[0], 'base_executable': sys._base_executable}))"
   if ($LASTEXITCODE -ne 0) {
     throw "Unable to inspect Python runtime: $PythonPath"
   }
   return ($IdentityJson | ConvertFrom-Json)
+}
+
+function Get-WindowsVersionParts {
+  param([Parameter(Mandatory=$true)][string]$Version)
+
+  if ($Version -notmatch '^v?(?<Major>\d+)\.(?<Minor>\d+)\.(?<Patch>\d+)(?:\.(?<Build>\d+))?(?:[-+].*)?$') {
+    throw "APP_VERSION must start with a Windows-compatible semantic version: $Version"
+  }
+  $Parts = @(
+    [int]$Matches.Major,
+    [int]$Matches.Minor,
+    [int]$Matches.Patch,
+    $(if ($Matches.Build) { [int]$Matches.Build } else { 0 })
+  )
+  if (@($Parts | Where-Object { $_ -lt 0 -or $_ -gt 65535 }).Count -gt 0) {
+    throw "Each Windows version component must be between 0 and 65535: $Version"
+  }
+  return $Parts
+}
+
+function Write-WindowsVersionInfo {
+  param(
+    [Parameter(Mandatory=$true)][string]$Path,
+    [Parameter(Mandatory=$true)][string]$Version
+  )
+
+  $VersionParts = @(Get-WindowsVersionParts -Version $Version)
+  $VersionTuple = "(" + ($VersionParts -join ", ") + ")"
+  $FileVersion = $VersionParts -join "."
+  $Content = @"
+# UTF-8 PyInstaller version resource generated from backend/app/version.py.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=$VersionTuple,
+    prodvers=$VersionTuple,
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        u'040904B0',
+        [
+          StringStruct(u'CompanyName', u'teangtang1122'),
+          StringStruct(u'FileDescription', u'司命 (Siming) 桌面应用'),
+          StringStruct(u'FileVersion', u'$FileVersion'),
+          StringStruct(u'InternalName', u'Siming'),
+          StringStruct(u'LegalCopyright', u'Copyright (C) 2026 teangtang1122'),
+          StringStruct(u'OriginalFilename', u'Siming.exe'),
+          StringStruct(u'ProductName', u'司命 (Siming)'),
+          StringStruct(u'ProductVersion', u'$Version')
+        ]
+      )
+    ]),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)
+"@
+  [System.IO.File]::WriteAllText(
+    $Path,
+    $Content,
+    [System.Text.UTF8Encoding]::new($false)
+  )
+}
+
+function Assert-WindowsVersionInfo {
+  param(
+    [Parameter(Mandatory=$true)][string]$ExecutablePath,
+    [Parameter(Mandatory=$true)][string]$Version
+  )
+
+  $ExpectedFileVersion = (@(Get-WindowsVersionParts -Version $Version) -join ".")
+  $VersionInfo = (Get-Item -LiteralPath $ExecutablePath).VersionInfo
+  $Expected = [ordered]@{
+    CompanyName = "teangtang1122"
+    ProductName = "司命 (Siming)"
+    FileDescription = "司命 (Siming) 桌面应用"
+    FileVersion = $ExpectedFileVersion
+    ProductVersion = $Version
+    OriginalFilename = "Siming.exe"
+  }
+  foreach ($Entry in $Expected.GetEnumerator()) {
+    $Actual = [string]$VersionInfo.($Entry.Key)
+    if ($Actual -ne [string]$Entry.Value) {
+      throw "Windows version resource mismatch for $($Entry.Key): expected '$($Entry.Value)', got '$Actual'."
+    }
+  }
 }
 
 function Invoke-Native {
@@ -133,14 +258,39 @@ function Remove-ReleaseExecutable {
   }
 }
 
-Write-Step "Checking build tools..."
+$Toolchain = Read-BuildToolchain -Path $ToolchainPath
+if (-not (Test-Path -LiteralPath $PythonBuildLock -PathType Leaf)) {
+  throw "Pinned Windows build dependencies are missing: $PythonBuildLock"
+}
+
+Write-Step "Checking pinned build tools..."
 $PythonExe = Resolve-BuildPython
 Write-Step "Using build Python: $PythonExe"
-Require-Command -Names @("node") -Hint "Node.js is required on the packaging machine." | Out-Null
-Require-Command -Names @("npm") -Hint "npm is required on the packaging machine." | Out-Null
+$NodeExe = Require-Command -Names @("node") -Hint "Node.js is required on the packaging machine."
+$NpmExe = Require-Command -Names @("npm") -Hint "npm is required on the packaging machine."
 
 $BuildPythonRuntime = Get-PythonRuntimeIdentity -PythonPath $PythonExe
 $BuildPythonVersion = $BuildPythonRuntime.version
+$BuildPythonImplementation = $BuildPythonRuntime.implementation
+$BuildPythonArchitecture = $BuildPythonRuntime.architecture
+if ($BuildPythonVersion -ne [string]$Toolchain.python) {
+  throw "Python $($Toolchain.python) is required for reproducible packaging; found $BuildPythonVersion at $PythonExe. Set SIMING_BUILD_PYTHON to the pinned runtime."
+}
+if ($BuildPythonImplementation -ne [string]$Toolchain.python_implementation) {
+  throw "Python implementation $($Toolchain.python_implementation) is required; found $BuildPythonImplementation at $PythonExe."
+}
+if ($BuildPythonArchitecture -ne [string]$Toolchain.python_architecture) {
+  throw "Python architecture $($Toolchain.python_architecture) is required; found $BuildPythonArchitecture at $PythonExe."
+}
+$NodeVersion = (Read-NativeVersion -FilePath $NodeExe).TrimStart("v")
+$NpmVersion = Read-NativeVersion -FilePath $NpmExe
+if ($NodeVersion -ne [string]$Toolchain.node) {
+  throw "Node.js $($Toolchain.node) is required for reproducible packaging; found $NodeVersion."
+}
+if ($NpmVersion -ne [string]$Toolchain.npm) {
+  throw "npm $($Toolchain.npm) is required for reproducible packaging; found $NpmVersion."
+}
+Write-Step "Pinned toolchain verified: Python $BuildPythonVersion, Node.js $NodeVersion, npm $NpmVersion."
 $BuildPythonBase = [System.IO.Path]::GetFullPath($BuildPythonRuntime.base_executable)
 $ExistingVenvPython = Join-Path $VenvDir "Scripts\python.exe"
 if (Test-Path -LiteralPath $ExistingVenvPython) {
@@ -163,10 +313,8 @@ if (Test-Path -LiteralPath $ExistingVenvPython) {
 Write-Step "Building frontend static files..."
 Push-Location $FrontendDir
 try {
-  if (-not (Test-Path (Join-Path $FrontendDir "node_modules"))) {
-    Invoke-Native "npm" @("install")
-  }
-  Invoke-Native "npm" @("run", "build")
+  Invoke-Native $NpmExe @("ci")
+  Invoke-Native $NpmExe @("run", "build")
 } finally {
   Pop-Location
 }
@@ -182,9 +330,18 @@ $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 Write-Step "Verifying the Windows GUI runtime..."
 Invoke-Native $VenvPython @("-c", "import tkinter; print(f'Tk {tkinter.TkVersion}')")
 
-Write-Step "Installing backend dependencies and PyInstaller..."
-Invoke-Native $VenvPython @("-m", "pip", "install", "-i", $PipIndexUrl, "--trusted-host", "pypi.org", "--trusted-host", "files.pythonhosted.org", "--upgrade", "pip")
-Invoke-Native $VenvPython @("-m", "pip", "install", "-i", $PipIndexUrl, "--trusted-host", "pypi.org", "--trusted-host", "files.pythonhosted.org", "-r", (Join-Path $BackendDir "requirements.txt"), "pyinstaller")
+Write-Step "Installing the locked Windows packaging environment..."
+Invoke-Native $VenvPython @("-m", "pip", "install", "--disable-pip-version-check", "--only-binary=:all:", "--no-deps", "-i", $PipIndexUrl, "pip==$($Toolchain.pip)", "setuptools==$($Toolchain.setuptools)")
+# proxy_tools 0.1.0 is the only locked package published as an sdist. Build it
+# with the already pinned setuptools instead of resolving an isolated build env.
+Invoke-Native $VenvPython @("-m", "pip", "install", "--disable-pip-version-check", "--only-binary=:all:", "--no-binary=proxy_tools", "--no-build-isolation", "--no-deps", "-i", $PipIndexUrl, "-r", $PythonBuildLock)
+Invoke-Native $VenvPython @((Join-Path $ScriptDir "verify-python-build-lock.py"), "--lock", $PythonBuildLock, "--pyinstaller-version", [string]$Toolchain.pyinstaller)
+Invoke-Native $VenvPython @("-m", "pip", "check")
+$BackendPathForPython = $BackendDir.Replace("\", "\\")
+$Version = (& $VenvPython -c "import sys; sys.path.insert(0, '$BackendPathForPython'); from app.version import APP_VERSION; print(APP_VERSION)").Trim()
+$VersionInfoPath = Join-Path $BuildDir "$AppName-version-info.txt"
+Write-Step "Generating Windows version resource for $AppName $Version..."
+Write-WindowsVersionInfo -Path $VersionInfoPath -Version $Version
 
 Write-Step "Cleaning previous package output..."
 Stop-ReleaseSimingProcesses
@@ -197,7 +354,6 @@ Remove-Item -LiteralPath (Join-Path $BuildDir "release-assets") -Recurse -Force 
 $PyInstallerMode = if ($OneDir) { "--onedir" } else { "--onefile" }
 $Separator = ":"
 $FrontendDist = Join-Path $FrontendDir "dist"
-$BackendPathForPython = $BackendDir.Replace("\", "\\")
 $DynamicWorkspaceModules = @(
   & $VenvPython -c "import sys; sys.path.insert(0, '$BackendPathForPython'); from app.services.workspace.dynamic_modules import LEGACY_HANDLER_MODULES; print(*LEGACY_HANDLER_MODULES, sep='\n')"
 )
@@ -220,6 +376,7 @@ try {
     $PyInstallerMode,
     "--windowed",
     "--name", $AppName,
+    "--version-file", $VersionInfoPath,
     "--distpath", $DistDir,
     "--workpath", (Join-Path $BuildDir "pyinstaller-work"),
     "--specpath", $BuildDir,
@@ -266,10 +423,12 @@ $ExePath = if ($OneDir) {
   Join-Path $DistDir "$AppName.exe"
 }
 
+Write-Step "Verifying Windows version resource..."
+Assert-WindowsVersionInfo -ExecutablePath $ExePath -Version $Version
+
 Write-Step "Verifying packaged MCP stdio and critical write tools..."
 Invoke-Native $VenvPython @((Join-Path $ScriptDir "smoke-packaged-mcp.py"), $ExePath)
 
-$Version = (& $VenvPython -c "import sys; sys.path.insert(0, '$BackendPathForPython'); from app.version import APP_VERSION; print(APP_VERSION)").Trim()
 $Sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $ExePath).Hash.ToLowerInvariant()
 $IsPrerelease = $Version.Contains("-")
 $ReleaseTag = "v$Version"

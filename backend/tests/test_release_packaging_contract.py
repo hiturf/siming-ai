@@ -1,9 +1,33 @@
 """Release packaging must include modules loaded only by migration scripts."""
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _canonical_package_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _exact_requirements(path: Path) -> dict[str, str]:
+    requirements: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        requirement = line.split(";", 1)[0].strip()
+        match = re.fullmatch(
+            r"(?P<name>[A-Za-z0-9_.-]+)(?:\[[^\]]+\])?==(?P<version>[^\s]+)",
+            requirement,
+        )
+        assert match, f"dependency is not exactly pinned: {raw_line}"
+        name = _canonical_package_name(match.group("name"))
+        assert name not in requirements, f"duplicate dependency pin: {name}"
+        requirements[name] = match.group("version")
+    return requirements
 
 
 def test_packager_includes_dynamic_database_migration_module():
@@ -27,6 +51,96 @@ def test_packager_uses_an_explicit_runtime_instead_of_the_backend_test_venv():
     assert '$ErrorActionPreference = "SilentlyContinue"' in script
     assert "base_executable" in script
     assert "$RuntimeChanged" in script
+
+
+def test_packager_embeds_and_verifies_windows_version_resource():
+    script = (ROOT / "scripts" / "build-exe.ps1").read_text(encoding="utf-8")
+
+    assert '"--version-file", $VersionInfoPath' in script
+    assert "Write-WindowsVersionInfo" in script
+    assert "Assert-WindowsVersionInfo" in script
+    assert "from app.version import APP_VERSION" in script
+    assert "StringStruct(u'CompanyName', u'teangtang1122')" in script
+    assert "StringStruct(u'ProductName', u'司命 (Siming)')" in script
+    assert "StringStruct(u'OriginalFilename', u'Siming.exe')" in script
+    assert "StringStruct(u'FileVersion', u'$FileVersion')" in script
+    assert "StringStruct(u'ProductVersion', u'$Version')" in script
+
+
+def test_windows_packaging_toolchain_and_python_environment_are_fully_pinned():
+    toolchain = json.loads((ROOT / "build-toolchain.json").read_text(encoding="utf-8"))
+    build_lock = _exact_requirements(ROOT / "backend" / "requirements-windows-build.lock")
+    runtime_requirements = _exact_requirements(ROOT / "backend" / "requirements.txt")
+    script = (ROOT / "scripts" / "build-exe.ps1").read_text(encoding="utf-8")
+
+    assert toolchain == {
+        "schema_version": 1,
+        "python": "3.11.15",
+        "python_implementation": "CPython",
+        "python_architecture": "64bit",
+        "pip": "26.2.1",
+        "setuptools": "79.0.1",
+        "pyinstaller": "6.21.0",
+        "node": "24.14.1",
+        "npm": "11.11.0",
+        "inno_setup": "6.7.1",
+    }
+    assert len(build_lock) >= 70
+    assert build_lock["pip"] == toolchain["pip"]
+    assert build_lock["setuptools"] == toolchain["setuptools"]
+    assert build_lock["pyinstaller"] == toolchain["pyinstaller"]
+    for package, version in runtime_requirements.items():
+        assert build_lock.get(package) == version
+
+    assert "requirements-windows-build.lock" in script
+    assert '"--no-deps"' in script
+    assert '"--only-binary=:all:"' in script
+    assert '"--no-binary=proxy_tools"' in script
+    assert '"--no-build-isolation"' in script
+    assert "verify-python-build-lock.py" in script
+    assert '"pip==$($Toolchain.pip)"' in script
+    assert '"setuptools==$($Toolchain.setuptools)"' in script
+    assert "--trusted-host" not in script
+
+
+def test_frontend_build_uses_the_exact_node_npm_and_package_lock():
+    toolchain = json.loads((ROOT / "build-toolchain.json").read_text(encoding="utf-8"))
+    package = json.loads((ROOT / "frontend" / "package.json").read_text(encoding="utf-8"))
+    package_lock = json.loads(
+        (ROOT / "frontend" / "package-lock.json").read_text(encoding="utf-8")
+    )
+    script = (ROOT / "scripts" / "build-exe.ps1").read_text(encoding="utf-8")
+
+    assert package["packageManager"] == f"npm@{toolchain['npm']}"
+    assert package["engines"] == {
+        "node": toolchain["node"],
+        "npm": toolchain["npm"],
+    }
+    assert package_lock["lockfileVersion"] == 3
+    assert package_lock["packages"][""]["engines"] == package["engines"]
+    assert 'Invoke-Native $NpmExe @("ci")' in script
+    assert 'Invoke-Native "npm" @("install")' not in script
+
+
+def test_windows_ci_reads_the_same_pinned_toolchain():
+    for workflow_name in ("windows-installer-ci.yml", "release-gate.yml"):
+        workflow = (ROOT / ".github" / "workflows" / workflow_name).read_text(
+            encoding="utf-8"
+        )
+        assert "Read pinned Windows toolchain" in workflow
+        assert "steps.windows_toolchain.outputs.python" in workflow
+        assert "steps.windows_toolchain.outputs.pip" in workflow
+        assert "steps.windows_toolchain.outputs.node" in workflow
+        assert "steps.windows_toolchain.outputs.npm" in workflow
+        assert "steps.windows_toolchain.outputs.inno_setup" in workflow
+        assert "--allow-downgrade" in workflow
+
+    toolchain = json.loads((ROOT / "build-toolchain.json").read_text(encoding="utf-8"))
+    for workflow_name in ("architecture-ci.yml", "frontend-ci.yml"):
+        workflow = (ROOT / ".github" / "workflows" / workflow_name).read_text(
+            encoding="utf-8"
+        )
+        assert f'node-version: "{toolchain["node"]}"' in workflow
 
 
 def test_publisher_stops_when_repository_verification_is_unavailable():

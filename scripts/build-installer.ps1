@@ -17,6 +17,7 @@ $PayloadDistDir = Join-Path $BuildDir "installer-payload"
 $InstallerScript = Join-Path $Root "installer\Siming.iss"
 $InstallerExe = Join-Path $ReleaseDir "Siming-Setup.exe"
 $InstallerShaPath = Join-Path $ReleaseDir "Siming-Setup.sha256"
+$ToolchainPath = Join-Path $Root "build-toolchain.json"
 
 function Write-Step {
   param([string]$Message)
@@ -62,6 +63,37 @@ function Resolve-InnoCompiler {
   throw "Inno Setup compiler ISCC.exe is required. Install Inno Setup or set SIMING_INNO_ISCC."
 }
 
+function Read-PinnedInnoVersion {
+  if (-not (Test-Path -LiteralPath $ToolchainPath -PathType Leaf)) {
+    throw "Pinned build toolchain is missing: $ToolchainPath"
+  }
+  $Toolchain = Get-Content -LiteralPath $ToolchainPath -Raw | ConvertFrom-Json
+  if ([string]::IsNullOrWhiteSpace([string]$Toolchain.inno_setup)) {
+    throw "Pinned build toolchain is missing 'inno_setup': $ToolchainPath"
+  }
+  return [string]$Toolchain.inno_setup
+}
+
+function Assert-InnoCompilerVersion {
+  param(
+    [Parameter(Mandatory=$true)][string]$CompilerPath,
+    [Parameter(Mandatory=$true)][string]$ExpectedVersion
+  )
+
+  $VersionInfo = (Get-Item -LiteralPath $CompilerPath).VersionInfo
+  foreach ($Candidate in @($VersionInfo.ProductVersion, $VersionInfo.FileVersion)) {
+    if ([string]$Candidate -match '(?<Version>\d+\.\d+\.\d+)') {
+      $ActualVersion = $Matches.Version
+      if ($ActualVersion -ne $ExpectedVersion) {
+        throw "Inno Setup $ExpectedVersion is required for reproducible packaging; found $ActualVersion at $CompilerPath."
+      }
+      Write-Step "Pinned Inno Setup $ActualVersion verified: $CompilerPath"
+      return
+    }
+  }
+  throw "Unable to determine Inno Setup version from $CompilerPath"
+}
+
 function Read-AppVersion {
   $VersionFile = Join-Path $Root "backend\app\version.py"
   $Match = Select-String -Path $VersionFile -Pattern 'APP_VERSION\s*=\s*["'']([^"'']+)' | Select-Object -First 1
@@ -71,6 +103,8 @@ function Read-AppVersion {
 
 Write-Step "Checking Inno Setup compiler..."
 $Iscc = Resolve-InnoCompiler
+$PinnedInnoVersion = Read-PinnedInnoVersion
+Assert-InnoCompilerVersion -CompilerPath $Iscc -ExpectedVersion $PinnedInnoVersion
 $Version = Read-AppVersion
 
 Write-Step "Removing stale legacy release assets..."

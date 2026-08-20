@@ -112,6 +112,11 @@ select {
   min-width: 44px;
 }
 
+.system-nav-tools .system-nav-tool-active {
+  background: var(--ant-color-primary-bg);
+  color: var(--ant-color-primary);
+}
+
 .global-operation-badge {
   display: inline-flex;
 }

@@ -66,13 +66,25 @@ release\Siming-Setup.sha256
 
 `.siming-installed` 是安装版标记，更新器用它识别正式安装布局。这样日常启动不再依赖 onefile 每次启动时的完整自解包流程，运行时文件也可以由安装器统一覆盖和维护。
 
+构建脚本会根据 `backend/app/version.py` 中的 `APP_VERSION` 自动生成并嵌入 Windows 版本资源。安装后的 `Siming.exe` 包含 `CompanyName=teangtang1122`、`ProductName=司命 (Siming)`、文件说明、原始文件名以及文件/产品版本；例如应用版本 `3.3.0` 对应 Windows 数值文件版本 `3.3.0.0`。构建完成后会读取 PE 版本信息并校验这些字段，避免发布空白或版本漂移的主程序。
+
 ## 构建机要求
 
-负责打包的 Windows 机器需要：
+Windows 安装包使用仓库根目录的 `build-toolchain.json` 作为工具链版本真源。当前固定版本为：
 
-- Python（带 Tk，且可用于 PyInstaller）
-- Node.js / npm
-- Inno Setup（`ISCC.exe`）
+| 工具 | 固定版本 |
+| --- | --- |
+| CPython（Windows x64，带 Tk） | 3.11.15 |
+| pip | 26.2.1 |
+| setuptools | 79.0.1 |
+| PyInstaller | 6.21.0 |
+| Node.js | 24.14.1 |
+| npm | 11.11.0 |
+| Inno Setup | 6.7.1 |
+
+`backend/requirements-windows-build.lock` 固定打入主程序的全部 Python 直接与传递依赖；`frontend/package-lock.json` 固定全部 npm 直接与传递依赖及包完整性摘要。`scripts/build-exe.ps1` 使用 `pip --no-deps` 安装完整 Python 锁，并在打包前检查环境中没有缺包、多包或版本漂移；前端始终使用 `npm ci` 重建依赖。Python、Node.js、npm、PyInstaller 或 Inno Setup 与清单不一致时，构建会直接失败。
+
+升级构建依赖时，应在同一次变更中更新 `build-toolchain.json`、对应锁文件和契约测试，并重新执行真实 Windows 安装包构建；不要只修改宽泛的依赖声明。
 
 可以通过环境变量显式指定 Inno Setup 编译器：
 

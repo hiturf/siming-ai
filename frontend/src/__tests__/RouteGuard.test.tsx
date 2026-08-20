@@ -24,6 +24,7 @@ vi.mock('../features/operations/components/GlobalOperationCenter', () => ({ defa
 vi.mock('../pages/DashboardPage', () => ({ default: () => <div data-testid="dashboard-page">作品库</div> }))
 vi.mock('../pages/ProjectWorkspace', () => ({ default: () => <div data-testid="project-page">项目工作区</div> }))
 vi.mock('../pages/SettingsPage', () => ({ default: () => <div data-testid="settings-page">设置</div> }))
+vi.mock('../pages/AboutPage', () => ({ default: () => <div data-testid="about-page">关于我们</div> }))
 
 import App from '../App'
 
@@ -54,6 +55,11 @@ describe('App route behavior', () => {
   it('opens system routes without a global project preload', async () => {
     render(<MemoryRouter initialEntries={['/settings']}><App /></MemoryRouter>)
     expect(await screen.findByTestId('settings-page')).toBeInTheDocument()
+  })
+
+  it('opens the about page as a stable system route', async () => {
+    render(<MemoryRouter initialEntries={['/about']}><App /></MemoryRouter>)
+    expect(await screen.findByTestId('about-page')).toBeInTheDocument()
   })
 
   it('allows direct project access', async () => {

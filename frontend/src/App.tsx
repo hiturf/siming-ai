@@ -9,6 +9,7 @@ import GatewayAdminGate, { useGatewayRuntime } from './features/gateway/GatewayA
 const DashboardPage = lazy(() => import('./pages/DashboardPage'))
 const ProjectWorkspace = lazy(() => import('./pages/ProjectWorkspace'))
 const SettingsPage = lazy(() => import('./pages/SettingsPage'))
+const AboutPage = lazy(() => import('./pages/AboutPage'))
 const GettingStartedPage = lazy(() => import('./pages/GettingStartedPage'))
 const ExternalAgentPage = lazy(() => import('./pages/ExternalAgentPage'))
 const GuiPage = lazy(() => import('./pages/GuiPage'))
@@ -146,6 +147,7 @@ function App() {
               <Route path="/novel-creation" element={<NovelCreationRedirect />} />
               <Route path="/project/:projectId/*" element={<ProjectWorkspace />} />
               <Route path="/settings" element={<SettingsPage />} />
+              <Route path="/about" element={<AboutPage />} />
               <Route path="/getting-started" element={<GettingStartedPage />} />
               <Route path="/external-agent" element={<ExternalAgentPage />} />
               <Route path="/gui" element={<GuiPage />} />

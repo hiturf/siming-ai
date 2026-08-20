@@ -1,6 +1,6 @@
 import { useNavigate, useLocation } from 'react-router-dom'
 import { Button, Space, Tooltip, Typography } from 'antd'
-import { BookOutlined, ExperimentOutlined, HomeOutlined, PlusOutlined, RocketOutlined, RobotOutlined, SettingOutlined } from '@ant-design/icons'
+import { BookOutlined, ExperimentOutlined, HomeOutlined, InfoCircleOutlined, PlusOutlined, RocketOutlined, RobotOutlined, SettingOutlined } from '@ant-design/icons'
 import ThemeSwitcher from '../themes/ThemeSwitcher'
 import { useGatewayRuntime } from './GatewayRuntimeContext'
 import AppVersion from './AppVersion'
@@ -9,7 +9,7 @@ const { Text } = Typography
 
 interface SystemNavProps {
   /** Highlight the current page */
-  current?: 'dashboard' | 'creation' | 'assistant' | 'getting-started' | 'settings' | 'external-agent' | 'models'
+  current?: 'dashboard' | 'creation' | 'assistant' | 'getting-started' | 'settings' | 'external-agent' | 'models' | 'about'
 }
 
 /**
@@ -27,6 +27,7 @@ function SystemNav({ current }: SystemNavProps) {
     if (location.pathname === '/gui') return 'assistant'
     if (location.pathname === '/getting-started') return 'getting-started'
     if (location.pathname === '/settings') return 'settings'
+    if (location.pathname === '/about') return 'about'
     if (location.pathname === '/external-agent') return 'external-agent'
     if (location.pathname === '/models') return 'models'
     return ''
@@ -65,10 +66,21 @@ function SystemNav({ current }: SystemNavProps) {
       </Space>
       <div className="system-nav-tools">
         <span id="global-operation-nav-slot" className="global-operation-nav-slot" />
+        <Tooltip title="关于我们">
+          <Button
+            type="text"
+            icon={<InfoCircleOutlined />}
+            className={active === 'about' ? 'system-nav-tool-active' : undefined}
+            aria-label="关于我们"
+            aria-current={active === 'about' ? 'page' : undefined}
+            onClick={() => navigate('/about')}
+          />
+        </Tooltip>
         <Tooltip title="系统设置">
           <Button
             type="text"
             icon={<SettingOutlined />}
+            className={active === 'settings' ? 'system-nav-tool-active' : undefined}
             aria-label="系统设置"
             aria-current={active === 'settings' ? 'page' : undefined}
             onClick={() => navigate('/settings')}

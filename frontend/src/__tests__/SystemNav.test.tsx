@@ -18,4 +18,10 @@ describe('SystemNav', () => {
 
     expect(screen.getByRole('button', { name: '作品库' })).toHaveAttribute('aria-current', 'page')
   })
+
+  it('exposes the about page in the utility navigation and marks it active', () => {
+    render(<MemoryRouter initialEntries={['/about']}><SystemNav /></MemoryRouter>)
+
+    expect(screen.getByRole('button', { name: '关于我们' })).toHaveAttribute('aria-current', 'page')
+  })
 })

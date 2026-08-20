@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "python": "3.11.15",
+  "python_implementation": "CPython",
+  "python_architecture": "64bit",
+  "pip": "26.2.1",
+  "setuptools": "79.0.1",
+  "pyinstaller": "6.21.0",
+  "node": "24.14.1",
+  "npm": "11.11.0",
+  "inno_setup": "6.7.1"
+}
