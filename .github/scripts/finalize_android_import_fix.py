@@ -120,7 +120,7 @@ write(android_path, android)
 backend_test_path = "backend/tests/test_importer.py"
 backend_tests = read(backend_test_path)
 anchor = "    def test_import_preview_uses_regex_chapter_boundaries_without_llm(self):\n"
-new_test = '''    def test_import_preview_ignores_sentence_like_chapter_prefixes_in_body(self):
+new_test = r'''    def test_import_preview_ignores_sentence_like_chapter_prefixes_in_body(self):
         project_id = self.create_project("Body Prefix Project")
         text = (
             "第一章 风起！\n"
