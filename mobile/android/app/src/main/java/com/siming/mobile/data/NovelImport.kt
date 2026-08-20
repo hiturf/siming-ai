@@ -173,16 +173,31 @@ internal object NovelImportSplitter {
     private const val MAX_CHAPTER_CHARS = 200_000
 
     private val marker = Regex(
-        """^[ \t]*((?:【[ \t]*)?(?:第[ \t]*[零〇一二三四五六七八九十百千万0-9]+[ \t]*[章节部卷]|(?:卷|部)[ \t]*[零〇一二三四五六七八九十百千万0-9]+|Chapter\s+[0-9]+|Part\s+[0-9]+|序章|楔子|引子|尾声)(?:[^\r\n]{0,60})?(?:[ \t]*】)?)[ \t]*$""",
+        """^[ \t]*((?:【[ \t]*)?(?:第[ \t]*[零〇一二三四五六七八九十百千万0-9]+[ \t]*[章节部卷]|(?:卷|部)[ \t]*[零〇一二三四五六七八九十百千万0-9]+|Chapter[ \t]+[0-9]+|Part[ \t]+[0-9]+|序章|楔子|引子|尾声)(?:[^\r\n]{0,60})?(?:[ \t]*】)?)[ \t]*$""",
         setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE),
     )
+    private val markerPrefix = Regex(
+        """^(?:第[ \t]*[零〇一二三四五六七八九十百千万0-9]+[ \t]*[章节部卷]|(?:卷|部)[ \t]*[零〇一二三四五六七八九十百千万0-9]+|Chapter[ \t]+[0-9]+|Part[ \t]+[0-9]+|序章|楔子|引子|尾声)""",
+        RegexOption.IGNORE_CASE,
+    )
+    private val titleSeparators = setOf(' ', '\t', '：', ':', '-', '—', '·', '_')
+    private val sentenceEndings = setOf('。', '！', '？', '!', '?', '；', ';', '，', ',')
+
+    private fun isLikelyChapterTitle(value: String): Boolean {
+        val raw = value.trim()
+        val bracketed = raw.startsWith("【") && raw.endsWith("】")
+        val core = raw.removePrefix("【").removeSuffix("】").trim()
+        val prefix = markerPrefix.find(core) ?: return false
+        if (bracketed) return true
+        val suffix = core.substring(prefix.range.last + 1)
+        if (suffix.isBlank()) return true
+        return suffix.first() in titleSeparators || suffix.trimEnd().last() !in sentenceEndings
+    }
 
     fun split(content: String): List<NovelChapterDraft> {
         require(content.isNotBlank()) { "TXT 文件内容为空" }
         val matches = marker.findAll(content)
-            .filterNot { match ->
-                match.value.trimEnd().lastOrNull()?.let { it in "。！？!?；;，," } == true
-            }
+            .filter { isLikelyChapterTitle(it.value) }
             .toList()
         val chapters = if (matches.isEmpty()) {
             chunkBody("导入章节", content.trim(), FALLBACK_CHUNK_CHARS)

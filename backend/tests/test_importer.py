@@ -184,6 +184,28 @@ class ImporterTestCase(unittest.TestCase):
         finally:
             db.close()
 
+    def test_import_preview_ignores_sentence_like_chapter_prefixes_in_body(self):
+        project_id = self.create_project("Body Prefix Project")
+        text = (
+            "第一章 风起！\n"
+            + "第一章正文。这里仍然属于正文，不是新章节。" * 6
+            + "\n\n第二章 云涌\n"
+            + "第二章正文继续。" * 6
+        )
+
+        response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/import/preview",
+            json={"text": text},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertEqual(data["total"], 2)
+        self.assertEqual(
+            [item["title"] for item in data["splits"]],
+            ["第一章 风起！", "第二章 云涌"],
+        )
+
     def test_import_preview_uses_regex_chapter_boundaries_without_llm(self):
         project_id = self.create_project("Preview Project")
         text = (

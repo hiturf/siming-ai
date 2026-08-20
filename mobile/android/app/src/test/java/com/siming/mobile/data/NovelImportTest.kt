@@ -60,6 +60,23 @@ class NovelImportTest {
     }
 
     @Test
+    fun ignoresSentenceLikeChapterPrefixesInsideBody() {
+        val text = """
+            第一章 风起！
+            第一章正文。这里仍然属于正文，不是新章节。
+
+            第二章 云涌
+            第二章正文继续。
+        """.trimIndent()
+
+        val chapters = NovelImportSplitter.split(text)
+
+        assertEquals(2, chapters.size)
+        assertEquals(listOf("第一章 风起！", "第二章 云涌"), chapters.map { it.title })
+        assertTrue(chapters.first().content.contains("第一章正文"))
+    }
+
+    @Test
     fun fallbackSplitDoesNotCreateEmptyChapters() {
         val text = "正文".repeat(3_000)
         val chapters = NovelImportSplitter.split(text)

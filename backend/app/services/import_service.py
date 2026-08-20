@@ -26,14 +26,49 @@ LLM_SPLIT_GROUP_SIZE = 3
 LLM_SPLIT_OVERLAP = 1
 SUPPORTED_IMPORT_EXTENSIONS = {"txt", "docx"}
 CHAPTER_TITLE_RE = re.compile(
-    r"(?im)^\s*("
-    r"第[零〇一二三四五六七八九十百千万\d]+[章节部卷](?:[^\n]{0,60})?"
-    r"|第\s*[0-9]+\s*[章节部卷](?:[^\n]{0,60})?"
-    r"|Chapter\s+\d+[^\n]{0,60}"
-    r"|CHAPTER\s+\d+[^\n]{0,60}"
-    r"|Part\s+\d+[^\n]{0,60}"
-    r")\s*$"
+    r"(?im)^[ \t]*("
+    r"(?:【[ \t]*)?"
+    r"(?:"
+    r"第[ \t]*[零〇一二三四五六七八九十百千万\d]+[ \t]*[章节部卷]"
+    r"|(?:卷|部)[ \t]*[零〇一二三四五六七八九十百千万\d]+"
+    r"|Chapter[ \t]+\d+"
+    r"|Part[ \t]+\d+"
+    r"|序章|楔子|引子|尾声"
+    r")"
+    r"(?:[^\r\n]{0,60})?"
+    r"(?:[ \t]*】)?"
+    r")[ \t]*$"
 )
+CHAPTER_PREFIX_RE = re.compile(
+    r"(?i)^(?:"
+    r"第[ \t]*[零〇一二三四五六七八九十百千万\d]+[ \t]*[章节部卷]"
+    r"|(?:卷|部)[ \t]*[零〇一二三四五六七八九十百千万\d]+"
+    r"|Chapter[ \t]+\d+"
+    r"|Part[ \t]+\d+"
+    r"|序章|楔子|引子|尾声"
+    r")"
+)
+_CHAPTER_TITLE_SEPARATORS = set(" \t：:-—·_")
+_CHAPTER_SENTENCE_ENDINGS = set("。！？!?；;，,")
+
+
+def _is_likely_chapter_title(value: str) -> bool:
+    raw = str(value or "").strip()
+    bracketed = raw.startswith("【") and raw.endswith("】")
+    core = raw.removeprefix("【").removesuffix("】").strip()
+    prefix = CHAPTER_PREFIX_RE.match(core)
+    if prefix is None:
+        return False
+    if bracketed:
+        return True
+    suffix = core[prefix.end() :]
+    if not suffix.strip():
+        return True
+    return (
+        suffix[0] in _CHAPTER_TITLE_SEPARATORS
+        or suffix.rstrip()[-1] not in _CHAPTER_SENTENCE_ENDINGS
+    )
+
 
 
 def _text_quality(text: str) -> float:
@@ -145,7 +180,7 @@ def _parse_raw_file(filename: str, raw: bytes) -> dict:
     if ext not in SUPPORTED_IMPORT_EXTENSIONS:
         raise ValidationError("仅支持 .txt 和 .docx 格式文件")
     if len(raw) > MAX_UPLOAD_BYTES:
-        raise ValidationError("文件太大，最大支持 10MB")
+        raise ValidationError("文件太大，最大支持 20 MiB")
 
     if ext == "docx":
         text = _parse_docx(raw)
@@ -212,7 +247,11 @@ def _fallback_splits(text: str, chunk_size: int = 5000) -> list[dict]:
 
 
 def _regex_splits(text: str) -> list[dict]:
-    matches = list(CHAPTER_TITLE_RE.finditer(text))
+    matches = [
+        match
+        for match in CHAPTER_TITLE_RE.finditer(text)
+        if _is_likely_chapter_title(match.group(1))
+    ]
     if not matches:
         return _fallback_splits(text)
 

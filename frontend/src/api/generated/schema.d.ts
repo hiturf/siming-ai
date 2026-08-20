@@ -846,6 +846,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/import/project-file": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import Project File As Project
+         * @description Decode, split and persist a complete novel in one transaction.
+         */
+        post: operations["import_project_file_as_project_api_v1_import_project_file_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/local-models/adapters": {
         parameters: {
             query?: never;
@@ -5755,6 +5775,11 @@ export interface components {
         };
         /** Body_import_file_api_v1_projects__project_id__import_file_post */
         Body_import_file_api_v1_projects__project_id__import_file_post: {
+            /** File */
+            file: string;
+        };
+        /** Body_import_project_file_as_project_api_v1_import_project_file_post */
+        Body_import_project_file_as_project_api_v1_import_project_file_post: {
             /** File */
             file: string;
         };
@@ -10848,6 +10873,39 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["ExternalAgentGlobalSettingsUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    import_project_file_as_project_api_v1_import_project_file_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_import_project_file_as_project_api_v1_import_project_file_post"];
             };
         };
         responses: {
