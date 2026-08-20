@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - fix/android-txt-import-performance-encoding
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
