@@ -124,9 +124,9 @@ new_test = r'''    def test_import_preview_ignores_sentence_like_chapter_prefixe
         project_id = self.create_project("Body Prefix Project")
         text = (
             "第一章 风起！\n"
-            "第一章正文。这里仍然属于正文，不是新章节。\n\n"
-            "第二章 云涌\n"
-            "第二章正文继续。"
+            + "第一章正文。这里仍然属于正文，不是新章节。" * 6
+            + "\n\n第二章 云涌\n"
+            + "第二章正文继续。" * 6
         )
 
         response = self.client.post(
