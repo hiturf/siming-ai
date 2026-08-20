@@ -1,0 +1,164 @@
+name: Apply model propagation and CLI tool bridge fix
+
+on:
+  push:
+    branches:
+      - fix/model-propagation-cli-tool-bridge
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/model-propagation-cli-tool-bridge
+          fetch-depth: 0
+
+      - name: Apply source and regression-test changes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text(encoding="utf-8")
+              if old not in text:
+                  raise SystemExit(f"expected source block not found in {path}: {old[:120]!r}")
+              target.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          creation_agent = "backend/app/services/novel_creation_agent.py"
+
+          replace_once(
+              creation_agent,
+              '''def _cli_mcp_system_prompt(session_id: str) -> str:\n    return _system_prompt(session_id) + f"""\n\n你当前是内化在司命聊天窗口中的本机 OpenCode Agent。用户已明确授权这一条消息连接临时 Siming MCP。\nMCP 只暴露当前 creation session_id={session_id} 的立项工具；不要尝试 Shell、编辑文件、扫描项目目录或访问其他会话。\n先调用 siming_turn_get_creation_snapshot 读取当前 revision 和现有事实，再按用户要求调用对应的 siming_turn_* 工具。\n每次写入都使用刚读取到的 revision；写入后必须再次读取并核对新 revision，才能告诉用户已经保存。\n临时 MCP 会在本条消息结束时销毁，不要修改 OpenCode 或其他 CLI 的任何配置文件。"""\n''',
+              '''def _cli_mcp_system_prompt(session_id: str, *, model: str | None = None) -> str:\n    model_label = str(model or "").strip() or "未显式解析"\n    return _system_prompt(session_id) + f"""\n\n你当前是内化在司命聊天窗口中的本机 OpenCode Agent。用户已明确授权这一条消息连接临时 Siming MCP。\nMCP 只暴露当前 creation session_id={session_id} 的立项工具；不要尝试 Shell、编辑文件、扫描项目目录或访问其他会话。\n当前对话模型身份：{model_label}。这个身份只说明当前 Agent 由谁执行，不代表应当递归启动另一个相同 CLI。\n先调用 siming_turn_get_creation_snapshot 读取当前 revision 和现有事实，再按用户要求调用对应的 siming_turn_* 工具。\n每次写入都使用刚读取到的 revision；写入后必须再次读取并核对新 revision，才能告诉用户已经保存。\n当 concepts 或 all 需要结构化内容、但没有另一个已在司命中配置并测试的非 CLI 模型可供内部任务使用时，由你当前模型直接生成完整结构，再用 patch_creation_artifact 写入 concepts artifact 的 /options；不要用空 model 调用 generate_creation_artifact，也不要递归启动当前 CLI。\n临时 MCP 会在本条消息结束时销毁，不要修改 OpenCode 或其他 CLI 的任何配置文件。"""\n''',
+          )
+
+          replace_once(
+              creation_agent,
+              '''    return {"content": "".join(content), "tool_calls": tool_calls}\n\n\ndef _prepare_agent_request(\n''',
+              '''    return {"content": "".join(content), "tool_calls": tool_calls}\n\n\ndef _resolve_effective_model(model: str | None) -> str | None:\n    """Resolve one stable model identity for both chat and nested tool runs."""\n    try:\n        selection = LLMGateway.select_model_for_task(\n            task_type="novel_creation",\n            model_override=model,\n        )\n        resolved = str(getattr(selection, "model", "") or "").strip()\n        if resolved:\n            return resolved\n    except Exception:\n        pass\n    fallback = str(model or "").strip()\n    return fallback or None\n\n\ndef _prepare_agent_request(\n''',
+          )
+
+          replace_once(
+              creation_agent,
+              '''        _cli_mcp_system_prompt(session.id)\n        if direct_transient_mcp\n''',
+              '''        _cli_mcp_system_prompt(session.id, model=model)\n        if direct_transient_mcp\n''',
+          )
+
+          replace_once(
+              creation_agent,
+              ''') -> dict[str, Any]:\n    messages, schemas, baseline_revision, extra_body, local_cli_mode = _prepare_agent_request(\n        session,\n        message,\n        model,\n''',
+              ''') -> dict[str, Any]:\n    effective_model = _resolve_effective_model(model)\n    messages, schemas, baseline_revision, extra_body, local_cli_mode = _prepare_agent_request(\n        session,\n        message,\n        effective_model,\n''',
+          )
+
+          replace_once(
+              creation_agent,
+              '''            model=model,\n            temperature=0.25,\n''',
+              '''            model=effective_model,\n            temperature=0.25,\n''',
+          )
+
+          replace_once(
+              creation_agent,
+              '''                if name in {"generate_creation_artifact", "refine_creation_artifact", "regenerate_creation_artifact"}:\n                    arguments.setdefault("model", model)\n''',
+              '''                if name in {"generate_creation_artifact", "refine_creation_artifact", "regenerate_creation_artifact"}:\n                    if not str(arguments.get("model") or "").strip():\n                        arguments["model"] = effective_model\n                    if effective_model:\n                        arguments["use_model"] = True\n''',
+          )
+
+          replace_once(
+              creation_agent,
+              '''                model=model,\n                temperature=0.2,\n''',
+              '''                model=effective_model,\n                temperature=0.2,\n''',
+          )
+
+          replace_once(
+              creation_agent,
+              '''                model=model,\n                assistant_reply=final_reply,\n''',
+              '''                model=effective_model,\n                assistant_reply=final_reply,\n''',
+          )
+
+          test_creation_agent = Path("backend/tests/test_novel_creation_agent.py")
+          creation_test_text = test_creation_agent.read_text(encoding="utf-8")
+          creation_test = r'''\n\ndef test_creation_agent_resolves_default_model_once_and_propagates_it_to_generation():\n    from types import SimpleNamespace\n\n    db = _db()\n    session = _ready_session(db)\n    completion = AsyncMock(side_effect=[\n        {\n            "content": "",\n            "tool_calls": [{\n                "id": "call-read-default-model",\n                "type": "function",\n                "function": {"name": "get_creation_snapshot", "arguments": "{}"},\n            }],\n        },\n        {\n            "content": "",\n            "tool_calls": [{\n                "id": "call-generate-default-model",\n                "type": "function",\n                "function": {\n                    "name": "generate_creation_artifact",\n                    "arguments": json.dumps({\n                        "artifact": "concepts",\n                        "model": None,\n                        "use_model": False,\n                    }),\n                },\n            }],\n        },\n        {"content": "已使用当前有效模型开始生成创意方向。", "tool_calls": []},\n    ])\n    executor = AsyncMock(side_effect=[\n        {"tool": "get_creation_snapshot", "status": "ok", "data": {"revision": session.revision}},\n        {"tool": "generate_creation_artifact", "status": "running", "data": {"run": {"id": "run-model", "status": "running"}}},\n    ])\n\n    with patch(\n        "app.services.novel_creation_agent.LLMGateway.select_model_for_task",\n        return_value=SimpleNamespace(model="openai:resolved-default"),\n    ) as select_model, patch(\n        "app.services.novel_creation_agent.LLMGateway.supports_tool_calling",\n        return_value=True,\n    ), patch(\n        "app.services.novel_creation_agent.LLMGateway.provider_for_model",\n        return_value="openai",\n    ), patch(\n        "app.services.novel_creation_agent.LLMGateway.stream_chat_completion_with_tools",\n        new=completion,\n    ), patch(\n        "app.services.novel_creation_agent.execute_workspace_action",\n        new=executor,\n    ):\n        result = asyncio.run(run_creation_agent(\n            db,\n            session=session,\n            message="生成创意方向",\n            model=None,\n        ))\n\n    select_model.assert_called_once_with(\n        task_type="novel_creation",\n        model_override=None,\n    )\n    assert completion.call_args_list[0].kwargs["model"] == "openai:resolved-default"\n    write_arguments = executor.call_args_list[1].args[2]["arguments"]\n    assert write_arguments["model"] == "openai:resolved-default"\n    assert write_arguments["use_model"] is True\n    assert result["run"]["id"] == "run-model"\n'''
+          if "test_creation_agent_resolves_default_model_once_and_propagates_it_to_generation" in creation_test_text:
+              raise SystemExit("creation model regression test already exists")
+          test_creation_agent.write_text(creation_test_text + creation_test, encoding="utf-8")
+
+          ai_writer = "backend/app/routers/ai_writer.py"
+
+          replace_once(
+              ai_writer,
+              '''def _workspace_action_summary(action: dict) -> str:\n    tool = str(action.get("tool") or "tool")\n    args = action.get("arguments") if isinstance(action.get("arguments"), dict) else {}\n    label = str(\n        args.get("title")\n        or args.get("name")\n        or args.get("chapter_title")\n        or args.get("field_name")\n        or args.get("id")\n        or ""\n    ).strip()\n    return f"{tool}：{_compact_workspace_detail(label, 80)}" if label else tool\n\n\ndef _build_workspace_final_reply(\n''',
+              '''def _workspace_action_summary(action: dict) -> str:\n    tool = str(action.get("tool") or "tool")\n    args = action.get("arguments") if isinstance(action.get("arguments"), dict) else {}\n    label = str(\n        args.get("title")\n        or args.get("name")\n        or args.get("chapter_title")\n        or args.get("field_name")\n        or args.get("id")\n        or ""\n    ).strip()\n    return f"{tool}：{_compact_workspace_detail(label, 80)}" if label else tool\n\n\ndef _workspace_local_cli_bridge_prompt(*, allow_writes: bool) -> str:\n    permission = (\n        "本轮已获得一次性项目写入授权；可在最终轮次提出写入 actions。"\n        if allow_writes\n        else "本轮尚未获得项目写入授权；仍应提出完成请求所需的写入 actions，司命会暂停并向用户申请一次性授权，绝不能声称已经保存。"\n    )\n    return f"""【本机 CLI 受控工具桥】\n当前 CLI 不通过原生 function calling 接收工具。不要因此声称本轮工具缺失，也不要要求用户改用命令行。\n你必须只输出一个 JSON 对象，禁止 Markdown 或额外文本：\n{{"reply":"给用户的简洁中文说明","done":true,"actions":[{{"tool":"工具名","arguments":{{}}}}],"needs_confirmation":false}}\n- 需要先读取资料时：done=false，actions 只放本轮需要的读取工具；司命会返回真实结果供下一轮继续。\n- 信息充分且需要写入时：done=true，actions 放最终写入工具；工具名必须来自系统提示中的“本轮可用工具”。\n- 只需聊天回答时：done=true，actions=[]，把回复放入 reply。\n- 不得把工具调用写进 reply，也不得用“工具列表里没有 create_character”等未经核对的说法代替 actions。\n{permission}"""\n\n\ndef _build_workspace_final_reply(\n''',
+          )
+
+          replace_once(
+              ai_writer,
+              '''            local_cli_selected = is_local_cli_provider(selected_provider)\n            local_cli_permission_granted = (\n                local_cli_selected\n                and payload.local_cli_permission_grant == "project_agent_once"\n            )\n            local_cli_mcp_enabled = local_cli_permission_granted\n            if local_cli_selected:\n''',
+              '''            local_cli_selected = is_local_cli_provider(selected_provider)\n            local_cli_permission_granted = (\n                local_cli_selected\n                and payload.local_cli_permission_grant == "project_agent_once"\n            )\n            local_cli_mcp_enabled = (\n                selected_provider == "opencode_cli" and local_cli_permission_granted\n            )\n            local_cli_bridge_mode = local_cli_selected and not local_cli_mcp_enabled\n            if local_cli_selected:\n''',
+          )
+
+          replace_once(
+              ai_writer,
+              '''            if skill_info:\n                yield _sse_event({\n                    "type": "skills_matched",\n                    "skills": skill_info,\n                })\n            initial_user = build_workspace_assistant_initial_user_message(\n''',
+              '''            if skill_info:\n                yield _sse_event({\n                    "type": "skills_matched",\n                    "skills": skill_info,\n                })\n            if local_cli_bridge_mode:\n                system_prompt = (\n                    f"{system_prompt}\\n\\n"\n                    f"{_workspace_local_cli_bridge_prompt(allow_writes=local_cli_permission_granted)}"\n                )\n            initial_user = build_workspace_assistant_initial_user_message(\n''',
+          )
+
+          replace_once(
+              ai_writer,
+              '''            use_function_calling = supports_function_calling\n            allow_plain_text_fallback = not supports_function_calling\n            if not supports_function_calling:\n                yield _sse_event({\n                    "type": "status",\n                    "message": (\n                        "本机 CLI 已连接 Siming MCP，可自行选择项目读写工具。"\n                        if local_cli_mcp_enabled\n                        else "当前模型不支持稳定工具调用，已切换为文本/计划编排模式。"\n                    ),\n                    "tool": "local_cli_mcp_mode" if local_cli_mcp_enabled else "local_cli_mode",\n                })\n''',
+              '''            use_function_calling = supports_function_calling\n            allow_plain_text_fallback = not supports_function_calling and not local_cli_bridge_mode\n            if not supports_function_calling:\n                if local_cli_mcp_enabled:\n                    mode_message = "OpenCode 已连接当前作品范围的临时 Siming MCP，可自行选择项目读写工具。"\n                    mode_tool = "local_cli_mcp_mode"\n                elif local_cli_bridge_mode and local_cli_permission_granted:\n                    mode_message = "本机 CLI 已启用受控工具桥；本轮可由司命校验并执行项目读写工具。"\n                    mode_tool = "local_cli_bridge_mode"\n                elif local_cli_bridge_mode:\n                    mode_message = "本机 CLI 已进入安全工具桥；读取可直接执行，写入会先请求一次性授权。"\n                    mode_tool = "local_cli_bridge_mode"\n                else:\n                    mode_message = "当前模型不支持稳定工具调用，已切换为文本模式。"\n                    mode_tool = "local_cli_mode"\n                yield _sse_event({\n                    "type": "status",\n                    "message": mode_message,\n                    "tool": mode_tool,\n                })\n''',
+          )
+
+          replace_once(
+              ai_writer,
+              '''                    search_actions = [a for a in actions if isinstance(a, dict) and a.get("tool") in SEARCH_TOOL_NAMES]\n                    write_actions = [a for a in actions if isinstance(a, dict) and a.get("tool") in WRITE_TOOL_NAMES]\n\n                    if not is_done and write_actions:\n''',
+              '''                    search_actions = [a for a in actions if isinstance(a, dict) and a.get("tool") in SEARCH_TOOL_NAMES]\n                    write_actions = [a for a in actions if isinstance(a, dict) and a.get("tool") in WRITE_TOOL_NAMES]\n\n                    if write_actions and local_cli_selected and not local_cli_permission_granted:\n                        requested_tools = ", ".join(\n                            sorted({str(action.get("tool") or "") for action in write_actions})\n                        )\n                        raise CLIPermissionRequiredError(\n                            f"项目写入工具需要一次性授权：{requested_tools or 'write'}"\n                        )\n\n                    if not is_done and write_actions:\n''',
+          )
+
+          replace_once(
+              ai_writer,
+              '''                se_names = SEARCH_TOOL_NAMES\n                wr_names = WRITE_TOOL_NAMES\n\n                yield _sse_event({\n''',
+              '''                se_names = SEARCH_TOOL_NAMES\n                wr_names = WRITE_TOOL_NAMES\n                if local_cli_selected and not local_cli_permission_granted:\n                    requested_writes = [\n                        tc["function"]["name"]\n                        for tc in tool_calls\n                        if tc["function"]["name"] in wr_names\n                    ]\n                    if requested_writes:\n                        raise CLIPermissionRequiredError(\n                            "项目写入工具需要一次性授权："\n                            + ", ".join(sorted(set(requested_writes)))\n                        )\n\n                yield _sse_event({\n''',
+          )
+
+          test_ai_writer = Path("backend/tests/test_ai_writer.py")
+          ai_test_text = test_ai_writer.read_text(encoding="utf-8")
+          marker = '''    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)\n    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")\n    def test_workspace_stream_one_turn_cli_grant_enables_project_mcp(self, mock_stream, _mock_supports):\n'''
+          new_tests = r'''    @patch("app.services.agent.local_cli_routing.classify_local_cli_workspace_request", new_callable=AsyncMock)\n    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)\n    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")\n    def test_workspace_stream_local_cli_write_action_requires_one_turn_grant(\n        self, mock_stream, _mock_supports, mock_route,\n    ):\n        project_id = self.create_project("CLI Safe Bridge Project")\n        mock_route.return_value = {"route": "general", "chapter_number": None, "outline_query": ""}\n        mock_stream.return_value = async_chunks(json.dumps({\n            "reply": "准备创建角色陈叙。",\n            "done": True,\n            "actions": [{\n                "tool": "create_character",\n                "arguments": {"name": "陈叙", "personality": "冷静", "abilities": []},\n            }],\n            "needs_confirmation": False,\n        }, ensure_ascii=False))\n\n        response = self.client.post(\n            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",\n            json={\n                "scope": "project",\n                "message": "新建角色陈叙",\n                "model": "claude_cli:claude-code",\n                "auto_apply": True,\n            },\n        )\n\n        self.assertEqual(response.status_code, 200)\n        self.assertIn('"type":"permission_required"', response.text)\n        self.assertIn("create_character", response.text)\n        call = mock_stream.call_args.kwargs\n        self.assertIn("本机 CLI 受控工具桥", call["messages"][0]["content"])\n        db = SessionLocal()\n        try:\n            self.assertIsNone(db.query(Character).filter(\n                Character.project_id == project_id,\n                Character.name == "陈叙",\n            ).one_or_none())\n        finally:\n            db.close()\n\n    @patch("app.services.agent.local_cli_routing.classify_local_cli_workspace_request", new_callable=AsyncMock)\n    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)\n    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")\n    def test_workspace_stream_local_cli_bridge_executes_granted_write(\n        self, mock_stream, _mock_supports, mock_route,\n    ):\n        project_id = self.create_project("CLI Granted Bridge Project")\n        mock_route.return_value = {"route": "general", "chapter_number": None, "outline_query": ""}\n        mock_stream.return_value = async_chunks(json.dumps({\n            "reply": "已创建角色陈叙。",\n            "done": True,\n            "actions": [{\n                "tool": "create_character",\n                "arguments": {"name": "陈叙", "personality": "冷静", "abilities": []},\n            }],\n            "needs_confirmation": False,\n        }, ensure_ascii=False))\n\n        response = self.client.post(\n            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",\n            json={\n                "scope": "project",\n                "message": "新建角色陈叙",\n                "model": "claude_cli:claude-code",\n                "auto_apply": True,\n                "local_cli_permission_grant": "project_agent_once",\n            },\n        )\n\n        self.assertEqual(response.status_code, 200)\n        self.assertIn("local_cli_bridge_mode", response.text)\n        self.assertIn("create_character", response.text)\n        db = SessionLocal()\n        try:\n            character = db.query(Character).filter(\n                Character.project_id == project_id,\n                Character.name == "陈叙",\n            ).one_or_none()\n            self.assertIsNotNone(character)\n        finally:\n            db.close()\n\n'''
+          if marker not in ai_test_text:
+              raise SystemExit("AI writer local CLI test insertion point not found")
+          if "test_workspace_stream_local_cli_write_action_requires_one_turn_grant" in ai_test_text:
+              raise SystemExit("AI writer CLI bridge tests already exist")
+          test_ai_writer.write_text(ai_test_text.replace(marker, new_tests + marker, 1), encoding="utf-8")
+          PY
+
+      - name: Install backend test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+
+      - name: Run targeted regressions
+        working-directory: backend
+        run: |
+          pytest -q tests/test_novel_creation_agent.py tests/test_ai_writer.py \
+            -k "resolves_default_model_once_and_propagates_it_to_generation or local_cli_write_action_requires_one_turn_grant or local_cli_bridge_executes_granted_write"
+          ruff check app/services/novel_creation_agent.py app/routers/ai_writer.py tests/test_novel_creation_agent.py tests/test_ai_writer.py
+
+      - name: Commit generated fix
+        shell: bash
+        run: |
+          rm -f .github/workflows/apply-model-cli-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/app/services/novel_creation_agent.py \
+                  backend/app/routers/ai_writer.py \
+                  backend/tests/test_novel_creation_agent.py \
+                  backend/tests/test_ai_writer.py \
+                  .github/workflows/apply-model-cli-fix.yml
+          git commit -m "Fix creation model propagation and local CLI tool bridge"
+          git push origin HEAD:fix/model-propagation-cli-tool-bridge
