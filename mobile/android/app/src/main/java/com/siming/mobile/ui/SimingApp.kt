@@ -2,6 +2,7 @@ package com.siming.mobile.ui
 
 import android.os.Build
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -93,9 +94,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -112,7 +114,7 @@ import com.siming.mobile.data.network.DirectApiConfig
 import com.siming.mobile.data.network.DirectApiSummary
 import com.siming.mobile.data.network.PcAuthoringContract
 import com.siming.mobile.data.network.PcFieldKind
-import com.siming.mobile.BuildConfig
+import com.siming.mobile.R
 
 private enum class RootTab(val label: String, val icon: ImageVector) {
     Library("作品", Icons.AutoMirrored.Outlined.LibraryBooks),
@@ -155,6 +157,7 @@ fun SimingApp(
     var rootTab by rememberSaveable { mutableStateOf(RootTab.Library) }
     var selectedProjectId by rememberSaveable { mutableStateOf<String?>(null) }
     var showDirectApiSetup by rememberSaveable { mutableStateOf(false) }
+    var showAbout by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(ui.notice, ui.error) {
         val message = ui.error ?: ui.notice ?: return@LaunchedEffect
@@ -170,6 +173,11 @@ fun SimingApp(
             onConfigured = { showDirectApiSetup = false },
             snackbar = snackbar,
         )
+        return
+    }
+
+    if (showAbout) {
+        MobileAboutWorkspace(onBack = { showAbout = false })
         return
     }
 
@@ -260,6 +268,7 @@ fun SimingApp(
                 viewModel = viewModel,
                 onConfigureApi = { showDirectApiSetup = true },
                 onOpenSync = { rootTab = RootTab.Sync },
+                onOpenAbout = { showAbout = true },
             )
         }
     }
@@ -284,15 +293,14 @@ private fun SimingTopBar(connection: GatewayConnection?, directApi: DirectApiSum
             }
         },
         navigationIcon = {
-            Surface(
-                color = MaterialTheme.colorScheme.primaryContainer,
-                shape = CircleShape,
-                modifier = Modifier.padding(start = 12.dp).size(34.dp),
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Text("命", color = SimingCinnabar, fontWeight = FontWeight.Bold)
-                }
-            }
+            Image(
+                painter = painterResource(R.drawable.ic_siming_pc),
+                contentDescription = "司命应用图标",
+                modifier = Modifier
+                    .padding(start = 12.dp)
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(9.dp)),
+            )
         },
         actions = {
             Icon(
@@ -1447,124 +1455,6 @@ private fun SnapshotBox(label: String, raw: String?) {
                 maxLines = 10,
                 overflow = TextOverflow.Ellipsis,
             )
-        }
-    }
-}
-
-@Composable
-private fun AboutScreen(
-    modifier: Modifier,
-    connection: GatewayConnection?,
-    directApi: DirectApiSummary?,
-    viewModel: MainViewModel,
-    onConfigureApi: () -> Unit,
-) {
-    val uriHandler = LocalUriHandler.current
-    var clearApiDialog by remember { mutableStateOf(false) }
-    LazyColumn(
-        modifier = modifier.fillMaxSize(),
-        contentPadding = PaddingValues(18.dp, 18.dp, 18.dp, 96.dp),
-        verticalArrangement = Arrangement.spacedBy(13.dp),
-    ) {
-        item {
-            ScreenHeading(
-                kicker = "OPEN SOURCE · FREE",
-                title = "设置与数据边界",
-                detail = "手机可以直接连接云端 API，也可以连接自己的 Gateway；作品正文始终保存在你的设备。",
-            )
-        }
-        item {
-            Text("手机直连 API", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-        }
-        item {
-            OutlinedCard(colors = CardDefaults.outlinedCardColors(containerColor = Color.White)) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-                    if (directApi == null) {
-                        Text("尚未配置", fontWeight = FontWeight.SemiBold)
-                        Text("配置后无需电脑开机即可使用项目助手。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Button(onClick = onConfigureApi, modifier = Modifier.fillMaxWidth()) {
-                            Icon(Icons.Outlined.Key, null)
-                            Spacer(Modifier.width(8.dp))
-                            Text("配置云端 API")
-                        }
-                    } else {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Outlined.CheckCircle, null, tint = SimingGreen)
-                            Spacer(Modifier.width(8.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(directApi.displayName, fontWeight = FontWeight.SemiBold)
-                                Text(directApi.model, style = MaterialTheme.typography.bodySmall)
-                            }
-                            MicroTag("可用", SimingGreen)
-                        }
-                        Text(directApi.baseUrl, maxLines = 2, overflow = TextOverflow.Ellipsis, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(onClick = viewModel::testDirectApi, modifier = Modifier.weight(1f)) { Text("重新测试") }
-                            OutlinedButton(onClick = onConfigureApi, modifier = Modifier.weight(1f)) { Text("编辑") }
-                        }
-                        TextButton(onClick = { clearApiDialog = true }, modifier = Modifier.fillMaxWidth()) {
-                            Text("清除本机 API 配置", color = MaterialTheme.colorScheme.error)
-                        }
-                    }
-                }
-            }
-        }
-        item {
-            Card(colors = CardDefaults.cardColors(containerColor = SimingPaperWarm)) {
-                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(11.dp)) {
-                    AboutRow(Icons.Outlined.Lock, "官方不转接正文", "设备只连接你配置的 API 或 Gateway")
-                    AboutRow(Icons.AutoMirrored.Outlined.LibraryBooks, "新作与二创", "从零建书，或导入已有 TXT 继续创作")
-                    AboutRow(Icons.Outlined.Person, "连续性资料", "角色目标、冲突和世界规则独立同步，帮助减少 OOC")
-                    AboutRow(Icons.Outlined.CloudOff, "离线仍可写", "Room 本地库 + WorkManager 可靠队列")
-                }
-            }
-        }
-        item {
-            OutlinedButton(
-                onClick = { uriHandler.openUri("https://github.com/teangtang1122/siming-ai") },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Icon(Icons.Outlined.Info, null)
-                Spacer(Modifier.width(8.dp))
-                Text("查看开源代码与许可证")
-            }
-        }
-        item {
-            Text("版本 ${BuildConfig.VERSION_NAME} · 同步协议 v${BuildConfig.SYNC_PROTOCOL_VERSION}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text(
-                when {
-                    connection != null -> "当前连接：${connection.gatewayName}"
-                    directApi != null -> "当前模式：手机独立 API"
-                    else -> "当前为纯离线模式"
-                },
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
-    if (clearApiDialog) {
-        AlertDialog(
-            onDismissRequest = { clearApiDialog = false },
-            title = { Text("清除手机直连 API？") },
-            text = { Text("将删除 Android Keystore 加密的 API 配置；本机作品和 Gateway 配对不会受影响。") },
-            confirmButton = {
-                TextButton(onClick = { clearApiDialog = false; viewModel.clearDirectApi() }) {
-                    Text("确认清除", color = MaterialTheme.colorScheme.error)
-                }
-            },
-            dismissButton = { TextButton(onClick = { clearApiDialog = false }) { Text("取消") } },
-        )
-    }
-}
-
-@Composable
-private fun AboutRow(icon: ImageVector, title: String, detail: String) {
-    Row(verticalAlignment = Alignment.Top) {
-        Icon(icon, null, tint = SimingCinnabar, modifier = Modifier.size(21.dp))
-        Spacer(Modifier.width(11.dp))
-        Column {
-            Text(title, fontWeight = FontWeight.SemiBold)
-            Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }

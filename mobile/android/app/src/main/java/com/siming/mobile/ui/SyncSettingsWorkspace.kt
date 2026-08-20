@@ -16,11 +16,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.ArrowForward
 import androidx.compose.material.icons.automirrored.outlined.LibraryBooks
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.CloudOff
 import androidx.compose.material.icons.outlined.CloudQueue
-import androidx.compose.material.icons.outlined.Code
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Devices
 import androidx.compose.material.icons.outlined.ErrorOutline
@@ -50,7 +50,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -327,8 +326,8 @@ internal fun MobileSettingsWorkspace(
     viewModel: MainViewModel,
     onConfigureApi: () -> Unit,
     onOpenSync: () -> Unit,
+    onOpenAbout: () -> Unit,
 ) {
-    val uriHandler = LocalUriHandler.current
     val ui by viewModel.uiState
     var showApiDetails by remember { mutableStateOf(false) }
     var showClearApi by remember { mutableStateOf(false) }
@@ -404,21 +403,26 @@ internal fun MobileSettingsWorkspace(
         }
         item { SettingsSectionTitle("关于") }
         item {
-            OutlinedCard(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Outlined.Info, null, tint = SimingCinnabar)
-                        Spacer(Modifier.width(9.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text("司命 ${BuildConfig.VERSION_NAME}", fontWeight = FontWeight.SemiBold)
-                            Text("同步协议 v${BuildConfig.SYNC_PROTOCOL_VERSION}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
+            OutlinedCard(onClick = onOpenAbout, modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Outlined.Info, contentDescription = null, tint = SimingCinnabar)
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("关于我们", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "司命 ${BuildConfig.VERSION_NAME} · 理念、数据边界与开源信息",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
-                    OutlinedButton(onClick = { uriHandler.openUri("https://github.com/teangtang1122/siming-ai") }, modifier = Modifier.fillMaxWidth()) {
-                        Icon(Icons.Outlined.Code, null)
-                        Spacer(Modifier.width(7.dp))
-                        Text("开源代码与许可证")
-                    }
+                    Icon(
+                        Icons.AutoMirrored.Outlined.ArrowForward,
+                        contentDescription = "打开关于我们",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
         }
