@@ -44,9 +44,6 @@ function Resolve-InnoCompiler {
     return $Configured
   }
 
-  $Command = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
-  if ($Command) { return $Command.Source }
-
   $Roots = @(${env:ProgramFiles}, ${env:ProgramFiles(x86)}) |
     Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) }
   foreach ($ProgramRoot in $Roots) {
@@ -59,6 +56,11 @@ function Resolve-InnoCompiler {
       return ($Candidates | Sort-Object -Descending | Select-Object -First 1)
     }
   }
+
+  # Package managers can expose an ISCC.exe shim whose own file version is
+  # unrelated to the installed compiler. Prefer the real Program Files binary.
+  $Command = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
+  if ($Command) { return $Command.Source }
 
   throw "Inno Setup compiler ISCC.exe is required. Install Inno Setup or set SIMING_INNO_ISCC."
 }
@@ -80,18 +82,35 @@ function Assert-InnoCompilerVersion {
     [Parameter(Mandatory=$true)][string]$ExpectedVersion
   )
 
-  $VersionInfo = (Get-Item -LiteralPath $CompilerPath).VersionInfo
-  foreach ($Candidate in @($VersionInfo.ProductVersion, $VersionInfo.FileVersion)) {
-    if ([string]$Candidate -match '(?<Version>\d+\.\d+\.\d+)') {
-      $ActualVersion = $Matches.Version
-      if ($ActualVersion -ne $ExpectedVersion) {
-        throw "Inno Setup $ExpectedVersion is required for reproducible packaging; found $ActualVersion at $CompilerPath."
-      }
-      Write-Step "Pinned Inno Setup $ActualVersion verified: $CompilerPath"
-      return
-    }
+  $ProbeDir = Join-Path ([System.IO.Path]::GetTempPath()) ("siming-inno-version-" + [guid]::NewGuid().ToString("N"))
+  $ProbeScript = Join-Path $ProbeDir "version-probe.iss"
+  New-Item -ItemType Directory -Force -Path $ProbeDir | Out-Null
+  [System.IO.File]::WriteAllText(
+    $ProbeScript,
+    "[Setup]`r`nAppName=Siming Compiler Probe`r`nAppVersion=1.0`r`nDefaultDirName={tmp}\SimingCompilerProbe`r`n",
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  $SavedErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "Continue"
+    $VersionOutput = (& $CompilerPath "/O-" $ProbeScript 2>&1 | Out-String).Trim()
+    $CompilerExitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $SavedErrorActionPreference
+    Remove-Item -LiteralPath $ProbeDir -Recurse -Force -ErrorAction SilentlyContinue
   }
-  throw "Unable to determine Inno Setup version from $CompilerPath"
+  if ($CompilerExitCode -ne 0) {
+    throw "Unable to query Inno Setup version from $CompilerPath (exit $CompilerExitCode): $VersionOutput"
+  }
+  $VersionMatch = [regex]::Match($VersionOutput, 'Compiler engine version:\s+.*?(?<Version>\d+\.\d+\.\d+)')
+  if (-not $VersionMatch.Success) {
+    throw "Unable to determine Inno Setup version from $CompilerPath output: $VersionOutput"
+  }
+  $ActualVersion = $VersionMatch.Groups["Version"].Value
+  if ($ActualVersion -ne $ExpectedVersion) {
+    throw "Inno Setup $ExpectedVersion is required for reproducible packaging; found $ActualVersion at $CompilerPath."
+  }
+  Write-Step "Pinned Inno Setup $ActualVersion verified: $CompilerPath"
 }
 
 function Read-AppVersion {

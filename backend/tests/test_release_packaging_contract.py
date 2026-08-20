@@ -56,12 +56,16 @@ def test_packager_uses_an_explicit_runtime_instead_of_the_backend_test_venv():
 def test_packager_embeds_and_verifies_windows_version_resource():
     script = (ROOT / "scripts" / "build-exe.ps1").read_text(encoding="utf-8")
 
+    assert script.isascii()
     assert '"--version-file", $VersionInfoPath' in script
     assert "Write-WindowsVersionInfo" in script
     assert "Assert-WindowsVersionInfo" in script
     assert "from app.version import APP_VERSION" in script
     assert "StringStruct(u'CompanyName', u'teangtang1122')" in script
-    assert "StringStruct(u'ProductName', u'司命 (Siming)')" in script
+    assert "StringStruct(u'ProductName', u'$ProductDisplayName')" in script
+    assert "StringStruct(u'FileDescription', u'$FileDescription')" in script
+    assert "5Y+45ZG9IChTaW1pbmcp" in script
+    assert "5Y+45ZG9IChTaW1pbmcpIOahjOmdouW6lOeUqA==" in script
     assert "StringStruct(u'OriginalFilename', u'Siming.exe')" in script
     assert "StringStruct(u'FileVersion', u'$FileVersion')" in script
     assert "StringStruct(u'ProductVersion', u'$Version')" in script
@@ -75,7 +79,7 @@ def test_windows_packaging_toolchain_and_python_environment_are_fully_pinned():
 
     assert toolchain == {
         "schema_version": 1,
-        "python": "3.11.15",
+        "python": "3.11.9",
         "python_implementation": "CPython",
         "python_architecture": "64bit",
         "pip": "26.2.1",
