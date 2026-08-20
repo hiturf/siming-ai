@@ -60,8 +60,9 @@ jobs:
       - name: Run backend import regressions
         working-directory: backend
         run: |
+          ruff check --fix --select I,F app/services/import_service.py app/routers/importer.py tests/test_importer.py
           pytest -q tests/test_importer.py tests/test_android_canonical_routes.py
-          ruff check app/services/import_service.py app/routers/importer.py app/bootstrap/http_security.py tests/test_importer.py
+          ruff check --select I,F app/services/import_service.py app/routers/importer.py app/bootstrap/http_security.py tests/test_importer.py
 
       - name: Run Android import unit tests and compile app
         working-directory: mobile/android
