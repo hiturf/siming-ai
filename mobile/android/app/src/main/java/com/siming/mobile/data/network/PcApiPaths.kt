@@ -9,6 +9,7 @@ package com.siming.mobile.data.network
 internal object PcApiPaths {
     const val RUNTIME_CAPABILITIES = "/api/v1/runtime/capabilities"
     const val PROJECTS = "/api/v1/projects"
+    const val IMPORT_PROJECT_FILE = "/api/v1/import/project-file"
     const val PAIRING_COMPLETE = "/api/v1/pairing/complete"
     const val AUTH_REFRESH = "/api/v1/auth/refresh"
     const val SYNC_PROJECTS = "/api/v1/sync/projects"

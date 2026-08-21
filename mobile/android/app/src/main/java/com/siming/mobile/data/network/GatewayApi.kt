@@ -24,6 +24,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -180,6 +181,41 @@ class GatewayApi(private val tokenStore: SecureTokenStore) {
             PcApiPaths.authoringItem(projectId, entityType, entityId),
             "DELETE",
         )
+    }
+
+    suspend fun importNovelProject(
+        connection: GatewayConnection,
+        filename: String,
+        bytes: ByteArray,
+    ): JsonObject = withContext(Dispatchers.IO) {
+        var token = validAccessToken(connection.baseUrl)
+        repeat(2) { attempt ->
+            val multipart = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart(
+                    "file",
+                    filename,
+                    bytes.toRequestBody(BINARY_MEDIA_TYPE),
+                )
+                .build()
+            val request = Request.Builder()
+                .url(connection.baseUrl + PcApiPaths.IMPORT_PROJECT_FILE)
+                .header("Authorization", "Bearer $token")
+                .header("Accept", "application/json")
+                .post(multipart)
+                .build()
+            client.newCall(request).execute().use { response ->
+                if (response.code == 401 && attempt == 0) {
+                    response.body?.close()
+                    token = refresh(connection.baseUrl, token)
+                    return@use
+                }
+                val raw = response.body?.string().orEmpty()
+                if (!response.isSuccessful) throw errorFrom(response.code, raw)
+                return@withContext json.decodeFromString<ApiEnvelope<JsonObject>>(raw).data
+            }
+        }
+        throw GatewayHttpException(401, "设备授权已失效，请重新连接 Gateway")
     }
 
     suspend fun deleteProject(connection: GatewayConnection, projectId: String) {
@@ -759,6 +795,7 @@ suspend fun downloadProjectExport(
 
     companion object {
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private val BINARY_MEDIA_TYPE = "application/octet-stream".toMediaType()
         private val EMPTY_BODY = ByteArray(0).toRequestBody(JSON_MEDIA_TYPE)
         private val refreshMutex = Mutex()
     }

@@ -37,10 +37,12 @@ import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -187,16 +189,19 @@ class SimingRepository(context: Context) {
         val projectIds = api.listSyncProjects(connection)
             .filter { it.status == "enabled" }
             .map { it.projectId }
+        return bootstrapProjects(connection, projectIds)
+    }
+
+    private suspend fun bootstrapProjects(
+        connection: GatewayConnection,
+        projectIds: List<String>,
+    ): Int {
         if (projectIds.isEmpty()) {
             dao.saveCursor(SyncCursor(cursor = 0, lastSuccessfulSyncAt = System.currentTimeMillis()))
             return 0
         }
         val response = api.bootstrap(connection, projectIds)
         database.withTransaction {
-            // bootstrap is a full authoritative snapshot for enabled projects.
-            // Remove only clean/non-conflicted replicas first so stale rows
-            // from older mobile schemas disappear, while offline edits and
-            // conflict branches remain available for upload/resolution.
             projectIds.forEach { projectId ->
                 dao.deleteCleanProjectReplicas(projectId)
             }
@@ -230,6 +235,154 @@ class SimingRepository(context: Context) {
             )
         }
         return projectIds.size
+    }
+
+    suspend fun importNovel(
+        file: MobileNovelImportFile,
+        onProgress: suspend (String) -> Unit = {},
+    ): MobileNovelImportResult {
+        require(file.bytes.isNotEmpty()) { "TXT 文件内容为空" }
+        require(file.bytes.size <= MAX_NOVEL_IMPORT_BYTES) {
+            "单个导入文件不能超过 20 MiB"
+        }
+
+        val connection = dao.connection()
+        if (connection != null && prepareCanonicalWrite()) {
+            onProgress("正在将原始 TXT 一次性上传到 Gateway…")
+            val remote = try {
+                api.importNovelProject(connection, file.filename, file.bytes)
+            } catch (error: GatewayHttpException) {
+                throw error
+            } catch (_: IOException) {
+                null
+            }
+            if (remote != null) {
+                val projectId = remote.string("project_id")
+                    .ifBlank { error("Gateway 批量导入结果缺少 project_id") }
+                val chapterCount = remote.int("total")
+                val encoding = remote.string("encoding").ifBlank { "未知" }
+                onProgress("Gateway 已批量落库，正在下载作品离线副本…")
+                val refreshWarning = runCatching {
+                    bootstrapProjects(connection, listOf(projectId))
+                }.exceptionOrNull()?.toUserFacingMessage()
+                return MobileNovelImportResult(
+                    projectId = projectId,
+                    chapterCount = chapterCount,
+                    encoding = encoding,
+                    remote = true,
+                    refreshWarning = refreshWarning,
+                )
+            }
+        }
+        return importNovelOffline(file, onProgress)
+    }
+
+    private suspend fun importNovelOffline(
+        file: MobileNovelImportFile,
+        onProgress: suspend (String) -> Unit,
+    ): MobileNovelImportResult {
+        onProgress("正在本机识别 TXT 编码…")
+        val decoded = withContext(Dispatchers.Default) {
+            TxtImportDecoder.decode(file.bytes)
+        }
+        onProgress("正在本机识别章节边界…")
+        val chapters = withContext(Dispatchers.Default) {
+            NovelImportSplitter.split(decoded.text)
+        }
+        val projectId = UUID.randomUUID().toString()
+        val title = file.filename.substringBeforeLast('.').trim().ifBlank { "导入作品" }
+        val now = Instant.now().toString()
+        val projectPayload = buildJsonObject {
+            put("_record_type", "project")
+            put("id", projectId)
+            put("title", title.take(200))
+            put("description", "由手机批量导入的已有小说")
+            put("narrative_perspective", "third_person")
+            put("writing_style", "natural")
+            put("short_sentences", false)
+            put("daily_word_goal", 6000)
+        }
+
+        onProgress("正在一个本地事务中写入 ${chapters.size} 章…")
+        database.withTransaction {
+            saveOfflineImportEntity(
+                projectId = projectId,
+                entityType = "project",
+                entityId = projectId,
+                payload = projectPayload,
+                now = now,
+            )
+            chapters.forEachIndexed { index, chapter ->
+                val chapterId = UUID.randomUUID().toString()
+                saveOfflineImportEntity(
+                    projectId = projectId,
+                    entityType = "chapter",
+                    entityId = chapterId,
+                    payload = buildJsonObject {
+                        put("_record_type", "chapter")
+                        put("id", chapterId)
+                        put("project_id", projectId)
+                        put("title", chapter.title.take(200))
+                        put("content", chapter.content)
+                        put("word_count", chapter.wordCount)
+                        put("current_version", 1)
+                        put("sort_order", (index + 1) * 1000)
+                    },
+                    now = now,
+                )
+            }
+        }
+        if (dao.connection() != null) SyncScheduler.enqueue(appContext)
+        return MobileNovelImportResult(
+            projectId = projectId,
+            chapterCount = chapters.size,
+            encoding = decoded.encoding,
+            remote = false,
+        )
+    }
+
+    private suspend fun saveOfflineImportEntity(
+        projectId: String,
+        entityType: String,
+        entityId: String,
+        payload: JsonObject,
+        now: String,
+    ) {
+        validateEntitySize(payload)
+        val encoded = json.encodeToString(payload)
+        val mutationEncoded = canonicalMutationJson(
+            projectId,
+            entityType,
+            entityId,
+            encoded,
+        ) ?: error("同步写入缺少 payload")
+        dao.saveEntity(
+            ReplicaEntity(
+                key = ReplicaEntity.key(projectId, entityType, entityId),
+                projectId = projectId,
+                entityType = entityType,
+                entityId = entityId,
+                revision = 0,
+                operation = "upsert",
+                payloadJson = encoded,
+                contentHash = sha256(encoded),
+                serverModifiedAt = now,
+                dirty = true,
+                conflicted = false,
+            ),
+        )
+        dao.saveMutation(
+            OutboxMutation(
+                mutationId = UUID.randomUUID().toString(),
+                projectId = projectId,
+                entityType = entityType,
+                entityId = entityId,
+                operation = "upsert",
+                baseRevision = 0,
+                payloadJson = mutationEncoded,
+                clientModifiedAt = now,
+            ),
+        )
     }
 
     suspend fun createProject(title: String, description: String = ""): String {

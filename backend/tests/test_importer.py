@@ -10,7 +10,7 @@ os.environ["DATABASE_URL"] = "sqlite:///./test_novel_agent.db"
 from fastapi.testclient import TestClient
 
 from app.core.utils import count_words
-from app.database.models import Chapter
+from app.database.models import Chapter, Project
 from app.database.session import Base, SessionLocal, engine
 from app.main import app
 
@@ -121,6 +121,90 @@ class ImporterTestCase(unittest.TestCase):
         self.assertEqual(data["filename"], "sample.txt")
         self.assertEqual(data["format"], "txt")
         self.assertIn("第一章", data["text"])
+
+    def test_import_file_detects_gb18030(self):
+        project_id = self.create_project("GB18030 Project")
+        text = "第一章 风起\n陆糖看见归墟阵重新亮起。"
+
+        response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/import/file",
+            files={"file": ("gb.txt", text.encode("gb18030"), "text/plain")},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertEqual(data["encoding"], "GB18030")
+        self.assertEqual(data["text"], text)
+        self.assertNotIn("\ufffd", data["text"])
+
+    def test_import_file_detects_utf16le_without_bom(self):
+        project_id = self.create_project("UTF16 Project")
+        text = "第一章 风起\n这是 UTF-16LE 正文。"
+
+        response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/import/file",
+            files={"file": ("utf16.txt", text.encode("utf-16-le"), "text/plain")},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertEqual(data["encoding"], "UTF-16LE")
+        self.assertEqual(data["text"], text)
+
+    def test_atomic_project_file_import_creates_project_and_all_chapters(self):
+        text = (
+            "第一章 风起\n" + "这里是第一章正文。" * 10 +
+            "\n\n第二章 云涌\n" + "这里是第二章正文。" * 10
+        )
+
+        response = self.client.post(
+            f"{API_PREFIX}/import/project-file",
+            files={"file": ("批量导入.txt", text.encode("gb18030"), "text/plain")},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertEqual(data["encoding"], "GB18030")
+        self.assertEqual(data["total"], 2)
+        project_id = data["project_id"]
+
+        db = SessionLocal()
+        try:
+            project = db.query(Project).filter(Project.id == project_id).one_or_none()
+            chapters = (
+                db.query(Chapter)
+                .filter(Chapter.project_id == project_id)
+                .order_by(Chapter.sort_order.asc())
+                .all()
+            )
+            self.assertIsNotNone(project)
+            self.assertEqual(project.title, "批量导入")
+            self.assertEqual(len(chapters), 2)
+            self.assertEqual([chapter.sort_order for chapter in chapters], [1000, 2000])
+        finally:
+            db.close()
+
+    def test_import_preview_ignores_sentence_like_chapter_prefixes_in_body(self):
+        project_id = self.create_project("Body Prefix Project")
+        text = (
+            "第一章 风起！\n"
+            + "第一章正文。这里仍然属于正文，不是新章节。" * 6
+            + "\n\n第二章 云涌\n"
+            + "第二章正文继续。" * 6
+        )
+
+        response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/import/preview",
+            json={"text": text},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertEqual(data["total"], 2)
+        self.assertEqual(
+            [item["title"] for item in data["splits"]],
+            ["第一章 风起！", "第二章 云涌"],
+        )
 
     def test_import_preview_uses_regex_chapter_boundaries_without_llm(self):
         project_id = self.create_project("Preview Project")

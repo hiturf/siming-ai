@@ -13,37 +13,159 @@ from docx import Document as DocxDocument
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
-from ..core.utils import count_words
-
-from ..modules.model_runtime.application.execution import model_executor as LLMGateway
 from ..core.exceptions import ValidationError
 from ..core.utils import count_words
 from ..database.models import Chapter
-from .chapter_ordering import CHAPTER_ORDER_STEP, next_chapter_sort_order
+from ..modules.model_runtime.application.execution import model_executor as LLMGateway
 from ..prompts.import_prompts import build_split_correction_messages
+from .chapter_ordering import CHAPTER_ORDER_STEP, next_chapter_sort_order
 
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MiB
+MAX_IMPORT_CHAPTERS = 2_000
 LLM_SPLIT_GROUP_SIZE = 3
 LLM_SPLIT_OVERLAP = 1
 SUPPORTED_IMPORT_EXTENSIONS = {"txt", "docx"}
 CHAPTER_TITLE_RE = re.compile(
-    r"(?im)^\s*("
-    r"第[零〇一二三四五六七八九十百千万\d]+[章节部卷](?:[^\n]{0,60})?"
-    r"|第\s*[0-9]+\s*[章节部卷](?:[^\n]{0,60})?"
-    r"|Chapter\s+\d+[^\n]{0,60}"
-    r"|CHAPTER\s+\d+[^\n]{0,60}"
-    r"|Part\s+\d+[^\n]{0,60}"
-    r")\s*$"
+    r"(?im)^[ \t]*("
+    r"(?:【[ \t]*)?"
+    r"(?:"
+    r"第[ \t]*[零〇一二三四五六七八九十百千万\d]+[ \t]*[章节部卷]"
+    r"|(?:卷|部)[ \t]*[零〇一二三四五六七八九十百千万\d]+"
+    r"|Chapter[ \t]+\d+"
+    r"|Part[ \t]+\d+"
+    r"|序章|楔子|引子|尾声"
+    r")"
+    r"(?:[^\r\n]{0,60})?"
+    r"(?:[ \t]*】)?"
+    r")[ \t]*$"
 )
+CHAPTER_PREFIX_RE = re.compile(
+    r"(?i)^(?:"
+    r"第[ \t]*[零〇一二三四五六七八九十百千万\d]+[ \t]*[章节部卷]"
+    r"|(?:卷|部)[ \t]*[零〇一二三四五六七八九十百千万\d]+"
+    r"|Chapter[ \t]+\d+"
+    r"|Part[ \t]+\d+"
+    r"|序章|楔子|引子|尾声"
+    r")"
+)
+_CHAPTER_TITLE_SEPARATORS = set(" \t：:-—·_")
+_CHAPTER_SENTENCE_ENDINGS = set("。！？!?；;，,")
+
+
+def _is_likely_chapter_title(value: str) -> bool:
+    raw = str(value or "").strip()
+    bracketed = raw.startswith("【") and raw.endswith("】")
+    core = raw.removeprefix("【").removesuffix("】").strip()
+    prefix = CHAPTER_PREFIX_RE.match(core)
+    if prefix is None:
+        return False
+    if bracketed:
+        return True
+    suffix = core[prefix.end() :]
+    if not suffix.strip():
+        return True
+    return (
+        suffix[0] in _CHAPTER_TITLE_SEPARATORS
+        or suffix.rstrip()[-1] not in _CHAPTER_SENTENCE_ENDINGS
+    )
+
+
+
+def _text_quality(text: str) -> float:
+    if not text:
+        return -10.0
+    sample = text[:20_000]
+    printable = 0
+    cjk = 0
+    bad = 0
+    for char in sample:
+        code = ord(char)
+        if char in {"\ufffd", "\x00"}:
+            bad += 8
+        elif (code < 32 and char not in "\n\r\t") or 0x7F <= code <= 0x9F:
+            bad += 4
+        elif char.isprintable() or char in "\n\r\t":
+            printable += 1
+        else:
+            bad += 2
+        if 0x3400 <= code <= 0x4DBF or 0x4E00 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF:
+            cjk += 1
+    size = max(1, len(sample))
+    return printable / size + min(cjk / size, 0.25) * 0.2 - bad / size
+
+
+def _strict_decode(raw: bytes, encoding: str) -> str | None:
+    try:
+        return raw.decode(encoding, errors="strict")
+    except (UnicodeDecodeError, LookupError):
+        return None
+
+
+def _looks_like_utf16(raw: bytes) -> bool:
+    sample = raw[: min(len(raw) - len(raw) % 2, 8_192)]
+    if len(sample) < 4:
+        return False
+    pairs = len(sample) // 2
+    even_zeros = sum(1 for index in range(0, len(sample), 2) if sample[index] == 0)
+    odd_zeros = sum(1 for index in range(1, len(sample), 2) if sample[index] == 0)
+    threshold = max(3, pairs // 12)
+    return even_zeros >= threshold or odd_zeros >= threshold
+
+
+def _decode_txt(raw: bytes) -> tuple[str, str]:
+    if raw.startswith(b"\xef\xbb\xbf"):
+        decoded = _strict_decode(raw[3:], "utf-8")
+        if decoded is None:
+            raise ValidationError("UTF-8 BOM 文件内容损坏")
+        return decoded, "UTF-8 BOM"
+    if raw.startswith(b"\xff\xfe"):
+        decoded = _strict_decode(raw[2:], "utf-16-le")
+        if decoded is None:
+            raise ValidationError("UTF-16LE 文件内容损坏")
+        return decoded, "UTF-16LE"
+    if raw.startswith(b"\xfe\xff"):
+        decoded = _strict_decode(raw[2:], "utf-16-be")
+        if decoded is None:
+            raise ValidationError("UTF-16BE 文件内容损坏")
+        return decoded, "UTF-16BE"
+
+    utf8 = _strict_decode(raw, "utf-8")
+    if utf8 is not None and _text_quality(utf8) >= 0.90:
+        return utf8.removeprefix("\ufeff"), "UTF-8"
+
+    candidates: list[tuple[float, str, str]] = []
+    if utf8 is not None:
+        candidates.append((_text_quality(utf8), "UTF-8", utf8))
+
+    if len(raw) % 2 == 0 and _looks_like_utf16(raw):
+        for encoding, label in (("utf-16-le", "UTF-16LE"), ("utf-16-be", "UTF-16BE")):
+            decoded = _strict_decode(raw, encoding)
+            if decoded is not None:
+                candidates.append((_text_quality(decoded), label, decoded))
+
+    simplified_hints = set("这为国后发里时会来个们说对从实还进")
+    traditional_hints = set("這為國後發裡時會來個們說對從實還進")
+    for encoding, label, hints in (
+        ("gb18030", "GB18030", simplified_hints),
+        ("big5", "Big5", traditional_hints),
+    ):
+        decoded = _strict_decode(raw, encoding)
+        if decoded is None:
+            continue
+        bonus = min(sum(1 for char in decoded[:20_000] if char in hints), 100) / 10_000
+        candidates.append((_text_quality(decoded) + bonus, label, decoded))
+
+    if not candidates:
+        raise ValidationError("无法识别 TXT 编码，请先另存为 UTF-8 或 GB18030")
+    score, label, decoded = max(candidates, key=lambda item: item[0])
+    if score < 0.72:
+        raise ValidationError("无法可靠识别 TXT 编码，请先另存为 UTF-8、GB18030 或 UTF-16")
+    return decoded.removeprefix("\ufeff"), label
 
 
 def _parse_txt(raw: bytes) -> str:
-    for encoding in ("utf-8", "utf-8-sig", "gb18030", "gbk", "utf-16"):
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
+    """Backward-compatible text-only parser."""
+    return _decode_txt(raw)[0]
 
 
 def _parse_docx(raw: bytes) -> str:
@@ -58,15 +180,20 @@ def _parse_raw_file(filename: str, raw: bytes) -> dict:
     if ext not in SUPPORTED_IMPORT_EXTENSIONS:
         raise ValidationError("仅支持 .txt 和 .docx 格式文件")
     if len(raw) > MAX_UPLOAD_BYTES:
-        raise ValidationError("文件太大，最大支持 10MB")
+        raise ValidationError("文件太大，最大支持 20 MiB")
 
-    text = _parse_docx(raw) if ext == "docx" else _parse_txt(raw)
+    if ext == "docx":
+        text = _parse_docx(raw)
+        detected_encoding = "DOCX"
+    else:
+        text, detected_encoding = _decode_txt(raw)
     if not text.strip():
         raise ValidationError("文件内容为空或无法解析")
 
     return {
         "filename": filename,
         "format": ext,
+        "encoding": detected_encoding,
         "text": text,
         "word_count": count_words(text),
         "preview": text[:500],
@@ -120,7 +247,11 @@ def _fallback_splits(text: str, chunk_size: int = 5000) -> list[dict]:
 
 
 def _regex_splits(text: str) -> list[dict]:
-    matches = list(CHAPTER_TITLE_RE.finditer(text))
+    matches = [
+        match
+        for match in CHAPTER_TITLE_RE.finditer(text)
+        if _is_likely_chapter_title(match.group(1))
+    ]
     if not matches:
         return _fallback_splits(text)
 

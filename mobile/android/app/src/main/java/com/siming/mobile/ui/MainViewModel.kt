@@ -8,6 +8,7 @@ import com.siming.mobile.data.AssistantRoute
 import com.siming.mobile.data.AssistantModelRoute
 import com.siming.mobile.data.MobileCatalogingProgress
 import com.siming.mobile.data.MobileExportFile
+import com.siming.mobile.data.MobileNovelImportFile
 import com.siming.mobile.data.creation.CreationExecutionRoute
 import com.siming.mobile.data.creation.CreationStartInput
 import com.siming.mobile.data.toUserFacingMessage
@@ -575,35 +576,34 @@ private fun updateCatalogingProgress(
         }
     }
 
-    fun importNovel(fileName: String, content: String, onCreated: (String) -> Unit) {
+    fun importNovel(file: MobileNovelImportFile, onCreated: (String) -> Unit) {
         viewModelScope.launch {
-            uiState.value = uiState.value.copy(busy = true, activity = "正在拆分并通过当前创作通道建档…")
+            uiState.value = uiState.value.copy(
+                busy = true,
+                activity = "正在识别编码并准备批量导入…",
+                error = null,
+            )
             try {
-                require(content.length <= 20_000_000) { "单个导入文件不能超过 2000 万字符" }
-                val title = fileName.substringBeforeLast('.').ifBlank { "导入作品" }
-                val projectId = repository.createProject(title, "由手机导入的已有小说")
-                val chapters = splitChapters(content)
-                chapters.forEachIndexed { index, (chapterTitle, chapterContent) ->
-                    saveRecordInternal(
-                        projectId,
-                        "chapter",
-                        null,
-                        mapOf(
-                            "title" to chapterTitle.ifBlank { "第 ${index + 1} 章" },
-                            "content" to chapterContent,
-                            "word_count" to chapterContent.count { !it.isWhitespace() },
-                            "current_version" to 1,
-                        ),
-                    )
+                val result = repository.importNovel(file) { activity ->
+                    uiState.value = uiState.value.copy(activity = activity)
                 }
+                val refreshWarning = result.refreshWarning
                 uiState.value = uiState.value.copy(
                     busy = false,
                     activity = "",
-                    notice = "已导入 ${chapters.size} 章，可以继续作品建档或直接阅读编辑",
-                    pendingCatalogingProjectId = projectId,
-                    importedChapterCount = chapters.size,
+                    notice = when {
+                        refreshWarning != null ->
+                            "Gateway 已导入 ${result.chapterCount} 章（${result.encoding}），" +
+                                "但手机刷新失败：$refreshWarning；请在同步页重试"
+                        result.remote ->
+                            "已通过 Gateway 单次批量导入 ${result.chapterCount} 章，识别编码：${result.encoding}"
+                        else ->
+                            "已在手机本地事务中导入 ${result.chapterCount} 章，识别编码：${result.encoding}"
+                    },
+                    pendingCatalogingProjectId = if (refreshWarning == null) result.projectId else null,
+                    importedChapterCount = if (refreshWarning == null) result.chapterCount else 0,
                 )
-                onCreated(projectId)
+                if (refreshWarning == null) onCreated(result.projectId)
             } catch (error: Exception) {
                 uiState.value = uiState.value.copy(busy = false, activity = "")
                 showError(error)
@@ -846,27 +846,6 @@ private fun updateCatalogingProgress(
 
     private fun showError(error: Throwable) {
         uiState.value = uiState.value.copy(error = error.toUserFacingMessage())
-    }
-
-    private fun splitChapters(content: String): List<Pair<String, String>> {
-        val marker = Regex("(?m)^(第[\\p{L}\\p{N}一二三四五六七八九十百千万零〇两]{1,16}[章节卷回部].*)$")
-        val matches = marker.findAll(content).toList()
-        val chapters = if (matches.isEmpty()) {
-            content.chunked(5_000).mapIndexed { index, text ->
-                "第 ${index + 1} 章" to text.trim()
-            }.filter { it.second.isNotBlank() }
-        } else {
-            matches.mapIndexed { index, match ->
-                val start = match.range.last + 1
-                val end = matches.getOrNull(index + 1)?.range?.first ?: content.length
-                match.value.trim() to content.substring(start, end).trim()
-            }.filter { it.second.isNotBlank() }
-        }
-        return chapters.flatMap { (title, body) ->
-            body.chunked(200_000).mapIndexed { index, part ->
-                (if (index == 0) title else "$title（续 ${index + 1}）") to part
-            }
-        }
     }
 
     private fun parseAssistantEvent(raw: String): AssistantEventUpdate = runCatching {

@@ -120,6 +120,7 @@ REMOTE_ANDROID_AUTHORING_PATHS: dict[str, frozenset[str]] = {
     "/api/v1/novel-creation/sessions/{session_id}/stages/{stage}/confirm": frozenset({"POST"}),
     "/api/v1/novel-creation/sessions/{session_id}/stages/{stage}": frozenset({"PATCH"}),
     "/api/v1/projects": frozenset({"GET", "POST"}),
+    "/api/v1/import/project-file": frozenset({"POST"}),
     "/api/v1/projects/{project_id}": frozenset({"GET", "PUT"}),
     "/api/v1/projects/{project_id}/chapters": frozenset({"GET", "POST"}),
     "/api/v1/projects/{project_id}/chapters/{chapter_id}": frozenset(
@@ -350,9 +351,10 @@ class GatewayAuthenticationMiddleware:
 
         project_id = route_values.get("project_id")
         if project_id is None:
-            return matched_template == "/api/v1/projects" or matched_template.startswith(
-                "/api/v1/novel-creation/"
-            )
+            return matched_template in {
+                "/api/v1/projects",
+                "/api/v1/import/project-file",
+            } or matched_template.startswith("/api/v1/novel-creation/")
         if not re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", project_id):
             return False
 
