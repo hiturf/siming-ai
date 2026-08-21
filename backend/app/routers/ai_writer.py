@@ -507,6 +507,27 @@ def _workspace_action_summary(action: dict) -> str:
     return f"{tool}：{_compact_workspace_detail(label, 80)}" if label else tool
 
 
+def _workspace_local_cli_bridge_prompt(*, allow_writes: bool) -> str:
+    permission = (
+        "本轮已获得一次性项目写入授权；可在最终轮次提出写入 actions。"
+        if allow_writes
+        else (
+            "本轮尚未获得项目写入授权；仍应提出完成请求所需的写入 actions，"
+            "司命会暂停并向用户申请一次性授权，绝不能声称已经保存。"
+        )
+    )
+    return f"""【本机 CLI 受控工具桥】
+当前 CLI 不通过原生 function calling 接收工具。不要因此声称本轮工具缺失，也不要要求用户改用命令行。
+你必须只输出一个 JSON 对象，禁止 Markdown 或额外文本：
+{{"reply":"给用户的简洁中文说明","done":true,"actions":[{{"tool":"工具名","arguments":{{}}}}],"needs_confirmation":false}}
+- 需要先读取资料时：done=false，actions 只放本轮需要的读取工具；司命会返回真实结果供下一轮继续。
+- 信息充分且需要写入时：done=true，actions 放最终写入工具；
+  工具名必须来自系统提示中的“本轮可用工具”。
+- 只需聊天回答时：done=true，actions=[]，把回复放入 reply。
+- 不得把工具调用写进 reply，也不得用“工具列表里没有 create_character”等未经核对的说法代替 actions。
+{permission}"""
+
+
 def _build_workspace_final_reply(
     final_reply: str,
     *,
@@ -1288,11 +1309,11 @@ async def workspace_assistant_stream(
                 local_cli_selected
                 and payload.local_cli_permission_grant == "project_agent_once"
             )
-            local_cli_mcp_enabled = local_cli_permission_granted
+            local_cli_mcp_enabled = (
+                selected_provider == "opencode_cli" and local_cli_permission_granted
+            )
+            local_cli_bridge_mode = local_cli_selected and not local_cli_mcp_enabled
             if local_cli_selected:
-                transient_opencode_mcp = (
-                    selected_provider == "opencode_cli" and local_cli_permission_granted
-                )
                 local_cli_read_permission_granted = (
                     selected_provider == "opencode_cli"
                     and payload.local_cli_read_permission_grant == "read_once"
@@ -1302,7 +1323,7 @@ async def workspace_assistant_stream(
                 local_cli_extra_body.update(
                     {
                         "local_cli_permission_granted": local_cli_permission_granted,
-                        "local_cli_allow_mcp": local_cli_permission_granted,
+                        "local_cli_allow_mcp": local_cli_mcp_enabled,
                         "local_cli_read_permission_granted": local_cli_read_permission_granted,
                         "local_cli_read_paths": (
                             list(payload.local_cli_read_paths)
@@ -1310,7 +1331,9 @@ async def workspace_assistant_stream(
                         ),
                         # OpenCode receives an inline one-process MCP config and
                         # therefore never needs the real project directory.
-                        "local_cli_isolated": transient_opencode_mcp or not local_cli_permission_granted,
+                        # Other CLIs use the validated JSON bridge in the same
+                        # isolated mode, even after one-turn write authorization.
+                        "local_cli_isolated": True,
                         "local_cli_mcp_permission_pack": "project_management",
                         "local_cli_mcp_project_id": project_id,
                     }
@@ -1417,6 +1440,11 @@ async def workspace_assistant_stream(
                     "type": "skills_matched",
                     "skills": skill_info,
                 })
+            if local_cli_bridge_mode:
+                system_prompt = (
+                    f"{system_prompt}\n\n"
+                    f"{_workspace_local_cli_bridge_prompt(allow_writes=local_cli_permission_granted)}"
+                )
             initial_user = build_workspace_assistant_initial_user_message(
                 project_title=project.title,
                 project_description=project.description,
@@ -1443,16 +1471,35 @@ async def workspace_assistant_stream(
             except Exception:
                 supports_function_calling = True
             use_function_calling = supports_function_calling
-            allow_plain_text_fallback = not supports_function_calling
+            allow_plain_text_fallback = (
+                not supports_function_calling and not local_cli_bridge_mode
+            )
             if not supports_function_calling:
+                if local_cli_mcp_enabled:
+                    mode_message = (
+                        "OpenCode 已连接当前作品范围的临时 Siming MCP，"
+                        "可自行选择项目读写工具。"
+                    )
+                    mode_tool = "local_cli_mcp_mode"
+                elif local_cli_bridge_mode and local_cli_permission_granted:
+                    mode_message = (
+                        "本机 CLI 已启用受控工具桥；"
+                        "本轮可由司命校验并执行项目读写工具。"
+                    )
+                    mode_tool = "local_cli_bridge_mode"
+                elif local_cli_bridge_mode:
+                    mode_message = (
+                        "本机 CLI 已进入安全工具桥；"
+                        "读取可直接执行，写入会先请求一次性授权。"
+                    )
+                    mode_tool = "local_cli_bridge_mode"
+                else:
+                    mode_message = "当前模型不支持稳定工具调用，已切换为文本模式。"
+                    mode_tool = "local_cli_mode"
                 yield _sse_event({
                     "type": "status",
-                    "message": (
-                        "本机 CLI 已连接 Siming MCP，可自行选择项目读写工具。"
-                        if local_cli_mcp_enabled
-                        else "当前模型不支持稳定工具调用，已切换为文本/计划编排模式。"
-                    ),
-                    "tool": "local_cli_mcp_mode" if local_cli_mcp_enabled else "local_cli_mode",
+                    "message": mode_message,
+                    "tool": mode_tool,
                 })
 
             for iteration in range(1, MAX_ITERATIONS + 1):
@@ -1623,6 +1670,14 @@ async def workspace_assistant_stream(
                     search_actions = [a for a in actions if isinstance(a, dict) and a.get("tool") in SEARCH_TOOL_NAMES]
                     write_actions = [a for a in actions if isinstance(a, dict) and a.get("tool") in WRITE_TOOL_NAMES]
 
+                    if write_actions and local_cli_selected and not local_cli_permission_granted:
+                        requested_tools = ", ".join(
+                            sorted({str(action.get("tool") or "") for action in write_actions})
+                        )
+                        raise CLIPermissionRequiredError(
+                            f"项目写入工具需要一次性授权：{requested_tools or 'write'}"
+                        )
+
                     if not is_done and write_actions:
                         yield _sse_event({
                             "type": "status",
@@ -1770,6 +1825,17 @@ async def workspace_assistant_stream(
 
                 se_names = SEARCH_TOOL_NAMES
                 wr_names = WRITE_TOOL_NAMES
+                if local_cli_selected and not local_cli_permission_granted:
+                    requested_writes = [
+                        tc["function"]["name"]
+                        for tc in tool_calls
+                        if tc["function"]["name"] in wr_names
+                    ]
+                    if requested_writes:
+                        raise CLIPermissionRequiredError(
+                            "项目写入工具需要一次性授权："
+                            + ", ".join(sorted(set(requested_writes)))
+                        )
 
                 yield _sse_event({
                     "type": "tool",

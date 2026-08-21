@@ -321,3 +321,77 @@ def test_local_cli_bridge_blocks_write_without_one_turn_grant():
     assert result["permission_required"] is True
     assert result["tool_results"][0]["status"] == "permission_required"
     assert "没有写入授权" in result["reply"]
+
+
+def test_creation_agent_resolves_default_model_once_and_propagates_it_to_generation():
+    from types import SimpleNamespace
+
+    db = _db()
+    session = _ready_session(db)
+    completion = AsyncMock(side_effect=[
+        {
+            "content": "",
+            "tool_calls": [{
+                "id": "call-read-default-model",
+                "type": "function",
+                "function": {"name": "get_creation_snapshot", "arguments": "{}"},
+            }],
+        },
+        {
+            "content": "",
+            "tool_calls": [{
+                "id": "call-generate-default-model",
+                "type": "function",
+                "function": {
+                    "name": "generate_creation_artifact",
+                    "arguments": json.dumps({
+                        "artifact": "concepts",
+                        "model": None,
+                        "use_model": False,
+                    }),
+                },
+            }],
+        },
+        {"content": "已使用当前有效模型开始生成创意方向。", "tool_calls": []},
+    ])
+    executor = AsyncMock(side_effect=[
+        {"tool": "get_creation_snapshot", "status": "ok", "data": {"revision": session.revision}},
+        {
+            "tool": "generate_creation_artifact",
+            "status": "running",
+            "data": {"run": {"id": "run-model", "status": "running"}},
+        },
+    ])
+
+    with patch(
+        "app.services.novel_creation_agent.LLMGateway.select_model_for_task",
+        return_value=SimpleNamespace(model="openai:resolved-default"),
+    ) as select_model, patch(
+        "app.services.novel_creation_agent.LLMGateway.supports_tool_calling",
+        return_value=True,
+    ), patch(
+        "app.services.novel_creation_agent.LLMGateway.provider_for_model",
+        return_value="openai",
+    ), patch(
+        "app.services.novel_creation_agent.LLMGateway.stream_chat_completion_with_tools",
+        new=completion,
+    ), patch(
+        "app.services.novel_creation_agent.execute_workspace_action",
+        new=executor,
+    ):
+        result = asyncio.run(run_creation_agent(
+            db,
+            session=session,
+            message="生成创意方向",
+            model=None,
+        ))
+
+    select_model.assert_called_once_with(
+        task_type="novel_creation",
+        model_override=None,
+    )
+    assert completion.call_args_list[0].kwargs["model"] == "openai:resolved-default"
+    write_arguments = executor.call_args_list[1].args[2]["arguments"]
+    assert write_arguments["model"] == "openai:resolved-default"
+    assert write_arguments["use_model"] is True
+    assert result["run"]["id"] == "run-model"

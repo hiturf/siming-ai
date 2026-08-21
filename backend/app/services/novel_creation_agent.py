@@ -86,13 +86,21 @@ def _text_only_system_prompt() -> str:
     只输出自然语言建议，不要声称任何内容已经保存、修改或开始生成。请用简洁中文回复。"""
 
 
-def _cli_mcp_system_prompt(session_id: str) -> str:
+def _cli_mcp_system_prompt(session_id: str, *, model: str | None = None) -> str:
+    model_label = str(model or "").strip() or "未显式解析"
     return _system_prompt(session_id) + f"""
 
 你当前是内化在司命聊天窗口中的本机 OpenCode Agent。用户已明确授权这一条消息连接临时 Siming MCP。
-MCP 只暴露当前 creation session_id={session_id} 的立项工具；不要尝试 Shell、编辑文件、扫描项目目录或访问其他会话。
-先调用 siming_turn_get_creation_snapshot 读取当前 revision 和现有事实，再按用户要求调用对应的 siming_turn_* 工具。
+MCP 只暴露当前 creation session_id={session_id} 的立项工具；
+不要尝试 Shell、编辑文件、扫描项目目录或访问其他会话。
+当前对话模型身份：{model_label}。
+这个身份只说明当前 Agent 由谁执行，不代表应当递归启动另一个相同 CLI。
+先调用 siming_turn_get_creation_snapshot 读取当前 revision 和现有事实，
+再按用户要求调用对应的 siming_turn_* 工具。
 每次写入都使用刚读取到的 revision；写入后必须再次读取并核对新 revision，才能告诉用户已经保存。
+当 concepts 或 all 需要结构化内容、但没有另一个已在司命中配置并测试的非 CLI 模型可供内部任务使用时，
+由你当前模型直接生成完整结构，再用 patch_creation_artifact 写入 concepts artifact 的 /options；
+不要用空 model 调用 generate_creation_artifact，也不要递归启动当前 CLI。
 临时 MCP 会在本条消息结束时销毁，不要修改 OpenCode 或其他 CLI 的任何配置文件。"""
 
 
@@ -186,6 +194,22 @@ async def _complete_tool_turn(**kwargs: Any) -> dict[str, Any]:
     return {"content": "".join(content), "tool_calls": tool_calls}
 
 
+def _resolve_effective_model(model: str | None) -> str | None:
+    """Resolve one stable model identity for chat and nested tool runs."""
+    try:
+        selection = LLMGateway.select_model_for_task(
+            task_type="novel_creation",
+            model_override=model,
+        )
+        resolved = str(getattr(selection, "model", "") or "").strip()
+        if resolved:
+            return resolved
+    except Exception:
+        pass
+    fallback = str(model or "").strip()
+    return fallback or None
+
+
 def _prepare_agent_request(
     session: Any,
     message: str,
@@ -208,7 +232,7 @@ def _prepare_agent_request(
     )
     local_cli_mode = "direct_mcp" if direct_transient_mcp else "bridge" if local_cli_selected else "none"
     prompt = (
-        _cli_mcp_system_prompt(session.id)
+        _cli_mcp_system_prompt(session.id, model=model)
         if direct_transient_mcp
         else _system_prompt(session.id)
         if native_tool_calls
@@ -285,10 +309,11 @@ async def run_creation_agent(
     local_cli_write_granted: bool = False,
     local_cli_read_paths: list[str] | None = None,
 ) -> dict[str, Any]:
+    effective_model = _resolve_effective_model(model)
     messages, schemas, baseline_revision, extra_body, local_cli_mode = _prepare_agent_request(
         session,
         message,
-        model,
+        effective_model,
         history,
         local_cli_write_granted=local_cli_write_granted,
         local_cli_read_paths=local_cli_read_paths,
@@ -301,7 +326,7 @@ async def run_creation_agent(
         result = await _complete_tool_turn(
             messages=messages,
             tools=schemas,
-            model=model,
+            model=effective_model,
             temperature=0.25,
             # Do not impose a second fixed cap here. The selected provider and
             # configured model capability remain the source of truth.
@@ -342,7 +367,10 @@ async def run_creation_agent(
                     db.refresh(session)
                     arguments["expected_revision"] = int(session.revision or 0)
                 if name in {"generate_creation_artifact", "refine_creation_artifact", "regenerate_creation_artifact"}:
-                    arguments.setdefault("model", model)
+                    if not str(arguments.get("model") or "").strip():
+                        arguments["model"] = effective_model
+                    if effective_model:
+                        arguments["use_model"] = True
                 signature = json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False, sort_keys=True, default=str)
                 if signature in seen_calls:
                     tool_result = {"tool": name, "status": "skipped", "detail": "相同工具调用已执行，本轮不重复提交"}
@@ -385,7 +413,7 @@ async def run_creation_agent(
             summary = await _complete_tool_turn(
                 messages=messages,
                 tools=[],
-                model=model,
+                model=effective_model,
                 temperature=0.2,
                 max_tokens=None,
                 timeout=0,
@@ -437,7 +465,7 @@ async def run_creation_agent(
             active_run = await present_serialized_run(
                 db,
                 run=durable_run,
-                model=model,
+                model=effective_model,
                 assistant_reply=final_reply,
                 tool_results=tool_results,
             )

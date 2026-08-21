@@ -321,9 +321,14 @@ class AIWriterIsolationTestCase(unittest.TestCase):
 
     @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
     @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
-    def test_workspace_stream_local_cli_plain_text_does_not_require_json(self, mock_stream, mock_supports):
+    def test_workspace_stream_local_cli_bridge_uses_json_envelope(self, mock_stream, mock_supports):
         project_id = self.create_project("CLI Chat Project")
-        mock_stream.return_value = async_chunks("你好，我在。")
+        mock_stream.return_value = async_chunks(json.dumps({
+            "reply": "你好，我在。",
+            "done": True,
+            "actions": [],
+            "needs_confirmation": False,
+        }, ensure_ascii=False))
 
         response = self.client.post(
             f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
@@ -337,18 +342,107 @@ class AIWriterIsolationTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("你好，我在。", response.text)
-        self.assertIn("local_cli_mode", response.text)
+        self.assertIn("local_cli_bridge_mode", response.text)
         self.assertNotIn("json_repair", response.text)
         self.assertNotIn("模型返回的工具格式不合法", response.text)
         call = mock_stream.call_args.kwargs
         self.assertFalse(call["extra_body"]["local_cli_allow_mcp"])
         self.assertFalse(call["extra_body"]["local_cli_permission_granted"])
         self.assertTrue(call["extra_body"]["local_cli_isolated"])
+        self.assertIn("本机 CLI 受控工具桥", call["messages"][0]["content"])
         self.assertIn(project_id, str(call["messages"]))
+
+    @patch("app.services.agent.local_cli_routing.classify_local_cli_workspace_request", new_callable=AsyncMock)
+    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
+    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
+    def test_workspace_stream_local_cli_write_action_requires_one_turn_grant(
+        self, mock_stream, _mock_supports, mock_route,
+    ):
+        project_id = self.create_project("CLI Safe Bridge Project")
+        mock_route.return_value = {"route": "general", "chapter_number": None, "outline_query": ""}
+        mock_stream.return_value = async_chunks(json.dumps({
+            "reply": "准备创建角色陈叙。",
+            "done": True,
+            "actions": [{
+                "tool": "create_character",
+                "arguments": {"name": "陈叙", "personality": "冷静", "abilities": []},
+            }],
+            "needs_confirmation": False,
+        }, ensure_ascii=False))
+
+        response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
+            json={
+                "scope": "project",
+                "message": "新建角色陈叙",
+                "model": "claude_cli:claude-code",
+                "auto_apply": True,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('"type":"permission_required"', response.text)
+        self.assertIn("create_character", response.text)
+        call = mock_stream.call_args.kwargs
+        self.assertIn("本机 CLI 受控工具桥", call["messages"][0]["content"])
+        db = SessionLocal()
+        try:
+            self.assertIsNone(db.query(Character).filter(
+                Character.project_id == project_id,
+                Character.name == "陈叙",
+            ).one_or_none())
+        finally:
+            db.close()
+
+    @patch("app.services.agent.local_cli_routing.classify_local_cli_workspace_request", new_callable=AsyncMock)
+    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
+    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
+    def test_workspace_stream_local_cli_bridge_executes_granted_write(
+        self, mock_stream, _mock_supports, mock_route,
+    ):
+        project_id = self.create_project("CLI Granted Bridge Project")
+        mock_route.return_value = {"route": "general", "chapter_number": None, "outline_query": ""}
+        mock_stream.return_value = async_chunks(json.dumps({
+            "reply": "已创建角色陈叙。",
+            "done": True,
+            "actions": [{
+                "tool": "create_character",
+                "arguments": {"name": "陈叙", "personality": "冷静", "abilities": []},
+            }],
+            "needs_confirmation": False,
+        }, ensure_ascii=False))
+
+        response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
+            json={
+                "scope": "project",
+                "message": "新建角色陈叙",
+                "model": "claude_cli:claude-code",
+                "auto_apply": True,
+                "local_cli_permission_grant": "project_agent_once",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("local_cli_bridge_mode", response.text)
+        self.assertIn("create_character", response.text)
+        call = mock_stream.call_args.kwargs
+        self.assertFalse(call["extra_body"]["local_cli_allow_mcp"])
+        self.assertTrue(call["extra_body"]["local_cli_permission_granted"])
+        self.assertTrue(call["extra_body"]["local_cli_isolated"])
+        db = SessionLocal()
+        try:
+            character = db.query(Character).filter(
+                Character.project_id == project_id,
+                Character.name == "陈叙",
+            ).one_or_none()
+            self.assertIsNotNone(character)
+        finally:
+            db.close()
 
     @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
     @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
-    def test_workspace_stream_one_turn_cli_grant_enables_project_mcp(self, mock_stream, _mock_supports):
+    def test_workspace_stream_opencode_one_turn_grant_enables_project_mcp(self, mock_stream, _mock_supports):
         project_id = self.create_project("CLI Agent Project")
         mock_stream.return_value = async_chunks("已完成。")
 
@@ -357,7 +451,7 @@ class AIWriterIsolationTestCase(unittest.TestCase):
             json={
                 "scope": "project",
                 "message": "读取项目并整理设定",
-                "model": "claude_cli:claude-code",
+                "model": "opencode_cli:opencode/deepseek-v4-flash-free",
                 "local_cli_permission_grant": "project_agent_once",
             },
         )
@@ -367,7 +461,7 @@ class AIWriterIsolationTestCase(unittest.TestCase):
         call = mock_stream.call_args.kwargs
         self.assertTrue(call["extra_body"]["local_cli_allow_mcp"])
         self.assertTrue(call["extra_body"]["local_cli_permission_granted"])
-        self.assertFalse(call["extra_body"]["local_cli_isolated"])
+        self.assertTrue(call["extra_body"]["local_cli_isolated"])
 
     @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
     @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
