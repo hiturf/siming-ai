@@ -87,12 +87,7 @@ def _run_legacy_startup_recovery() -> None:
     from ..services.workspace.run_log import mark_interrupted_assistant_runs
 
     recover_content_sync_queue()
-    if get_settings().gateway_enabled:
-        from ..modules.gateway.infrastructure.change_capture import (
-            recover_sync_capture_queue,
-        )
-
-        recover_sync_capture_queue()
+    _recover_gateway_sync_capture_queue()
     with SqlAlchemyUnitOfWork(SessionLocal) as uow:
         mark_interrupted_assistant_runs(uow.session)
         # Creation runs own their durable result state. Reconcile them before
@@ -106,6 +101,24 @@ def _run_legacy_startup_recovery() -> None:
         mark_interrupted_operations(uow.session)
         SqlAlchemySystemConversationStore(uow.session).interrupt_running_messages()
         uow.commit()
+
+
+def _recover_gateway_sync_capture_queue() -> None:
+    """Recover optional Gateway replication without blocking desktop startup."""
+
+    if not get_settings().gateway_enabled:
+        return
+    try:
+        from ..modules.gateway.infrastructure.change_capture import (
+            recover_sync_capture_queue,
+        )
+
+        recover_sync_capture_queue()
+    except Exception:
+        # Gateway capture is a retryable projection of canonical authoring data.
+        # A stale or malformed queue item must not make the whole desktop app
+        # unavailable; keep it for a later retry and expose the cause in logs.
+        logger.exception("Failed to recover Gateway sync capture queue")
 
 
 def _start_scheduler() -> None:

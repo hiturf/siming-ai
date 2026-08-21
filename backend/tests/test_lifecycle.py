@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 from app.bootstrap.lifecycle import (
     _install_windows_transport_exception_filter,
     _is_benign_windows_pipe_reset,
+    _recover_gateway_sync_capture_queue,
 )
 
 
@@ -73,3 +74,14 @@ def test_transport_filter_swallows_only_the_known_benign_event():
 
     previous_handler.assert_not_called()
     loop.default_exception_handler.assert_not_called()
+
+
+def test_gateway_sync_recovery_failure_does_not_block_application_startup(caplog):
+    settings = MagicMock(gateway_enabled=True)
+    with patch("app.bootstrap.lifecycle.get_settings", return_value=settings), patch(
+        "app.modules.gateway.infrastructure.change_capture.recover_sync_capture_queue",
+        side_effect=RuntimeError("stale capture contract"),
+    ):
+        _recover_gateway_sync_capture_queue()
+
+    assert "Failed to recover Gateway sync capture queue" in caplog.text
