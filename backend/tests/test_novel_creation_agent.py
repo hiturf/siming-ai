@@ -1256,7 +1256,7 @@ def test_creation_agent_resolves_default_model_once_and_propagates_it_to_generat
         ))
 
     select_model.assert_called_once_with(
-        task_type="novel_creation",
+        task_type="planning",
         model_override=None,
     )
     assert completion.call_args_list[0].kwargs["model"] == "openai:resolved-default"
