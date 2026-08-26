@@ -5,14 +5,18 @@ on:
     paths:
       - "backend/**"
       - "scripts/check-architecture.py"
+      - "scripts/export-mobile-prompt-contract.py"
       - "scripts/run-backend-tests-isolated.py"
+      - "mobile/android/app/src/main/assets/pc_workspace_prompt_contract.json"
       - ".github/workflows/backend-ci.yml"
   push:
     branches: [main, "codex/3.0-architecture"]
     paths:
       - "backend/**"
       - "scripts/check-architecture.py"
+      - "scripts/export-mobile-prompt-contract.py"
       - "scripts/run-backend-tests-isolated.py"
+      - "mobile/android/app/src/main/assets/pc_workspace_prompt_contract.json"
       - ".github/workflows/backend-ci.yml"
 
 jobs:
