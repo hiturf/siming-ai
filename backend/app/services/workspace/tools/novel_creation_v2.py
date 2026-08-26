@@ -1,4 +1,4 @@
-"""Workspace tools for the resumable V2 novel creation workbench."""
+"""Workspace tools for the resumable novel creation workbench."""
 from __future__ import annotations
 
 from app.architecture.uow import commit_session
@@ -14,24 +14,20 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from ....core.model_limits import MAX_CONFIGURABLE_LIMIT, default_output_token_limit
 from ....modules.model_runtime.application.execution import model_executor as LLMGateway
 from ...operation_runtime import current_operation_id, record_operation_signal
 from ....core.json_repair import parse_json_object_detailed
 from ....database.models import NovelCreationMaterialImport, NovelCreationSession, NovelCreationStageRun, OperationRun
 from ....services.context_orchestrator import activate_context_manifest
-from ....services.character_role_types import append_character_role_description, normalize_character_role_type
 from ....services.novel_creation_authoring import (
-    AuthorLockViolation,  # noqa: F401 - compatibility export
     _WORLD_STYLE_TEXT_FIELDS,
     _author_context,
     _author_text,
-    _dedupe_dicts,
     _dict_rows,
     _looks_like_cli_metadata,
     _opening_outline_chapter_count,
-    _safe_compact_concepts,
     _stage_contract,
-    _validate_author_requirements,
     _validate_compact_concepts,
     _validate_stage,
 )
@@ -62,22 +58,22 @@ from ....services.novel_creation_consistency import (
     creation_dependency_graph,
     validate_creation_consistency,
 )
-from ....services.novel_creation_submission import submit_creation_stage
+from ....services.novel_creation_submission import save_creation_stage_data
 from ....services.novel_creation_versions import (
     artifact_version_diff,
     get_artifact_version,
     list_artifact_versions,
-    record_artifact_version,
     serialize_artifact_version,
 )
 from ....services.operation_runtime import register_operation_actions
 from ....modules.operations.interfaces.dependencies import get_operation_service
-from ....services.observability.run_events import classify_failure
 from ...novel_creation_workspace import (
+    STAGE_ORDER,
     STAGE_LABELS,
     confirm_run,
     creation_artifact_dependencies,
     list_creation_artifacts,
+    initialize_session_draft,
     patch_creation_artifact,
     patch_session,
     serialize_creation_artifact,
@@ -85,6 +81,13 @@ from ...novel_creation_workspace import (
     set_creation_artifact_locks,
     undo_creation_artifact,
 )
+from ....services.novel_creation_entity_normalization import (
+    normalize_characters as _normalize_characters,
+    normalize_locations as _normalize_locations,
+)
+
+STREAM_PROGRESS_INTERVAL_SECONDS = 0.2
+STREAM_PROGRESS_PREVIEW_CHARS = 320
 
 
 def _text(value: Any) -> str:
@@ -107,59 +110,6 @@ def _repair_provenance(raw: str, method: str, warning: str) -> dict[str, Any]:
         "original_response_excerpt": raw[:12_000],
         "_diagnostic_raw": raw,
     }
-
-
-def _safe_partial_stage(
-    raw: str,
-    stage: str,
-    baseline: dict[str, Any],
-    draft: dict[str, Any],
-) -> dict[str, Any] | None:
-    parsed, _method = parse_json_object_detailed(raw)
-    if not isinstance(parsed, dict):
-        return None
-    partial = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
-    if not isinstance(partial, dict):
-        return None
-    try:
-        data = _normalize_stage_data(stage, partial, baseline)
-        _validate_stage(stage, data)
-        _validate_author_requirements(stage, data, baseline, draft)
-    except Exception:
-        return None
-    return data if data != baseline else None
-
-
-def _safe_partial_concepts(
-    raw: str,
-    *,
-    expected_count: int,
-    draft: dict[str, Any],
-) -> list[dict[str, Any]] | None:
-    parsed, _method = parse_json_object_detailed(raw)
-    if not isinstance(parsed, dict):
-        return None
-    payload = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
-    rows = payload.get("concepts") if isinstance(payload.get("concepts"), list) else []
-    if not rows:
-        return None
-    safe = deepcopy(_safe_compact_concepts(draft))
-    while len(safe) < expected_count:
-        safe.append(deepcopy(safe[-1] if safe else {}))
-    merged = safe[:expected_count]
-    for index, row in enumerate(rows[:expected_count]):
-        if not isinstance(row, dict):
-            continue
-        protagonist = dict(merged[index].get("protagonist_seed") or {})
-        protagonist.update(row.get("protagonist_seed") if isinstance(row.get("protagonist_seed"), dict) else {})
-        merged[index].update(row)
-        merged[index]["protagonist_seed"] = protagonist
-    try:
-        cards = _validate_compact_concepts(merged, expected_count=expected_count)
-        _validate_author_requirements("concepts", {"options": cards}, {}, draft)
-    except Exception:
-        return None
-    return cards
 
 
 def _raise_if_task_cancelled() -> None:
@@ -190,22 +140,6 @@ def _ensure_stage_not_cancelled(
             raise asyncio.CancelledError
 
 
-def _is_transient_transport_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    failure_class = classify_failure(message)
-    if failure_class in {"auth", "quota_or_rate_limit"}:
-        return False
-    return failure_class in {"network", "timeout"} or any(token in message for token in (
-        "incomplete chunked read",
-        "peer closed connection",
-        "connection closed",
-        "connection reset",
-        "remote protocol error",
-        "server disconnected",
-        "unexpected eof",
-    ))
-
-
 def _normalize_worldbuilding(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, list):
         return [deepcopy(item) for item in value if isinstance(item, dict)]
@@ -223,73 +157,6 @@ def _normalize_worldbuilding(value: Any) -> list[dict[str, Any]]:
             item = {"title": _text(key), "dimension": _text(key), "content": _author_text(child)}
         rows.append(item)
     return rows
-
-
-def _normalize_characters(data: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
-    source_rows = _dict_rows(data.get("characters"))
-    base_rows = _dict_rows(baseline.get("characters"))
-    if not source_rows:
-        source_rows = deepcopy(base_rows)
-    base_by_name = {_text(row.get("name")): row for row in base_rows if _text(row.get("name"))}
-    characters: list[dict[str, Any]] = []
-    for index, source in enumerate(source_rows):
-        name = _text(source.get("name"))
-        base = base_by_name.get(name) or (base_rows[index] if index < len(base_rows) else {})
-        item = {**deepcopy(base), **deepcopy(source)}
-        item["name"] = name or _text(base.get("name")) or f"角色{index + 1}"
-        profile = {**deepcopy(base.get("profile") if isinstance(base.get("profile"), dict) else {}), **deepcopy(item.get("profile") if isinstance(item.get("profile"), dict) else {})}
-        source_profile = source.get("profile") if isinstance(source.get("profile"), dict) else {}
-        raw_role_type = source.get("role_type") or source.get("role") or base.get("role_type")
-        role_type = normalize_character_role_type(
-            raw_role_type,
-            default="protagonist" if index == 0 else "supporting",
-        )
-        goal = _text(
-            source.get("goal")
-            or source.get("current_goal")
-            or source_profile.get("core_motivation")
-            or base.get("goal")
-            or profile.get("core_motivation")
-        )
-        item["role_type"] = role_type
-        item["goal"] = goal
-        item["current_goal"] = goal
-        item["background"] = append_character_role_description(
-            _text(item.get("background") or item.get("position") or item.get("status")),
-            raw_role_type,
-        )
-        if not _text(profile.get("core_motivation")):
-            profile["core_motivation"] = goal
-        item["profile"] = profile
-        characters.append(item)
-    characters = _dedupe_dicts(characters, lambda item: _text(item.get("name")).casefold())
-    relationships = _dict_rows(data.get("relationships"), name_field="id") or _dict_rows(baseline.get("relationships"), name_field="id")
-    relationships = _dedupe_dicts(
-        relationships,
-        lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str),
-    )
-    return {**deepcopy(baseline), **deepcopy(data), "characters": characters, "relationships": relationships}
-
-
-def _normalize_locations(data: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
-    entries = (
-        _dict_rows(data.get("entries"), name_field="title")
-        + _dict_rows(baseline.get("entries"), name_field="title")
-    )
-    entries = _dedupe_dicts(entries, lambda item: _text(item.get("title")).casefold())
-    relations = (
-        _dict_rows(data.get("relations"), name_field="id")
-        + _dict_rows(baseline.get("relations"), name_field="id")
-    )
-    relations = _dedupe_dicts(
-        relations,
-        lambda item: (
-            _text(item.get("source_title")).casefold(),
-            _text(item.get("target_title")).casefold(),
-            _text(item.get("relation_type")).casefold(),
-        ),
-    )
-    return {**deepcopy(baseline), **deepcopy(data), "entries": entries, "relations": relations}
 
 
 def _chapter_range(value: Any) -> tuple[int | None, int | None]:
@@ -310,11 +177,6 @@ def _normalize_macro_outline(data: dict[str, Any], baseline: dict[str, Any]) -> 
     base_volumes = _dict_rows(baseline.get("volumes"), name_field="title")
     if not source_volumes:
         source_volumes = deepcopy(base_volumes)
-    requested_count = int(baseline.get("requested_volume_count") or 0)
-    if requested_count:
-        source_volumes = source_volumes[:requested_count]
-        if len(source_volumes) < requested_count:
-            source_volumes.extend(deepcopy(base_volumes[len(source_volumes):requested_count]))
     volumes: list[dict[str, Any]] = []
     for index, source in enumerate(source_volumes):
         base = base_volumes[index] if index < len(base_volumes) else {}
@@ -462,11 +324,20 @@ def _session(db: Session, session_id: str) -> NovelCreationSession | None:
     return db.query(NovelCreationSession).filter(NovelCreationSession.id == session_id).first()
 
 
-def _free_opencode_candidates(model: str) -> list[str]:
-    # A stage run is pinned to the model selected when it was submitted.
-    # Never turn an availability, quota, or configuration failure into an
-    # implicit model choice on the author's behalf.
-    return [model]
+def _creation_output_token_limit(model: str, context_manifest: Any | None) -> int:
+    """Use the governed model budget without imposing a stage-specific cap."""
+
+    manifest_limit = int(getattr(context_manifest, "output_reserve_tokens", 0) or 0)
+    if manifest_limit > 0:
+        return min(manifest_limit, MAX_CONFIGURABLE_LIMIT)
+    raw_model = _text(model)
+    provider, separator, model_name = raw_model.partition(":")
+    if not separator:
+        provider, model_name = "", raw_model
+    return min(
+        default_output_token_limit(provider, model_name),
+        MAX_CONFIGURABLE_LIMIT,
+    )
 
 
 async def _stream_model_text(
@@ -478,69 +349,63 @@ async def _stream_model_text(
     extra_body: dict[str, Any] | None,
 ) -> tuple[str, int]:
     operation_id = current_operation_id()
-    for attempt in (1, 2):
-        _raise_if_task_cancelled()
-        chunks: list[str] = []
-        emitted_chars = 0
-        last_report_at = 0.0
-        try:
-            generator = LLMGateway.stream_chat_completion(
-                messages=messages,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                timeout=0,
-                # The gateway handles pre-output failures. This outer attempt
-                # additionally restarts a whole request after a partial stream
-                # was closed, which is safe because stage data is not persisted
-                # until it has passed contract validation.
-                retry=0,
-                extra_body=extra_body,
-            )
-            async for chunk in generator:
-                _raise_if_task_cancelled()
-                chunks.append(chunk)
-                emitted_chars += len(chunk)
-                now = time.monotonic()
-                if operation_id and now - last_report_at >= 2:
-                    last_report_at = now
-                    record_operation_signal(
-                        operation_id,
-                        "output",
-                        {"output_chars": emitted_chars, "attempt": attempt},
-                        message="模型正在生成并校验立项内容",
-                    )
-            _raise_if_task_cancelled()
-            return "".join(chunks), attempt
-        except Exception as exc:
-            if attempt == 1 and _is_transient_transport_error(exc):
-                if operation_id:
-                    record_operation_signal(
-                        operation_id,
-                        "retry",
-                        {"attempt": 2, "failure_class": classify_failure(str(exc)) or "network"},
-                        message="模型连接中断，正在使用同一模型完整重试一次",
-                    )
-                continue
-            raise
-    raise RuntimeError("模型流式调用未完成")
+    chunks: list[str] = []
+    emitted_chars = 0
+    last_report_at = 0.0
+    last_reported_chars = 0
+    preview = ""
+    resume_count = 0
 
+    def report_progress(*, force: bool = False) -> None:
+        nonlocal last_report_at, last_reported_chars
+        if not operation_id or emitted_chars <= 0:
+            return
+        now = time.monotonic()
+        if not force and now - last_report_at < STREAM_PROGRESS_INTERVAL_SECONDS:
+            return
+        if emitted_chars == last_reported_chars:
+            return
+        last_report_at = now
+        last_reported_chars = emitted_chars
+        readable_preview = re.sub(r"\s+", " ", preview).strip()
+        record_operation_signal(
+            operation_id,
+            "stream_output",
+            {
+                "kind": "model_output",
+                "output_chars": emitted_chars,
+                "output_preview": readable_preview,
+                "max_output_tokens": max_tokens,
+                "attempt": resume_count + 1,
+            },
+            message=f"模型正在生成并校验立项内容 · 已输出 {emitted_chars:,} 字",
+        )
 
-async def _generate_compact_concepts_with_fallback(
-    session: NovelCreationSession,
-    model: str,
-    *,
-    context_manifest: Any,
-    on_fallback: Any,
-    input_snapshot: dict[str, Any] | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    del on_fallback  # Compatibility with the existing call site/event contract.
-    return await _generate_compact_concepts(
-        session,
-        model,
-        context_manifest=context_manifest,
-        input_snapshot=input_snapshot,
+    async def record_resume(payload: dict[str, Any]) -> None:
+        nonlocal resume_count
+        resume_count = max(resume_count, int(payload.get("resume_attempt") or 0))
+
+    _raise_if_task_cancelled()
+    generator = LLMGateway.stream_chat_completion(
+        messages=messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout=300,
+        retry=1,
+        extra_body=extra_body,
+        resume=8,
+        on_resume=record_resume,
     )
+    async for chunk in generator:
+        _raise_if_task_cancelled()
+        chunks.append(chunk)
+        emitted_chars += len(chunk)
+        preview = (preview + chunk)[-STREAM_PROGRESS_PREVIEW_CHARS:]
+        report_progress()
+    _raise_if_task_cancelled()
+    report_progress(force=True)
+    return "".join(chunks), resume_count + 1
 
 
 async def _repair_json_with_model(
@@ -578,12 +443,11 @@ async def _generate_compact_concepts(
     context_manifest: Any | None = None,
     input_snapshot: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Generate decision-ready concepts, never a complete project blueprint."""
+    """Generate one or more decision-ready concept seeds for the current stage."""
     draft = deepcopy(input_snapshot) if isinstance(input_snapshot, dict) else (session.draft_json if isinstance(session.draft_json, dict) else {})
     interview = draft.get("interview") if isinstance(draft.get("interview"), dict) else {}
     author = _author_context(draft)
     author_led = author["creation_mode"] == "author_led"
-    expected_count = 1
     instruction = _text(draft.get("_refinement_instruction"))
     context = {
         "brief": _text(session.user_brief),
@@ -608,7 +472,11 @@ async def _generate_compact_concepts(
             extra_body=LLMGateway.local_cli_extra_body(
                 model,
                 cwd=str(content_root()),
-                base={"moshu_task_type": "planning", "storage_target": "session_draft"},
+                base={
+                    "moshu_task_type": "planning",
+                    "storage_target": "session_draft",
+                    "local_cli_retry_attempts": 1,
+                },
             ),
         )
     _raise_if_task_cancelled()
@@ -619,8 +487,7 @@ async def _generate_compact_concepts(
         if not isinstance(parsed, dict):
             raise ValueError("模型返回的轻量创意卡不是有效 JSON")
         payload = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
-        cards = _validate_compact_concepts(payload.get("concepts"), expected_count=expected_count)
-        _validate_author_requirements("concepts", {"options": cards}, {}, draft)
+        cards = _validate_compact_concepts(payload.get("concepts"))
         metadata = {"attempt": attempt, "result_mode": "model", "warning": None}
         if parse_method != "direct":
             metadata.update(_repair_provenance(
@@ -635,20 +502,23 @@ async def _generate_compact_concepts(
                 raw=raw,
                 error=parse_error,
                 model=model,
-                contract=f"顶层 concepts 数组必须恰好包含 {expected_count} 张卡，字段与示例完全一致",
+                contract="顶层 concepts 必须是非空数组，每张卡的字段与示例一致，不得为了满足数量而复制方案",
                 max_tokens=3200,
                 extra_body=LLMGateway.local_cli_extra_body(
                     model,
                     cwd=str(content_root()),
-                    base={"moshu_task_type": "planning", "storage_target": "session_draft"},
+                    base={
+                        "moshu_task_type": "planning",
+                        "storage_target": "session_draft",
+                        "local_cli_retry_attempts": 1,
+                    },
                 ),
             )
             if not isinstance(repaired, dict):
                 raise ValueError("结构修复没有返回 JSON 对象")
             payload = repaired.get("data") if isinstance(repaired.get("data"), dict) else repaired
-            cards = _validate_compact_concepts(payload.get("concepts"), expected_count=expected_count)
+            cards = _validate_compact_concepts(payload.get("concepts"))
             _raise_if_task_cancelled()
-            _validate_author_requirements("concepts", {"options": cards}, {}, draft)
             metadata = {
                 "attempt": attempt + repair_attempt,
                 **_repair_provenance(raw, "model_json", "模型原始回复格式不合法，已使用同一模型完成一次结构修复"),
@@ -657,21 +527,6 @@ async def _generate_compact_concepts(
                 metadata["repair_method"] = "model_json+deterministic_json"
             return cards, metadata
         except Exception as repair_error:
-            safe_cards = None if instruction else _safe_partial_concepts(
-                raw,
-                expected_count=expected_count,
-                draft=draft,
-            )
-            if safe_cards is not None:
-                return safe_cards, {
-                    "attempt": attempt + 1,
-                    "result_mode": "deterministic_fallback",
-                    "warning": "模型返回的部分创意结构不可用，系统已保留可识别内容并补齐安全默认值",
-                    "repair_method": "safe_partial_draft",
-                    "repair_error": str(repair_error)[:1000],
-                    "original_response_excerpt": raw[:12_000],
-                    "_diagnostic_raw": raw,
-                }
             raise StageModelResponseError(
                 f"{parse_error}；同模型结构修复失败：{repair_error}",
                 attempt=attempt + 1,
@@ -717,15 +572,7 @@ async def _enhance_with_model(
     )
     from ....services.content_store import content_root
 
-    # Three opening chapters fit a 6k response. Keep that cap for this stage
-    # so local models do not spend a long call on an unnecessarily large
-    # opening-outline response, while still respecting a smaller manifest.
-    manifest_output_limit = int(getattr(context_manifest, "output_reserve_tokens", 0) or 0)
-    if stage == "opening_outline":
-        max_output_tokens = min(6000, manifest_output_limit) if manifest_output_limit else 6000
-    else:
-        max_output_tokens = max(6000, manifest_output_limit)
-    max_output_tokens = min(max_output_tokens, 1_000_000)
+    max_output_tokens = _creation_output_token_limit(model, context_manifest)
 
     with activate_context_manifest(context_manifest) if context_manifest else nullcontext():
         _raise_if_task_cancelled()
@@ -737,7 +584,11 @@ async def _enhance_with_model(
             extra_body=LLMGateway.local_cli_extra_body(
                 model,
                 cwd=str(content_root()),
-                base={"moshu_task_type": "planning", "storage_target": "session_draft"},
+                base={
+                    "moshu_task_type": "planning",
+                    "storage_target": "session_draft",
+                    "local_cli_retry_attempts": 1,
+                },
             ),
         )
     _raise_if_task_cancelled()
@@ -748,10 +599,8 @@ async def _enhance_with_model(
         if not isinstance(parsed, dict):
             raise ValueError("模型返回的阶段 JSON 格式不合法")
         data = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
-        _validate_author_requirements(stage, data, baseline, draft)
         data = _normalize_stage_data(stage, data, baseline)
         _validate_stage(stage, data)
-        _validate_author_requirements(stage, data, baseline, draft)
         metadata = {"attempt": attempt, "result_mode": "model", "warning": None}
         if parse_method != "direct":
             metadata.update(_repair_provenance(
@@ -771,17 +620,19 @@ async def _enhance_with_model(
                 extra_body=LLMGateway.local_cli_extra_body(
                     model,
                     cwd=str(content_root()),
-                    base={"moshu_task_type": "planning", "storage_target": "session_draft"},
+                    base={
+                        "moshu_task_type": "planning",
+                        "storage_target": "session_draft",
+                        "local_cli_retry_attempts": 1,
+                    },
                 ),
             )
             if not isinstance(repaired, dict):
                 raise ValueError("结构修复没有返回 JSON 对象")
             data = repaired.get("data") if isinstance(repaired.get("data"), dict) else repaired
             _raise_if_task_cancelled()
-            _validate_author_requirements(stage, data, baseline, draft)
             data = _normalize_stage_data(stage, data, baseline)
             _validate_stage(stage, data)
-            _validate_author_requirements(stage, data, baseline, draft)
             metadata = {
                 "attempt": attempt + repair_attempt,
                 **_repair_provenance(raw, "model_json", "模型原始回复格式不合法，已使用同一模型完成一次结构修复"),
@@ -790,40 +641,76 @@ async def _enhance_with_model(
                 metadata["repair_method"] = "model_json+deterministic_json"
             return data, metadata
         except Exception as repair_error:
-            safe_data = None if instruction else _safe_partial_stage(raw, stage, baseline, draft)
-            if safe_data is not None:
-                return safe_data, {
-                    "attempt": attempt + 1,
-                    "result_mode": "deterministic_fallback",
-                    "warning": "模型返回的部分阶段结构不可用，系统已保留可识别内容并补齐安全默认值",
-                    "repair_method": "safe_partial_draft",
-                    "repair_error": str(repair_error)[:1000],
-                    "original_response_excerpt": raw[:12_000],
-                    "_diagnostic_raw": raw,
-                }
             raise StageModelResponseError(
                 f"{parse_error}；同模型结构修复失败：{repair_error}",
                 attempt=attempt + 1,
             ) from repair_error
 
 
-async def get_novel_creation_session(db: Session, project_id: str, args: dict[str, Any]) -> dict:
+async def get_creation_session(db: Session, project_id: str, args: dict[str, Any]) -> dict:
     session_id = _text(args.get("session_id"))
     session = _session(db, session_id)
     if not session:
-        return {"tool": "get_novel_creation_session", "status": "skipped", "detail": "Session not found", "data": None}
+        return {"tool": "get_creation_session", "status": "skipped", "detail": "Session not found", "data": None}
     return {
-        "tool": "get_novel_creation_session",
+        "tool": "get_creation_session",
         "status": "ok",
         "detail": "Novel creation session loaded",
         "data": serialize_session(session),
     }
 
 
-async def get_creation_session(db: Session, project_id: str, args: dict[str, Any]) -> dict:
-    """Stable conversational alias for the resumable creation session contract."""
-    result = await get_novel_creation_session(db, project_id, args)
-    return {**result, "tool": "get_creation_session"}
+def _compact_creation_snapshot(session: NovelCreationSession) -> dict[str, Any]:
+    """Return only facts needed for one model turn, without duplicated workflow history."""
+
+    draft = deepcopy(initialize_session_draft(session, persist=False))
+    stages = draft.get("stages") if isinstance(draft.get("stages"), dict) else {}
+    locks = draft.get("artifact_locks") if isinstance(draft.get("artifact_locks"), dict) else {}
+    compact_draft = {
+        key: deepcopy(draft.get(key))
+        for key in (
+            "schema_version",
+            "creation_mode",
+            "author_brief",
+            "author_outline",
+            "locked_requirements",
+            "form",
+        )
+    }
+    revision = int(session.revision or 0)
+    artifacts: list[dict[str, Any]] = []
+    for stage in STAGE_ORDER:
+        state = stages.get(stage) if isinstance(stages.get(stage), dict) else {}
+        artifacts.append({
+            "artifact": stage,
+            "label": STAGE_LABELS[stage],
+            "status": _text(state.get("status")) or "pending",
+            "data": deepcopy(state.get("data")),
+            "source": _text(state.get("source")) or "unknown",
+            "updated_at": state.get("updated_at"),
+            "stale_reason": state.get("stale_reason"),
+            "locked_paths": list(locks.get(stage) or []),
+            "revision": revision,
+        })
+    return {
+        "revision": revision,
+        "session": {
+            "id": session.id,
+            "source_project_id": session.source_project_id,
+            "created_project_id": session.created_project_id,
+            "status": session.status,
+            "mode": session.mode,
+            "schema_version": int(draft.get("schema_version") or session.schema_version or 1),
+            "current_stage": session.current_stage,
+            "revision": revision,
+            "user_brief": session.user_brief,
+            "target_audience": session.target_audience,
+            "genre": session.genre,
+            "platform": session.platform,
+            "draft": compact_draft,
+        },
+        "artifacts": artifacts,
+    }
 
 
 async def get_creation_snapshot(db: Session, project_id: str, args: dict[str, Any]) -> dict:
@@ -834,11 +721,7 @@ async def get_creation_snapshot(db: Session, project_id: str, args: dict[str, An
         "tool": "get_creation_snapshot",
         "status": "ok",
         "detail": "Creation snapshot loaded",
-        "data": {
-            "revision": int(session.revision or 0),
-            "session": serialize_session(session),
-            "artifacts": list_creation_artifacts(session),
-        },
+        "data": _compact_creation_snapshot(session),
     }
 
 
@@ -861,7 +744,7 @@ async def patch_creation_session_tool(db: Session, project_id: str, args: dict[s
         return _revision_error("patch_creation_session", session)
     changes = args.get("changes") if isinstance(args.get("changes"), dict) else {}
     try:
-        patch_session(session, changes)
+        patch_session(session, changes, source="assistant")
         commit_session(db)
         return {"tool": "patch_creation_session", "status": "ok", "detail": "Creation session patched", "data": serialize_session(session)}
     except Exception as exc:
@@ -950,7 +833,7 @@ async def patch_creation_artifact_tool(db: Session, project_id: str, args: dict[
             session,
             _text(args.get("artifact")),
             args.get("changes") if isinstance(args.get("changes"), list) else [],
-            source=_text(args.get("source")) or "assistant",
+            source="assistant",
             validator=_validate_stage,
         )
         commit_session(db)
@@ -1043,7 +926,7 @@ async def patch_creation_entity_tool(db: Session, project_id: str, args: dict[st
             entity,
             args.get("changes") if isinstance(args.get("changes"), list) else [],
             expected_revision=int(args["expected_revision"]),
-            source=_text(args.get("source")) or "assistant",
+            source="assistant",
         )
         commit_session(db)
         return {"tool": "patch_creation_entity", "status": "ok", "detail": "Creation entity patched", "data": result}
@@ -1064,7 +947,7 @@ async def delete_creation_entity_tool(db: Session, project_id: str, args: dict[s
             session,
             entity,
             expected_revision=int(args["expected_revision"]),
-            source=_text(args.get("source")) or "assistant",
+            source="assistant",
         )
         commit_session(db)
         return {"tool": "delete_creation_entity", "status": "ok", "detail": "Creation entity deleted", "data": result}
@@ -1078,18 +961,6 @@ async def list_creation_artifact_versions_tool(db: Session, project_id: str, arg
     artifact = _text(args.get("artifact"))
     if not session:
         return {"tool": "list_creation_artifact_versions", "status": "skipped", "detail": "Session not found", "data": None}
-    current = serialize_creation_artifact(session, artifact)
-    if isinstance(current.get("data"), dict):
-        record_artifact_version(
-            session,
-            artifact,
-            current["data"],
-            revision=int(session.revision or 0),
-            status=current["status"],
-            source=current["source"],
-            change_type="legacy_baseline",
-        )
-        commit_session(db)
     versions = list_artifact_versions(
         db,
         session_id=session.id,
@@ -1206,46 +1077,71 @@ async def apply_creation_import(db: Session, project_id: str, args: dict[str, An
         return {"tool": "apply_creation_import", "status": "error", "detail": str(exc), "data": None}
 
 
-async def generate_novel_creation_stage(db: Session, project_id: str, args: dict[str, Any]) -> dict:
-    from ....services.novel_creation_stage_execution import execute_novel_creation_stage
+def _resolve_creation_model(model: Any, *, use_model: bool) -> str:
+    if not use_model:
+        return ""
+    requested = _text(model)
+    if requested.casefold() in {"siming", "default", "auto", "openai"}:
+        requested = ""
+    try:
+        selection = LLMGateway.select_model_for_task(
+            task_type="planning",
+            model_override=requested or None,
+        )
+        return _text(getattr(selection, "model", "")) or requested
+    except Exception:
+        return requested
 
-    return await execute_novel_creation_stage(
+
+async def run_creation_artifact_generation(db: Session, project_id: str, args: dict[str, Any]) -> dict:
+    from ....services.novel_creation_stage_execution import execute_creation_artifact_generation
+
+    payload = dict(args)
+    payload["model"] = _resolve_creation_model(
+        payload.get("model"),
+        use_model=bool(payload.get("use_model", True)),
+    )
+    return await execute_creation_artifact_generation(
         db,
         project_id,
-        args,
+        payload,
         ensure_not_cancelled=_ensure_stage_not_cancelled,
-        generate_concepts=_generate_compact_concepts_with_fallback,
+        generate_concepts=_generate_compact_concepts,
         normalize_stage=_normalize_stage_data,
         enhance_with_model=_enhance_with_model,
-        model_response_error=StageModelResponseError,
     )
 
 
-async def submit_novel_creation_stage(db: Session, project_id: str, args: dict[str, Any]) -> dict:
-    return await submit_creation_stage(
+async def save_creation_artifact(db: Session, project_id: str, args: dict[str, Any]) -> dict:
+    return await save_creation_stage_data(
         db, args, normalize_stage=_normalize_stage_data, validate_stage=_validate_stage,
     )
 
 
 async def confirm_creation_artifact(db: Session, project_id: str, args: dict[str, Any]) -> dict:
-    """Confirm exactly one artifact without implicitly generating another artifact."""
+    """Confirm the current artifact without implicitly generating another artifact."""
     session_id = _text(args.get("session_id"))
     artifact = _text(args.get("artifact"))
     session = _session(db, session_id)
     if not session:
         return {"tool": "confirm_creation_artifact", "status": "skipped", "detail": "Session not found", "data": None}
-    data = args.get("data")
-    if not isinstance(data, dict):
-        current = serialize_creation_artifact(session, artifact)
-        data = current.get("data") if isinstance(current.get("data"), dict) else None
+    if "data" in args:
+        return {
+            "tool": "confirm_creation_artifact",
+            "status": "error",
+            "detail": "确认工具不能同时修改内容；请先在上一条用户消息中保存修改，再由作者确认当前版本",
+            "data": None,
+        }
+    current = serialize_creation_artifact(session, artifact)
+    data = current.get("data") if isinstance(current.get("data"), dict) else None
     if not isinstance(data, dict):
         return {"tool": "confirm_creation_artifact", "status": "conflict", "detail": "Artifact has no generated data to confirm", "data": None}
-    result = await submit_novel_creation_stage(db, project_id, {
+    result = await save_creation_artifact(db, project_id, {
         "session_id": session_id,
         "stage": artifact,
         "data": data,
         "confirm": True,
-        "source": _text(args.get("source")) or "author",
+        "source": "assistant",
         "expected_revision": args.get("expected_revision"),
     })
     if result.get("status") == "ok":
@@ -1279,7 +1175,7 @@ async def _generate_creation_artifact(
     }
     if operation == "refine" and not _text(payload.get("instruction")):
         return {"tool": tool, "status": "error", "detail": "instruction is required for refinement", "data": None}
-    result = await generate_novel_creation_stage(db, project_id, payload)
+    result = await run_creation_artifact_generation(db, project_id, payload)
     return {**result, "tool": tool}
 
 
@@ -1326,19 +1222,3 @@ async def retry_creation_operation(db: Session, project_id: str, args: dict[str,
 async def validate_creation_session(db: Session, project_id: str, args: dict[str, Any]) -> dict:
     result = await validate_creation_consistency_tool(db, project_id, args)
     return {**result, "tool": "validate_creation_session"}
-
-
-async def finalize_creation_session(db: Session, project_id: str, args: dict[str, Any]) -> dict:
-    """Validate a session and idempotently create its formal project."""
-    validation = await validate_creation_consistency_tool(db, project_id, args)
-    if validation.get("status") not in {"ok"}:
-        return {
-            "tool": "finalize_creation_session",
-            "status": "conflict",
-            "detail": "Creation session has unresolved consistency issues",
-            "data": validation.get("data"),
-        }
-    from .novel_creation import apply_novel_blueprint
-
-    result = await apply_novel_blueprint(db, project_id, {**args, "mode": "auto"})
-    return {**result, "tool": "finalize_creation_session"}

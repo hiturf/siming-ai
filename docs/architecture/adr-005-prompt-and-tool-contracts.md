@@ -34,7 +34,7 @@ therefore reach one entry point without reaching the others.
 ## Consequences
 
 Six initial PromptSpecs cover shared execution, workspace assistance, quality
-chapter writing, staged new-novel creation, merged cataloging, and external
+chapter writing, staged new-novel creation, staged cataloging, and external
 cataloging. Ten high-impact creation and continuity tools now derive schemas
 from Pydantic models; the remaining tools can migrate incrementally. Fixed
 prompt text is substantially smaller, but prompt edits now need to pass the

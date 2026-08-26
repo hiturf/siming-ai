@@ -29,8 +29,7 @@ def test_android_prompt_contract_has_no_pc_source_drift():
     assert committed["source_sha256"]
     assert committed["source_versions"] == {
         "workspace": "assistant.workspace.quality@3.1.0",
-        "chapter_quality": "assistant.chapter.quality@3.0.0",
-        "chapter_fast": "assistant.chapter.fast@3.0.0",
+        "chapter_quality": "assistant.chapter.quality@3.1.0",
         "novel_creation": "creation.novel.stage@3.0.0",
     }
 
@@ -44,10 +43,10 @@ def test_android_prompt_contract_contains_full_nested_writer_pipeline():
         "character_writer",
         "outline_writer",
         "worldbuilding_writer",
-        "create_chapter",
-        "update_chapter",
         "update_project_info",
     } <= names
+    assert "create_chapter" not in names
+    assert "update_chapter" not in names
     assert "只调用本轮实际提供的工具" in contract["workspace_system_template"]
     assert "质量模式宁可多检查一次因果" in contract["chapter"]["quality_system_template"]
     assert set(contract["writer_output_tools"]) == {"character", "outline", "world"}
@@ -60,8 +59,34 @@ def test_android_prompt_contract_contains_pc_novel_creation_pipeline():
 
     assert contract["schema_version"] == 3
     assert agent["max_iterations"] == 6
-    assert "不要强迫用户走固定阶段" in agent["system_template"]
+    assert "可按任意顺序工作" in agent["system_template"]
     assert "立即增量写入" in agent["system_template"]
+    assert "最多完成一次成功的写工具调用" in agent["system_template"]
+    assert agent["max_successful_writes_per_turn"] == 1
+    assert agent["max_failed_writes_per_turn"] == 3
+    assert "confirm_creation_artifact" in agent["write_tool_names"]
+    assert "patch_creation_artifact" in agent["revision_tool_names"]
+    assert payload["tool_categories"]["controller"] == "set_tool_categories"
+    assert set(payload["tool_categories"]["categories"]) == {
+        "project_files",
+        "story_knowledge",
+        "writing_context",
+        "cataloging",
+        "analysis_governance",
+        "creation_data",
+        "creation_flow",
+        "agent_runtime",
+        "extensions",
+    }
+    assert {
+        schema["function"]["name"] for schema in agent["tool_schemas"]
+    } >= {"set_tool_categories", "get_creation_snapshot", "finalize_creation_session"}
+    confirm_schema = next(
+        schema["function"]
+        for schema in agent["tool_schemas"]
+        if schema["function"]["name"] == "confirm_creation_artifact"
+    )
+    assert "data" not in confirm_schema["parameters"]["properties"]
     assert contract["stage_order"] == [
         "constraints",
         "concepts",

@@ -1,322 +1,99 @@
-# Siming MCP Architecture Specification
+# Siming MCP 现行架构
 
-> Version: 0.1.0 (draft)
-> Date: 2026-06-07
-> Status: Phase 0 — specification
+> 协议版本：MCP `2024-11-05`
+> 传输：stdio
+> 权威实现：`backend/app/mcp/server.py`、`backend/app/services/workspace/registry.py`
 
-## 1. Scope
+## 1. 单一工具来源
 
-This document defines the first MCP version for Siming (司命). In this version:
+MCP、项目助手 API、立项 Agent 和手机独立 Agent 共用同一套业务工具契约：
 
-- Siming acts as an **MCP Server** only.
-- MCP Client integration (connecting Siming to external MCP servers) is a **later phase** and is out of scope for this spec.
-- The server is **readonly by default**. Write and generator tools are gated behind explicit permission tiers and are not exposed in the initial release.
+- `ToolRegistry` 保存工具名称、参数结构、处理器、权限类型和 Agent 类别。
+- `backend/app/architecture/tool_categories.py` 是宽粒度工具类别的唯一目录。
+- 每个已注册业务工具必须且只能属于一个类别；启动校验会拒绝漏分或重复分配。
+- MCP 不维护另一份业务工具表，也不解析模型输出中的 JSON 指令来模拟工具调用。
 
-## 2. Transport
+## 2. 模型控制的类别开放
 
-| Transport | Status | Notes |
-|-----------|--------|-------|
-| **stdio** | Supported (v1) | Recommended for local use with MCP clients such as Claude Desktop, Cursor, and other editors. The server reads JSON-RPC from stdin and writes to stdout. |
-| Streamable HTTP | Deferred | May be added in a later version for remote access. Requires authentication and is not part of v1. |
+司命启动 API 或 CLI Agent 回合时，首个模型步骤只开放 `set_tool_categories`：
 
-The v1 entrypoint is a standalone Python script (`scripts/moshu-mcp-server.py`) that loads the Siming database, registers tools, and serves over stdio.
-
-## 3. Resource URI Scheme
+1. 模型根据用户最新消息决定完成任务需要哪些能力类别。
+2. 模型调用 `set_tool_categories(enabled_categories=[...])`，以完整替换语义设置下一步骤的类别；空数组关闭全部业务工具。
+3. 控制器调用立即结束当前模型步骤。该步骤里夹带的其他工具调用全部失效。
+4. 下一模型步骤只看到“所选类别 ∩ 当前权限包 ∩ 当前入口真实实现”的工具。
+5. 需要换类时，模型再次调用控制器并进入新的模型步骤。
 
-All Siming resources use the `moshu://` scheme. URIs are stable, hierarchical, and case-sensitive.
+应用代码不会通过正则、关键词、界面选中项或固定短语替模型选择类别。类别控制器只接受结构化类别名，并不接受单个工具开关。
 
-### 3.1 URI Patterns
+当前类别如下：
 
-| URI | Description |
-|-----|-------------|
-| `moshu://projects` | Index of all projects |
-| `moshu://projects/{project_id}` | Single project metadata |
-| `moshu://projects/{project_id}/chapters` | Chapter list for a project |
-| `moshu://projects/{project_id}/chapters/{chapter_id}` | Single chapter with content |
-| `moshu://projects/{project_id}/characters` | Character list for a project |
-| `moshu://projects/{project_id}/characters/{character_id}` | Single character card |
-| `moshu://projects/{project_id}/worldbuilding` | Worldbuilding entry list |
-| `moshu://projects/{project_id}/worldbuilding/{entry_id}` | Single worldbuilding entry |
-| `moshu://projects/{project_id}/outline` | Outline tree (titles and hierarchy) |
-| `moshu://projects/{project_id}/outline/{node_id}` | Single outline node with summary |
-| `moshu://projects/{project_id}/relationships` | Character relationships |
-
-### 3.2 Resource Metadata
-
-Each resource returns:
-- `uri`: the canonical `moshu://` URI
-- `name`: human-readable label
-- `mimeType`: `application/json` for structured data, `text/plain` for prose content
-- `contents`: the resource payload (JSON object or plain text)
-
-## 4. Tool Permission Tiers
-
-Every MCP-exposed tool belongs to exactly one tier. The server enforces tier gating independent of any LLM prompt.
-
-### 4.1 Tier Definitions
-
-| Tier | Prefix | Behavior | v1 Status |
-|------|--------|----------|-----------|
-| **readonly** | `read`, `search`, `list`, `get`, `preview`, `detect`, `evaluate`, `explain`, `suggest`, `design` | Read-only queries and analysis. No database mutations. | **Exposed in v1** |
-| **draft** | `*_writer`, `rewrite_*`, `expand_*`, `continue_*`, `roleplay_*`, `dialogue_*` | Generator tools that produce content in-memory but do **not** write to the database. The caller is responsible for persisting results via a separate write call. | Gated in v1; implementation deferred to Phase 4 |
-| **write_confirmed** | `create_*`, `update_*`, `delete_*`, `merge_*`, `import_*`, `start_*`, `run_*`, `set_*`, `apply_*`, `pause_*`, `resume_*`, `cancel_*`, `ensure_*`, `reset_*` | Tools that mutate the database. Require an explicit confirmation token issued per-invocation. | Denied in v1 until confirmation layer exists (Phase 4) |
-
-### 4.2 Default Mode
+| 类别 | 能力范围 |
+| --- | --- |
+| `project_files` | 作品资料、项目文件、导入导出和写作统计 |
+| `story_knowledge` | 大纲、章节、角色、关系和世界观实体 |
+| `writing_context` | 写作上下文、正文或资料生成、未保存草稿 |
+| `cataloging` | 建档任务、候选事实和状态控制 |
+| `analysis_governance` | 质量、冲突、拆书和叙事治理 |
+| `creation_data` | 立项会话、结构化资料、实体、依赖和字段锁 |
+| `creation_flow` | 立项生成、确认、版本、任务、导入和正式建书 |
+| `agent_runtime` | Agent 运行、进度、草稿缓冲、计划任务和记忆 |
+| `extensions` | Skill、联网、MCP 指南、提示词包和质量规范 |
 
-The server starts in **readonly** mode. Only tools in the `readonly` tier are advertised via `tools/list`. Attempting to call a tool in a higher tier returns a permission-denied error.
-
-### 4.3 Tool Type Mapping
-
-The existing `ToolRegistry` uses a `tool_type` field on each `ToolDef`. The MCP adapter maps these to tiers:
-
-| `tool_type` | MCP Tier |
-|-------------|----------|
-| `read` | readonly |
-| `analysis` | readonly |
-| `web` | readonly |
-| `memory` | readonly (list/recall only; write memory is draft) |
-| `generator` | draft |
-| `write` | write_confirmed |
-| `scheduler` | write_confirmed |
-
-## 5. First Version: Exposed Readonly Tools
-
-The following tools are exposed in v1. They are a strict subset of the existing `ToolRegistry`, filtered to `tool_type` values `read`, `analysis`, and `web`.
-
-### 5.1 Project & System
-
-| Tool | Description |
-|------|-------------|
-| `list_projects` | List all projects, optional search by title |
-| `get_project_info` | Read project metadata and settings |
-| `get_export_word_count` | Chapter word counts for a project |
-
-### 5.2 Search & Catalog
-
-| Tool | Description |
-|------|-------------|
-| `search_chapters` | Search chapters by title, with content preview |
-| `search_characters` | Search characters by name fragment |
-| `search_worldbuilding` | Search worldbuilding entries by title/dimension |
-| `search_outline` | Search outline nodes by title or subtree |
-| `search_outline_tree` | Get full outline tree structure |
-| `search_relationships` | Query character relationships |
-| `search_context` | Full-text RAG search across all indexed content |
-| `list_characters` | Quick character name/ID overview |
-| `list_chapters` | Quick chapter title/ID overview |
-| `list_worldbuilding` | Quick worldbuilding title/ID/dimension overview |
-
-### 5.3 Analysis & Preview
-
-| Tool | Description |
-|------|-------------|
-| `preview_writing_context` | Pre-write context check: outline, summaries, characters, worldbuilding |
-| `preview_rag_context` | RAG-aware context packing preview |
-| `explain_context_selection` | Explain why sources were included/excluded from context |
-| `evaluate_chapter` | 8-dimension chapter quality evaluation |
-| `detect_character_changes` | Detect character state changes in text |
-| `detect_new_worldbuilding` | Detect unrecorded worldbuilding in text |
-| `detect_worldbuilding_conflicts` | Detect contradictions across worldbuilding entries |
-| `detect_forbidden_patterns` | Rule-based forbidden phrase detection |
-| `suggest_conflicts` | Generate plot conflict suggestions |
-| `design_plot` | Design chapter plot with multi-dimensional analysis |
-
-### 5.4 Cataloging & Deconstruct (Read-only parts)
-
-| Tool | Description |
-|------|-------------|
-| `list_cataloging_jobs` | List cataloging jobs and progress |
-| `get_cataloging_job` | Read a cataloging job with chapter runs |
-| `list_cataloging_candidates` | List cataloging candidates for review |
-| `list_cataloging_facts` | List saved cataloging facts |
-| `preview_deconstruct_source` | Preview chapters before deconstruct |
-| `list_deconstruct_reports` | List persisted deconstruct reports |
-| `get_deconstruct_report` | Read a deconstruct report |
-
-### 5.5 Skills & Stats (Read-only parts)
-
-| Tool | Description |
-|------|-------------|
-| `list_skills` | List AI skills |
-| `list_skill_templates` | List skill templates |
-| `list_skill_tools` | List skill tool metadata |
-| `list_skill_versions` | List skill version history |
-| `preview_skill_match` | Preview skill matching for a message |
-| `get_today_writing_stats` | Today's writing statistics |
-| `get_writing_stats_history` | Writing stats history |
-
-### 5.6 Memory (Read-only parts)
-
-| Tool | Description |
-|------|-------------|
-| `recall` | Search saved memories |
-| `list_memories` | List saved memories |
-
-### 5.7 Web
-
-| Tool | Description |
-|------|-------------|
-| `web_search` | Internet search for reference material |
-
-## 6. Adapter: Relationship with Existing ToolRegistry
-
-### 6.1 Architecture
-
-```
-MCP Client (Claude Desktop, Cursor, etc.)
-        │  JSON-RPC (stdio)
-        ▼
-  ┌─────────────┐
-  │  MCP Server  │  ← backend/app/mcp/server.py
-  │  (protocol)  │
-  └──────┬───────┘
-         │
-  ┌──────▼───────┐
-  │  MCP Adapter  │  ← backend/app/mcp/adapter.py
-  │  (filter +    │     reads from ToolRegistry
-  │   transform)  │     applies permission filter
-  └──────┬───────┘
-         │
-  ┌──────▼───────┐
-  │  Permissions  │  ← backend/app/mcp/permissions.py
-  │  (tier gate)  │     enforces readonly/draft/write_confirmed
-  └──────┬───────┘
-         │
-  ┌──────▼───────┐
-  │ ToolRegistry  │  ← backend/app/services/workspace/registry.py
-  │  (existing)   │     single source of truth for tool metadata + handlers
-  └──────────────┘
-```
-
-### 6.2 Key Design Decisions
-
-1. **No duplication.** The MCP adapter reads `ToolDef` entries from the existing `ToolRegistry` singleton. It does not maintain a parallel tool list. When a new tool is registered in `registry.py`, it automatically becomes available to the MCP adapter (subject to permission filtering).
-
-2. **Schema conversion.** The adapter converts `ToolDef` fields to MCP `Tool` format:
-   - `ToolDef.name` → `Tool.name`
-   - `ToolDef.description` → `Tool.description`
-   - `ToolDef.input_schema` + `ToolDef.required` → `Tool.inputSchema` (JSON Schema object)
-
-3. **Handler delegation.** The adapter calls the existing `execute_workspace_action` function (or equivalent) to run a tool. It does not import or call handlers directly. This ensures the same validation, error handling, and logging paths apply.
-
-4. **Permission filter.** The `permissions.py` module sits between the adapter and the registry. It maintains a deny-list of tool name patterns and a per-tier allow-list. The filter is applied at `tools/list` time (so denied tools are never advertised) and again at `tools/call` time (defense in depth).
-
-5. **No ToolRegistry modification.** The existing `ToolRegistry` class in `registry.py` is not modified. The MCP adapter is a read-only consumer of its API (`get_schemas`, `get`, `get_handler`, `all_names`).
-
-### 6.3 Adapter Input/Output
-
-When the MCP server receives a `tools/call` request:
-
-1. Validate the tool name against the permission filter.
-2. Look up the `ToolDef` in the registry.
-3. Convert MCP `arguments` to the format expected by the handler.
-4. Call the handler via the existing execution path.
-5. Wrap the result in the MCP response format (see Section 7).
-
-## 7. Error Contract
-
-All errors returned by the Siming MCP server follow a consistent structure.
-
-### 7.1 Error Response Format
-
-MCP errors use the standard JSON-RPC error object:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "error": {
-    "code": <integer>,
-    "message": "<human-readable description>",
-    "data": {
-      "tool": "<tool name, if applicable>",
-      "reason": "<machine-readable reason code>"
-    }
-  }
-}
-```
-
-### 7.2 Error Codes
-
-| Code | Name | When Used |
-|------|------|-----------|
-| -32600 | Invalid Request | Malformed JSON-RPC request |
-| -32601 | Method Not Found | Unknown MCP method |
-| -32602 | Invalid Params | Missing or invalid tool arguments |
-| -32603 | Internal Error | Unhandled exception in tool execution |
-| -32000 | Tool Not Found | Tool name not in registry |
-| -32001 | Permission Denied | Tool exists but is gated by permission tier |
-| -32002 | Project Not Found | Required `project_id` does not match any project |
-| -32003 | Tool Execution Failed | Handler raised an exception or returned an error |
-
-### 7.3 Tool Result Format
-
-Successful tool calls return:
-
-```json
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "<JSON-encoded result>"
-    }
-  ],
-  "isError": false
-}
-```
-
-Failed tool calls return:
-
-```json
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "{\"error\": \"<description>\", \"reason\": \"<code>\"}"
-    }
-  ],
-  "isError": true
-}
-```
-
-### 7.4 Security: Never Expose
-
-The following must never appear in any MCP response, regardless of tool tier:
-
-- API keys, model secrets, tokens, or credentials
-- Database connection strings
-- Internal file system paths outside the project scope
-- Raw LLM prompts used for internal tool execution
-
-## 8. Versioning
-
-The MCP server identifies itself as:
-
-```
-name: "siming"
-version: "<siming-app-version>"
-```
-
-The protocol version follows the MCP specification version supported by the server.
-
-## 9. Implementation Phases
-
-| Phase | Content | Depends On |
-|-------|---------|------------|
-| 0 | This spec, security policy | — |
-| 1 | MCP server skeleton, readonly tools, stdio entrypoint | Phase 0 |
-| 2 | Resource URIs (`moshu://`) | Phase 1 |
-| 3 | Prompts (`moshu_writing_context`, etc.) | Phase 1 |
-| 4 | Draft tier + write confirmation tokens | Phase 1, security policy |
-| 5 | MCP Client integration (external servers) | Phase 1 |
-| 6 | Agent/scheduler integration | Phase 1, 5 |
-| 7 | Release readiness (docs, packaging, regression) | All |
-
-## 10. Out of Scope for v1
-
-- MCP Client mode (connecting to external MCP servers)
-- Streamable HTTP transport
-- Write tools of any kind
-- Resource subscriptions
-- Prompt templates (Phase 3)
-- Authentication or multi-tenancy
+具体成员由代码目录生成，文档不复制工具清单，避免形成第二事实源。
+
+## 3. MCP 回合状态
+
+司命启动的本机 CLI 使用临时 `siming_turn` MCP，并传入仅本轮有效的类别状态文件：
+
+- `tools/list` 初始只返回 `set_tool_categories`。
+- 控制器写入“请求类别版本”，但不会在同一 CLI 模型步骤激活。
+- 同一步骤继续调用其他工具会得到拒绝结果。
+- 外层 Agent 观察到新版本后结束该 CLI 步骤、激活类别，并以新的 CLI 模型步骤继续。
+- 审计记录保存控制器选择、工具参数和实际结果；CLI 退出后删除临时状态。
+
+普通、非 Agent 回合启动的 MCP 若没有类别状态文件，则仍只按显式权限包列出工具；它不会获得隐式项目权限。
+
+## 4. 权限与实体边界
+
+类别不是授权。每次 `tools/list` 和 `tools/call` 都会再次执行确定性校验：
+
+- permission pack / permission tier；
+- 当前项目或立项会话归属；
+- 实体 ID 是否存在、归属是否正确、类型是否可用；
+- 写入事务、revision、幂等键和状态机；
+- 章节草稿和建档的回合终止边界。
+
+模型可以选择业务目标和工具，但不能通过选择类别扩大入口本身的权限。
+
+## 5. 章节写作边界
+
+- API 模型在 `writing_context` 类别中使用 `chapter_writer`。
+- 本机 CLI 在同一类别中使用 `prepare_external_writing_context` 和 `save_external_chapter_draft`。
+- 目标必须由 Agent 读取真实作品实体后提供章级 ID；界面当前章节不会暗中绑定到生成器。
+- 新章节生成一份独立未保存草稿，不更新正式章节。
+- 草稿成功即结束模型回合；作者随后选择“仅保存”或“保存并建档”。
+- 建档完成前不得自动生成下一章。
+
+## 6. JSON-RPC 与错误
+
+服务器支持 `initialize`、`tools/list`、`tools/call`、`prompts/list`、`prompts/get` 和 `ping`。响应使用标准 JSON-RPC 2.0；工具业务结果放在 MCP text content 中，并包含 `tool`、`status`、`detail` 和可选 `data`。
+
+协议错误使用以下代码：
+
+| 代码 | 含义 |
+| --- | --- |
+| `-32700` | JSON 解析失败 |
+| `-32600` | 请求格式无效 |
+| `-32601` | 方法不存在 |
+| `-32602` | 参数无效 |
+| `-32603` | 内部错误 |
+| `-32000` | 工具不存在 |
+| `-32001` | 权限或类别拒绝 |
+| `-32002` | 项目不存在 |
+| `-32003` | 工具执行失败 |
+
+错误不会触发隐藏 fallback、另一套工具桥或静默写入路径。
+
+## 7. 安全要求
+
+MCP 不得暴露 API Key、模型密钥、令牌、数据库连接串、项目范围外路径或内部隐藏推理。司命启动的临时 MCP 只绑定当前作品或立项会话，进程退出后失效，也不会修改 CLI 的全局 MCP 配置。

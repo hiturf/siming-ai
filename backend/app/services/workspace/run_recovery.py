@@ -7,17 +7,15 @@ Provides three layers:
 """
 from __future__ import annotations
 
-from app.architecture.uow import commit_session
-
-import json
-
 from sqlalchemy.orm import Session
+
+from app.architecture.uow import commit_session
 
 from ...database.models import AssistantRun, AssistantRunStep
 from .executor import execute_workspace_action
 from .idempotency import generate_idempotency_key
 from .run_log import finish_run_step, mark_assistant_run, start_run_step
-
+from .run_step_payloads import deserialize_step_request, deserialize_step_value_for_display
 
 # ---------------------------------------------------------------------------
 # Retry
@@ -50,12 +48,10 @@ async def retry_step(
     if not run:
         raise ValueError("任务不存在")
 
-    args = {}
-    if original.request_json:
-        try:
-            args = json.loads(original.request_json)
-        except Exception:
-            raise ValueError("步骤请求参数解析失败")
+    # Tool execution is only safe when the exact argument object is available.
+    # Historical values that were hard-truncated are rejected before
+    # idempotency calculation or any business tool can run.
+    args = deserialize_step_request(original.request_json)
 
     if not original.tool:
         raise ValueError("步骤缺少工具名称")
@@ -235,13 +231,7 @@ def _enriched_step_payload(step: AssistantRunStep) -> dict:
     from .run_log import step_payload as _sp
     payload = _sp(step)
     if step.request_json:
-        try:
-            payload["request"] = json.loads(step.request_json)
-        except Exception:
-            payload["request"] = step.request_json
+        payload["request"] = deserialize_step_value_for_display(step.request_json)
     if step.result_json:
-        try:
-            payload["result"] = json.loads(step.result_json)
-        except Exception:
-            payload["result"] = step.result_json
+        payload["result"] = deserialize_step_value_for_display(step.result_json)
     return payload

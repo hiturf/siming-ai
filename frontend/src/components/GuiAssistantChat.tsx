@@ -2,8 +2,8 @@
  * Desktop control-panel assistant.
  *
  * It runs outside the project workspace page. When a project is selected it
- * uses the normal workspace assistant; without a project it behaves as a
- * system-level assistant that can help users create the first novel project.
+ * uses the normal workspace assistant; without a project the first message
+ * creates a creation context and continues through the creation Agent.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
@@ -29,6 +29,7 @@ import {
 } from 'antd'
 import {
   ArrowLeftOutlined,
+  BookOutlined,
   DeleteOutlined,
   DatabaseOutlined,
   FileAddOutlined,
@@ -54,11 +55,14 @@ import { motionAwareScrollBehavior } from '../utils/motion'
 import { extractExplicitLocalPaths } from '../utils/localCliPathGrant'
 import { apiDateTimeMs } from '../utils/dateTime'
 import { AssistantMessageTime } from './assistant/MessageTime'
-import { startNovelCreationSession } from '../services/novelCreationAgent'
+import { ReasoningDisclosure } from './assistant/ReasoningDisclosure'
+import {
+  runCreationAgentTurn,
+  type CreationAgentTurnEvent,
+} from '../services/novelCreationAgent'
 import {
   defaultCreationAgentRuntime,
   extractCreationAgentErrorDetail,
-  formatSystemAssistantError,
   type CreationAgentRuntime,
 } from '../utils/creationAgent'
 import './GuiAssistantChat.css'
@@ -68,7 +72,6 @@ const { Title, Paragraph, Text } = Typography
 const EMPTY_ASSISTANT_REPLY = '没有收到模型的文字回复。请重试一次，或在系统设置里测试当前模型/CLI 是否支持项目助手的流式输出和工具调用。'
 const CHAT_MESSAGE_CHAR_LIMIT = 1_000_000
 const LONG_CREATION_TEXT_THRESHOLD = 20_000
-const LOCAL_CLI_WRITE_INTENT = /(?:修改|改成|改为|调整|更新|写入|保存|补充|新增|生成|删除|移除|替换|确认|锁定|解锁|撤销|恢复|导入|创建|建项|立项|回改|设置)/
 
 interface ApiResponse<T> {
   code: number
@@ -99,11 +102,10 @@ interface Conversation {
   project_id?: string
   title: string
   scope?: string
-  scope_type?: 'system' | 'creation' | 'project'
+  scope_type?: 'creation' | 'project'
   scope_id?: string
   creation_session_id?: string
   user_brief?: string
-  blueprints?: NovelBlueprint[]
   message_count?: number
   created_at?: string
   updated_at?: string
@@ -118,7 +120,12 @@ interface PersistedMessage {
   run_id?: string | null
   operation_id?: string | null
   message_type?: string
-  payload?: { reply?: string; run?: NovelCreationRunSummary; question?: ChatQuestion } | null
+  payload?: {
+    reply?: string
+    reasoning_content?: string
+    run?: NovelCreationRunSummary
+    question?: ChatQuestion
+  } | null
   created_at?: string
 }
 
@@ -128,11 +135,13 @@ interface ChatMessage {
   id?: string
   role: 'user' | 'assistant'
   content: string
+  reasoning_content?: string
   status?: string
   created_at?: string
   questions?: ChatQuestion[]
   messageType?: string
   run?: NovelCreationRunSummary
+  progressEvents?: CreationAgentTurnEvent[]
 }
 
 interface NovelCreationRunSummary {
@@ -148,6 +157,13 @@ interface NovelCreationRunSummary {
   model_source?: string
   attempt?: number
   result_mode?: string
+  stream_progress?: {
+    kind: 'model_output'
+    output_chars: number
+    output_preview?: string
+    max_output_tokens?: number
+    attempt?: number
+  }
   card_presentation?: {
     status: 'queued' | 'running' | 'waiting_user' | 'paused' | 'completed' | 'partial_success' | 'failed' | 'cancelled' | 'interrupted'
     label: string
@@ -177,10 +193,7 @@ interface CreationArtifactSummary {
   latest_version_id?: string | null
   revision: number
   flow?: {
-    can_view?: boolean
-    can_generate?: boolean
     can_confirm?: boolean
-    blocked_by?: Array<{ stage: string; label: string; reason: string }>
     soft_dependencies?: Array<{ stage: string; label: string; reason: string; message: string }>
   }
   running_operation?: NovelCreationRunSummary | null
@@ -287,108 +300,19 @@ interface PendingInputClarification {
   currentQuestion: string
 }
 
-interface NovelBlueprint {
-  title: string
-  subtitle?: string
-  logline?: string
-  premise?: string
-  genre?: string
-  creation_engine?: string
-  estimated_chapters?: number
-  protagonist?: {
-    name?: string
-    goal?: string
-    conflict?: string
-    personality?: string
-    background?: string
-    weakness?: string
-    opening_pressure?: string
-  }
-  characters?: unknown[]
-  relationships?: unknown[]
-  worldbuilding?: unknown[]
-  volume_outline?: Array<{ title?: string; summary?: string; start_chapter?: number; end_chapter?: number }>
-  outline?: unknown[]
-  selling_points?: string[]
-  world_hook?: string
-  core_conflict?: string
-  golden_three?: {
-    opening_scene?: string
-    chapter_1?: string
-    chapter_2?: string
-    chapter_3?: string
-    promise?: string
-  }
-  creative_slots?: Record<string, unknown>
-  requirement_coverage?: { score?: number; covered?: string[]; missing?: string[]; warnings?: string[] }
-  quality_self_check?: { score?: number; pass?: boolean; issues?: string[]; suggestions?: string[] }
-}
 
 const PROJECT_STORAGE_KEY = 'siming.gui.assistant.projectId'
 const LEGACY_PROJECT_STORAGE_KEY = 'moshu.gui.assistant.projectId'
 const SIDEBAR_STORAGE_KEY = 'siming.gui.assistant.sidebarCollapsed'
 const LEGACY_SIDEBAR_STORAGE_KEY = 'moshu.gui.assistant.sidebarCollapsed'
-const CREATION_TEMPLATE_KEY = 'siming:novelCreationTemplates'
-const LEGACY_CREATION_TEMPLATE_KEY = 'moshu:novelCreationTemplates'
 
-interface CreationTemplate {
-  id: string
-  name: string
-  brief: string
-  creative_slots?: Record<string, string | string[]>
-}
-
-function slotValueToText(value: string | string[] | undefined): string {
-  if (Array.isArray(value)) return value.join('；')
-  return value || ''
-}
-
-function slotDraftToFeedback(slots: Record<string, string | string[]>): string {
-  const labels: Record<string, string> = {
-    story_engine: '故事发动机',
-    genre_fusion: '类型融合',
-    protagonist_design: '主角设计',
-    world_rules: '世界规则',
-    conflict_engine: '冲突发动机',
-    reader_promise: '读者承诺',
-    scale_plan: '篇幅规划',
-    custom_motifs: '创意要素',
-    avoid_list: '禁用/避免',
-    reference_examples: '参考样例',
-  }
-  return Object.entries(slots)
-    .map(([key, value]) => `${labels[key] || key}：${slotValueToText(value)}`)
-    .filter((line) => line.trim().length > 2)
-    .join('\n')
-}
-
-function readCreationTemplates(): CreationTemplate[] {
-  try {
-    const raw = localStorage.getItem(CREATION_TEMPLATE_KEY) || localStorage.getItem(LEGACY_CREATION_TEMPLATE_KEY)
-    const parsed = raw ? JSON.parse(raw) : []
-    return Array.isArray(parsed) ? parsed : []
-  } catch {
-    return []
-  }
-}
-
-function shouldUseNovelCreation(text: string, hasActiveProject: boolean) {
-  const normalized = text.trim()
-  if (!normalized) return false
-  if (hasActiveProject && /(写|续写|重写|生成).{0,8}第?\d+\s*章/.test(normalized)) {
-    return false
-  }
-  if (/新书|新小说|新作品|帮我创建|创建.*(小说|作品|项目)|新建.*(小说|作品|项目)|设计.*(小说|新书)|开书|立项|我想写|我要写|帮我写.*小说|\d{3,5}\s*章.*创意/.test(normalized)) {
-    return true
-  }
-  if (!hasActiveProject && /(克苏鲁|规则怪谈|修仙|仙侠|玄幻|都市|科幻|悬疑|言情|历史|末日|赛博|无限流)/.test(normalized)) {
-    return true
-  }
-  return false
-}
-
-function requestsFreshNovelContext(text: string) {
-  return /(一本新的|新的一本|另(?:开|建|写)一本|再(?:创建|开|写)一本|重新(?:创建|立项)|创建.*新(?:小说|作品)|新建.*(?:小说|作品))/.test(text)
+function isVisibleCreationContext(
+  session: CreationSessionContext,
+  liveProjectIds: ReadonlySet<string>,
+) {
+  return !session.created_project_id
+    && session.status !== 'completed'
+    && (!session.source_project_id || liveProjectIds.has(session.source_project_id))
 }
 
 function GuiAssistantChat() {
@@ -400,6 +324,7 @@ function GuiAssistantChat() {
   const openedRequestedArtifactRef = useRef<string>('')
   const [projects, setProjects] = useState<Project[]>([])
   const [creationSessions, setCreationSessions] = useState<CreationSessionContext[]>([])
+  const [creationSessionsInitialized, setCreationSessionsInitialized] = useState(false)
   const [activeProjectId, setActiveProjectId] = useState<string>()
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeConvId, setActiveConvId] = useState<string | null>(null)
@@ -408,6 +333,7 @@ function GuiAssistantChat() {
   const [streaming, setStreaming] = useState(false)
   const [loading, setLoading] = useState(false)
   const [projectsLoading, setProjectsLoading] = useState(true)
+  const [projectsInitialized, setProjectsInitialized] = useState(false)
   const [conversationsLoading, setConversationsLoading] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => {
@@ -421,7 +347,7 @@ function GuiAssistantChat() {
   const creationRunPresentationRequestRef = useRef(0)
   const creationRunPresentationAttemptRef = useRef(new Set<string>())
   const pendingCreationContextRef = useRef<string>()
-  const [systemBlueprints, setSystemBlueprints] = useState<NovelBlueprint[]>([])
+  const loadedAssistantContextKeyRef = useRef<string>()
   const [runningStartTime, setRunningStartTime] = useState<number | null>(null)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const [pendingFiles, setPendingFiles] = useState<PendingMaterialFile[]>([])
@@ -473,29 +399,44 @@ function GuiAssistantChat() {
 
   const {
     defaultModel,
+    taskModel,
     modelOptions = [],
     loading: modelsLoading = false,
-  } = useModelOptions()
+  } = useModelOptions('planning')
   const [selectedModelOverride, setSelectedModelOverride] = useState<string>()
   const selectedModel = selectedModelOverride || defaultModel || undefined
   const selectedProvider = String(selectedModel || '').split(':', 1)[0]
   const isLocalCliModel = selectedProvider.endsWith('_cli')
   const supportsTransientCreationMcp = selectedProvider === 'opencode_cli'
-  const [nextLocalCliGrant, setNextLocalCliGrant] = useState(false)
   const creationAgentModelSource = selectedModelOverride
     ? 'conversation_override'
-    : selectedModel ? 'global_default' : 'unconfigured'
+    : taskModel ? 'task_setting'
+      : selectedModel ? 'global_default' : 'unconfigured'
 
   useEffect(() => {
-    setNextLocalCliGrant(false)
   }, [selectedModel])
   const [systemSessionId, setSystemSessionId] = useState<string>()
+  const systemSessionIdRef = useRef<string>()
+  const pendingCreationSessionRef = useRef<Promise<{
+    sessionId: string
+    brief: string
+    created: boolean
+  }> | null>(null)
   const [systemBrief, setSystemBrief] = useState('')
+  const [createdProjectHandoff, setCreatedProjectHandoff] = useState<{
+    sessionId: string
+    projectId: string
+  } | null>(null)
   const adoptCreationSession = useCallback((sessionId: string, brief = '') => {
+    setCreatedProjectHandoff((current) => (
+      current?.sessionId === sessionId ? current : null
+    ))
+    systemSessionIdRef.current = sessionId
     setSystemSessionId(sessionId)
     if (brief) setSystemBrief(brief)
   }, [])
   const resetCreationSession = useCallback(() => {
+    systemSessionIdRef.current = undefined
     setSystemSessionId(undefined)
     setSystemBrief('')
   }, [])
@@ -515,12 +456,21 @@ function GuiAssistantChat() {
   }, [systemSessionId])
 
   useEffect(() => {
-    const params = new URLSearchParams(location.search)
-    const resumedSessionId = params.get('creationSession') || ''
-    const resumedImportId = params.get('import') || ''
-    if (resumedSessionId && resumedSessionId !== systemSessionId) {
-      adoptCreationSession(resumedSessionId)
+    if (!requestedCreationSession || !creationSessionsInitialized) return
+    const liveProjectIds = new Set(projects.map((project) => project.id))
+    const resumedSession = creationSessions.find((session) => (
+      session.id === requestedCreationSession
+      && isVisibleCreationContext(session, liveProjectIds)
+    ))
+    if (resumedSession && resumedSession.id !== systemSessionId) {
+      adoptCreationSession(resumedSession.id, resumedSession.user_brief || '')
+    } else if (!resumedSession && systemSessionId === requestedCreationSession) {
+      resetCreationSession()
     }
+  }, [adoptCreationSession, creationSessions, creationSessionsInitialized, projects, requestedCreationSession, resetCreationSession, systemSessionId])
+
+  useEffect(() => {
+    const resumedImportId = new URLSearchParams(location.search).get('import') || ''
     if (resumedImportId) {
       void apiClient.get<ApiResponse<MaterialImportSummary>>(`/novel-creation/imports/${resumedImportId}`)
         .then((response) => {
@@ -532,7 +482,7 @@ function GuiAssistantChat() {
         })
         .catch(() => message.error('无法恢复资料导入状态，请从任务中心重试'))
     }
-  }, [adoptCreationSession, location.search, systemSessionId])
+  }, [location.search])
 
   const openArtifactEditor = useCallback(async (artifact: CreationArtifactSummary, sessionIdOverride?: string) => {
     const targetSessionId = sessionIdOverride || systemSessionId || activeCreationRun?.session_id
@@ -742,7 +692,6 @@ function GuiAssistantChat() {
     conversation_override: '本次对话覆盖',
     global_default: '全局默认',
     task_setting: '任务设置',
-    task_setting_fallback: '任务设置回退',
     unconfigured: '未配置',
     unknown: '待确认',
   }
@@ -750,14 +699,8 @@ function GuiAssistantChat() {
     ? '额度：已耗尽或限流'
     : '额度：未检测'
   const runtimeToolModeLabel = isLocalCliModel
-    ? '工具模式：受控本机 Agent 工具桥'
+    ? '工具模式：本轮原生 Siming MCP'
     : '工具模式：Creation Agent 原生工具调用'
-  // Creative slots editor state
-  const [slotEditorOpen, setSlotEditorOpen] = useState(false)
-  const [slotBlueprintIndex, setSlotBlueprintIndex] = useState<number | null>(null)
-  const [slotDraft, setSlotDraft] = useState<Record<string, string | string[]>>({})
-  const [creationTemplates, setCreationTemplates] = useState<CreationTemplate[]>([])
-
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const activeProjectOperationRef = useRef<string | null>(null)
@@ -790,7 +733,8 @@ function GuiAssistantChat() {
         )))
         if (['waiting_user', 'waiting_author', 'completed', 'failed', 'cancelled', 'interrupted'].includes(nextRun.status)) {
           const binding = creationRunMessageRef.current
-          if (binding) {
+          const runSessionId = nextRun.session_id || systemSessionId
+          if (binding && runSessionId) {
             const presentedStatus = nextRun.card_presentation?.status
             const messageStatus = presentedStatus === 'failed' || (!presentedStatus && nextRun.status === 'failed')
               ? 'error'
@@ -807,7 +751,7 @@ function GuiAssistantChat() {
                 || '立项任务状态已更新',
               messageStatus,
               {
-                creationSessionId: nextRun.session_id || systemSessionId,
+                creationSessionId: runSessionId,
                 userBrief: systemBrief,
                 messageType: 'operation',
                 run: nextRun,
@@ -825,9 +769,34 @@ function GuiAssistantChat() {
         // A reconnect will deliver a fresh snapshot; malformed events are ignored.
       }
     }
+    const updateModelOutput = (event: MessageEvent) => {
+      try {
+        const update = JSON.parse(event.data) as {
+          message?: string
+          payload?: NovelCreationRunSummary['stream_progress']
+        }
+        if (update.payload?.kind !== 'model_output') return
+        const applyProgress = (current: NovelCreationRunSummary): NovelCreationRunSummary => ({
+          ...current,
+          current_message: update.message || current.current_message,
+          stream_progress: update.payload,
+        })
+        setActiveCreationRun((current) => (
+          current && (current.id || current.run_id) === runId ? applyProgress(current) : current
+        ))
+        setMessages((previous) => previous.map((item) => (
+          item.run && (item.run.id || item.run.run_id) === runId
+            ? { ...item, run: applyProgress(item.run), content: update.message || item.content }
+            : item
+        )))
+      } catch {
+        // A later model_output event or snapshot will replace this preview.
+      }
+    }
     if (typeof EventSource !== 'undefined') {
       source = new EventSource(`/api/v1/novel-creation/runs/${runId}/stream`)
       source.addEventListener('snapshot', updateRun as EventListener)
+      source.addEventListener('model_output', updateModelOutput as EventListener)
       source.addEventListener('done', updateRun as EventListener)
     } else {
       const poll = async () => {
@@ -889,35 +858,49 @@ function GuiAssistantChat() {
   }, [activeCreationRun?.id, activeCreationRun?.run_id, activeCreationRun?.status, activeCreationRun?.card_presentation?.judged_by, messages, selectedModel])
 
   // Load creation templates on mount
-  useEffect(() => {
-    setCreationTemplates(readCreationTemplates())
-  }, [])
-
   const activeProject = useMemo(
     () => projects.find((project) => project.id === activeProjectId),
     [projects, activeProjectId],
+  )
+  const liveProjectIds = useMemo(
+    () => new Set(projects.map((project) => project.id)),
+    [projects],
   )
   const activeCreationContext = useMemo(
     () => creationSessions.find((session) => session.id === systemSessionId),
     [creationSessions, systemSessionId],
   )
+  const visibleActiveCreationContext = activeCreationContext && isVisibleCreationContext(activeCreationContext, liveProjectIds)
+    ? activeCreationContext
+    : undefined
+  const recoveredFormalProject = useMemo(() => {
+    const projectId = activeCreationContext?.created_project_id
+    return projectId ? projects.find((project) => project.id === projectId) : undefined
+  }, [activeCreationContext, projects])
+  const formalProjectHandoff = createdProjectHandoff
+    ? {
+        projectId: createdProjectHandoff.projectId,
+        title: projects.find((project) => project.id === createdProjectHandoff.projectId)?.title,
+      }
+    : recoveredFormalProject
+      ? { projectId: recoveredFormalProject.id, title: recoveredFormalProject.title }
+      : null
   const assistantContextLabel = activeProject
     ? `作品上下文 · ${activeProject.title}`
-    : activeCreationContext
-      ? `作品上下文 · ${(activeCreationContext.display_title || activeCreationContext.user_brief || '未命名作品').slice(0, 28)}`
+    : visibleActiveCreationContext
+      ? `作品上下文 · ${(visibleActiveCreationContext.display_title || visibleActiveCreationContext.user_brief || '未命名作品').slice(0, 28)}`
       : '未选择作品 · 发送消息后自动新建'
   const assistantContextOptions = useMemo(() => {
-    const projectIds = new Set(projects.map((project) => project.id))
     return [
       ...projects.map((project) => ({ value: `project:${project.id}`, label: project.title })),
       ...creationSessions
-        .filter((session) => !session.created_project_id || !projectIds.has(session.created_project_id))
+        .filter((session) => isVisibleCreationContext(session, liveProjectIds))
         .map((session) => ({
           value: `creation:${session.id}`,
           label: `${(session.display_title || session.user_brief || '未命名作品').slice(0, 42)} · 筹备中`,
         })),
     ]
-  }, [creationSessions, projects])
+  }, [creationSessions, liveProjectIds, projects])
 
   useEffect(() => {
     localStorage.setItem(SIDEBAR_STORAGE_KEY, sidebarCollapsed ? '1' : '0')
@@ -937,8 +920,12 @@ function GuiAssistantChat() {
 
       const savedProjectId = localStorage.getItem(PROJECT_STORAGE_KEY) || localStorage.getItem(LEGACY_PROJECT_STORAGE_KEY) || undefined
       const nextProject = items.find((item) => item.id === savedProjectId)
+      setActiveProjectId((current) => {
+        if (current && items.some((item) => item.id === current)) return current
+        if (nextProject && !requestedCreationSession && !requestedConversationId) return nextProject.id
+        return undefined
+      })
       if (nextProject && !requestedCreationSession && !requestedConversationId) {
-        setActiveProjectId((current) => current || nextProject.id)
         localStorage.setItem(PROJECT_STORAGE_KEY, nextProject.id)
       } else if (savedProjectId) {
         localStorage.removeItem(PROJECT_STORAGE_KEY)
@@ -948,6 +935,7 @@ function GuiAssistantChat() {
       message.error(err.message || '加载作品失败')
     } finally {
       setProjectsLoading(false)
+      setProjectsInitialized(true)
     }
   }, [requestedConversationId, requestedCreationSession])
 
@@ -963,27 +951,64 @@ function GuiAssistantChat() {
     } catch {
       setCreationSessions([])
       return []
+    } finally {
+      setCreationSessionsInitialized(true)
     }
   }, [])
+
+  const ensureCreationSession = useCallback(async () => {
+    const currentSessionId = systemSessionIdRef.current
+    if (currentSessionId) {
+      return { sessionId: currentSessionId, brief: systemBrief, created: false }
+    }
+    if (pendingCreationSessionRef.current) return pendingCreationSessionRef.current
+
+    const pending = (async () => {
+      const startRes = await apiClient.post<ApiResponse<{
+        session_id: string
+        session?: CreationSessionContext
+      }>>('/novel-creation/start', {
+        mode: 'internal_llm',
+        user_brief: '',
+      })
+      const sessionId = String(startRes.data?.data?.session_id || '').trim()
+      if (!sessionId) throw new Error('立项上下文创建失败：服务端没有返回 session_id。')
+      const brief = String(startRes.data?.data?.session?.user_brief || '')
+      systemConversationIdRef.current = undefined
+      setSystemConversationId(undefined)
+      adoptCreationSession(sessionId, brief)
+      await fetchCreationSessions()
+      return { sessionId, brief, created: true }
+    })()
+    pendingCreationSessionRef.current = pending
+    try {
+      return await pending
+    } finally {
+      if (pendingCreationSessionRef.current === pending) pendingCreationSessionRef.current = null
+    }
+  }, [adoptCreationSession, fetchCreationSessions, systemBrief])
 
   const fetchConversations = useCallback(async (projectId = activeProjectId) => {
     setConversationsLoading(true)
     try {
-      const responses = projectId
-        ? [await apiClient.get<ApiResponse<{ items: Conversation[]; total: number }>>(
-            '/ai/system-assistant/conversations',
-            { scope_type: 'project', scope_id: projectId },
-          )]
-        : await Promise.all([
-            apiClient.get<ApiResponse<{ items: Conversation[]; total: number }>>(
-              '/ai/system-assistant/conversations', { scope_type: 'system' },
-            ),
-            apiClient.get<ApiResponse<{ items: Conversation[]; total: number }>>(
-              '/ai/system-assistant/conversations', { scope_type: 'creation' },
-            ),
-          ])
+      const visibleCreationSessionIds = new Set(
+        (projectId ? [] : await fetchCreationSessions())
+          .filter((session) => isVisibleCreationContext(session, liveProjectIds))
+          .map((session) => session.id),
+      )
+      const responses = [await apiClient.get<ApiResponse<{ items: Conversation[]; total: number }>>(
+        '/ai/assistant/conversations',
+        projectId
+          ? { scope_type: 'project', scope_id: projectId }
+          : { scope_type: 'creation' },
+      )]
       const items = responses
         .flatMap((res) => res.data?.data?.items || [])
+        .filter((conversation) => (
+          projectId
+          || conversation.scope_type !== 'creation'
+          || visibleCreationSessionIds.has(conversation.creation_session_id || conversation.scope_id || '')
+        ))
         .sort((left, right) => {
           const rightTime = apiDateTimeMs(right.updated_at || right.created_at)
           const leftTime = apiDateTimeMs(left.updated_at || left.created_at)
@@ -997,18 +1022,19 @@ function GuiAssistantChat() {
     } finally {
       setConversationsLoading(false)
     }
-  }, [activeProjectId])
+  }, [activeProjectId, fetchCreationSessions, liveProjectIds])
 
   const fetchMessages = useCallback(async (convId: string) => {
     setLoading(true)
     try {
       const res = await apiClient.get<ApiResponse<{ conversation: Conversation; messages: PersistedMessage[] }>>(
-        `/ai/system-assistant/conversations/${convId}`,
+        `/ai/assistant/conversations/${convId}`,
       )
       const loadedMessages = (res.data?.data?.messages || []).map((item) => ({
         id: item.id,
         role: item.role,
         content: item.content || item.payload?.reply || '',
+        reasoning_content: item.payload?.reasoning_content,
         status: item.status,
         created_at: item.created_at,
         messageType: item.message_type,
@@ -1032,7 +1058,6 @@ function GuiAssistantChat() {
         } else {
           resetCreationSession()
         }
-        setSystemBlueprints(conversation.blueprints || [])
       }
     } catch (err: any) {
       message.error(err.message || '加载对话失败')
@@ -1047,7 +1072,14 @@ function GuiAssistantChat() {
   }, [fetchCreationSessions, fetchProjects])
 
   useEffect(() => {
-    if (projectsLoading) return
+    if (!projectsInitialized) return
+    const contextKey = [
+      activeProjectId || 'system',
+      requestedConversationId || '-',
+      requestedCreationSession || '-',
+    ].join(':')
+    if (loadedAssistantContextKeyRef.current === contextKey) return
+    loadedAssistantContextKeyRef.current = contextKey
     if (!activeProjectId) {
       setActiveConvId(null)
       setSystemConversationId(undefined)
@@ -1087,17 +1119,17 @@ function GuiAssistantChat() {
     fetchConversations(activeProjectId).then((items) => {
       if (items[0]) fetchMessages(items[0].id)
     })
-  }, [activeProjectId, adoptCreationSession, fetchConversations, fetchMessages, projectsLoading, requestedConversationId, requestedCreationSession, resetCreationSession])
+  }, [activeProjectId, adoptCreationSession, fetchConversations, fetchMessages, projectsInitialized, requestedConversationId, requestedCreationSession, resetCreationSession])
 
   const startNewConversation = () => {
     abortRef.current?.abort()
+    setCreatedProjectHandoff(null)
     setStreaming(false)
     setActiveConvId(null)
     setMessages([])
     setInputValue('')
     setSystemConversationId(undefined)
     systemConversationIdRef.current = undefined
-    setSystemBlueprints([])
     setPendingFiles([])
     setPendingInputClarification(null)
   }
@@ -1115,13 +1147,17 @@ function GuiAssistantChat() {
       return
     }
     if (kind === 'creation') {
+      const session = creationSessions.find((item) => item.id === id)
+      if (!session || !isVisibleCreationContext(session, liveProjectIds)) {
+        message.warning('这个立项上下文已不存在，页面不会再显示它')
+        return
+      }
       if (activeProjectId) {
         pendingCreationContextRef.current = id
         setActiveProjectId(undefined)
         return
       }
-      const session = creationSessions.find((item) => item.id === id)
-      adoptCreationSession(id, session?.user_brief || '')
+      adoptCreationSession(id, session.user_brief || '')
       const items = await fetchConversations(undefined)
       const existing = items.find((item) => item.creation_session_id === id)
       if (existing) await fetchMessages(existing.id)
@@ -1137,7 +1173,7 @@ function GuiAssistantChat() {
       okButtonProps: { danger: true },
       onOk: async () => {
         try {
-          await apiClient.delete(`/ai/system-assistant/conversations/${convId}`)
+          await apiClient.delete(`/ai/assistant/conversations/${convId}`)
           setConversations((prev) => prev.filter((item) => item.id !== convId))
           if (activeConvId === convId) startNewConversation()
           message.success('对话已删除')
@@ -1154,6 +1190,19 @@ function GuiAssistantChat() {
       const last = next[next.length - 1]
       if (last?.role === 'assistant') {
         last.content = replace ? text : `${last.content}${text}`
+        last.status = 'running'
+      }
+      return [...next]
+    })
+  }
+
+  const appendAssistantReasoning = (text: string) => {
+    if (!text) return
+    setMessages((prev) => {
+      const next = [...prev]
+      const last = next[next.length - 1]
+      if (last?.role === 'assistant') {
+        last.reasoning_content = `${last.reasoning_content || ''}${text}`
         last.status = 'running'
       }
       return [...next]
@@ -1179,12 +1228,12 @@ function GuiAssistantChat() {
       appendAssistantText(`\n${event.message || '正在执行...'}\n`, true)
       return
     }
-    if (event.type === 'thinking_delta') {
+    if (event.type === 'content_delta') {
       appendAssistantText(event.delta || '')
       return
     }
-    if (event.type === 'thinking') {
-      appendAssistantText(event.content || '', true)
+    if (event.type === 'reasoning_delta') {
+      appendAssistantReasoning(event.delta || '')
       return
     }
     if (event.type === 'tool') {
@@ -1200,6 +1249,7 @@ function GuiAssistantChat() {
         const last = next[next.length - 1]
         if (last?.role === 'assistant') {
           last.content = reply
+          last.reasoning_content = event.data?.reasoning_content || last.reasoning_content
           last.status = 'completed'
         }
         return [...next]
@@ -1234,17 +1284,17 @@ function GuiAssistantChat() {
 
   const startSystemTurn = async (
     userContent: string,
-    state: { creationSessionId?: string; userBrief?: string; messageType?: string },
+    state: { creationSessionId: string; userBrief?: string; messageType?: string },
     forceNewConversation = false,
   ) => {
     let conversationId = forceNewConversation ? undefined : systemConversationIdRef.current
     if (!conversationId) {
       const createRes = await apiClient.post<ApiResponse<{ conversation: Conversation }>>(
-        '/ai/system-assistant/conversations',
+        '/ai/assistant/conversations',
         {
           title: userContent.slice(0, 36),
-          scope_type: state.creationSessionId ? 'creation' : 'system',
-          scope_id: state.creationSessionId || null,
+          scope_type: 'creation',
+          scope_id: state.creationSessionId,
         },
       )
       conversationId = createRes.data.data.conversation.id
@@ -1252,14 +1302,14 @@ function GuiAssistantChat() {
       systemConversationIdRef.current = conversationId
     }
     const response = await apiClient.post<ApiResponse<{ conversation: Conversation; messages: ChatMessage[] }>>(
-      `/ai/system-assistant/conversations/${conversationId}/turns/start`,
+      `/ai/assistant/conversations/${conversationId}/turns/start`,
       {
         user_content: userContent,
-        creation_session_id: state.creationSessionId || null,
+        creation_session_id: state.creationSessionId,
         user_brief: state.userBrief || '',
         message_type: state.messageType || 'text',
-        scope_type: state.creationSessionId ? 'creation' : 'system',
-        scope_id: state.creationSessionId || null,
+        scope_type: 'creation',
+        scope_id: state.creationSessionId,
       },
     )
     if (!activeProjectId) {
@@ -1279,9 +1329,8 @@ function GuiAssistantChat() {
     assistantContent: string,
     status: ChatMessage['status'],
     state: {
-      creationSessionId?: string
+      creationSessionId: string
       userBrief?: string
-      blueprints?: NovelBlueprint[]
       messageType?: string
       run?: NovelCreationRunSummary
       question?: ChatQuestion
@@ -1289,18 +1338,17 @@ function GuiAssistantChat() {
   ) => {
     if (!assistantMessageId) return
     await apiClient.patch(
-      `/ai/system-assistant/conversations/${conversationId}/turns/${assistantMessageId}`,
+      `/ai/assistant/conversations/${conversationId}/turns/${assistantMessageId}`,
       {
         assistant_content: assistantContent,
         status: status || 'completed',
-        creation_session_id: state.creationSessionId || null,
+        creation_session_id: state.creationSessionId,
         user_brief: state.userBrief || '',
-        blueprints: state.blueprints || [],
         run_id: state.run?.id || state.run?.run_id || null,
         operation_id: state.run?.operation_id || null,
         message_type: state.messageType || (state.run ? 'operation' : state.question ? 'question' : 'text'),
-        scope_type: state.creationSessionId ? 'creation' : 'system',
-        scope_id: state.creationSessionId || null,
+        scope_type: 'creation',
+        scope_id: state.creationSessionId,
         payload: state.run ? { run: state.run } : state.question ? { question: state.question } : null,
       },
     )
@@ -1311,20 +1359,19 @@ function GuiAssistantChat() {
     assistantContent: string,
     status: ChatMessage['status'],
     state: {
-      creationSessionId?: string
+      creationSessionId: string
       userBrief?: string
-      blueprints?: NovelBlueprint[]
     },
   ) => {
     try {
       let conversationId = systemConversationIdRef.current
       if (!conversationId) {
         const createRes = await apiClient.post<ApiResponse<{ conversation: Conversation }>>(
-          '/ai/system-assistant/conversations',
+          '/ai/assistant/conversations',
           {
             title: userContent.slice(0, 36),
-            scope_type: state.creationSessionId ? 'creation' : 'system',
-            scope_id: state.creationSessionId || null,
+            scope_type: 'creation',
+            scope_id: state.creationSessionId,
           },
         )
         conversationId = createRes.data.data.conversation.id
@@ -1332,16 +1379,15 @@ function GuiAssistantChat() {
         systemConversationIdRef.current = conversationId
       }
       const turnRes = await apiClient.post<ApiResponse<{ conversation: Conversation }>>(
-        `/ai/system-assistant/conversations/${conversationId}/turns`,
+        `/ai/assistant/conversations/${conversationId}/turns`,
         {
           user_content: userContent,
           assistant_content: assistantContent,
           status: status || 'completed',
-          creation_session_id: state.creationSessionId || null,
+          creation_session_id: state.creationSessionId,
           user_brief: state.userBrief || '',
-          blueprints: state.blueprints || [],
-          scope_type: state.creationSessionId ? 'creation' : 'system',
-          scope_id: state.creationSessionId || null,
+          scope_type: 'creation',
+          scope_id: state.creationSessionId,
         },
       )
       if (!activeProjectId) {
@@ -1356,27 +1402,21 @@ function GuiAssistantChat() {
   const handleSystemAssistantMessage = async (
     text: string,
     originalText?: string,
-    grantLocalCliOnce = false,
     localCliReadPaths: string[] = [],
-    skipAutomaticCreation = false,
-    forceGeneralChat = false,
   ) => {
     const sourceText = text
     const displayText = originalText || text
     setAgentRuntimeOverride({})
-    const forceFreshCreation = (
-      !skipAutomaticCreation && (
-        (Boolean(activeProjectId) && shouldUseNovelCreation(displayText, true))
-        || (Boolean(systemSessionId) && requestsFreshNovelContext(displayText))
-      )
-    )
     let finalReply = ''
     let finalStatus: ChatMessage['status'] = 'completed'
     let durableTurn: { conversationId: string; assistantMessageId?: string } | null = null
-    let persistedSessionId = systemSessionId
-    let persistedBrief = systemBrief
-    let persistedBlueprints = systemBlueprints
+    let persistedSessionId = ''
+    let persistedBrief = ''
     let durablePayload: { run?: NovelCreationRunSummary; question?: ChatQuestion } = {}
+    let creationAgentTurnPersistedByBackend = false
+    let creationAgentTurnAcceptedByBackend = false
+    let creationAgentPersistedBinding: { conversationId: string; assistantMessageId?: string } | null = null
+    let activeTurnAbortController: AbortController | null = null
     const finish = (
       content: string,
       status: ChatMessage['status'] = 'completed',
@@ -1388,196 +1428,148 @@ function GuiAssistantChat() {
       setLastAssistantMessage(content, status)
     }
 
-    if (forceFreshCreation) {
-      abortRef.current?.abort()
-      setActiveProjectId(undefined)
-      resetCreationSession()
-      persistedSessionId = undefined
-      persistedBrief = ''
-      persistedBlueprints = []
-      setSystemConversationId(undefined)
-      systemConversationIdRef.current = undefined
-      creationArtifactRequestRef.current += 1
-      setCreationArtifacts([])
-      setCreationConsistency(null)
-      setActiveCreationRun(null)
-    }
-
     setMessages((prev) => [
-      ...(forceFreshCreation ? [] : prev),
+      ...prev,
       { role: 'user', content: displayText, status: 'completed', created_at: new Date().toISOString() },
-      { role: 'assistant', content: '正在处理...', status: 'running', created_at: new Date().toISOString() },
+      {
+        role: 'assistant',
+        content: '已接收请求，正在理解任务并准备所需能力…',
+        status: 'running',
+        created_at: new Date().toISOString(),
+        progressEvents: [],
+      },
     ])
     setInputValue('')
     setStreaming(true)
 
-    if (!skipAutomaticCreation && !persistedSessionId && (!activeProjectId || forceFreshCreation)) {
+    try {
+      const creationContext = await ensureCreationSession()
+      persistedSessionId = creationContext.sessionId
+      persistedBrief = creationContext.brief
       try {
-        const created = await startNovelCreationSession({
-          userBrief: displayText,
-          creationMode: 'author_led',
-          authorBrief: displayText.slice(0, 5000),
-        })
-        persistedSessionId = created.id
-        persistedBrief = displayText
-        adoptCreationSession(created.id, displayText)
-        await fetchCreationSessions()
-      } catch (error: unknown) {
-        finish(error instanceof Error ? error.message : '新建立项数据失败，请重试。', 'error')
-        setStreaming(false)
-        return
+        durableTurn = await startSystemTurn(displayText, {
+          creationSessionId: persistedSessionId,
+          userBrief: persistedBrief,
+        }, creationContext.created)
+      } catch {
+        message.warning('本轮消息暂未保存到系统历史，仍会继续处理请求')
       }
-    }
-
-    try {
-      durableTurn = await startSystemTurn(displayText, {
-        creationSessionId: persistedSessionId,
-        userBrief: persistedBrief,
-      }, forceFreshCreation)
-    } catch {
-      message.warning('本轮消息暂未保存到系统历史，仍会继续处理请求')
-    }
-
-    try {
-      if (forceGeneralChat) {
-        try {
-          const chatRes = await apiClient.post<ApiResponse<{ reply: string }>>('/novel-creation/system-chat', {
-            message: sourceText,
-            model: selectedModel,
-            context: {
-              blueprints: systemBlueprints,
-              sessionId: systemSessionId,
-              brief: systemBrief,
-              history: messages.slice(-8).map((item) => ({ role: item.role, content: item.content })),
-              readOnly: true,
-            },
-          }, { timeout: 0 })
-          const reply = String(chatRes.data?.data?.reply || '').trim()
-          if (!reply) throw new Error('当前模型没有返回文字回复。')
-          finish(reply)
-        } catch (error: unknown) {
-          finish(formatSystemAssistantError(error), 'error')
+      {
+        activeTurnAbortController = new AbortController()
+        abortRef.current = activeTurnAbortController
+        let streamedReply = ''
+        const appendProgressEvent = (event: CreationAgentTurnEvent) => {
+          if (event.type === 'turn_started') {
+            creationAgentTurnAcceptedByBackend = true
+            const conversationId = String(event.data?.conversation_id || '')
+            const assistantMessageId = String(event.data?.assistant_message_id || '')
+            if (conversationId) {
+              creationAgentPersistedBinding = {
+                conversationId,
+                assistantMessageId: assistantMessageId || undefined,
+              }
+            }
+          }
+          setMessages((prev) => {
+            const next = [...prev]
+            const last = next[next.length - 1]
+            if (last?.role !== 'assistant') return prev
+            if (last.progressEvents?.some((item) => item.sequence === event.sequence)) return prev
+            if (event.type === 'reply_delta') {
+              const delta = String(event.data?.delta || '')
+              streamedReply += delta
+              if (streamedReply) last.content = streamedReply
+            } else if (event.type !== 'complete') {
+              last.progressEvents = [...(last.progressEvents || []), event].slice(-80)
+              if (!streamedReply && event.message) last.content = event.message
+              if (event.type === 'error') last.status = 'error'
+              if (event.type === 'cancelled') last.status = 'aborted'
+            }
+            return [...next]
+          })
         }
-        return
-      }
-      const controlText = displayText.trim().replace(/[。！!？?\s]+/g, '')
-      const controlAction = /^(停止|取消)$/.test(controlText)
-        ? 'cancel'
-        : /^(暂停)$/.test(controlText)
-          ? 'pause'
-          : /^(继续|恢复|继续生成)$/.test(controlText)
-            ? 'continue'
-            : /^(按原输入重试)$/.test(controlText)
-              ? 'retry-original'
-              : /^(重试|按最新内容重试|切换模型后重试|用当前模型重试)$/.test(controlText)
-                ? 'retry-latest'
-              : null
-      if (controlAction && activeCreationRun?.operation_id) {
-        if (controlAction === 'retry-original' || controlAction === 'retry-latest') {
-          const runId = activeCreationRun.id || activeCreationRun.run_id
-          if (!runId) throw new Error('缺少可重试的立项任务')
-          const useLatestDraft = controlAction === 'retry-latest'
-          const response = await apiClient.post<ApiResponse<{ run: NovelCreationRunSummary }>>(
-            `/novel-creation/runs/${runId}/retry`,
-            { use_latest_draft: useLatestDraft, model: selectedModel || null },
-          )
-          setActiveCreationRun(response.data.data.run)
-          finish(
-            `已按${useLatestDraft ? '最新内容' : '原输入'}和当前模型创建重试任务。`,
-            'running',
-            { run: response.data.data.run },
-          )
-        } else {
-          const endpoint = controlAction === 'continue' ? 'continue' : controlAction
-          const response = await apiClient.post<ApiResponse<NovelCreationRunSummary>>(
-            `/operations/${activeCreationRun.operation_id}/${endpoint}`,
-          )
-          const nextStatus = controlAction === 'pause' ? 'paused' : controlAction === 'continue' ? 'running' : 'cancelled'
-          const nextRun = { ...activeCreationRun, status: nextStatus }
-          setActiveCreationRun(nextRun)
-          finish(
-            controlAction === 'pause' ? '任务已暂停，检查点和已有草稿均已保留。'
-              : controlAction === 'continue' ? '正在从最近检查点继续。'
-                : '任务已取消，已有草稿保持不变。',
-            controlAction === 'continue' ? 'running' : 'completed',
-            { run: nextRun },
-          )
-          void response
+        const response = await runCreationAgentTurn(
+          persistedSessionId,
+          sourceText,
+          selectedModel || undefined,
+          {
+            conversationId: durableTurn?.conversationId,
+            assistantMessageId: durableTurn?.assistantMessageId,
+            localCliReadPaths,
+            signal: activeTurnAbortController.signal,
+            onEvent: appendProgressEvent,
+          },
+        )
+        creationAgentTurnPersistedByBackend = response.turn_persisted === true
+        if (creationAgentTurnPersistedByBackend && response.conversation_id) {
+          creationAgentPersistedBinding = {
+            conversationId: response.conversation_id,
+            assistantMessageId: response.assistant_message_id,
+          }
+          setSystemConversationId(response.conversation_id)
+          systemConversationIdRef.current = response.conversation_id
+          setActiveConvId(response.conversation_id)
         }
-        return
-      }
-
-      if (persistedSessionId) {
-        const response = await apiClient.post<ApiResponse<{
-          reply: string
-          run?: NovelCreationRunSummary | null
-          tool_results?: Array<Record<string, unknown>>
-        }>>('/novel-creation/agent-turn', {
-          session_id: persistedSessionId,
-          message: sourceText,
-          model: selectedModel || null,
-          history: messages.slice(-12).map((item) => ({ role: item.role, content: item.content })),
-          local_cli_permission_grant: grantLocalCliOnce ? 'creation_agent_once' : 'chat_only',
-          local_cli_read_permission_grant: localCliReadPaths.length > 0 ? 'read_once' : 'none',
-          local_cli_read_paths: localCliReadPaths,
-        })
-        const run = response.data.data.run
+        const run = response.run as NovelCreationRunSummary | null | undefined
+        const finalizedToolResult = response.tool_results?.find((result) => (
+          result.tool === 'finalize_creation_session' && result.status === 'ok'
+        ))
+        const finalizedToolData = finalizedToolResult?.data as Record<string, unknown> | undefined
+        const finalizedProjectId = String(
+          response.created_project_id || finalizedToolData?.project_id || '',
+        ).trim()
         if (run) setActiveCreationRun(run)
-        await Promise.all([fetchCreationArtifacts(), fetchCreationSessions()])
+        if (finalizedProjectId) {
+          setCreatedProjectHandoff({ sessionId: persistedSessionId, projectId: finalizedProjectId })
+          finish(
+            '正式作品已创建并进入作品库。请点击下方按钮进入正式作品；进入后项目助手会自动展开，后续正文与项目资料都在那里继续。',
+            'completed',
+            run ? { run } : undefined,
+          )
+          await Promise.allSettled([
+            fetchCreationArtifacts(),
+            fetchCreationSessions(),
+            fetchProjects(),
+          ])
+          return
+        }
+        await Promise.allSettled([
+          fetchCreationArtifacts(),
+          fetchCreationSessions(),
+        ])
         finish(
-          response.data.data.reply || run?.current_message || '已完成本轮立项工具调用',
-          run ? 'running' : 'completed',
+          response.reply || run?.current_message || '已完成本轮立项工具调用',
+          response.message_status || (run ? 'running' : 'completed'),
           run ? { run } : undefined,
         )
         return
       }
 
-      if (/作品|项目|列表|有哪些|查看/.test(text)) {
-        const res = await apiClient.get<ApiResponse<{ items: Project[]; total: number }>>('/projects')
-        const items = res.data?.data?.items || []
-        setProjects(items)
-        if (!items.length) {
-          finish('当前还没有作品。你可以直接说“我想写克苏鲁+修仙+规则怪谈”，我会先生成一套创意方向，再按你的反馈持续调整。')
-          return
-        }
-        const projectList = items.map((project, index) => `${index + 1}. ${project.title}`).join('\n')
-        finish(`当前共有 ${items.length} 个作品：\n${projectList}\n\n你可以在顶部作品下拉框切换作品，也可以直接让我创建新作品。`)
-        return
-      }
-
-      // LLM-powered natural conversation fallback
-      try {
-        const chatRes = await apiClient.post<ApiResponse<{ reply: string }>>('/novel-creation/system-chat', {
-          message: sourceText,
-          model: selectedModel,
-          context: {
-            blueprints: systemBlueprints,
-            sessionId: systemSessionId,
-            brief: systemBrief,
-            importedFiles: pendingFiles.map(f => ({ name: f.name, length: f.content.length })),
-            history: messages.slice(-6).map(m => ({ role: m.role, content: m.content })),
-          },
-        }, { timeout: 0 })
-        const reply = String(chatRes.data?.data?.reply || '').trim()
-        if (!reply) {
-          throw new Error('当前模型没有返回文字回复。请重试，或在系统设置中测试当前模型/CLI。')
-        }
-        finish(reply)
-      } catch (err: unknown) {
-        recordAgentRuntimeError(err)
-        finish(formatSystemAssistantError(err), 'error')
-      }
     } catch (err: any) {
-      recordAgentRuntimeError(err)
-      finish(err.message || '处理失败', 'error')
-      message.error(err.message || '处理失败')
+      if (err?.name === 'AbortError') {
+        finish('已停止显示实时进度；后台仍会完成本轮，最终以保存的对话结果为准。', 'aborted')
+      } else {
+        recordAgentRuntimeError(err)
+        finish(err.message || '处理失败', 'error')
+        message.error(err.message || '处理失败')
+      }
     } finally {
-      if (durableTurn) {
+      if (activeTurnAbortController && abortRef.current === activeTurnAbortController) {
+        abortRef.current = null
+      }
+      if (creationAgentTurnPersistedByBackend || creationAgentTurnAcceptedByBackend) {
+        const binding = creationAgentPersistedBinding || durableTurn
+        if (durablePayload.run && binding?.assistantMessageId) {
+          creationRunMessageRef.current = {
+            conversationId: binding.conversationId,
+            assistantMessageId: binding.assistantMessageId,
+          }
+        }
+      } else if (durableTurn) {
         try {
           await finishSystemTurn(durableTurn.conversationId, durableTurn.assistantMessageId, finalReply, finalStatus, {
             creationSessionId: persistedSessionId,
             userBrief: persistedBrief,
-            blueprints: persistedBlueprints,
             run: durablePayload.run,
             question: durablePayload.question,
           })
@@ -1594,7 +1586,6 @@ function GuiAssistantChat() {
         await persistSystemTurn(displayText, finalReply, finalStatus, {
           creationSessionId: persistedSessionId,
           userBrief: persistedBrief,
-          blueprints: persistedBlueprints,
         })
       }
       setStreaming(false)
@@ -1642,27 +1633,17 @@ function GuiAssistantChat() {
     ])
     setInputValue('')
     setStreaming(true)
-    let sessionId = systemSessionId
+    let sessionId = ''
     let durableTurn: Awaited<ReturnType<typeof startSystemTurn>> | null = null
     try {
-      if (!sessionId) {
-        const creationSeed = sourceText.length > 5000
-          ? `用户提交了 ${sourceText.length.toLocaleString('zh-CN')} 字作品资料，原文已进入持久化分块导入任务。`
-          : (userText || sourceText)
-        const created = await startNovelCreationSession({
-          userBrief: creationSeed,
-          creationMode: 'author_led',
-          authorBrief: creationSeed,
-        })
-        sessionId = created.id
-        adoptCreationSession(created.id, creationSeed)
-      }
+      const creationContext = await ensureCreationSession()
+      sessionId = creationContext.sessionId
       try {
         durableTurn = await startSystemTurn(displayText, {
           creationSessionId: sessionId,
           userBrief: sourceText.length > 5000 ? `已导入 ${sourceText.length.toLocaleString('zh-CN')} 字长文本` : sourceText,
           messageType: 'operation',
-        })
+        }, creationContext.created)
       } catch {
         message.warning('对话消息暂未绑定，但文件导入任务仍会持久保存')
       }
@@ -1866,16 +1847,13 @@ function GuiAssistantChat() {
     userInstruction: string,
     clarificationHistory: Array<{ question: string; answer: string }> = [],
   ) => {
-    const latestClarification = clarificationHistory[clarificationHistory.length - 1]
+    const creationSessionId = systemSessionIdRef.current || ''
     const sharedFields = {
       user_instruction: userInstruction,
-      clarification_question: latestClarification?.question || '',
-      clarification_answer: latestClarification?.answer || '',
-      clarification_already_asked: clarificationHistory.length > 0,
       clarification_history: clarificationHistory,
-      context_scope: activeProjectId ? 'project' : systemSessionId ? 'creation' : 'system',
+      context_scope: activeProjectId ? 'project' : 'creation',
       active_project_id: activeProjectId || '',
-      creation_session_id: systemSessionId || '',
+      creation_session_id: creationSessionId,
       history: messages.slice(-8).map((item) => ({ role: item.role, content: item.content })),
       model: selectedModel || null,
     }
@@ -1927,10 +1905,10 @@ function GuiAssistantChat() {
     setPendingFiles([])
     setInputValue('')
     try {
+      const creationContext = await ensureCreationSession()
       await persistSystemTurn(displayText, question, 'completed', {
-        creationSessionId: systemSessionId,
-        userBrief: systemBrief,
-        blueprints: systemBlueprints,
+        creationSessionId: creationContext.sessionId,
+        userBrief: creationContext.brief,
       })
     } catch {
       // The pending in-memory source remains available even when history persistence fails.
@@ -1968,7 +1946,6 @@ function GuiAssistantChat() {
     originalInstruction: string,
     clarificationHistory: Array<{ question: string; answer: string }> = [],
     clarificationAnswer?: string,
-    grantLocalCliOnce = false,
     readPaths: string[] = [],
   ) => {
     const resolvedInstruction = decision.resolved_instruction
@@ -2007,30 +1984,23 @@ function GuiAssistantChat() {
       await handleSystemAssistantMessage(
         messageForAssistant,
         displayText,
-        grantLocalCliOnce,
         readPaths,
-        true,
-        true,
       )
       return
     }
     await sendMessage({
-      grantLocalCliOnce,
       readPaths,
       routedMessage: messageForAssistant,
       routedDisplayText: displayText,
       bypassDataRouting: true,
-      projectAutoApply: false,
     })
   }
 
   const sendMessage = async (options?: {
-    grantLocalCliOnce?: boolean
     readPaths?: string[]
     routedMessage?: string
     routedDisplayText?: string
     bypassDataRouting?: boolean
-    projectAutoApply?: boolean
   }) => {
     const rawInput = inputValue.trim()
     const text = options?.routedDisplayText ?? rawInput
@@ -2042,9 +2012,6 @@ function GuiAssistantChat() {
     // Allow sending if there are pending files (even without text)
     if ((!text && pendingFiles.length === 0 && !pendingInputClarification) || streaming) return
     const effectiveText = options?.routedMessage ?? text
-    const grantLocalCliOnce = isLocalCliModel && Boolean(
-      options?.grantLocalCliOnce || nextLocalCliGrant,
-    )
     const proposedReadPaths = supportsTransientCreationMcp
       ? (options?.readPaths ?? extractExplicitLocalPaths(permissionInstruction))
       : []
@@ -2072,38 +2039,14 @@ function GuiAssistantChat() {
       return
     }
     const grantedReadPaths = supportsTransientCreationMcp ? proposedReadPaths : []
-    if (
-      isLocalCliModel
-      && !options?.bypassDataRouting
-      && pendingFiles.length === 0
-      && !pendingInputClarification
-      && systemSessionId
-      && !grantLocalCliOnce
-      && LOCAL_CLI_WRITE_INTENT.test(permissionInstruction)
-    ) {
-      Modal.confirm({
-        title: '允许本机 CLI 仅修改本轮立项数据？',
-        okText: '允许本轮修改',
-        cancelText: '保持只读',
-        content: (
-          <div className="gui-chat-cli-grant-copy">
-            <p>CLI 本身仍处于隔离环境，不能读取项目目录、Shell 或其他程序的配置文件。</p>
-            <p>{supportsTransientCreationMcp
-              ? '司命会向当前 OpenCode 子进程注入仅含本立项会话工具的临时 MCP；OpenCode 将直接调用并回读验证。'
-              : '司命会通过受控工具桥执行立项白名单操作，并校验当前会话与数据版本。'}</p>
-            <p>授权在这条消息结束后自动失效，不会扫描或修改该 CLI 的全局 MCP 配置。</p>
-          </div>
-        ),
-        onOk: () => void sendMessage({
-          ...options,
-          grantLocalCliOnce: true,
-          readPaths: grantedReadPaths,
-        }),
-      })
-      return
+    if (!activeProjectId) {
+      try {
+        await ensureCreationSession()
+      } catch (error) {
+        message.error(error instanceof Error ? error.message : '立项上下文创建失败，请重试')
+        return
+      }
     }
-    setNextLocalCliGrant(false)
-
     if (!options?.bypassDataRouting && pendingInputClarification) {
       const answer = dataSourceInstruction
       if (!answer) return
@@ -2128,7 +2071,6 @@ function GuiAssistantChat() {
           pendingInputClarification.originalInstruction,
           clarificationHistory,
           answer,
-          grantLocalCliOnce,
           grantedReadPaths,
         )
       } catch (error) {
@@ -2161,7 +2103,6 @@ function GuiAssistantChat() {
           outerInstruction,
           [],
           undefined,
-          grantLocalCliOnce,
           grantedReadPaths,
         )
       } catch (error) {
@@ -2174,12 +2115,10 @@ function GuiAssistantChat() {
     let messageWithContext = effectiveText
     const displayText = text
 
-    const continuesSystemCreation = systemBlueprints.length > 0 && !/(写|续写|重写|查看|打开).{0,8}第?\d+\s*章/.test(text)
-    if (!activeProjectId || shouldUseNovelCreation(text, Boolean(activeProjectId)) || continuesSystemCreation) {
+    if (!activeProjectId) {
       await handleSystemAssistantMessage(
         messageWithContext,
         displayText,
-        grantLocalCliOnce,
         grantedReadPaths,
       )
       return
@@ -2200,6 +2139,7 @@ function GuiAssistantChat() {
 
     let durableProjectTurn: { conversationId: string; assistantMessageId?: string } | null = null
     let durableProjectReply = ''
+    let durableProjectReasoning = ''
     let durableProjectRun: NovelCreationRunSummary | undefined
     const normalizeProjectSseEvent = (event: any) => {
       if (!durableProjectTurn) return event
@@ -2225,7 +2165,7 @@ function GuiAssistantChat() {
       let conversationId = systemConversationId || activeConvId || undefined
       if (!conversationId) {
         const createRes = await apiClient.post<ApiResponse<{ conversation: Conversation }>>(
-          '/ai/system-assistant/conversations',
+          '/ai/assistant/conversations',
           { title: displayText.slice(0, 36), scope_type: 'project', scope_id: activeProjectId },
         )
         conversationId = createRes.data.data.conversation.id
@@ -2234,7 +2174,7 @@ function GuiAssistantChat() {
         upsertConversation(createRes.data.data.conversation)
       }
       const turnRes = await apiClient.post<ApiResponse<{ conversation: Conversation; messages: PersistedMessage[] }>>(
-        `/ai/system-assistant/conversations/${conversationId}/turns/start`,
+        `/ai/assistant/conversations/${conversationId}/turns/start`,
         {
           user_content: displayText,
           message_type: 'text',
@@ -2253,17 +2193,13 @@ function GuiAssistantChat() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          scope: 'project',
           message: messageWithContext,
           conversation_id: undefined,
           canonical_conversation_id: durableProjectTurn.conversationId,
           creation_session_id: systemSessionId,
           model: selectedModel,
-          assistant_mode: 'fast',
           temperature: 0.3,
           max_tokens: undefined,
-          auto_apply: options?.projectAutoApply ?? true,
-          local_cli_permission_grant: grantLocalCliOnce ? 'project_agent_once' : 'chat_only',
           local_cli_read_permission_grant: grantedReadPaths.length > 0 ? 'read_once' : 'none',
           local_cli_read_paths: grantedReadPaths,
           outline_batch_count: 3,
@@ -2297,6 +2233,7 @@ function GuiAssistantChat() {
           }
           if (event.type === 'complete') {
             durableProjectReply = event.data?.reply?.trim() || EMPTY_ASSISTANT_REPLY
+            durableProjectReasoning = String(event.data?.reasoning_content || '')
             durableProjectRun = event.data?.run
           }
           handleSseEvent(event)
@@ -2318,6 +2255,7 @@ function GuiAssistantChat() {
           }
           if (event.type === 'complete') {
             durableProjectReply = event.data?.reply?.trim() || EMPTY_ASSISTANT_REPLY
+            durableProjectReasoning = String(event.data?.reasoning_content || '')
             durableProjectRun = event.data?.run
           }
           handleSseEvent(event)
@@ -2325,14 +2263,19 @@ function GuiAssistantChat() {
       }
       if (durableProjectTurn?.assistantMessageId) {
         await apiClient.patch(
-          `/ai/system-assistant/conversations/${durableProjectTurn.conversationId}/turns/${durableProjectTurn.assistantMessageId}`,
+          `/ai/assistant/conversations/${durableProjectTurn.conversationId}/turns/${durableProjectTurn.assistantMessageId}`,
           {
             assistant_content: durableProjectReply || EMPTY_ASSISTANT_REPLY,
             status: 'completed',
             message_type: durableProjectRun ? 'operation' : 'text',
             run_id: durableProjectRun?.id || durableProjectRun?.run_id || null,
             operation_id: durableProjectRun?.operation_id || null,
-            payload: durableProjectRun ? { run: durableProjectRun } : null,
+            payload: durableProjectRun || durableProjectReasoning
+              ? {
+                  ...(durableProjectRun ? { run: durableProjectRun } : {}),
+                  ...(durableProjectReasoning ? { reasoning_content: durableProjectReasoning } : {}),
+                }
+              : null,
             scope_type: 'project',
             scope_id: activeProjectId,
           },
@@ -2344,7 +2287,7 @@ function GuiAssistantChat() {
         const cancelled = err.name === 'AbortError'
         try {
           await apiClient.patch(
-            `/ai/system-assistant/conversations/${durableProjectTurn.conversationId}/turns/${durableProjectTurn.assistantMessageId}`,
+            `/ai/assistant/conversations/${durableProjectTurn.conversationId}/turns/${durableProjectTurn.assistantMessageId}`,
             {
               assistant_content: cancelled ? '任务已取消，未完成内容不会写入。' : (err.message || '项目助手执行失败'),
               status: cancelled ? 'cancelled' : 'error',
@@ -2475,9 +2418,9 @@ function GuiAssistantChat() {
       if (last?.role === 'assistant' && last?.status === 'running') {
         last.status = 'aborted'
         if (!last.content || last.content === '正在处理...' || last.content === '思考中...' || last.content === '正在分析需求...') {
-          last.content = '已停止生成。'
+          last.content = '已停止显示实时进度；后台仍会完成本轮，最终以保存的对话结果为准。'
         } else {
-          last.content += '\n\n（已停止生成）'
+          last.content += '\n\n（已停止显示实时进度；后台仍在继续）'
         }
       }
       return [...next]
@@ -2491,248 +2434,42 @@ function GuiAssistantChat() {
     }
   }
 
-  // ── Creative Slots Editor ──
-  const openSlotEditor = (index: number) => {
-    const bp = systemBlueprints[index]
-    if (!bp) return
-    setSlotBlueprintIndex(index)
-    setSlotDraft({ ...(bp.creative_slots || {}) } as Record<string, string | string[]>)
-    setSlotEditorOpen(true)
-  }
 
-  const closeSlotEditor = () => {
-    setSlotEditorOpen(false)
-    setSlotBlueprintIndex(null)
-    setSlotDraft({})
-  }
-
-  const submitSlotEditor = async () => {
-    const feedback = `请按以下创意槽调整当前方案：\n${slotDraftToFeedback(slotDraft)}`
-    closeSlotEditor()
-    await handleSystemAssistantMessage(feedback)
-  }
-
-  const saveBlueprintAsTemplate = (blueprint: NovelBlueprint) => {
-    const nextTemplate: CreationTemplate = {
-      id: Date.now().toString(),
-      name: blueprint.title || '未命名模板',
-      brief: [
-        blueprint.premise || '',
-        blueprint.core_conflict ? `核心冲突：${blueprint.core_conflict}` : '',
-        blueprint.protagonist?.name ? `主角：${blueprint.protagonist.name}` : '',
-      ].filter(Boolean).join('\n'),
-      creative_slots: blueprint.creative_slots as Record<string, string | string[]> | undefined,
-    }
-    const next = [nextTemplate, ...creationTemplates].slice(0, 12)
-    localStorage.setItem(CREATION_TEMPLATE_KEY, JSON.stringify(next))
-    setCreationTemplates(next)
-    message.success('已保存为新书创作模板')
-  }
-
-  const renderSlotEditorModal = () => {
-    if (!slotEditorOpen) return null
-    const SLOT_LABELS: [string, string][] = [
-      ['story_engine', '故事发动机'],
-      ['genre_fusion', '类型融合'],
-      ['protagonist_design', '主角设计'],
-      ['world_rules', '世界规则'],
-      ['conflict_engine', '冲突发动机'],
-      ['reader_promise', '读者承诺'],
-      ['scale_plan', '篇幅规划'],
-      ['custom_motifs', '创意要素'],
-      ['avoid_list', '禁用/避免'],
-      ['reference_examples', '参考样例'],
-    ]
+  const renderFormalProjectHandoffCard = () => {
+    if (!formalProjectHandoff) return null
+    const projectTitle = formalProjectHandoff.title
+      || activeCreationContext?.display_title
+      || activeCreationContext?.user_brief?.slice(0, 36)
+      || '新作品'
     return (
-      <div style={{
-        position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-        background: 'rgba(0,0,0,0.5)', zIndex: 1000,
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-      }}>
-        <div style={{
-          background: 'var(--ant-color-bg-elevated)', borderRadius: 8, padding: 24, width: 600,
-          maxHeight: '80vh', overflow: 'auto',
-        }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
-            <Text strong>
-              编辑创意槽{slotBlueprintIndex !== null ? ` · 方案 ${slotBlueprintIndex + 1}` : ''}
-            </Text>
-            <Button size="small" onClick={closeSlotEditor}>✕</Button>
-          </div>
-          <div style={{ marginBottom: 16 }}>
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              这里改的是创作方向，不会直接覆盖原方案。确认后，助手会把这些槽位作为反馈重新调整方案。
-            </Text>
-          </div>
-          <Space direction="vertical" size={12} style={{ width: '100%' }}>
-            {SLOT_LABELS.map(([key, label]) => (
-              <div key={key}>
-                <Text strong style={{ fontSize: 13 }}>{label}</Text>
-                <Input.TextArea
-                  value={slotValueToText(slotDraft[key])}
-                  onChange={(e) => setSlotDraft((prev) => ({ ...prev, [key]: e.target.value }))}
-                  autoSize={{ minRows: 2, maxRows: 5 }}
-                  style={{ marginTop: 4 }}
-                />
-              </div>
-            ))}
-          </Space>
-          <div style={{ display: 'flex', gap: 8, marginTop: 16, justifyContent: 'flex-end' }}>
-            <Button onClick={closeSlotEditor}>取消</Button>
-            <Button type="primary" onClick={submitSlotEditor}>按创意槽调整</Button>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  const renderBlueprintCards = () => {
-    if (!systemBlueprints.length) return null
-    return (
-      <div className="gui-chat-blueprints">
-        <div className="gui-chat-blueprints-head">
+      <Card className="gui-chat-creation-run gui-chat-project-handoff gui-chat-creation-run-completed" variant="outlined">
+        <div className="gui-chat-creation-run-head">
           <div>
-            <Text strong>新书方案</Text>
-            <Text type="secondary">  ·  可继续对话微调，也可以直接创建</Text>
+            <Text type="secondary" className="gui-chat-creation-run-kicker">正式作品</Text>
+            <Title level={5}>{projectTitle}</Title>
           </div>
-          <Space size={8}>
-            <Button size="small" onClick={() => handleSystemAssistantMessage('全部重新生成')} disabled={streaming}>
-              重新生成
-            </Button>
-            <Button size="small" onClick={() => handleSystemAssistantMessage('强化书名、主角动机和前三章钩子')} disabled={streaming}>
-              强化方案
-            </Button>
-          </Space>
+          <Tag color="success">已进入作品库</Tag>
         </div>
-        <div className={`gui-chat-blueprint-grid${systemBlueprints.length === 1 ? ' gui-chat-blueprint-grid-single' : ''}`}>
-          {systemBlueprints.map((bp, index) => {
-            const score = bp.requirement_coverage?.score
-            return (
-              <Card
-                key={`${bp.title}-${index}`}
-                size="small"
-                className="gui-chat-blueprint-card"
-                title={<span className="gui-chat-blueprint-title">《{bp.title}》</span>}
-                extra={score != null ? <Tag color={score >= 90 ? 'green' : 'blue'}>覆盖率 {score}%</Tag> : null}
-              >
-                <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                  <Space size={6} wrap>
-                    {bp.subtitle && <Tag color="purple">{bp.subtitle}</Tag>}
-                    {bp.genre && <Tag>{bp.genre}</Tag>}
-                    {bp.estimated_chapters && <Tag>{bp.estimated_chapters}章</Tag>}
-                    <Tag>{(bp.characters?.length || 0) + 1} 角色</Tag>
-                    <Tag>{bp.relationships?.length || 0} 关系</Tag>
-                    <Tag>{bp.worldbuilding?.length || 0} 设定</Tag>
-                    <Tag>{bp.volume_outline?.length || 0} 卷</Tag>
-                    <Tag>{bp.outline?.length || 0} 节点</Tag>
-                  </Space>
-                  <Text type="secondary">主角：{bp.protagonist?.name || '待定主角'}</Text>
-                  {bp.logline && <Paragraph className="gui-chat-blueprint-logline">{bp.logline}</Paragraph>}
-                  {bp.premise && <Paragraph className="gui-chat-blueprint-premise">{bp.premise}</Paragraph>}
-                  <Collapse
-                    ghost
-                    size="small"
-                    items={[
-                      {
-                        key: 'details',
-                        label: '查看完整方案',
-                        children: (
-                          <Space direction="vertical" size={10} style={{ width: '100%' }}>
-                            {bp.selling_points?.length ? (
-                              <div>
-                                <Text strong>核心卖点</Text>
-                                <ul className="gui-chat-blueprint-list">
-                                  {bp.selling_points.slice(0, 4).map((point, pointIndex) => (
-                                    <li key={`${bp.title}-selling-${pointIndex}`}>{point}</li>
-                                  ))}
-                                </ul>
-                              </div>
-                            ) : null}
-                            {bp.world_hook && <Text>世界钩子：{bp.world_hook}</Text>}
-                            {bp.core_conflict && <Text>核心冲突：{bp.core_conflict}</Text>}
-                            {bp.protagonist?.goal && <Text>主角目标：{bp.protagonist.goal}</Text>}
-                            {bp.protagonist?.weakness && <Text>主角弱点：{bp.protagonist.weakness}</Text>}
-                            {bp.protagonist?.opening_pressure && <Text>开局压力：{bp.protagonist.opening_pressure}</Text>}
-                            {bp.protagonist?.background && <Text type="secondary">主角背景：{bp.protagonist.background}</Text>}
-                            {bp.golden_three && (
-                              <div>
-                                <Text strong>黄金三章</Text>
-                                <Space direction="vertical" size={4} className="gui-chat-blueprint-details">
-                                  {bp.golden_three.chapter_1 && <Text type="secondary">1：{bp.golden_three.chapter_1}</Text>}
-                                  {bp.golden_three.chapter_2 && <Text type="secondary">2：{bp.golden_three.chapter_2}</Text>}
-                                  {bp.golden_three.chapter_3 && <Text type="secondary">3：{bp.golden_three.chapter_3}</Text>}
-                                </Space>
-                              </div>
-                            )}
-                            {bp.volume_outline?.length ? (
-                              <div>
-                                <Text strong>卷纲概览</Text>
-                                <Space direction="vertical" size={4} className="gui-chat-blueprint-details">
-                                  {bp.volume_outline.slice(0, 4).map((volume, volumeIndex) => (
-                                    <Text type="secondary" key={`${bp.title}-volume-${volumeIndex}`}>
-                                      {volume.title || `第${volumeIndex + 1}卷`}
-                                      {volume.summary ? `：${volume.summary}` : ''}
-                                    </Text>
-                                  ))}
-                                </Space>
-                              </div>
-                            ) : null}
-                            {bp.requirement_coverage?.missing?.length ? (
-                              <Alert
-                                type="warning"
-                                showIcon
-                                message="仍需补充"
-                                description={bp.requirement_coverage.missing.slice(0, 3).join('；')}
-                              />
-                            ) : null}
-                            {bp.quality_self_check?.issues?.length ? (
-                              <Alert
-                                type={bp.quality_self_check.pass ? 'info' : 'warning'}
-                                showIcon
-                                message={`质量自检 ${bp.quality_self_check.score ?? 0} 分`}
-                                description={bp.quality_self_check.issues.slice(0, 2).join('；')}
-                              />
-                            ) : null}
-                          </Space>
-                        ),
-                      },
-                    ]}
-                  />
-                  <Button
-                    type="primary"
-                    block
-                    loading={streaming}
-                    disabled={streaming}
-                    onClick={() => handleSystemAssistantMessage(`使用第${index + 1}个创建`)}
-                  >
-                    使用这个创建作品
-                  </Button>
-                  <Space size={4}>
-                    <Button
-                      size="small"
-                      onClick={() => openSlotEditor(index)}
-                      disabled={streaming}
-                    >
-                      编辑创意槽
-                    </Button>
-                    <Button
-                      size="small"
-                      onClick={() => saveBlueprintAsTemplate(bp)}
-                    >
-                      保存为模板
-                    </Button>
-                  </Space>
-                </Space>
-              </Card>
-            )
-          })}
+        <Paragraph className="gui-chat-creation-run-message">
+          立项已经完成。后续正文创作和项目资料维护请在正式作品页进行，进入后项目助手会自动展开。
+        </Paragraph>
+        <div className="gui-chat-creation-run-actions">
+          <Button
+            type="primary"
+            size="large"
+            icon={<BookOutlined />}
+            aria-label="进入正式作品并展开项目助手"
+            onClick={() => navigate(`/project/${formalProjectHandoff.projectId}?assistant=open`)}
+          >
+            进入正式作品并展开项目助手
+          </Button>
         </div>
-      </div>
+      </Card>
     )
   }
 
   const renderCreationRunCard = () => {
-    if (!activeCreationRun) return null
+    if (!activeCreationRun || formalProjectHandoff) return null
     const runArtifact = creationArtifacts.find((item) => item.artifact === activeCreationRun.stage)
     const artifactStatus = runArtifact?.stored_status || runArtifact?.status
     const artifactAlreadyConfirmed = ['waiting_user', 'waiting_author'].includes(activeCreationRun.status)
@@ -2791,7 +2528,19 @@ function GuiAssistantChat() {
           {activeCreationRun.model_source && <Tag>模型：{activeCreationRun.model_source}</Tag>}
           {activeCreationRun.attempt != null && <Tag>尝试：{activeCreationRun.attempt}</Tag>}
           {activeCreationRun.result_mode && <Tag>结果：{activeCreationRun.result_mode}</Tag>}
+          {activeCreationRun.stream_progress?.output_chars ? (
+            <Tag color="cyan">已输出：{activeCreationRun.stream_progress.output_chars.toLocaleString()} 字</Tag>
+          ) : null}
+          {activeCreationRun.stream_progress?.max_output_tokens ? (
+            <Tag>输出预算：{activeCreationRun.stream_progress.max_output_tokens.toLocaleString()} tokens</Tag>
+          ) : null}
         </Space>
+        {isRunning && activeCreationRun.stream_progress?.output_preview ? (
+          <div className="gui-chat-creation-run-preview" aria-live="polite">
+            <Text type="secondary">实时输出</Text>
+            <Text>{activeCreationRun.stream_progress.output_preview}</Text>
+          </div>
+        ) : null}
         <div className="gui-chat-creation-run-actions">
           {isRunning && (
             <>
@@ -2930,14 +2679,14 @@ function GuiAssistantChat() {
       })
       if (artifact.artifact === 'final_review') {
         const applied = await apiClient.post<ApiResponse<{ project_id: string; warnings?: string[] }>>(
-          '/novel-creation/apply',
-          { session_id: systemSessionId, mode: 'auto' },
+          '/novel-creation/finalize',
+          { session_id: systemSessionId },
         )
         const projectId = applied.data.data.project_id
         if (!projectId) throw new Error('最终审阅已确认，但正式作品没有创建成功。')
-        message.success('最终审阅已确认，小说项目已创建。')
-        await Promise.all([fetchProjects(), fetchCreationSessions()])
-        navigate(`/project/${projectId}`)
+        setCreatedProjectHandoff({ sessionId: systemSessionId, projectId })
+        message.success('正式作品已创建，可进入作品页继续')
+        await Promise.allSettled([fetchProjects(), fetchCreationSessions()])
       } else {
         message.success(`${artifact.label}已确认`)
       }
@@ -3178,11 +2927,6 @@ function GuiAssistantChat() {
                   旧任务结果未覆盖当前内容；候选稿已保留，可按原输入或最新内容重试
                 </Text>
               )}
-              {artifact.flow?.blocked_by?.length ? (
-                <Text type="secondary" className="gui-chat-creation-artifact-blocked">
-                  建议先完善：{artifact.flow.blocked_by.map((item) => item.label).join('、')}
-                </Text>
-              ) : null}
               {artifact.flow?.soft_dependencies?.length ? (
                 <Text type="secondary" className="gui-chat-creation-artifact-blocked">
                   可先生成；补充{artifact.flow.soft_dependencies.map((item) => item.label).join('、')}后质量会更稳定
@@ -3380,10 +3124,14 @@ function GuiAssistantChat() {
             <Select
               showSearch
               allowClear
-              value={activeProjectId ? `project:${activeProjectId}` : systemSessionId ? `creation:${systemSessionId}` : undefined}
+              value={activeProjectId
+                ? `project:${activeProjectId}`
+                : visibleActiveCreationContext
+                  ? `creation:${visibleActiveCreationContext.id}`
+                  : undefined}
               onChange={(value) => void selectAssistantContext(value)}
               onOpenChange={(open) => {
-                if (open) void fetchCreationSessions()
+                if (open) void Promise.all([fetchProjects(), fetchCreationSessions()])
               }}
               options={assistantContextOptions}
               loading={projectsLoading}
@@ -3481,11 +3229,42 @@ function GuiAssistantChat() {
                   <div className="gui-chat-msg-content">
                     {msg.status === 'error' && <Tag color="error" className="gui-chat-msg-status">执行失败</Tag>}
                     {msg.status === 'aborted' && <Tag color="default" className="gui-chat-msg-status">已停止</Tag>}
-                    {msg.content || (streaming && msg.role === 'assistant' ? '思考中...' : '')}
+                    {msg.role === 'assistant' && (
+                      <ReasoningDisclosure
+                        content={msg.reasoning_content}
+                        streaming={streaming && msg.status === 'running'}
+                      />
+                    )}
+                    <div className="gui-chat-msg-text">
+                      {msg.content || (streaming && msg.role === 'assistant' ? '思考中...' : '')}
+                    </div>
                     {msg.status === 'running' && elapsedSeconds > 0 && (
                       <span style={{ color: 'var(--ant-color-text-tertiary)', fontSize: 12, marginLeft: 8 }}>
                         ⏱ {elapsedSeconds}s
                       </span>
+                    )}
+                    {msg.role === 'assistant' && Boolean(msg.progressEvents?.length) && (
+                      <Collapse
+                        ghost
+                        size="small"
+                        className="gui-chat-progress"
+                        items={[{
+                          key: 'progress',
+                          label: `运行过程（${msg.progressEvents?.length || 0}）`,
+                          children: (
+                            <div className="gui-chat-progress-list">
+                              {msg.progressEvents?.map((event) => (
+                                <div key={event.sequence} className={`gui-chat-progress-item gui-chat-progress-${event.type}`}>
+                                  <span aria-hidden="true">
+                                    {event.type === 'error' ? '!' : event.type === 'tool_completed' ? '✓' : '•'}
+                                  </span>
+                                  <span>{event.message}</span>
+                                </div>
+                              ))}
+                            </div>
+                          ),
+                        }]}
+                      />
                     )}
                     {msg.status === 'error' && (
                       <div className="gui-chat-error-actions">
@@ -3503,8 +3282,8 @@ function GuiAssistantChat() {
                   </div>
                 </div>
               ))}
-              {renderBlueprintCards()}
               {renderMaterialImportCard()}
+              {renderFormalProjectHandoffCard()}
               {renderCreationRunCard()}
               <div ref={messagesEndRef} />
             </>
@@ -3522,45 +3301,6 @@ function GuiAssistantChat() {
               action={(
                 <Button size="small" onClick={() => setPendingInputClarification(null)}>
                   取消处理
-                </Button>
-              )}
-            />
-          )}
-          {isLocalCliModel && systemSessionId && (
-            <Alert
-              className="gui-chat-cli-permission"
-              type={nextLocalCliGrant ? 'warning' : 'info'}
-              showIcon
-              message={nextLocalCliGrant ? '下一条消息可修改当前立项数据' : '本机 CLI 已安全内化到聊天'}
-              description={nextLocalCliGrant
-                ? supportsTransientCreationMcp
-                  ? '仅下一条有效；OpenCode 将直连当前会话的临时 Siming MCP，结束即销毁，不改全局配置。'
-                  : '仅下一条有效；司命通过受控工具桥校验并执行立项操作，CLI 无法访问项目目录或全局配置。'
-                : '默认可对话和读取立项数据；需要写入时由你单次授权。消息中出现本地路径时会另行确认，并只提供临时只读快照。不会自动扫描或修改全局 MCP 配置。'}
-              action={nextLocalCliGrant ? (
-                <Button size="small" onClick={() => setNextLocalCliGrant(false)}>取消授权</Button>
-              ) : (
-                <Button
-                  size="small"
-                  onClick={() => {
-                    Modal.confirm({
-                      title: '仅授权下一条消息修改立项？',
-                      okText: '仅授权下一条',
-                      cancelText: '保持只读',
-                      content: (
-                        <div className="gui-chat-cli-grant-copy">
-                          <p>{supportsTransientCreationMcp
-                            ? 'OpenCode 会直接连接只包含当前立项会话工具的临时 Siming MCP。'
-                            : '司命会通过受控工具桥执行经过白名单校验的立项工具。'}</p>
-                          <p>CLI 不会获得项目文件、Shell 或其他程序的全局配置权限。</p>
-                          <p>授权在下一条消息结束后自动失效。</p>
-                        </div>
-                      ),
-                      onOk: () => setNextLocalCliGrant(true),
-                    })
-                  }}
-                >
-                  授权下一条修改
                 </Button>
               )}
             />
@@ -3613,7 +3353,6 @@ function GuiAssistantChat() {
         </div>
       </main>
       {renderCreationDataPanel()}
-      {renderSlotEditorModal()}
       <Modal
         title={`版本历史 · ${versionHistoryArtifact?.label || ''}`}
         open={Boolean(versionHistoryArtifact)}

@@ -25,9 +25,9 @@ class McpErrorContractTest(unittest.TestCase):
         from app.mcp.adapter import _build_error_payload
 
         exc = ValueError("something broke")
-        payload = _build_error_payload(tool_name="create_chapter", exc=exc)
+        payload = _build_error_payload(tool_name="create_character", exc=exc)
 
-        self.assertEqual(payload["tool"], "create_chapter")
+        self.assertEqual(payload["tool"], "create_character")
         self.assertEqual(payload["status"], "error")
 
     def test_error_includes_error_type(self):

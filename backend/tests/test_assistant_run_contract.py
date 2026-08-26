@@ -21,7 +21,6 @@ def _run() -> SimpleNamespace:
         status="running",
         phase="model",
         scope="project",
-        assistant_mode="quality",
         model="openai:gpt-test",
         current_iteration=2,
         error=None,

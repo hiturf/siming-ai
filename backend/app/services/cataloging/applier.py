@@ -20,6 +20,7 @@ from ...database.models import (
     CatalogingJob,
     Chapter,
 )
+from ...database.write_coordination import DatabaseWriteLockTimeout
 from ..narrative_governance import record_chapter_governance_review
 from ..story_granularity import inspect_candidate_coverage_items
 from .candidate_io import candidate_payload, candidate_to_dict
@@ -64,6 +65,8 @@ def apply_candidates_for_run(db: Session, job: CatalogingJob, run: CatalogingCha
                 "detail": result.get("detail"),
                 "data": result,
             })
+        except DatabaseWriteLockTimeout:
+            raise
         except Exception as exc:
             candidate.status = "apply_failed"
             candidate.error = str(exc)

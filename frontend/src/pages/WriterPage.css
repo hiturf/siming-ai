@@ -153,6 +153,18 @@
   border-left-color: var(--siming-accent, var(--ant-color-primary));
 }
 
+.writer-pending-draft-list {
+  border-bottom: 1px solid var(--ant-color-border-secondary);
+}
+
+.writer-chapter-item-draft {
+  cursor: default;
+}
+
+.writer-chapter-item-draft:hover {
+  transform: none;
+}
+
 /* ── Center: Editor ── */
 .writer-editor {
   min-width: 0;
@@ -231,16 +243,61 @@
   grid-template-columns: minmax(0, 1fr);
 }
 
+.writer-de-ai-diff-legend {
+  align-items: center;
+  color: var(--ant-color-text-secondary);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 12px;
+  gap: 14px;
+  justify-content: flex-end;
+  margin: 0 2px 8px;
+}
+
+.writer-de-ai-diff-legend span {
+  align-items: center;
+  display: inline-flex;
+  gap: 6px;
+}
+
+.writer-de-ai-diff-legend i {
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  height: 10px;
+  width: 18px;
+}
+
+.writer-de-ai-legend-removed {
+  color: var(--ant-color-error-text);
+}
+
+.writer-de-ai-legend-removed i {
+  background: var(--ant-color-error-bg);
+  border-color: var(--ant-color-error-border);
+}
+
+.writer-de-ai-legend-added {
+  color: var(--ant-color-success-text);
+}
+
+.writer-de-ai-legend-added i {
+  background: var(--ant-color-success-bg);
+  border-color: var(--ant-color-success-border);
+}
+
 .writer-de-ai-pane {
-  background: var(--ant-color-fill-quaternary);
+  background: var(--ant-color-bg-container);
   border: 1px solid var(--ant-color-border-secondary);
   border-radius: 8px;
   min-width: 0;
   overflow: hidden;
 }
 
+.writer-de-ai-pane-original-diff {
+  border-color: var(--ant-color-error-border);
+}
+
 .writer-de-ai-pane-candidate {
-  background: var(--ant-color-success-bg);
   border-color: var(--ant-color-success-border);
 }
 
@@ -264,6 +321,40 @@
   padding: 14px 16px;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.writer-de-ai-pane-original-diff .writer-de-ai-pane-head {
+  background: color-mix(in srgb, var(--ant-color-error-bg) 78%, var(--ant-color-bg-container));
+  border-bottom-color: var(--ant-color-error-border);
+}
+
+.writer-de-ai-pane-candidate .writer-de-ai-pane-head {
+  background: color-mix(in srgb, var(--ant-color-success-bg) 78%, var(--ant-color-bg-container));
+  border-bottom-color: var(--ant-color-success-border);
+}
+
+.writer-de-ai-diff-removed,
+.writer-de-ai-diff-added {
+  border-radius: 3px;
+  box-decoration-break: clone;
+  font-weight: 550;
+  padding-block: 1px;
+  -webkit-box-decoration-break: clone;
+}
+
+.writer-de-ai-diff-removed {
+  background: var(--ant-color-error-bg);
+  box-shadow: inset 0 -2px 0 var(--ant-color-error-border);
+  color: var(--ant-color-error-text);
+  text-decoration-color: var(--ant-color-error);
+  text-decoration-thickness: 1px;
+}
+
+.writer-de-ai-diff-added {
+  background: var(--ant-color-success-bg);
+  box-shadow: inset 0 -2px 0 var(--ant-color-success-border);
+  color: var(--ant-color-success-text);
+  text-decoration: none;
 }
 
 .writer-quality-toolbar {

@@ -148,7 +148,6 @@ def catalog(db: Session = Depends(get_db)):
     store = local_model_store(db)
     rows = store.catalog_models()
     runtime = store.runtime_installation("llama_cpp")
-    settings = store.task_settings()
     usage_enabled = not local_runtime_disabled("local_llama_cpp")
     runtime_state = get_runtime_manager().status()
     observed_runtime_status = runtime.status if runtime else "not_installed"
@@ -169,15 +168,6 @@ def catalog(db: Session = Depends(get_db)):
             **runtime_state,
         },
         "model_root": str(model_root()),
-        "task_settings": {
-            item.task_type: {
-                "model_key": item.model_key,
-                "adapter_ids": item.adapter_ids or [],
-                "context_length": item.context_length,
-                "allow_api_fallback": item.allow_api_fallback,
-            }
-            for item in settings
-        },
     })
 
 
@@ -364,7 +354,7 @@ async def benchmark(payload: BenchmarkRequest):
         model=f"local_llama_cpp:{payload.model_key}",
         temperature=0.2,
         max_tokens=payload.max_tokens,
-        extra_body={"moshu_task_type": "chat"},
+        extra_body={"moshu_task_type": "assistant"},
         retry=0,
         timeout=180,
     )
@@ -405,37 +395,6 @@ async def qualify(payload: QualificationRequest, db: Session = Depends(get_db)):
         raise ValidationError(f"验证上下文 {context_length} 超过模型容量 {capacity}")
     result = await qualify_local_model(payload.model_key, context_length)
     return ApiResponse.success(data=result)
-
-
-@router.put("/task-settings/{task_type}")
-def update_task_setting(task_type: str, payload: dict, db: Session = Depends(get_db)):
-    model_key = str(payload.get("model_key") or "").strip()
-    store = local_model_store(db)
-    row = store.task_setting(task_type)
-    if not model_key:
-        if row:
-            store.delete(row)
-            commit_session(db)
-        return ApiResponse.success(message="任务模型设置已清除，将跟随全局默认模型")
-    _ensure_local_runtime_usage_enabled()
-    if not row:
-        row = store.create_task_setting(task_type, model_key)
-    row.model_key = model_key
-    row.adapter_ids = payload.get("adapter_ids") or []
-    row.context_length = payload.get("context_length")
-    row.allow_api_fallback = bool(payload.get("allow_api_fallback", False))
-    commit_session(db)
-    return ApiResponse.success(message="任务模型设置已保存")
-
-
-@router.delete("/task-settings/{task_type}")
-def clear_task_setting(task_type: str, db: Session = Depends(get_db)):
-    store = local_model_store(db)
-    row = store.task_setting(task_type)
-    if row:
-        store.delete(row)
-        commit_session(db)
-    return ApiResponse.success(message="任务模型设置已清除，将跟随全局默认模型")
 
 
 @router.get("/adapters")

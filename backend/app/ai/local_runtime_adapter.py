@@ -20,7 +20,7 @@ class LocalRuntimeAdapter(OpenAIAdapter):
 
     def _runtime_context(self, model: str, extra_body: Optional[dict]) -> tuple[str, dict]:
         payload = dict(extra_body or {})
-        task_type = str(payload.pop("moshu_task_type", "chat"))
+        task_type = str(payload.pop("moshu_task_type", "assistant"))
         project_id = payload.pop("moshu_project_id", None)
         context_length = payload.pop("moshu_context_length", None)
         adapter_ids = payload.pop("moshu_adapter_ids", None)

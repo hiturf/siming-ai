@@ -9,6 +9,8 @@ import {
 } from 'antd'
 import {
   DownloadOutlined,
+  ExportOutlined,
+  GlobalOutlined,
   ReloadOutlined,
   SafetyCertificateOutlined,
   SaveOutlined,
@@ -17,7 +19,37 @@ import {
 const { Paragraph, Text } = Typography
 
 export type UpdateChannel = 'stable' | 'preview'
+export type UpdateDownloadSourceKey = 'auto' | 'github' | 'gitee'
 type InstallMode = 'installer' | 'portable'
+
+interface UpdateDownloadSource {
+  key: Exclude<UpdateDownloadSourceKey, 'auto'> | 'custom'
+  label: string
+  download_url: string
+  releases_url: string
+}
+
+interface ManualDownloadPage {
+  key: Exclude<UpdateDownloadSourceKey, 'auto'>
+  label: string
+  url: string
+  description: string
+}
+
+const defaultManualDownloadPages: ManualDownloadPage[] = [
+  {
+    key: 'github',
+    label: 'GitHub 全部版本',
+    url: 'https://github.com/teangtang1122/siming-ai/releases',
+    description: '官方完整发布记录与历史版本',
+  },
+  {
+    key: 'gitee',
+    label: 'Gitee 镜像下载',
+    url: 'https://gitee.com/teangtang13/siming-ai/releases',
+    description: '大陆网络备用，可手动选择镜像中保留的版本',
+  },
+]
 
 interface UpdateSignature {
   valid: boolean
@@ -35,6 +67,7 @@ interface UpdateMetadata {
   asset_name?: string
   install_mode?: InstallMode
   migration?: boolean
+  download_sources?: UpdateDownloadSource[]
 }
 
 interface StagedUpdate {
@@ -45,6 +78,8 @@ interface StagedUpdate {
   error?: string
   install_mode?: InstallMode
   migration?: boolean
+  download_source?: string
+  download_source_label?: string
 }
 
 export interface UpdateStatus {
@@ -57,6 +92,7 @@ export interface UpdateStatus {
   installed_layout?: boolean
   downloaded?: boolean
   signature_verification_required?: boolean
+  manual_download_pages?: ManualDownloadPage[]
 }
 
 interface UpdateSettingsCardProps {
@@ -70,7 +106,7 @@ interface UpdateSettingsCardProps {
   onChannelChange: (channel: UpdateChannel) => void
   onSaveChannel: () => void
   onCheck: () => void
-  onDownload: () => void
+  onDownload: (source: UpdateDownloadSourceKey) => void
   onInstall: () => void
 }
 
@@ -92,6 +128,19 @@ export function UpdateSettingsCard({
   const migrationAvailable = Boolean(availableUpdate?.migration)
   const stagedMigration = Boolean(updateStatus?.staged_update?.migration)
   const signatureVerificationRequired = Boolean(updateStatus?.signature_verification_required)
+  const downloadSources = availableUpdate?.download_sources?.length
+    ? availableUpdate.download_sources
+    : availableUpdate
+      ? [{
+          key: 'github' as const,
+          label: 'GitHub',
+          download_url: availableUpdate.download_url,
+          releases_url: availableUpdate.source,
+        }]
+      : []
+  const manualDownloadPages = updateStatus?.manual_download_pages?.length
+    ? updateStatus.manual_download_pages
+    : defaultManualDownloadPages
 
   return (
     <Card className="settings-card" title={<span><SafetyCertificateOutlined /> 安全更新</span>}>
@@ -116,6 +165,38 @@ export function UpdateSettingsCard({
             </Radio>
           </Space>
         </Radio.Group>
+        {updateStatus?.update_available && availableUpdate && (
+          <div className="settings-update-route">
+            <div className="settings-update-route-copy">
+              <Text strong>选择本次下载源</Text>
+              <Text type="secondary">
+                两条线路地位相同；点击哪一个就只从该来源下载，完成后都按发布 SHA256 复核。
+              </Text>
+            </div>
+            <Space className="settings-update-source-actions" wrap>
+              {downloadSources.map((source) => {
+                const sourceKey: UpdateDownloadSourceKey = source.key === 'github' || source.key === 'gitee'
+                  ? source.key
+                  : 'auto'
+                const actionLabel = migrationAvailable
+                  ? `从${source.label}下载安装包`
+                  : `从${source.label}下载并校验 ${availableUpdate.version}`
+                return (
+                  <Button
+                    key={source.key}
+                    aria-label={actionLabel}
+                    icon={<DownloadOutlined />}
+                    loading={downloadingUpdate}
+                    disabled={!availableUpdate.sha256_available}
+                    onClick={() => onDownload(sourceKey)}
+                  >
+                    {source.label}
+                  </Button>
+                )
+              })}
+            </Space>
+          </div>
+        )}
         <Space wrap>
           <Button
             icon={<SaveOutlined />}
@@ -129,18 +210,6 @@ export function UpdateSettingsCard({
           <Button aria-label="检查更新" icon={<ReloadOutlined />} loading={checkingUpdate} onClick={onCheck}>
             检查更新
           </Button>
-          {updateStatus?.update_available && availableUpdate && (
-            <Button
-              type="primary"
-              icon={<DownloadOutlined />}
-              aria-label={migrationAvailable ? '下载并迁移到安装版' : `下载并校验 ${availableUpdate.version}`}
-              loading={downloadingUpdate}
-              disabled={!availableUpdate.sha256_available}
-              onClick={onDownload}
-            >
-              {migrationAvailable ? '下载安装包并迁移' : `下载并校验 ${availableUpdate.version}`}
-            </Button>
-          )}
           {updateStatus?.staged_update?.ready_to_install && (
             <Button
               type="primary"
@@ -190,10 +259,30 @@ export function UpdateSettingsCard({
             description={updateStatus.staged_update.ready_to_install
               ? (stagedMigration
                 ? `版本 ${updateStatus.staged_update.version}。点击“迁移到安装版”后会打开安装向导，你可以选择安装目录和桌面快捷方式。`
-                : `版本 ${updateStatus.staged_update.version}，SHA256：${updateStatus.staged_update.sha256}`)
+                : `版本 ${updateStatus.staged_update.version}${updateStatus.staged_update.download_source_label ? `，来源：${updateStatus.staged_update.download_source_label}` : ''}，SHA256：${updateStatus.staged_update.sha256}`)
               : updateStatus.staged_update.error || '请重新下载更新。'}
           />
         )}
+        <div className="settings-update-manual">
+          <div className="settings-update-manual-heading">
+            <GlobalOutlined aria-hidden="true" />
+            <div>
+              <Text strong>浏览器手动下载</Text>
+              <Text type="secondary">网络受限、需要旧版本或希望自行保存安装包时使用。</Text>
+            </div>
+          </div>
+          <nav className="settings-update-manual-links" aria-label="手动下载版本">
+            {manualDownloadPages.map((page) => (
+              <a key={page.key} href={page.url} target="_blank" rel="noreferrer">
+                <span>
+                  <strong>{page.label}</strong>
+                  <small>{page.description}</small>
+                </span>
+                <ExportOutlined aria-hidden="true" />
+              </a>
+            ))}
+          </nav>
+        </div>
       </Space>
     </Card>
   )

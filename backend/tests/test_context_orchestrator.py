@@ -16,13 +16,13 @@ from app.database.models import (
     CharacterRelationship,
     ContextManifest,
     LocalModel,
-    LocalModelTaskSetting,
+    ModelTaskSetting,
     ModelContextProfile,
     NovelCreationSession,
     OutlineNode,
     Project,
 )
-from app.services.context_orchestrator import ContextOrchestrator
+from app.services.context_orchestrator import ContextOrchestrator, TASK_CONTEXT_CONTRACTS
 
 
 class ContextOrchestratorTestCase(unittest.TestCase):
@@ -46,18 +46,31 @@ class ContextOrchestratorTestCase(unittest.TestCase):
         self.db.close()
         self.engine.dispose()
 
-    def test_unknown_model_uses_conservative_window_and_hard_budget(self):
+    def test_unknown_remote_model_uses_large_platform_window_and_hard_budget(self):
         manifest = self.service.prepare(
             project_id="p1",
             task_type="writing",
             model="unknown-provider:unknown-model",
             arguments={"outline_node_id": "o1", "requirements": "Write the opening."},
         )
-        self.assertEqual(manifest.context_window_tokens, 16384)
-        self.assertEqual(manifest.input_budget_tokens, 8500)
+        self.assertEqual(manifest.context_window_tokens, 1_000_000)
+        self.assertEqual(manifest.output_reserve_tokens, 16_000)
+        self.assertEqual(manifest.input_budget_tokens, 983_488)
         self.assertLessEqual(manifest.estimated_input_tokens, manifest.input_budget_tokens)
         self.assertEqual(manifest.status, "ready")
-        self.assertTrue(any("Unknown model context profile" in warning for warning in manifest.warnings_json))
+        self.assertTrue(any("platform 1M context default" in warning for warning in manifest.warnings_json))
+
+    def test_deepseek_creation_budget_uses_registered_large_output_capacity(self):
+        profile = self.service.resolve_model_profile(
+            "deepseek:deepseek-v4-flash",
+            "new_project",
+        )
+        budget = self.service.budget_for(TASK_CONTEXT_CONTRACTS["new_project"], profile)
+
+        self.assertEqual(profile.context_window_tokens, 1_000_000)
+        self.assertEqual(profile.max_output_tokens, 384_000)
+        self.assertEqual(budget.output_reserve_tokens, 300_000)
+        self.assertEqual(budget.hard_input_budget_tokens, 699_488)
 
     def test_formal_creation_brief_is_a_required_writing_style_anchor(self):
         creation = NovelCreationSession(
@@ -145,9 +158,10 @@ class ContextOrchestratorTestCase(unittest.TestCase):
             context_length=262144,
             status="installed",
         ))
-        self.db.add(LocalModelTaskSetting(
+        self.db.add(ModelTaskSetting(
             task_type="writing",
-            model_key="local-qwen",
+            provider="local_llama_cpp",
+            model_name="local-qwen",
             context_length=8192,
         ))
         self.db.commit()
@@ -193,9 +207,10 @@ class ContextOrchestratorTestCase(unittest.TestCase):
             context_length=262144,
             status="installed",
         ))
-        self.db.add(LocalModelTaskSetting(
+        self.db.add(ModelTaskSetting(
             task_type="cataloging",
-            model_key="local-qwen",
+            provider="local_llama_cpp",
+            model_name="local-qwen",
             context_length=16384,
         ))
         self.db.add(ModelContextProfile(
@@ -507,44 +522,6 @@ class ContextOrchestratorTestCase(unittest.TestCase):
         rebound_run = self.db.query(AgentRun).filter(AgentRun.id == run.id).first()
         self.assertIsNotNone(persisted)
         self.assertEqual(rebound_run.context_manifest_id, manifest_id)
-
-    def test_external_route_cannot_bypass_evidence_with_internal_manifest(self):
-        from app.services.workspace.tools.chapters import create_chapter
-
-        manifest = self.service.prepare(
-            project_id="p1",
-            task_type="writing",
-            model="openai:test",
-            execution_route="internal_api",
-            arguments={"outline_node_id": "o1"},
-        )
-        blocked = asyncio.run(create_chapter(self.db, "p1", {
-            "title": "Opening",
-            "content": "The protagonist crosses the city gate.",
-            "context_manifest_id": manifest.id,
-            "_context_execution_route": "external_mcp",
-            "skip_style_repair": True,
-        }))
-        self.assertEqual(blocked["status"], "needs_confirmation")
-
-        self.service.submit_evidence(manifest, [
-            {
-                "source_type": item.source_type,
-                "source_id": item.source_id,
-                "source_hash": item.source_hash,
-            }
-            for item in manifest.items
-            if item.required
-        ])
-        created = asyncio.run(create_chapter(self.db, "p1", {
-            "title": "Opening",
-            "content": "The protagonist crosses the city gate.",
-            "context_manifest_id": manifest.id,
-            "_context_execution_route": "external_mcp",
-            "skip_style_repair": True,
-        }))
-        self.assertEqual(created["status"], "ok")
-
 
 if __name__ == "__main__":
     unittest.main()

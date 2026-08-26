@@ -38,7 +38,6 @@ class NovelCreationSession(Base):
     schema_version = Column(Integer, nullable=False, default=1)
     current_stage = Column(String(50), nullable=True)
     revision = Column(Integer, nullable=False, default=0)
-    blueprint_json = Column(JSON, nullable=True)
     review_json = Column(JSON, nullable=True)
     draft_json = Column(JSON, nullable=True)
     checkpoints_json = Column(JSON, nullable=True)

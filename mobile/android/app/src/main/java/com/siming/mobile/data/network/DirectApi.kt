@@ -5,7 +5,9 @@ import java.util.concurrent.TimeUnit
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -17,6 +19,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import okhttp3.HttpUrl
@@ -33,17 +36,47 @@ data class DirectApiConfig(
     val apiKey: String,
     val model: String,
     val protocol: String = PROTOCOL_AUTO,
+    val availableModels: List<String> = emptyList(),
+    val taskModels: Map<String, String> = emptyMap(),
 ) {
-    fun summary() = DirectApiSummary(displayName, baseUrl, model, protocol)
+    fun modelForTask(taskType: String): String = taskModels[taskType]
+        ?.trim()
+        ?.takeIf(String::isNotBlank)
+        ?: model
+
+    fun forTask(taskType: String): DirectApiConfig = copy(model = modelForTask(taskType))
+
+    fun summary() = DirectApiSummary(
+        displayName = displayName,
+        baseUrl = baseUrl,
+        model = model,
+        protocol = protocol,
+        availableModels = availableModels,
+        taskModels = taskModels,
+    )
 
     companion object {
         const val PROTOCOL_AUTO = "auto"
         const val PROTOCOL_RESPONSES = "responses"
         const val PROTOCOL_CHAT_COMPLETIONS = "chat_completions"
+        const val TASK_ASSISTANT = "assistant"
+        const val TASK_PLANNING = "planning"
+        const val TASK_CATALOGING = "cataloging"
+        const val TASK_WRITING = "writing"
+        const val TASK_EVALUATION = "evaluation"
+        const val TASK_DECONSTRUCT = "deconstruct"
         val supportedProtocols = setOf(
             PROTOCOL_AUTO,
             PROTOCOL_RESPONSES,
             PROTOCOL_CHAT_COMPLETIONS,
+        )
+        val taskModelLabels = linkedMapOf(
+            TASK_ASSISTANT to "项目助手",
+            TASK_PLANNING to "立项与规划",
+            TASK_CATALOGING to "作品建档",
+            TASK_WRITING to "章节写作",
+            TASK_EVALUATION to "质量评估",
+            TASK_DECONSTRUCT to "拆书分析",
         )
     }
 }
@@ -53,6 +86,8 @@ data class DirectApiSummary(
     val baseUrl: String,
     val model: String,
     val protocol: String,
+    val availableModels: List<String> = emptyList(),
+    val taskModels: Map<String, String> = emptyMap(),
 )
 
 data class DirectApiProbe(
@@ -68,9 +103,49 @@ data class DirectAgentToolCall(
 
 data class DirectAgentTurn(
     val content: String,
+    val reasoningContent: String,
     val toolCalls: List<DirectAgentToolCall>,
     val assistantMessage: JsonObject,
+    val promptTokens: Int? = null,
 )
+
+private data class DirectStreamSegment(
+    val finishReason: String,
+    val terminalSeen: Boolean,
+)
+
+private data class DirectStreamEvent(
+    val delta: String = "",
+    val finishReason: String = "",
+    val terminal: Boolean = false,
+    val error: String? = null,
+)
+
+private class DirectResumeHandshake(
+    private val expectedPrefix: String,
+) {
+    private val buffer = StringBuilder()
+    var verified: Boolean = false
+        private set
+
+    fun consume(chunk: String): String {
+        if (verified) return chunk
+        buffer.append(chunk)
+        val candidate = buffer.toString().trimStart()
+        if (candidate.length < expectedPrefix.length) {
+            require(expectedPrefix.startsWith(candidate)) { "模型没有按检查点恢复协议继续输出" }
+            return ""
+        }
+        require(candidate.startsWith(expectedPrefix)) { "模型没有按检查点恢复协议继续输出" }
+        verified = true
+        buffer.clear()
+        return candidate.removePrefix(expectedPrefix)
+    }
+
+    fun requireVerified() {
+        require(verified) { "模型恢复响应在检查点握手完成前结束" }
+    }
+}
 
 class DirectApiHttpException(
     val statusCode: Int,
@@ -134,6 +209,95 @@ class DirectApiClient(
         temperature,
         extraBody,
     ).response
+
+    /**
+     * Stream long standalone-mobile text with the same verified checkpoint
+     * handshake used by the PC gateway. A broken segment is never appended
+     * unless the replacement model response proves the exact join point.
+     */
+    suspend fun completeResumable(
+        config: DirectApiConfig,
+        systemPrompt: String,
+        userPrompt: String,
+        maxOutputTokens: Int = 4_000,
+        temperature: Double = 0.7,
+        extraBody: JsonObject? = null,
+        initialContent: String = "",
+        maxResumeAttempts: Int = 8,
+        onCheckpoint: suspend (String) -> Unit = {},
+    ): String {
+        validateConfig(config)
+        val protocols = when (config.protocol) {
+            DirectApiConfig.PROTOCOL_AUTO -> listOf(
+                DirectApiConfig.PROTOCOL_RESPONSES,
+                DirectApiConfig.PROTOCOL_CHAT_COMPLETIONS,
+            )
+            else -> listOf(config.protocol)
+        }
+        var protocolIndex = 0
+        var protocol = protocols[protocolIndex]
+        var committed = initialContent
+        var resumeAttempt = 0
+        var preOutputRetry = 0
+
+        while (true) {
+            val resumeMarker = if (committed.isBlank()) null else "[SIMING_RESUME_${UUID.randomUUID().toString().replace("-", "")}]"
+            val anchor = committed.takeLast(STREAM_RESUME_ANCHOR_CHARS)
+            val handshake = resumeMarker?.let { DirectResumeHandshake(it + anchor) }
+            val messages = directTextMessages(
+                systemPrompt = systemPrompt,
+                userPrompt = userPrompt,
+                committed = committed,
+                resumeMarker = resumeMarker,
+                anchor = anchor,
+            )
+            var segmentProduced = false
+            try {
+                val segment = streamTextSegment(
+                    config = config,
+                    protocol = protocol,
+                    messages = messages,
+                    maxOutputTokens = maxOutputTokens,
+                    temperature = temperature,
+                    extraBody = extraBody,
+                ) { rawDelta ->
+                    segmentProduced = segmentProduced || rawDelta.isNotEmpty()
+                    val delta = handshake?.consume(rawDelta) ?: rawDelta
+                    if (delta.isNotEmpty()) {
+                        committed += delta
+                        onCheckpoint(committed)
+                    }
+                }
+                handshake?.requireVerified()
+                val incomplete = segment.finishReason.lowercase() in INCOMPLETE_FINISH_REASONS
+                require(segment.terminalSeen && !incomplete) { "模型流在完整结束前停止" }
+                require(committed.isNotBlank()) { "模型返回了空内容，请检查模型名或切换 API 协议" }
+                return committed
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                val canTryProtocol = (
+                    committed.isBlank() && !segmentProduced && protocolIndex < protocols.lastIndex &&
+                        error.isProtocolMismatch()
+                    )
+                if (canTryProtocol) {
+                    protocol = protocols[++protocolIndex]
+                    continue
+                }
+                if (
+                    committed.isBlank() && !segmentProduced &&
+                    preOutputRetry < retryDelaysMillis.size
+                ) {
+                    delay(retryDelaysMillis[preOutputRetry++])
+                    continue
+                }
+                if ((committed.isNotBlank() || segmentProduced) && resumeAttempt < maxResumeAttempts.coerceIn(0, 32)) {
+                    resumeAttempt += 1
+                    continue
+                }
+                throw error
+            }
+        }
+    }
 
     /** One native function-calling turn used by the embedded PC prompt contract. */
     suspend fun agentTurn(
@@ -319,15 +483,31 @@ class DirectApiClient(
             }.joinToString("")
             else -> ""
         }
+        val reasoning = listOf("reasoning_content", "reasoning", "reasoning_text")
+            .firstNotNullOfOrNull { key -> (message[key] as? JsonPrimitive)?.contentOrNull }
+            .orEmpty()
         val calls = (message["tool_calls"] as? JsonArray).orEmpty().mapNotNull(::parseToolCall)
+        val canonicalToolCalls = buildJsonArray {
+            calls.forEach { call ->
+                add(buildJsonObject {
+                    put("id", call.id)
+                    put("type", "function")
+                    put("function", buildJsonObject {
+                        put("name", call.name)
+                        put("arguments", json.encodeToString(call.arguments))
+                    })
+                })
+            }
+        }
         val canonical = buildJsonObject {
             put("role", "assistant")
             put("content", content)
+            if (reasoning.isNotBlank()) put("reasoning_content", reasoning)
             if (calls.isNotEmpty()) {
-                put("tool_calls", message["tool_calls"] ?: JsonArray(emptyList()))
+                put("tool_calls", canonicalToolCalls)
             }
         }
-        return DirectAgentTurn(content.trim(), calls, canonical)
+        return DirectAgentTurn(content.trim(), reasoning, calls, canonical, promptTokens(root, "prompt_tokens"))
     }
 
     private fun parseResponsesAgentTurn(root: JsonObject): DirectAgentTurn {
@@ -342,6 +522,20 @@ class DirectApiClient(
             )
         }
         val content = parseResponsesText(root)
+        val reasoning = output
+            .mapNotNull { it as? JsonObject }
+            .filter { it.string("type") == "reasoning" }
+            .flatMap { item ->
+                listOf("summary", "content").flatMap { key ->
+                    (item[key] as? JsonArray).orEmpty().mapNotNull { rawPart ->
+                        val part = rawPart as? JsonObject ?: return@mapNotNull null
+                        part.string("text")
+                            .ifBlank { part.string("content") }
+                            .takeIf(String::isNotBlank)
+                    }
+                } + listOf(item.string("reasoning_content"), item.string("text")).filter(String::isNotBlank)
+            }
+            .joinToString("\n")
         val toolCalls = buildJsonArray {
             calls.forEach { call ->
                 add(buildJsonObject {
@@ -359,7 +553,7 @@ class DirectApiClient(
             put("content", content)
             if (calls.isNotEmpty()) put("tool_calls", toolCalls)
         }
-        return DirectAgentTurn(content.trim(), calls, canonical)
+        return DirectAgentTurn(content.trim(), reasoning, calls, canonical, promptTokens(root, "input_tokens"))
     }
 
     private fun parseToolCall(element: JsonElement): DirectAgentToolCall? {
@@ -390,6 +584,200 @@ class DirectApiClient(
 
     private fun JsonObject.string(name: String): String =
         (get(name) as? JsonPrimitive)?.contentOrNull.orEmpty()
+
+    private fun promptTokens(root: JsonObject, key: String): Int? =
+        ((root["usage"] as? JsonObject)?.get(key) as? JsonPrimitive)
+            ?.intOrNull
+            ?.coerceAtLeast(0)
+
+    private fun directTextMessages(
+        systemPrompt: String,
+        userPrompt: String,
+        committed: String,
+        resumeMarker: String?,
+        anchor: String,
+    ): List<JsonObject> {
+        if (resumeMarker == null) {
+            return listOf(
+                buildJsonObject { put("role", "system"); put("content", systemPrompt) },
+                buildJsonObject { put("role", "user"); put("content", userPrompt) },
+            )
+        }
+        val resumeInstruction = (
+            "这是运行时恢复协议，不是新的用户意图。上一条 assistant 输出因传输中断，已输出内容由运行时保存。" +
+                "收到恢复请求时必须先逐字输出指定恢复标记和断点锚点，随后从锚点后的下一个字符继续；" +
+                "不得重复更早内容，也不得解释恢复协议。"
+            )
+        val expected = resumeMarker + anchor
+        return listOf(
+            buildJsonObject {
+                put("role", "system")
+                put("content", "$systemPrompt\n\n$resumeInstruction")
+            },
+            buildJsonObject { put("role", "user"); put("content", userPrompt) },
+            buildJsonObject { put("role", "assistant"); put("content", committed) },
+            buildJsonObject {
+                put("role", "user")
+                put(
+                    "content",
+                    "继续刚才因传输中断的同一响应。回复开头必须严格等于下面一行，" +
+                        "不能添加代码块、空格或说明；之后紧接尚未输出的内容：\n$expected",
+                )
+            },
+        )
+    }
+
+    private fun streamTextPayload(
+        config: DirectApiConfig,
+        protocol: String,
+        messages: List<JsonObject>,
+        maxOutputTokens: Int,
+        temperature: Double,
+        extraBody: JsonObject?,
+    ): JsonObject = if (protocol == DirectApiConfig.PROTOCOL_RESPONSES) {
+        val instructions = messages
+            .filter { it.string("role") == "system" }
+            .joinToString("\n\n") { it.string("content") }
+        buildJsonObject {
+            put("model", config.model.trim())
+            if (instructions.isNotBlank()) put("instructions", instructions)
+            put("input", buildJsonArray {
+                messages.filterNot { it.string("role") == "system" }.forEach { message ->
+                    add(buildJsonObject {
+                        put("role", message.string("role"))
+                        put("content", message.string("content"))
+                    })
+                }
+            })
+            put("temperature", temperature)
+            put("max_output_tokens", maxOutputTokens)
+            put("stream", true)
+            extraBody?.forEach { (key, value) -> put(key, value) }
+        }
+    } else {
+        buildJsonObject {
+            put("model", config.model.trim())
+            put("messages", JsonArray(messages))
+            put("temperature", temperature)
+            put("max_tokens", maxOutputTokens)
+            put("stream", true)
+            extraBody?.forEach { (key, value) -> put(key, value) }
+        }
+    }
+
+    private suspend fun streamTextSegment(
+        config: DirectApiConfig,
+        protocol: String,
+        messages: List<JsonObject>,
+        maxOutputTokens: Int,
+        temperature: Double,
+        extraBody: JsonObject?,
+        onDelta: suspend (String) -> Unit,
+    ): DirectStreamSegment {
+        val path = if (protocol == DirectApiConfig.PROTOCOL_RESPONSES) "responses" else "chat/completions"
+        val body = json.encodeToString(
+            streamTextPayload(config, protocol, messages, maxOutputTokens, temperature, extraBody),
+        )
+        var lastError: Throwable? = null
+        for (endpoint in endpointCandidates(config.baseUrl, path)) {
+            var transientAttempt = 0
+            while (true) {
+                try {
+                    return executeTextStream(endpoint, config.apiKey, body, protocol, onDelta)
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    lastError = error
+                    val status = (error as? DirectApiHttpException)?.statusCode
+                    if (status in PATH_FALLBACK_STATUS_CODES) break
+                    if (status in TRANSIENT_STATUS_CODES && transientAttempt < retryDelaysMillis.size) {
+                        delay(retryDelaysMillis[transientAttempt++])
+                        continue
+                    }
+                    throw error
+                }
+            }
+        }
+        throw lastError ?: DirectApiHttpException(404, "API 地址没有提供 $path 接口")
+    }
+
+    private suspend fun executeTextStream(
+        endpoint: HttpUrl,
+        apiKey: String,
+        body: String,
+        protocol: String,
+        onDelta: suspend (String) -> Unit,
+    ): DirectStreamSegment = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url(endpoint)
+            .header("Accept", "text/event-stream")
+            .header("Authorization", "Bearer ${apiKey.trim()}")
+            .post(body.toRequestBody(JSON_MEDIA_TYPE))
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                val raw = response.body?.string().orEmpty()
+                ensureSuccess(RawResponse(response.code, raw))
+            }
+            val source = response.body?.source() ?: throw IOException("AI 流式响应为空")
+            var finishReason = ""
+            var terminalSeen = false
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val line = source.readUtf8Line() ?: break
+                if (!line.startsWith("data:")) continue
+                val data = line.removePrefix("data:").trim()
+                if (data.isEmpty()) continue
+                if (data == "[DONE]") {
+                    terminalSeen = true
+                    break
+                }
+                val root = runCatching { json.parseToJsonElement(data) as JsonObject }.getOrNull() ?: continue
+                val event = parseDirectStreamEvent(root, protocol)
+                event.error?.let { throw DirectApiHttpException(502, it) }
+                if (event.delta.isNotEmpty()) onDelta(event.delta)
+                if (event.finishReason.isNotBlank()) finishReason = event.finishReason
+                terminalSeen = terminalSeen || event.terminal
+            }
+            DirectStreamSegment(finishReason.ifBlank { "stop" }, terminalSeen)
+        }
+    }
+
+    private fun parseDirectStreamEvent(root: JsonObject, protocol: String): DirectStreamEvent {
+        val choice = (root["choices"] as? JsonArray)?.firstOrNull() as? JsonObject
+        if (choice != null) {
+            val deltaObject = choice["delta"] as? JsonObject
+            val delta = when (val content = deltaObject?.get("content")) {
+                is JsonPrimitive -> content.contentOrNull.orEmpty()
+                is JsonArray -> content.mapNotNull { part ->
+                    ((part as? JsonObject)?.get("text") as? JsonPrimitive)?.contentOrNull
+                }.joinToString("")
+                else -> ""
+            }
+            val finish = choice.string("finish_reason")
+            return DirectStreamEvent(delta, finish, finish.isNotBlank())
+        }
+        if (protocol == DirectApiConfig.PROTOCOL_RESPONSES) {
+            val type = root.string("type")
+            val response = root["response"] as? JsonObject
+            val status = response?.string("status").orEmpty()
+            val error = (root["error"] as? JsonObject)?.string("message")
+                ?: (response?.get("error") as? JsonObject)?.string("message")
+            val delta = if (type == "response.output_text.delta" || type == "output_text.delta") {
+                root.string("delta")
+            } else {
+                ""
+            }
+            val terminal = type in setOf("response.completed", "response.incomplete", "response.failed")
+            val finish = when {
+                type == "response.incomplete" || status == "incomplete" -> "incomplete"
+                type == "response.failed" || status == "failed" -> "failed"
+                terminal -> "stop"
+                else -> ""
+            }
+            return DirectStreamEvent(delta, finish, terminal, error)
+        }
+        return DirectStreamEvent()
+    }
 
     private suspend fun completeWithProtocol(
         config: DirectApiConfig,
@@ -590,8 +978,16 @@ class DirectApiClient(
     private data class RawResponse(val statusCode: Int, val body: String)
 
     companion object {
+        private const val STREAM_RESUME_ANCHOR_CHARS = 64
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val TRANSIENT_STATUS_CODES = setOf(500, 502, 503, 504)
         private val PATH_FALLBACK_STATUS_CODES = setOf(404, 405)
+        private val INCOMPLETE_FINISH_REASONS = setOf(
+            "length",
+            "max_tokens",
+            "token_limit",
+            "incomplete",
+            "failed",
+        )
     }
 }

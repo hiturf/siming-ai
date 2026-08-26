@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
-  Alert,
   Badge,
   Button,
   Card,
-  Divider,
   Drawer,
   Form,
   Input,
@@ -26,7 +24,6 @@ import {
   BulbOutlined,
   DeleteOutlined,
   EditOutlined,
-  ExperimentOutlined,
   HistoryOutlined,
   LockOutlined,
   PlusOutlined,
@@ -60,8 +57,6 @@ interface Skill {
   is_builtin: boolean
   created_at: string
   updated_at: string
-  _score?: number
-  _prompt_fragment?: string
 }
 
 interface SkillTemplate {
@@ -110,15 +105,6 @@ interface SkillToolsResponse {
 interface SkillVersionsResponse {
   items: SkillVersion[]
   total: number
-}
-
-interface MatchPreview {
-  matched_skills: Skill[]
-  candidate_score: number | null
-  candidate_would_match: boolean
-  threshold: number
-  max_skills: number
-  skill_prompt_info: Array<Record<string, unknown>>
 }
 
 interface SkillsPageProps {
@@ -188,9 +174,6 @@ function SkillsPage({ projectId }: SkillsPageProps) {
   const [draftRequirements, setDraftRequirements] = useState('')
   const [selectedTemplateKey, setSelectedTemplateKey] = useState<string>()
   const [drafting, setDrafting] = useState(false)
-  const [testMessage, setTestMessage] = useState('')
-  const [testing, setTesting] = useState(false)
-  const [matchPreview, setMatchPreview] = useState<MatchPreview | null>(null)
   const [versionDrawerOpen, setVersionDrawerOpen] = useState(false)
   const [versionLoading, setVersionLoading] = useState(false)
   const [versions, setVersions] = useState<SkillVersion[]>([])
@@ -234,8 +217,6 @@ function SkillsPage({ projectId }: SkillsPageProps) {
   const resetAssistantState = () => {
     setDraftRequirements('')
     setSelectedTemplateKey(undefined)
-    setTestMessage('')
-    setMatchPreview(null)
   }
 
   const openCreateModal = () => {
@@ -374,37 +355,11 @@ function SkillsPage({ projectId }: SkillsPageProps) {
       if (draft.template_key) {
         setSelectedTemplateKey(draft.template_key)
       }
-      setMatchPreview(null)
       message.success('已生成技能草案')
     } catch (err: any) {
       message.error(err.message || '生成技能草案失败')
     } finally {
       setDrafting(false)
-    }
-  }
-
-  const previewMatch = async () => {
-    if (!testMessage.trim()) {
-      message.warning('请输入一条用于测试触发的用户消息')
-      return
-    }
-    setTesting(true)
-    try {
-      const values = form.getFieldsValue(true)
-      const canPreviewCandidate = values.name && values.system_prompt
-      const res = await apiClient.post<ApiResponse<MatchPreview>>(
-        `/projects/${projectId}/skills/preview-match`,
-        {
-          message: testMessage,
-          scope: values.scope || 'project',
-          candidate: canPreviewCandidate ? skillPayload(values) : null,
-        }
-      )
-      setMatchPreview(res.data.data)
-    } catch (err: any) {
-      message.error(err.message || '触发测试失败')
-    } finally {
-      setTesting(false)
     }
   }
 
@@ -451,7 +406,7 @@ function SkillsPage({ projectId }: SkillsPageProps) {
       render: (desc: string | null) => desc || <Text type="secondary">-</Text>,
     },
     {
-      title: '触发词',
+      title: '使用示例',
       dataIndex: 'trigger_examples',
       key: 'trigger_examples',
       width: 240,
@@ -597,7 +552,7 @@ function SkillsPage({ projectId }: SkillsPageProps) {
               <Button icon={<RobotOutlined />} onClick={applyDraft} loading={drafting}>
                 生成草案
               </Button>
-              <Text type="secondary">草案会填充触发词、提示词和推荐工具，保存前仍可手动修改。</Text>
+              <Text type="secondary">草案会填充使用示例、提示词和推荐工具，保存前仍可手动修改。</Text>
             </Space>
           </Space>
         </Card>
@@ -626,10 +581,10 @@ function SkillsPage({ projectId }: SkillsPageProps) {
             <Input placeholder="技能的简要描述" />
           </Form.Item>
 
-          <Form.Item name="trigger_examples" label="触发关键词">
+          <Form.Item name="trigger_examples" label="使用示例">
             <Select
               mode="tags"
-              placeholder="输入关键词后回车添加"
+              placeholder="输入典型使用请求后回车添加，供 Agent 理解"
               tokenSeparators={[',', '，']}
             />
           </Form.Item>
@@ -640,7 +595,7 @@ function SkillsPage({ projectId }: SkillsPageProps) {
             rules={[{ required: true, message: '请输入系统提示词' }]}
           >
             <TextArea
-              placeholder="技能注入到 AI 系统提示词中的内容..."
+              placeholder="Agent 选中该技能后应遵循的内容..."
               autoSize={{ minRows: 5, maxRows: 12 }}
               maxLength={4000}
               showCount
@@ -700,75 +655,11 @@ function SkillsPage({ projectId }: SkillsPageProps) {
               </Button>
             </Popconfirm>
             <Text type="secondary" style={{ marginLeft: 8 }}>
-              将系统提示词、触发词、描述等恢复为内置默认值
+              将系统提示词、使用示例、描述等恢复为内置默认值
             </Text>
           </div>
         )}
 
-        <Divider />
-
-        <Card size="small" title={<Space><ExperimentOutlined />触发测试</Space>}>
-          <Space direction="vertical" style={{ width: '100%' }}>
-            <TextArea
-              value={testMessage}
-              onChange={(event) => setTestMessage(event.target.value)}
-              placeholder="输入一条用户消息，测试当前技能是否会被选中，例如：帮我续写第151章。"
-              autoSize={{ minRows: 2, maxRows: 4 }}
-            />
-            <Space>
-              <Button icon={<ExperimentOutlined />} onClick={previewMatch} loading={testing}>
-                测试触发
-              </Button>
-              {matchPreview && (
-                <Text type={matchPreview.candidate_would_match ? 'success' : 'secondary'}>
-                  当前草案分数：{matchPreview.candidate_score ?? '-'} / 阈值 {matchPreview.threshold}
-                </Text>
-              )}
-            </Space>
-            {matchPreview && (
-              <Alert
-                type={matchPreview.candidate_would_match ? 'success' : 'info'}
-                showIcon
-                message={
-                  matchPreview.candidate_would_match
-                    ? '当前草案会被触发'
-                    : '当前草案暂不会被触发'
-                }
-                description={
-                  <Space direction="vertical" size={4}>
-                    <Text>实际会注入的技能最多 {matchPreview.max_skills} 个：</Text>
-                    {matchPreview.matched_skills.map((skill) => (
-                      <div key={skill.id} style={{ marginBottom: 8 }}>
-                        <Tag color="blue">
-                          {skill.name}
-                          {typeof skill._score === 'number' ? ` · ${skill._score}` : ''}
-                        </Tag>
-                        {skill._prompt_fragment && (
-                          <div style={{
-                            marginTop: 4,
-                            padding: '4px 8px',
-                            background: '#f5f5f5',
-                            borderRadius: 4,
-                            fontSize: 12,
-                            color: '#666',
-                            maxHeight: 80,
-                            overflow: 'auto',
-                            whiteSpace: 'pre-wrap',
-                          }}>
-                            {skill._prompt_fragment}
-                          </div>
-                        )}
-                      </div>
-                    ))}
-                    {matchPreview.matched_skills.length === 0 && (
-                      <Text type="secondary">没有匹配技能</Text>
-                    )}
-                  </Space>
-                }
-              />
-            )}
-          </Space>
-        </Card>
       </Modal>
 
       <Drawer

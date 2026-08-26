@@ -10,6 +10,7 @@ from unittest.mock import patch
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.ai.capabilities import sanitize_tool_request
 from app.ai.gateway import LLMGateway
 from app.ai.local_runtime_adapter import LocalRuntimeAdapter
 from app.database.models import (
@@ -17,7 +18,7 @@ from app.database.models import (
     Base,
     Chapter,
     LocalModel,
-    LocalModelTaskSetting,
+    ModelTaskSetting,
     Project,
 )
 from app.modules.model_runtime.infrastructure.config_crud import SqlAlchemyModelConfigCrud
@@ -31,7 +32,7 @@ from app.services.local_runtime.model_jobs import import_custom_model
 
 def test_hardware_profile_has_safe_recommendation():
     profile = detect_hardware()
-    assert profile.recommended_model in {"qwen3.5-4b-q4", "qwen3.5-9b-q4", "qwen3.5-27b-q4"}
+    assert profile.recommended_model in {"qwen3.5-4b-q4", "qwen3.5-9b-q4", "qwen3.8-27b-q4"}
     assert profile.recommended_context in {8192, 16384, 32768}
     assert profile.cpu_count >= 1
 
@@ -50,14 +51,38 @@ def test_hardware_profiles_recommend_memory_safe_starting_contexts():
         assert (profile.profile, profile.recommended_context) == expected
 
 
-def test_embedded_catalog_contains_three_qwen_tiers():
+def test_embedded_catalog_contains_current_qwen_tiers():
     items = model_catalog()
     assert [item["model_key"] for item in items] == [
         "qwen3.5-4b-q4",
         "qwen3.5-9b-q4",
-        "qwen3.5-27b-q4",
+        "qwen3.8-27b-q4",
     ]
     assert all(item["context_length"] == 262144 and item["sources"] for item in items)
+    latest = items[-1]
+    assert latest["family"] == "qwen3.8"
+    assert latest["file_name"] == "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+    assert "/unsloth/Qwen3.8-27B-GGUF/" in latest["sources"][0]
+
+
+def test_local_runtime_tool_request_is_not_stripped():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "get_project_info",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
+
+    safe_tools, safe_tool_choice, notes = sanitize_tool_request(
+        "local_llama_cpp",
+        tools,
+        "auto",
+    )
+
+    assert safe_tools is tools
+    assert safe_tool_choice == "auto"
+    assert notes == []
 
 
 def test_task_setting_routes_to_local_runtime_by_default():
@@ -65,7 +90,19 @@ def test_task_setting_routes_to_local_runtime_by_default():
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     with Session() as db:
-        db.add(LocalModelTaskSetting(task_type="writing", model_key="qwen3.5-9b-q4"))
+        db.add(APIConfig(
+            provider="local_llama_cpp",
+            provider_type="local_runtime",
+            api_key_encrypted="",
+            default_model="qwen3.5-9b-q4",
+            readiness_status="ready",
+            readiness_json='{"source":"test_verification"}',
+        ))
+        db.add(ModelTaskSetting(
+            task_type="writing",
+            provider="local_llama_cpp",
+            model_name="qwen3.5-9b-q4",
+        ))
         db.commit()
 
     with patch("app.modules.model_runtime.infrastructure.configuration.SessionLocal", Session):
@@ -79,7 +116,19 @@ def test_task_setting_routes_to_local_runtime_without_environment_opt_in():
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     with Session() as db:
-        db.add(LocalModelTaskSetting(task_type="writing", model_key="qwen3.5-9b-q4"))
+        db.add(APIConfig(
+            provider="local_llama_cpp",
+            provider_type="local_runtime",
+            api_key_encrypted="",
+            default_model="qwen3.5-9b-q4",
+            readiness_status="ready",
+            readiness_json='{"source":"test_verification"}',
+        ))
+        db.add(ModelTaskSetting(
+            task_type="writing",
+            provider="local_llama_cpp",
+            model_name="qwen3.5-9b-q4",
+        ))
         db.commit()
 
     with patch(
@@ -94,7 +143,7 @@ def test_runtime_start_request_accepts_high_context_values():
     assert request.context_length == 1_000_000
 
 
-def test_global_default_model_wins_over_task_local_setting_until_opt_in():
+def test_task_default_model_wins_over_global_and_explicit_override_wins_over_task():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
@@ -108,17 +157,26 @@ def test_global_default_model_wins_over_task_local_setting_until_opt_in():
             readiness_status="ready",
             readiness_json='{"source":"test_verification"}',
         ))
-        db.add(LocalModelTaskSetting(task_type="cataloging", model_key="qwen3.5-27b-q4", context_length=262144))
+        db.add(APIConfig(
+            provider="local_llama_cpp",
+            provider_type="local_runtime",
+            api_key_encrypted="",
+            default_model="qwen3.5-27b-q4",
+            readiness_status="ready",
+            readiness_json='{"source":"test_verification"}',
+        ))
+        db.add(ModelTaskSetting(
+            task_type="cataloging",
+            provider="local_llama_cpp",
+            model_name="qwen3.5-27b-q4",
+            context_length=262144,
+        ))
         db.commit()
 
     with patch(
         "app.modules.model_runtime.infrastructure.configuration.SessionLocal", Session,
     ):
         selected = LLMGateway.select_model_for_task(task_type="cataloging")
-        opt_in = LLMGateway.select_model_for_task(
-            task_type="cataloging",
-            extra_body={"moshu_task_type": "cataloging", "moshu_prefer_task_model": True},
-        )
         explicit_body = {"moshu_task_type": "cataloging"}
         explicit = LLMGateway.select_model_for_task(
             task_type="cataloging",
@@ -126,11 +184,9 @@ def test_global_default_model_wins_over_task_local_setting_until_opt_in():
             extra_body=explicit_body,
         )
 
-    assert selected.model == "claude_cli:claude-code"
-    assert selected.source == "global_default"
-    assert selected.provider == "claude_cli"
-    assert opt_in.model == "local_llama_cpp:qwen3.5-27b-q4"
-    assert opt_in.source == "task_setting"
+    assert selected.model == "local_llama_cpp:qwen3.5-27b-q4"
+    assert selected.source == "task_setting"
+    assert selected.provider == "local_llama_cpp"
     assert explicit.model == "local_llama_cpp:qwen3.5-27b-q4"
     assert explicit.source == "explicit"
     assert explicit_body["moshu_context_length"] == 262144

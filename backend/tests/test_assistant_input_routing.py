@@ -59,33 +59,6 @@ def test_large_document_view_covers_the_end_instead_of_only_truncating_the_head(
     assert coverage["omitted_chars"] > 0
 
 
-def test_instruction_candidate_scan_finds_a_request_between_distributed_windows():
-    source = (
-        ("普通正文。" * 8_000)
-        + "\n\n任务要求：请把这份内容作为新作品导入。\n\n"
-        + ("后续正文。" * 8_000)
-    )
-
-    candidates, coverage = routing.build_document_intent_candidates(source)
-
-    assert "请把这份内容作为新作品导入" in candidates
-    assert coverage["source_scanned_chars"] == len(source)
-    assert coverage["included_candidate_count"] >= 1
-
-
-def test_instruction_candidate_scan_handles_a_single_line_txt_export():
-    source = (
-        ("普通正文。" * 10_000)
-        + "任务要求：请把这份内容作为参考并总结。"
-        + ("后续正文。" * 10_000)
-    )
-
-    candidates, coverage = routing.build_document_intent_candidates(source)
-
-    assert "请把这份内容作为参考并总结" in candidates
-    assert coverage["pattern_match_count"] >= 1
-
-
 def test_model_may_continue_clarifying_and_receives_all_previous_answers(monkeypatch):
     captured: dict = {}
 
@@ -117,9 +90,6 @@ def test_model_may_continue_clarifying_and_receives_all_previous_answers(monkeyp
             source_text="林野来到灰港。",
             source_kind="attachment",
             user_instruction="",
-            clarification_already_asked=True,
-            clarification_question=exchanges[-1]["question"],
-            clarification_answer=exchanges[-1]["answer"],
             clarification_history=exchanges,
         )
     )
@@ -143,7 +113,6 @@ def test_router_failure_stays_safe_even_after_an_earlier_question(monkeypatch):
             source_text="林野来到灰港。",
             source_kind="attachment",
             user_instruction="",
-            clarification_already_asked=True,
             clarification_history=[{"question": "怎么处理？", "answer": "还没想好"}],
         )
     )

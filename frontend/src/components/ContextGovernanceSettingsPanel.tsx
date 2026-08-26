@@ -26,6 +26,12 @@ interface ProfileFormValues {
   enabled: boolean
 }
 
+function formatTokens(value: number) {
+  if (value >= 1_000_000) return `${Number((value / 1_000_000).toFixed(2))}M`
+  if (value >= 1_000) return `${Number((value / 1_000).toFixed(1))}K`
+  return value.toLocaleString()
+}
+
 export default function ContextGovernanceSettingsPanel() {
   const [profiles, setProfiles] = useState<ModelProfile[]>([])
   const [semantic, setSemantic] = useState<{ available?: boolean; model?: string; reason?: string } | null>(null)
@@ -51,7 +57,7 @@ export default function ContextGovernanceSettingsPanel() {
 
   const showCreate = () => {
     setEditing(null)
-    form.setFieldsValue({ context_window_tokens: 16384, safety_margin_tokens: 512, enabled: true, provider: '', model_name: '' })
+    form.setFieldsValue({ context_window_tokens: 1_000_000, safety_margin_tokens: 512, enabled: true, provider: '', model_name: '' })
     setOpen(true)
   }
 
@@ -83,7 +89,7 @@ export default function ContextGovernanceSettingsPanel() {
         <Text type="secondary" style={{ fontSize: 12 }}>{semantic?.model || 'multilingual-e5-small'}{semantic?.reason ? ` · ${semantic.reason}` : ''}</Text>
       </div>
       <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
-        未配置的模型按 16K 上下文窗口和保守预留执行。这里的档案只决定预算，不会修改 API 或 CLI 凭据。
+        未配置档案的远程模型按 1M 上下文窗口编排；单次输出仍受模型能力表或模型设置中的最大输出限制。若服务商限制更低，请在这里填写精确档案。
       </Text>
       <Table
         rowKey="id"
@@ -95,7 +101,7 @@ export default function ContextGovernanceSettingsPanel() {
         columns={[
           { title: '提供商', dataIndex: 'provider', width: 130 },
           { title: '模型', dataIndex: 'model_name', ellipsis: true },
-          { title: '上下文窗口', dataIndex: 'context_window_tokens', width: 130, render: (value: number) => `${Math.round(value / 1024)}K` },
+          { title: '上下文窗口', dataIndex: 'context_window_tokens', width: 130, render: (value: number) => formatTokens(value) },
           { title: '最大输出', dataIndex: 'max_output_tokens', width: 120, render: (value?: number | null) => value ? value.toLocaleString() : '自动' },
           { title: '余量', dataIndex: 'safety_margin_tokens', width: 90 },
           { title: '状态', dataIndex: 'enabled', width: 90, render: (value: boolean) => <Tag color={value ? 'green' : 'default'}>{value ? '启用' : '停用'}</Tag> },

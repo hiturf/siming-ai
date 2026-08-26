@@ -15,7 +15,7 @@ describe('MessageList cataloging navigation action', () => {
     const messages: WorkspaceAssistantMessage[] = [{
       id: 'cataloging-operation-job-1-started',
       role: 'assistant',
-      content: '《第二章 吐纳》已保存，正在自动建档。',
+      content: '《第二章 吐纳》已保存，建档已经开始。',
       status: 'running',
       created_at: '2026-08-14T15:30:00',
       navigation_action: {
@@ -29,7 +29,6 @@ describe('MessageList cataloging navigation action', () => {
         <MessageList
           messages={messages}
           generating={false}
-          matchedSkills={[]}
           showScrollBottom={false}
           onScrollToBottom={() => undefined}
           messagesRef={{ current: null }}

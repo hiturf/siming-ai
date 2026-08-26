@@ -214,7 +214,7 @@ function OutlinePage({ projectId }: OutlinePageProps) {
   const [creating, setCreating] = useState(false)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
-  const { setAiContext, refreshKey } = useAiPanelContext()
+  const { refreshKey } = useAiPanelContext()
   const {
     saveStatus,
     saveError,
@@ -280,11 +280,6 @@ function OutlinePage({ projectId }: OutlinePageProps) {
     fetchOutline()
     fetchCharacters()
   }, [fetchCharacters, fetchOutline])
-
-  // Sync outline node selection to AI context
-  useEffect(() => {
-    setAiContext({ selectedOutlineNodeId: selectedId })
-  }, [selectedId, setAiContext])
 
   // Refresh data when AI applies changes
   useEffect(() => {

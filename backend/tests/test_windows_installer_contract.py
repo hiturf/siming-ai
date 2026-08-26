@@ -20,6 +20,24 @@ def test_installer_allows_path_selection_and_defaults_desktop_shortcut_on():
     assert "UsePreviousTasks=yes" in script
 
 
+def test_installer_recreates_packaged_runtime_during_in_place_updates():
+    script = (ROOT / "installer" / "Siming.iss").read_text(encoding="utf-8")
+
+    assert "[InstallDelete]" in script
+    assert 'Type: filesandordirs; Name: "{app}\\_internal"' in script
+
+
+def test_installer_ci_seeds_removed_files_and_boots_the_installed_runtime():
+    for workflow_name in ("windows-installer-ci.yml", "release-gate.yml"):
+        workflow = (ROOT / ".github" / "workflows" / workflow_name).read_text(
+            encoding="utf-8"
+        )
+
+        assert '"workspace-fast.md", "chapter-fast.md", "chapter-fast-public.md"' in workflow
+        assert "Installer left removed runtime files behind" in workflow
+        assert "smoke-test-release.ps1 -SkipBuild -SimingExePath" in workflow
+
+
 def test_installer_build_uses_onedir_payload_without_portable_release_asset():
     script = (ROOT / "scripts" / "build-installer.ps1").read_text(encoding="utf-8")
 

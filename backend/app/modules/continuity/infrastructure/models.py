@@ -48,6 +48,7 @@ class CharacterChangeLog(Base):
         String(36), ForeignKey("characters.id", ondelete="CASCADE"), nullable=False
     )
     chapter_id = Column(String(36), ForeignKey("chapters.id", ondelete="CASCADE"), nullable=False)
+    chapter_version = Column(Integer, nullable=True)
     change_type = Column(String(50), nullable=False)  # skill/experience/relationship/personality
     field_name = Column(String(100), nullable=False)
     old_value = Column(Text, nullable=True)
@@ -165,6 +166,7 @@ class CatalogingChapterRun(Base):
     chapter_id = Column(String(36), ForeignKey("chapters.id", ondelete="CASCADE"), nullable=False)
     status = Column(String(30), nullable=False, default="pending")
     chapter_order = Column(Integer, default=0)
+    chapter_version = Column(Integer, nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     error = Column(Text, nullable=True)

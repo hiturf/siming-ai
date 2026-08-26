@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 class SkillCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100, description="技能名称")
     description: Optional[str] = Field(None, description="技能描述")
-    trigger_examples: list[str] = Field(default_factory=list, description="触发关键词列表")
+    trigger_examples: list[str] = Field(default_factory=list, description="供 Agent 语义选择参考的使用示例")
     system_prompt: str = Field(..., min_length=1, description="技能系统提示词")
     recommended_tools: list[str] = Field(default_factory=list, description="推荐使用的工具（信息性）")
     forbidden_tools: list[str] = Field(default_factory=list, description="禁用的工具列表")
@@ -55,12 +55,6 @@ class SkillDraftRequest(BaseModel):
     requirements: str = Field(..., min_length=1, description="用户想创建的技能需求")
     template_key: Optional[str] = Field(None, description="可选模板 key")
     scope: str = Field("global", description="期望适用范围")
-
-
-class SkillMatchPreviewRequest(BaseModel):
-    message: str = Field(..., min_length=1, description="用于测试触发的用户消息")
-    scope: str = Field("project", description="助手所在范围")
-    candidate: Optional[SkillCreate] = Field(None, description="未保存的技能草案，可用于预览触发效果")
 
 
 class SkillVersionResponse(BaseModel):

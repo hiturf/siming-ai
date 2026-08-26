@@ -75,6 +75,14 @@ def _summary_candidate(
     }
 
 
+def _overview_fact(summary: str):
+    return {
+        "fact_type": "chapter_overview",
+        "evidence": summary,
+        "payload": {"summary": summary, "key_events": [summary]},
+    }
+
+
 def _complete_alice_candidates(chapter_title: str, summary: str):
     return [
         _summary_candidate(
@@ -152,11 +160,12 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
         self.db.close()
 
     def test_full_cataloging_workflow(self):
-        """Full external cataloging: start -> get chapter -> save candidates -> verify."""
+        """Full external cataloging: facts -> candidates -> apply -> verify."""
         from app.services.workspace.tools.external_cataloging import (
             start_external_cataloging_job,
             get_next_external_cataloging_chapter,
             save_external_cataloging_candidates,
+            save_external_cataloging_facts,
             verify_external_cataloging_progress,
         )
         from app.services.workspace.tools.cataloging import apply_pending_cataloging
@@ -176,12 +185,32 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
             result = _run(get_next_external_cataloging_chapter(self.db, project_id, {"job_id": job_id}))
             self.assertEqual(result["status"], "ok", f"get_next_chapter {i} failed: {result}")
             self.assertFalse(result["data"].get("all_done"))
-            self.assertEqual(result["data"]["phase"], "merged")
-            self.assertEqual(result["data"]["next_tool"], "save_external_cataloging_candidates")
+            self.assertEqual(result["data"]["phase"], "facts")
+            self.assertEqual(result["data"]["next_tool"], "save_external_cataloging_facts")
             self.assertIn("source language", result["data"]["workflow_reminder"]["language_rule"])
             self.assertIn('node_type="section"', result["data"]["outline_granularity_policy"])
             self.assertIn("outline_granularity_policy", result["data"]["workflow_reminder"])
             chapter_id = result["data"]["chapter_id"]
+
+            result = _run(save_external_cataloging_facts(
+                self.db,
+                project_id,
+                {
+                    "job_id": job_id,
+                    "chapter_id": chapter_id,
+                    "facts": [_overview_fact(f"Chapter {i + 1} summary")],
+                },
+            ))
+            self.assertEqual(result["status"], "ok", f"save_facts {i} failed: {result}")
+
+            result = _run(get_next_external_cataloging_chapter(
+                self.db,
+                project_id,
+                {"job_id": job_id, "phase": "candidates"},
+            ))
+            self.assertEqual(result["status"], "ok", result)
+            self.assertEqual(result["data"]["chapter_id"], chapter_id)
+            self.assertEqual(result["data"]["phase"], "candidates")
 
             # Save candidates
             candidates = _complete_alice_candidates(
@@ -190,7 +219,7 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
             )
             result = _run(save_external_cataloging_candidates(
                 self.db, project_id,
-                {"job_id": job_id, "chapter_id": chapter_id, "phase": "merged", "candidates": candidates},
+                {"job_id": job_id, "chapter_id": chapter_id, "candidates": candidates},
             ))
             self.assertEqual(result["status"], "ok", f"save_candidates {i} failed: {result}")
             self.assertEqual(result["data"]["candidates_saved"], 5)
@@ -285,8 +314,17 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
         chapter_id = result["data"]["chapter_id"]
 
         facts = [
-            {"type": "character_appearance", "data": {"name": "特昂糖", "evidence": "特昂糖在陆家醒来。"}},
-            {"type": "setting", "data": {"title": "陆家府邸", "evidence": "故事从陆家府邸开始。"}},
+            _overview_fact("特昂糖在陆家醒来，开始判断自身处境。"),
+            {
+                "fact_type": "character_fact",
+                "evidence": "特昂糖在陆家醒来。",
+                "payload": {"primary_name": "特昂糖", "actions": ["醒来"]},
+            },
+            {
+                "fact_type": "worldbuilding_fact",
+                "evidence": "故事从陆家府邸开始。",
+                "payload": {"title_hint": "陆家府邸", "dimension_hint": "geography"},
+            },
         ]
         result = _run(save_external_cataloging_facts(
             self.db,
@@ -306,7 +344,7 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
                 "type": "character_create",
                 "name": "特昂糖",
                 "aliases": ["陆糖"],
-                "role_type": "主角",
+                "role_type": "protagonist",
                 "personality": "冷静而善于观察。",
                 "background": "穿越女娃，在陆家醒来并开始观察这个修仙世界。",
             },
@@ -391,7 +429,7 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
         result = _run(save_external_cataloging_facts(
             self.db,
             "",
-            {"job_id": job_id, "chapter_id": chapter_id, "facts": [{"type": "character", "data": {"name": "Alice"}}]},
+            {"job_id": job_id, "chapter_id": chapter_id, "facts": [_overview_fact("Alice appears in the forest.")]},
         ))
         self.assertEqual(result["status"], "ok", result)
         self.assertEqual(result["data"]["project_id"], project_id)
@@ -459,7 +497,7 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
 
             result = _run(save_external_cataloging_facts(
                 self.db, project_id,
-                {"job_id": job_id, "chapter_id": chapter_id, "facts": [{"type": "test", "data": {}}]},
+                {"job_id": job_id, "chapter_id": chapter_id, "facts": [_overview_fact("Alice appears in the forest.")]},
             ))
             self.assertEqual(result["status"], "ok")
 
@@ -478,8 +516,8 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
 
             mock_llm.assert_not_called()
 
-    def test_candidates_are_serial_even_when_facts_are_parallel(self):
-        """Facts may be saved out ahead, but candidates must follow chapter_order."""
+    def test_each_chapter_must_finish_before_next_chapter_facts(self):
+        """Facts, candidates, and application are serialized by chapter."""
         from app.services.workspace.tools.external_cataloging import (
             start_external_cataloging_job,
             get_next_external_cataloging_chapter,
@@ -503,40 +541,48 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
         result = _run(save_external_cataloging_facts(
             self.db,
             project_id,
-            {"job_id": job_id, "chapter_id": first_chapter_id, "facts": [{"type": "event", "data": {"summary": "first"}}]},
+            {
+                "job_id": job_id,
+                "chapter_id": first_chapter_id,
+                "facts": [_overview_fact("first")],
+            },
         ))
         self.assertEqual(result["status"], "ok", result)
         self.assertTrue(result["data"]["candidate_generation_allowed"])
 
-        second = _run(get_next_external_cataloging_chapter(
+        blocked = _run(get_next_external_cataloging_chapter(
             self.db,
             project_id,
             {"job_id": job_id, "phase": "facts"},
         ))
-        self.assertEqual(second["status"], "ok", second)
-        second_chapter_id = second["data"]["chapter_id"]
-        result = _run(save_external_cataloging_facts(
-            self.db,
-            project_id,
-            {"job_id": job_id, "chapter_id": second_chapter_id, "facts": [{"type": "event", "data": {"summary": "second"}}]},
-        ))
-        self.assertEqual(result["status"], "ok", result)
-        self.assertFalse(result["data"]["candidate_generation_allowed"])
-        self.assertEqual(result["data"]["blocking_run"]["chapter_id"], first_chapter_id)
+        self.assertEqual(blocked["status"], "ok", blocked)
+        self.assertEqual(blocked["data"]["next_arguments"]["phase"], "candidates")
+        self.assertEqual(
+            blocked["data"]["next_candidate_run"]["chapter_id"],
+            first_chapter_id,
+        )
 
-        result = _run(save_external_cataloging_candidates(
+        second_chapter_id = (
+            self.db.query(CatalogingChapterRun)
+            .filter(
+                CatalogingChapterRun.job_id == job_id,
+                CatalogingChapterRun.chapter_id != first_chapter_id,
+            )
+            .order_by(CatalogingChapterRun.chapter_order)
+            .first()
+            .chapter_id
+        )
+        rejected = _run(save_external_cataloging_facts(
             self.db,
             project_id,
             {
                 "job_id": job_id,
                 "chapter_id": second_chapter_id,
-                "candidates": [{"type": "outline", "action": "create", "title": "Chapter 2", "summary": "second"}],
+                "facts": [_overview_fact("second")],
             },
         ))
-        self.assertEqual(result["status"], "skipped", result)
-        self.assertFalse(result["data"]["candidate_generation_allowed"])
-        self.assertEqual(result["data"]["blocking_run"]["chapter_id"], first_chapter_id)
-        self.assertEqual(result["data"]["next_arguments"]["phase"], "candidates")
+        self.assertEqual(rejected["status"], "skipped", rejected)
+        self.assertEqual(rejected["data"]["blocking_run"]["chapter_id"], first_chapter_id)
 
         result = _run(get_next_external_cataloging_chapter(
             self.db,
@@ -559,13 +605,13 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
         result = _run(apply_pending_cataloging(self.db, project_id, {"job_id": job_id}))
         self.assertEqual(result["status"], "ok", result)
 
-        result = _run(get_next_external_cataloging_chapter(
+        next_chapter = _run(get_next_external_cataloging_chapter(
             self.db,
             project_id,
-            {"job_id": job_id, "phase": "candidates"},
+            {"job_id": job_id, "phase": "facts"},
         ))
-        self.assertEqual(result["status"], "ok", result)
-        self.assertEqual(result["data"]["chapter_id"], second_chapter_id)
+        self.assertEqual(next_chapter["status"], "ok", next_chapter)
+        self.assertEqual(next_chapter["data"]["chapter_id"], second_chapter_id)
 
     def test_managed_cli_turn_cannot_advance_to_another_chapter(self):
         from app.services.workspace.tools.external_cataloging import (
@@ -592,7 +638,7 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
             "MOSHU_MANAGED_CATALOGING_JOB_ID": job_id,
             "MOSHU_MANAGED_CATALOGING_CHAPTER_ID": first_run.chapter_id,
             "MOSHU_MANAGED_CATALOGING_CHAPTER_RUN_ID": first_run.id,
-            "MOSHU_MANAGED_CATALOGING_STAGE": "full",
+            "MOSHU_MANAGED_CATALOGING_STAGE": "facts",
         }
         with patch.dict(os.environ, env, clear=False):
             assigned = _run(get_next_external_cataloging_chapter(
@@ -608,7 +654,7 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
                 {
                     "job_id": job_id,
                     "chapter_id": first_run.chapter_id,
-                    "facts": [{"type": "event", "data": {"summary": "first"}}],
+                    "facts": [_overview_fact("first")],
                 },
             ))
             self.assertEqual(saved["status"], "ok")
@@ -664,7 +710,7 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
                 {
                     "job_id": job_id,
                     "chapter_id": second_run.chapter_id,
-                    "facts": [{"type": "event", "data": {"summary": "second"}}],
+                    "facts": [_overview_fact("second")],
                 },
             ))
             self.assertEqual(wrong_write["status"], "skipped")
@@ -693,71 +739,27 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
             {
                 "job_id": job_id,
                 "chapter_id": run.chapter_id,
-                "facts": [{
-                    "fact_type": "character_appearance",
-                    "payload": {"character_name": "Alice", "description": "red coat"},
-                    "confidence": 0.9,
-                    "evidence": "Alice wore a red coat.",
-                }],
+                "facts": [
+                    _overview_fact("Alice enters the forest."),
+                    {
+                        "fact_type": "character_fact",
+                        "payload": {"character_name": "Alice", "description": "red coat"},
+                        "confidence": 0.9,
+                        "evidence": "Alice wore a red coat.",
+                    },
+                ],
             },
         ))
 
         self.assertEqual(saved["status"], "ok")
-        fact = self.db.query(CatalogingFact).filter(CatalogingFact.chapter_run_id == run.id).one()
+        fact = self.db.query(CatalogingFact).filter(
+            CatalogingFact.chapter_run_id == run.id,
+            CatalogingFact.fact_type == "character_fact",
+        ).one()
         self.assertEqual(fact.fact_type, "character_fact")
         self.assertEqual(json.loads(fact.raw_payload)["character_name"], "Alice")
         self.assertEqual(fact.confidence, 0.9)
         self.assertEqual(fact.evidence, "Alice wore a red coat.")
-
-    def test_fact_type_is_inferred_for_provider_specific_shapes(self):
-        from app.services.workspace.tools.external_cataloging import (
-            save_external_cataloging_facts,
-            start_external_cataloging_job,
-        )
-
-        started = _run(start_external_cataloging_job(self.db, self.project.id, {}))
-        job_id = started["data"]["job_id"]
-        run = (
-            self.db.query(CatalogingChapterRun)
-            .filter(CatalogingChapterRun.job_id == job_id)
-            .order_by(CatalogingChapterRun.chapter_order)
-            .first()
-        )
-        saved = _run(save_external_cataloging_facts(
-            self.db,
-            self.project.id,
-            {
-                "job_id": job_id,
-                "chapter_id": run.chapter_id,
-                "facts": [
-                    {"name": "Alice", "updates": {"traits": ["careful"]}},
-                    {"title": "Forest law", "description": "Do not whistle after dark."},
-                    {"title": "Chapter 1", "summary": "Alice enters the forest."},
-                    {"title": "First warning", "parent_title": "Chapter 1", "summary": "A sign appears."},
-                    {"source_name": "Alice", "target_name": "Bob", "relationship_type": "friend"},
-                ],
-            },
-        ))
-        self.assertEqual(saved["status"], "ok")
-        types = [
-            item.fact_type
-            for item in (
-                self.db.query(CatalogingFact)
-                .filter(CatalogingFact.chapter_run_id == run.id)
-                .order_by(CatalogingFact.sort_order)
-                .all()
-            )
-        ]
-        self.assertEqual(
-            types,
-            [
-                "character_fact",
-                "worldbuilding_fact",
-                "chapter_overview",
-                "outline_fact",
-                "relationship_fact",
-            ],
-        )
 
     def test_empty_or_incomplete_candidates_cannot_complete_chapter(self):
         from app.services.workspace.tools.external_cataloging import (
@@ -813,13 +815,14 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
             {
                 "job_id": job_id,
                 "chapter_id": run.chapter_id,
-                "candidates": [{"candidate_type": "chapter_summary", "payload": {"summary": "first"}}],
+                "candidates": [{"type": "chapter_summary", "summary_text": "first"}],
             },
         ))
         self.assertFalse(partial["data"]["candidate_set_complete"])
         self.assertEqual(
             set(partial["data"]["missing_required_items"]),
             {
+                "chapter-level outline",
                 "chapter_summary.scene_count coverage declaration",
                 "chapter_summary.characters coverage declaration",
                 "chapter_summary.worldbuilding coverage declaration",
@@ -832,16 +835,16 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
             "skipped",
         )
 
-        projected = (
-            self.db.query(CatalogingCandidate)
-            .filter(
+        chapter_title = next(
+            chapter.title for chapter in self.chapters if chapter.id == run.chapter_id
+        )
+        self.assertEqual(
+            self.db.query(CatalogingCandidate).filter(
                 CatalogingCandidate.chapter_run_id == run.id,
                 CatalogingCandidate.item_type == "outline_create",
-                CatalogingCandidate.source_task == "deterministic_required_outline",
-            )
-            .one()
+            ).count(),
+            0,
         )
-        self.assertIn("Chapter 1", projected.raw_payload)
 
         complete = _run(save_external_cataloging_candidates(
             self.db,
@@ -852,8 +855,10 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
                 "candidates": [
                     _summary_candidate("first"),
                     {
-                        "candidate_type": "outline_create",
-                        "payload": {"title": "Chapter 1", "node_type": "chapter", "summary": "first"},
+                        "type": "outline_create",
+                        "title": chapter_title,
+                        "node_type": "chapter",
+                        "summary": "first",
                     },
                 ],
             },
@@ -877,9 +882,10 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
         self.assertEqual(review.source, "provided")
         self.assertEqual(review.chapter_version, run.chapter.current_version or 1)
 
-    def test_complete_summary_only_projects_outline_without_another_model_call(self):
+    def test_complete_summary_without_outline_remains_incomplete(self):
         from app.services.workspace.tools.external_cataloging import (
             save_external_cataloging_candidates,
+            save_external_cataloging_facts,
             start_external_cataloging_job,
         )
 
@@ -894,6 +900,16 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
             .filter(CatalogingChapterRun.job_id == job_id)
             .one()
         )
+        facts = _run(save_external_cataloging_facts(
+            self.db,
+            self.project.id,
+            {
+                "job_id": job_id,
+                "chapter_id": run.chapter_id,
+                "facts": [_overview_fact("Only the complete summary arrived.")],
+            },
+        ))
+        self.assertEqual(facts["status"], "ok", facts)
 
         saved = _run(save_external_cataloging_candidates(
             self.db,
@@ -901,14 +917,14 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
             {
                 "job_id": job_id,
                 "chapter_id": run.chapter_id,
-                "phase": "merged",
                 "candidates": [_summary_candidate("Only the complete summary arrived.")],
             },
         ))
 
-        self.assertTrue(saved["data"]["candidate_set_complete"], saved)
-        self.assertEqual(saved["data"]["candidates_saved"], 2)
-        self.assertEqual(saved["data"]["chapter_run_status"], "awaiting_confirmation")
+        self.assertFalse(saved["data"]["candidate_set_complete"], saved)
+        self.assertEqual(saved["data"]["candidates_saved"], 1)
+        self.assertEqual(saved["data"]["chapter_run_status"], "facts_saved")
+        self.assertIn("chapter-level outline", saved["data"]["missing_required_items"])
         outlines = (
             self.db.query(CatalogingCandidate)
             .filter(
@@ -917,99 +933,7 @@ class ExternalCatalogingE2ETest(unittest.TestCase):
             )
             .all()
         )
-        self.assertEqual(len(outlines), 1)
-        self.assertEqual(outlines[0].source_task, "deterministic_required_outline")
-        self.assertIn(self.chapters[0].title, outlines[0].raw_payload)
-
-    def test_provider_fields_and_changes_candidate_shapes_are_applied(self):
-        from app.services.workspace.tools.external_cataloging import (
-            save_external_cataloging_candidates,
-            save_external_cataloging_facts,
-            start_external_cataloging_job,
-        )
-        from app.services.workspace.tools.cataloging import apply_pending_cataloging
-
-        started = _run(start_external_cataloging_job(self.db, self.project.id, {}))
-        job_id = started["data"]["job_id"]
-        run = (
-            self.db.query(CatalogingChapterRun)
-            .filter(CatalogingChapterRun.job_id == job_id)
-            .order_by(CatalogingChapterRun.chapter_order)
-            .first()
-        )
-        _run(save_external_cataloging_facts(
-            self.db,
-            self.project.id,
-            {
-                "job_id": job_id,
-                "chapter_id": run.chapter_id,
-                "facts": [{"name": "Alice", "description": "A careful traveler."}],
-            },
-        ))
-        staged = _run(save_external_cataloging_candidates(
-            self.db,
-            self.project.id,
-            {
-                "job_id": job_id,
-                "chapter_id": run.chapter_id,
-                "candidates": [
-                    {
-                        "candidate_type": "chapter_summary",
-                        "fields": {
-                            **_summary_candidate(
-                                "Alice finds a wolf.",
-                                characters=["Alice"],
-                                worldbuilding=["Iron Wolf"],
-                                character_profiles=["Alice"],
-                            ),
-                        },
-                    },
-                    {
-                        "candidate_type": "outline_create",
-                        "target_name": "Chapter 1",
-                        "fields": {"node_type": "chapter", "summary": "Alice enters the forest."},
-                    },
-                    {
-                        "candidate_type": "character_create",
-                        "target_name": "Alice",
-                        "fields": {
-                            "name": "Alice",
-                            "appearance": "Red coat",
-                            "background": "A careful traveler.",
-                        },
-                    },
-                    {
-                        "candidate_type": "character_state_update",
-                        "target_name": "Alice",
-                        "changes": ["mental_state:alert", "current_location:forest"],
-                    },
-                    {
-                        "candidate_type": "worldbuilding_create",
-                        "target_name": "Iron Wolf",
-                        "fields": {"category": "creature", "description": "A fast low-level beast."},
-                    },
-                    {
-                        "candidate_type": "chapter_link",
-                        "fields": {
-                            "character_names": ["Alice"],
-                            "worldbuilding_titles": ["Iron Wolf"],
-                            "description": "Alice encounters the Iron Wolf.",
-                        },
-                    },
-                ],
-            },
-        ))
-        self.assertTrue(staged["data"]["candidate_set_complete"])
-        applied = _run(apply_pending_cataloging(self.db, self.project.id, {"job_id": job_id}))
-        self.assertEqual(applied["status"], "ok")
-        failures = [
-            event for event in applied["data"]["events"]
-            if event["type"] == "candidate_apply_failed"
-        ]
-        self.assertEqual(failures, [])
-        alice = self.db.query(Character).filter(Character.project_id == self.project.id, Character.name == "Alice").one()
-        self.assertEqual(alice.current_location, "forest")
-
+        self.assertEqual(outlines, [])
 
 if __name__ == "__main__":
     unittest.main()

@@ -231,7 +231,7 @@ def _is_strict_path(path: Path) -> bool:
             "database/schema_models.py",
             "core/legacy_env.py",
             "core/numbers.py",
-            "prompts/workspace_contract.py",
+            "architecture/tool_categories.py",
             "services/scheduler/ports.py",
             "services/skills/tool_catalog.py",
             "services/workspace/idempotency.py",

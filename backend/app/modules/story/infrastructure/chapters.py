@@ -142,6 +142,7 @@ class SqlAlchemyChapterWorkspace:
             content=content,
             word_count=count_words(content),
             current_version=1,
+            cataloging_required=bool(str(payload.get("content") or "").strip()),
             sort_order=next_chapter_sort_order(self._session, project_id),
             context_manifest_id=payload.get("context_manifest_id"),
         )
@@ -201,6 +202,8 @@ class SqlAlchemyChapterWorkspace:
             chapter.context_manifest_id = data["context_manifest_id"]
         chapter.word_count = count_words(chapter.content or "")
         chapter.current_version = (chapter.current_version or 1) + 1
+        if narrative_content_changed:
+            chapter.cataloging_required = True
         self._session.add(create_snapshot(chapter, trigger_type))
         stale_count = 0
         if narrative_content_changed:
@@ -327,6 +330,7 @@ class SqlAlchemyChapterWorkspace:
         chapter = self._chapter(project_id, chapter_id)
         snapshot = self._snapshot(project_id, chapter_id, snapshot_id)
         restore_chapter_from_snapshot(self._session, chapter, snapshot)
+        chapter.cataloging_required = True
         ledger_restore = restore_ledger_checkpoint(
             self._session, project_id, chapter, snapshot.id
         )

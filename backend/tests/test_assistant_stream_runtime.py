@@ -22,7 +22,7 @@ class DetachedAssistantStreamTestCase(unittest.IsolatedAsyncioTestCase):
                 '"operation_id":"operation-1"}}\n\n'
             )
             for index in range(300):
-                yield f'data: {{"type":"thinking_delta","delta":"{index}"}}\n\n'
+                yield f'data: {{"type":"reasoning_delta","delta":"{index}"}}\n\n'
             yield 'data: {"type":"complete","data":{"reply":"done"}}\n\n'
             yield 'data: [DONE]\n\n'
 

@@ -8,14 +8,9 @@ from sqlalchemy.orm import sessionmaker
 from app.core.utils import count_words
 from app.database import models as _models  # noqa: F401
 from app.database.session import Base
-from app.modules.continuity.infrastructure.models import (
-    CatalogingChapterRun,
-    CatalogingJob,
-    NarrativeCheckpoint,
-)
+from app.modules.continuity.infrastructure.models import CatalogingJob, NarrativeCheckpoint
 from app.modules.gateway.application.contracts import SyncMutation
 from app.modules.gateway.infrastructure.mutation_service import GatewayMutationApplier
-from app.modules.gateway.infrastructure.service import GatewayService
 from app.modules.story.infrastructure.chapters import SqlAlchemyChapterWorkspace
 from app.modules.story.infrastructure.entities import (
     Chapter,
@@ -23,10 +18,6 @@ from app.modules.story.infrastructure.entities import (
     Character,
     CharacterVersion,
     Project,
-)
-from app.services.cataloging.launcher import (
-    AUTO_CHAPTER_WRITE_SOURCE,
-    create_and_queue_cataloging_job,
 )
 from app.services.gateway_legacy_replication import apply_domain_mutation
 
@@ -158,13 +149,8 @@ def test_offline_existing_character_save_reuses_pc_character_version_semantics(t
         engine.dispose()
 
 
-def test_mobile_replay_matches_pc_chapter_lifecycle_and_is_idempotent(tmp_path):
-    """Compare canonical PC create with the Android outbox replay path.
-
-    Identifiers differ by design, so the assertion compares the final domain
-    state: chapter, snapshot, checkpoint, and durable cataloging job.  Replaying
-    the same mutation ID must not create another version or job.
-    """
+def test_mobile_replay_matches_pc_save_only_lifecycle_and_is_idempotent(tmp_path):
+    """PC and Android saves persist chapters without starting cataloging."""
 
     engine, Session = _session(tmp_path)
     try:
@@ -187,17 +173,6 @@ def test_mobile_replay_matches_pc_chapter_lifecycle_and_is_idempotent(tmp_path):
             )
             db.commit()
             pc_chapter_id = pc_result.data["id"]
-            create_and_queue_cataloging_job(
-                db,
-                pc_project.id,
-                [pc_chapter_id],
-                execution_mode="auto",
-                backend_override="external_agent",
-                provider_override="parity_test",
-                trigger_source=AUTO_CHAPTER_WRITE_SOURCE,
-                run_now=False,
-            )
-
             mutation = SyncMutation(
                 mutation_id="mobile-write-run-1",
                 project_id=mobile_project.id,
@@ -222,22 +197,6 @@ def test_mobile_replay_matches_pc_chapter_lifecycle_and_is_idempotent(tmp_path):
             db.commit()
             assert applied.status == "applied"
 
-            deferred = GatewayService(db).take_deferred_chapter_cataloging()
-            assert deferred == [
-                (mutation.mutation_id, mobile_project.id, mutation.entity_id),
-            ]
-            for _mutation_id, project_id, chapter_id in deferred:
-                create_and_queue_cataloging_job(
-                    db,
-                    project_id,
-                    [chapter_id],
-                    execution_mode="auto",
-                    backend_override="external_agent",
-                    provider_override="parity_test",
-                    trigger_source=AUTO_CHAPTER_WRITE_SOURCE,
-                    run_now=False,
-                )
-
             def final_state(project_id: str, chapter_id: str) -> dict:
                 chapter = db.get(Chapter, chapter_id)
                 assert chapter is not None
@@ -256,15 +215,6 @@ def test_mobile_replay_matches_pc_chapter_lifecycle_and_is_idempotent(tmp_path):
                     .order_by(NarrativeCheckpoint.sequence.asc())
                     .all()
                 )
-                jobs = (
-                    db.query(CatalogingJob)
-                    .join(CatalogingChapterRun, CatalogingChapterRun.job_id == CatalogingJob.id)
-                    .filter(
-                        CatalogingJob.project_id == project_id,
-                        CatalogingChapterRun.chapter_id == chapter_id,
-                    )
-                    .all()
-                )
                 return {
                     "chapter": {
                         "title": chapter.title,
@@ -281,16 +231,6 @@ def test_mobile_replay_matches_pc_chapter_lifecycle_and_is_idempotent(tmp_path):
                         (item.trigger_type, item.label.endswith(" 创建"))
                         for item in checkpoints
                     ],
-                    "cataloging": [
-                        (
-                            item.status,
-                            item.execution_mode,
-                            item.execution_backend,
-                            str(item.model_source or "").split(":", 1)[0],
-                            item.total_chapters,
-                        )
-                        for item in jobs
-                    ],
                 }
 
             assert final_state(mobile_project.id, mutation.entity_id) == final_state(
@@ -302,7 +242,7 @@ def test_mobile_replay_matches_pc_chapter_lifecycle_and_is_idempotent(tmp_path):
             duplicate = applier.apply(mutation, device_id="android-test")
             db.commit()
             assert duplicate.status == "duplicate"
-            assert GatewayService(db).take_deferred_chapter_cataloging() == []
+            assert db.query(CatalogingJob).count() == 0
             assert final_state(mobile_project.id, mutation.entity_id) == before
     finally:
         engine.dispose()

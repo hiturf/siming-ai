@@ -203,21 +203,6 @@ class LauncherDataDirectoryTestCase(unittest.TestCase):
         find_port.assert_not_called()
 
     def test_native_window_close_stops_embedded_server_and_activation_restores_window(self):
-        class FakeThread:
-            def __init__(self, *, target, name=None, daemon=False):
-                self.target = target
-                self.name = name
-                self.daemon = daemon
-
-            def start(self):
-                self.target()
-
-            def is_alive(self):
-                return False
-
-            def join(self, timeout=None):
-                return None
-
         class FakeWindow:
             def __init__(self):
                 self.loaded_url = None
@@ -245,7 +230,7 @@ class LauncherDataDirectoryTestCase(unittest.TestCase):
         webview = types.ModuleType("webview")
         webview.FileDialog = types.SimpleNamespace(FOLDER="folder")
         webview.create_window = MagicMock(return_value=window)
-        webview.start = MagicMock()
+        webview.start = MagicMock(side_effect=lambda callback: callback())
         browser_app = types.ModuleType("app.main")
         browser_app.app = object()
 
@@ -258,8 +243,8 @@ class LauncherDataDirectoryTestCase(unittest.TestCase):
         ), patch("launcher._find_free_port", return_value=9876), patch(
             "launcher._prepare_environment", return_value=home
         ), patch("launcher._wait_for_server", return_value=True), patch(
-            "launcher.threading.Thread", FakeThread
-        ), patch("launcher.time.sleep"), patch("launcher._log"), patch.dict(
+            "launcher.time.sleep"
+        ), patch("launcher._log"), patch.dict(
             "sys.modules", {"app.main": browser_app, "webview": webview}
         ):
             launcher.main()
@@ -271,6 +256,54 @@ class LauncherDataDirectoryTestCase(unittest.TestCase):
         activation_handler()
         self.assertEqual(window.restore_count, 1)
         self.assertEqual(window.show_count, 1)
+
+    def test_native_boot_failure_closes_window_and_releases_instance(self):
+        class FakeWindow:
+            def __init__(self):
+                self.evaluated_scripts = []
+                self.destroy_count = 0
+
+            def evaluate_js(self, script):
+                self.evaluated_scripts.append(script)
+
+            def destroy(self):
+                self.destroy_count += 1
+
+        temporary_home = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_home.cleanup)
+        home = Path(temporary_home.name)
+        instance = MagicMock()
+        instance.acquire.return_value = True
+        server = MagicMock()
+        server.stop.return_value = True
+        window = FakeWindow()
+        webview = types.ModuleType("webview")
+        webview.FileDialog = types.SimpleNamespace(FOLDER="folder")
+        webview.create_window = MagicMock(return_value=window)
+        webview.start = MagicMock(side_effect=lambda callback: callback())
+        broken_app = types.ModuleType("app.main")
+
+        with patch.object(launcher.sys, "argv", ["launcher.py", "--desktop"]), patch(
+            "launcher._app_home", return_value=home
+        ), patch(
+            "launcher.DesktopInstanceCoordinator", return_value=instance
+        ), patch(
+            "launcher.UvicornServerController", return_value=server
+        ), patch("launcher._find_free_port", return_value=9876), patch(
+            "launcher._prepare_environment", return_value=home
+        ), patch("launcher._show_error") as show_error, patch(
+            "launcher._log"
+        ), patch.dict(
+            "sys.modules", {"app.main": broken_app, "webview": webview}
+        ):
+            launcher.main()
+
+        show_error.assert_called_once()
+        self.assertEqual(window.destroy_count, 1)
+        self.assertTrue(any("启动失败" in script for script in window.evaluated_scripts))
+        server.start.assert_not_called()
+        server.stop.assert_called_once_with(timeout=20.0)
+        instance.close.assert_called_once()
 
     def test_staged_update_helper_replaces_old_executable_and_restarts(self):
         with tempfile.TemporaryDirectory() as temp_dir:

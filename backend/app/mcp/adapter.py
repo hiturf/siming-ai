@@ -44,10 +44,6 @@ _PROJECT_OPTIONAL_TOOLS = {
     "get_quality_rubric",
     "list_skill_templates",
     "start_novel_creation_session",
-    "draft_novel_blueprint",
-    "review_novel_blueprint",
-    "apply_novel_blueprint",
-    "get_novel_creation_session",
     "get_creation_artifact",
     "list_creation_artifacts",
     "get_creation_dependencies",
@@ -55,8 +51,6 @@ _PROJECT_OPTIONAL_TOOLS = {
     "lock_creation_fields",
     "unlock_creation_fields",
     "undo_creation_artifact",
-    "generate_novel_creation_stage",
-    "submit_novel_creation_stage",
     "get_creation_session",
     "get_creation_snapshot",
     "get_creation_operation",
@@ -447,152 +441,6 @@ def _safe_rollback(db: Any) -> None:
             logger.exception("Failed to roll back MCP database session")
 
 
-def _managed_chapter_write_guard(
-    db: Any,
-    project_id: str,
-    tool_name: str,
-    arguments: dict[str, Any],
-    run_id: str | None,
-) -> dict[str, Any] | None:
-    """Fence a managed CLI chapter write against parent/child cancellation."""
-    if tool_name not in {"create_chapter", "update_chapter"}:
-        return None
-
-    from app.database.models import (
-        AgentRun,
-        ChapterDraft,
-        ChapterWriteClaim,
-        ContextManifest,
-        OperationRun,
-    )
-    from app.modules.operations.domain.state import ACTIVE_STATUSES
-    from app.services.workspace.idempotency import validate_chapter_write_claim
-
-    child_run = None
-    manifest = None
-    if run_id:
-        child_run = (
-            db.query(AgentRun)
-            .filter(AgentRun.id == run_id, AgentRun.project_id == project_id)
-            .first()
-        )
-        if child_run and child_run.context_manifest_id:
-            manifest = (
-                db.query(ContextManifest)
-                .filter(
-                    ContextManifest.id == child_run.context_manifest_id,
-                    ContextManifest.project_id == project_id,
-                )
-                .first()
-            )
-    if manifest is None:
-        manifest_id = str(arguments.get("context_manifest_id") or "").strip()
-        if not manifest_id:
-            draft_id = str(arguments.get("draft_id") or arguments.get("content_ref") or "").strip()
-            draft = (
-                db.query(ChapterDraft)
-                .filter(ChapterDraft.id == draft_id, ChapterDraft.project_id == project_id)
-                .first()
-                if draft_id
-                else None
-            )
-            manifest_id = str(getattr(draft, "context_manifest_id", "") or "").strip()
-        if manifest_id:
-            manifest = (
-                db.query(ContextManifest)
-                .filter(
-                    ContextManifest.id == manifest_id,
-                    ContextManifest.project_id == project_id,
-                )
-                .first()
-            )
-
-    query = manifest.query_json if manifest and isinstance(manifest.query_json, dict) else {}
-    contract = query.get("arguments") if isinstance(query, dict) else None
-    contract = contract if isinstance(contract, dict) else {}
-    if not contract.get("managed_chapter_write"):
-        return None
-
-    def denied(detail: str) -> dict[str, Any]:
-        return {
-            "status": "error",
-            "tool": tool_name,
-            "detail": detail,
-            "data": {"run_id": run_id, "context_manifest_id": getattr(manifest, "id", None)},
-        }
-
-    if not run_id or child_run is None:
-        return denied("受管本机 CLI 写章必须携带任务 run_id，本轮未写入章节。")
-    if child_run.status not in {"created", "running"}:
-        return denied(f"本机 CLI 子任务已处于 {child_run.status} 状态，本轮未写入章节。")
-    child_operation = (
-        db.query(OperationRun).filter(OperationRun.id == child_run.operation_id).first()
-        if child_run.operation_id
-        else None
-    )
-    if child_operation is None or child_operation.status not in ACTIVE_STATUSES:
-        return denied("本机 CLI 子任务已取消、结束或中断，本轮未写入章节。")
-
-    claim_id = str(contract.get("chapter_claim_id") or "").strip()
-    claim_token = str(contract.get("chapter_claim_token") or "").strip()
-    target_key = str(contract.get("chapter_target_key") or "").strip()
-    idempotency_key = str(contract.get("chapter_idempotency_key") or "").strip()
-    claim = (
-        db.query(ChapterWriteClaim)
-        .filter(ChapterWriteClaim.id == claim_id, ChapterWriteClaim.project_id == project_id)
-        .first()
-        if claim_id
-        else None
-    )
-    parent_operation_id = str(contract.get("parent_operation_id") or "").strip()
-    if claim and claim.operation_id:
-        if parent_operation_id and parent_operation_id != claim.operation_id:
-            return denied("章节写作占用与父任务不匹配，本轮未写入章节。")
-        parent_operation_id = claim.operation_id
-    parent_operation = (
-        db.query(OperationRun).filter(OperationRun.id == parent_operation_id).first()
-        if parent_operation_id
-        else None
-    )
-    if parent_operation_id and (
-        parent_operation is None or parent_operation.status not in ACTIVE_STATUSES
-    ):
-        return denied("父写作任务已取消、结束或中断，本轮未写入章节。")
-    if not validate_chapter_write_claim(
-        db,
-        project_id=project_id,
-        target_key=target_key,
-        idempotency_key=idempotency_key,
-        claim_id=claim_id,
-        claim_token=claim_token,
-    ):
-        return denied("章节写作占用已失效或已取消，本轮未写入章节。")
-
-    rewrite = bool(contract.get("rewrite"))
-    expected_tool = "update_chapter" if rewrite else "create_chapter"
-    if tool_name != expected_tool:
-        return denied(
-            f"当前受管任务必须调用 {expected_tool}，不能调用 {tool_name}，本轮未写入章节。"
-        )
-    outline_node_id = str(contract.get("outline_node_id") or "").strip()
-    requested_outline = str(arguments.get("outline_node_id") or "").strip()
-    if requested_outline and outline_node_id and requested_outline != outline_node_id:
-        return denied("写入目标与受管章节大纲不一致，本轮未写入章节。")
-
-    arguments["outline_node_id"] = outline_node_id
-    arguments["_chapter_claim_id"] = claim_id
-    arguments["_chapter_claim_token"] = claim_token
-    arguments["_chapter_target_key"] = target_key
-    arguments["_chapter_idempotency_key"] = idempotency_key
-    if rewrite:
-        arguments["rewrite"] = True
-        arguments["rewrite_request_id"] = str(
-            contract.get("parent_plan_id") or idempotency_key
-        )
-        arguments.setdefault("trigger_type", "ai_insert")
-    return None
-
-
 def _creation_session_scope_error(
     db: Any,
     td: ToolDef,
@@ -756,41 +604,12 @@ async def execute_tool(
     else:
         arguments.pop("run_id", None)  # Strip if passed explicitly
 
-    managed_write_error = _managed_chapter_write_guard(
-        db,
-        effective_project_id,
-        tool_name,
-        arguments,
-        str(run_id or "").strip() or None,
-    )
-    if managed_write_error:
-        if run_id:
-            _log_run_tool_event(
-                db,
-                str(run_id),
-                "tool_result",
-                tool_name,
-                arguments,
-                status="error",
-                detail=str(managed_write_error.get("detail") or "受管写章校验失败"),
-            )
-        return make_text_result(
-            json.dumps(managed_write_error, ensure_ascii=False),
-            is_error=True,
-        )
-
     # Workspace handlers use this marker to distinguish an author/manual API
     # save from a formal write initiated by an MCP client.  The latter must
     # carry a governed manifest and verified evidence before it can become
     # project state.  It is deliberately internal-only and never part of the
     # public tool schema.
     arguments.setdefault("_context_execution_route", "external_mcp")
-    if run_id and tool_name in {"create_chapter", "update_chapter"}:
-        # Trusted, out-of-band provenance used only to select the matching
-        # canonical cataloging route after the chapter commit.  Public clients
-        # cannot spoof this marker through a tool schema argument.
-        arguments["_source_agent_run_id"] = str(run_id)
-
     # Check confirmation token for legacy write tiers and explicitly sensitive tools.
     # Trusted local mode is intentionally frictionless: it can execute Siming MCP
     # project tools without an extra frontend confirmation prompt. Secret/internal

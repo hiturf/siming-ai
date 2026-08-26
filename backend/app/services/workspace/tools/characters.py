@@ -7,7 +7,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from ...character_role_types import append_character_role_description, normalize_character_role_type
+from ...character_role_types import normalize_character_role_type
 
 from ....database.models import Character, CharacterAIConfig, CharacterVersion, Project
 from ....modules.story.application.content_sync import queue_content_sync
@@ -36,7 +36,6 @@ async def create_character(
         if value:
             background_parts.append(f"{label}：{value}")
     background = "\n".join(part for part in background_parts if part)
-    background = append_character_role_description(background, args.get("role_type")) or ""
     character = Character(
         project_id=project_id,
         name=name[:100],
@@ -113,7 +112,6 @@ async def update_character(
             setattr(character, field, value)
             changed = True
     if "role_type" in args:
-        character.background = append_character_role_description(character.background, args.get("role_type"))
         character.role_type = normalize_character_role_type(
             args.get("role_type"),
             default=character.role_type or "other",

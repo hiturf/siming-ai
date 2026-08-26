@@ -62,7 +62,10 @@ export function ToolLogPanel({
           </Tag>
           {log.tool && <Text code>{log.tool}</Text>}
           <Text>{log.message}</Text>
-          {log.status === 'error' && !log.resolvedStepId && log.stepId && currentRun && (
+          {log.status === 'error' && !log.resolvedStepId && log.canRetry === false && log.retryBlockReason && (
+            <Text type="secondary">{log.retryBlockReason}</Text>
+          )}
+          {log.status === 'error' && !log.resolvedStepId && log.canRetry !== false && log.stepId && currentRun && (
             <Space size={4}>
               <Button
                 type="link"

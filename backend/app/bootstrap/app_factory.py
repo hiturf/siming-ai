@@ -66,7 +66,6 @@ def resolve_frontend_file(frontend_dist: Path, requested_path: str) -> Path | No
 
 def _register_routers(app: FastAPI) -> None:
     from ..routers import (
-        agent,
         ai_writer,
         application_updates,
         cataloging,
@@ -105,7 +104,6 @@ def _register_routers(app: FastAPI) -> None:
         deconstruct,
         importer,
         cataloging,
-        agent,
         tools,
         prompt_packs,
         novel_creation,

@@ -20,8 +20,8 @@ MODULES = (
     ),
     ModuleDescriptor(
         "creation",
-        "New-novel interviews, staged drafts, and blueprint application.",
-        ("novel_creation_sessions", "concepts", "blueprints"),
+        "New-novel interviews, staged drafts, and project materialization.",
+        ("novel_creation_sessions", "concepts", "creation_artifacts"),
     ),
     ModuleDescriptor(
         "continuity",
@@ -30,8 +30,8 @@ MODULES = (
     ),
     ModuleDescriptor(
         "assistant",
-        "Conversation intent, plans, tools, and author-facing outcomes.",
-        ("assistant_conversations", "agent_plans", "workspace_tools"),
+        "Conversation intent, tools, drafts, and author-facing outcomes.",
+        ("assistant_conversations", "chapter_drafts", "workspace_tools"),
     ),
     ModuleDescriptor(
         "operations",

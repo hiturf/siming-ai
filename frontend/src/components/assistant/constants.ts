@@ -67,6 +67,8 @@ export const runStepToLog = (step: WorkspaceAssistantRunStep): WorkspaceRunLog =
   status: step.status || 'running',
   message: step.detail || step.error || step.tool || step.step_type || '步骤',
   stepId: step.id,
+  canRetry: step.can_retry,
+  retryBlockReason: step.retry_block_reason,
 })
 
 export function assistantOutcomeToRunLog(
@@ -118,6 +120,9 @@ export const toWorkspaceMessage = (
   conversation_id: item.conversation_id,
   role: item.role,
   content: item.content,
+  reasoning_content: item.role === 'assistant'
+    ? item.payload?.reasoning_content
+    : undefined,
   status: item.status,
   created_at: item.created_at || undefined,
   updated_at: item.updated_at || undefined,

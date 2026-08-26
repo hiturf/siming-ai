@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { useDownloadRate } from '../hooks/useDownloadRate'
@@ -7,6 +7,7 @@ import {
   Button,
   Collapse,
   Input,
+  Modal,
   Progress,
   Select,
   Space,
@@ -55,6 +56,16 @@ interface FreeModelOption {
 type ActivationStatus = 'pending' | 'running' | 'auth_required' | 'ready' | 'failed'
 type ActivationPhase = 'checking' | 'checking_release' | 'selecting_source' | 'switching_source' | 'downloading' | 'verifying' | 'auth_required' | 'authenticating' | 'credential_required' | 'discovering_models' | 'testing' | 'ready' | 'failed'
 
+interface PathIntegrationStatus {
+  supported: boolean
+  managed_install: boolean
+  configured: boolean
+  directory: string
+  scope: 'user'
+  requires_new_terminal: boolean
+  changed?: boolean
+}
+
 interface ActivationJob {
   id: string
   status: ActivationStatus
@@ -75,6 +86,8 @@ interface ActivationJob {
   auth_mode?: 'browser' | 'credential' | null
   auth_status?: 'running' | 'credential_required' | 'submitted' | 'completed' | 'failed' | 'interrupted' | null
   auth_prompt?: string | null
+  command?: string | null
+  path_integration?: PathIntegrationStatus | null
 }
 
 interface GettingStartedStatus {
@@ -92,6 +105,7 @@ interface GettingStartedStatus {
   available_model?: { provider: string; model: string } | null
   activation_job?: ActivationJob | null
   opencode_mcp_configured?: boolean
+  path_integration?: PathIntegrationStatus | null
   official_links?: { model_docs?: string }
 }
 
@@ -184,6 +198,9 @@ export function GettingStartedPanel() {
   const [mcpSetupRunning, setMcpSetupRunning] = useState(false)
   const [mcpSetupError, setMcpSetupError] = useState('')
   const [mcpConfigured, setMcpConfigured] = useState(false)
+  const [pathSetupRunning, setPathSetupRunning] = useState(false)
+  const [pathIntegrationResult, setPathIntegrationResult] = useState<PathIntegrationStatus>()
+  const pathPromptedJobs = useRef(new Set<string>())
   const [mcpDeferred, setMcpDeferred] = useState(
     () => localStorage.getItem('siming_getting_started_mcp_deferred') === '1',
   )
@@ -206,6 +223,49 @@ export function GettingStartedPanel() {
     }
   }, [queryClient])
 
+  const addOpenCodeToPath = useCallback(async () => {
+    setPathSetupRunning(true)
+    try {
+      const response = await apiClient.put<ApiEnvelope<PathIntegrationStatus>>(
+        '/config/getting-started/opencode/path',
+        { enabled: true },
+      )
+      setPathIntegrationResult(response.data.data)
+      message.success('已添加到当前用户 PATH；请打开一个新终端后运行 opencode。')
+      await fetchStatus(false)
+    } catch (error) {
+      message.error(`PATH 配置没有完成：${errorText(error)}`)
+      throw error
+    } finally {
+      setPathSetupRunning(false)
+    }
+  }, [fetchStatus])
+
+  const offerPathSetup = useCallback((activationJob: ActivationJob) => {
+    const path = activationJob.path_integration
+    if (!path?.supported || !path.managed_install || path.configured || !activationJob.command) return
+    if (pathPromptedJobs.current.has(activationJob.id)) return
+    pathPromptedJobs.current.add(activationJob.id)
+    Modal.confirm({
+      title: 'OpenCode 已安装，要加入 PATH 吗？',
+      width: 560,
+      content: (
+        <Space direction="vertical" size="small">
+          <Text>
+            添加后，可以在新打开的 PowerShell、CMD 或其他终端中直接输入 <Text code>opencode</Text> 启动。
+          </Text>
+          <Text type="secondary">只修改当前 Windows 用户，不需要管理员权限；不添加也不影响司命继续使用 OpenCode。</Text>
+          <Text type="secondary" copyable>{path.directory}</Text>
+        </Space>
+      ),
+      okText: '添加到 PATH',
+      cancelText: '暂不添加',
+      onOk: async () => {
+        await addOpenCodeToPath()
+      },
+    })
+  }, [addOpenCodeToPath])
+
   useEffect(() => {
     if (status?.opencode_mcp_configured) {
       setMcpConfigured(true)
@@ -221,9 +281,12 @@ export function GettingStartedPanel() {
       return
     }
     const activationJob = status.activation_job || null
-    if (activationJob && activationJob.status !== 'ready') setJob(activationJob)
+    if (activationJob && activationJob.status !== 'ready') {
+      setJob(activationJob)
+      offerPathSetup(activationJob)
+    }
     setSelectedModel((current) => current || status.recommended_model || status.free_models?.[0]?.id)
-  }, [status])
+  }, [offerPathSetup, status])
 
   useEffect(() => {
     if (status?.has_usable_models) return
@@ -234,6 +297,7 @@ export function GettingStartedPanel() {
         const response = await apiClient.get<ApiEnvelope<ActivationJob>>(`/config/getting-started/opencode/jobs/${job.id}`)
         const next = response.data.data
         setJob(next)
+        offerPathSetup(next)
         if (next.status === 'ready') {
           localStorage.removeItem('siming_getting_started_deferred')
           await fetchStatus(false)
@@ -243,7 +307,7 @@ export function GettingStartedPanel() {
       }
     }, 1000)
     return () => window.clearTimeout(timer)
-  }, [fetchStatus, job, status?.has_usable_models])
+  }, [fetchStatus, job, offerPathSetup, status?.has_usable_models])
 
   const startActivation = async () => {
     setSetupError('')
@@ -251,7 +315,10 @@ export function GettingStartedPanel() {
       const response = await apiClient.post<ApiEnvelope<ActivationJob>>('/config/getting-started/opencode/activate', {
         preferred_model: selectedModel || null,
       })
-      setJob(response.data.data)
+      const next = response.data.data
+      setPathIntegrationResult(undefined)
+      setJob(next)
+      offerPathSetup(next)
     } catch (error) {
       setSetupError(errorText(error))
     }
@@ -262,7 +329,9 @@ export function GettingStartedPanel() {
     setSetupError('')
     try {
       const response = await apiClient.post<ApiEnvelope<ActivationJob>>(`/config/getting-started/opencode/jobs/${job.id}/retry`)
-      setJob(response.data.data)
+      const next = response.data.data
+      setJob(next)
+      offerPathSetup(next)
     } catch (error) {
       setSetupError(errorText(error))
     }
@@ -334,6 +403,30 @@ export function GettingStartedPanel() {
   }
 
   const ready = job?.status === 'ready' || status.has_usable_models
+  const pathIntegration = pathIntegrationResult || job?.path_integration || status.path_integration
+  const shouldOfferPathSetup = Boolean(
+    ready
+      && pathIntegration?.supported
+      && pathIntegration.managed_install
+      && !pathIntegration.configured,
+  )
+  const pathSetupNotice = shouldOfferPathSetup ? (
+    <Alert
+      className="getting-started-path-notice"
+      type="info"
+      showIcon
+      message="需要在终端直接启动 OpenCode？"
+      description="可将司命托管的 OpenCode 目录添加到当前用户 PATH。添加后请打开新终端，再输入 opencode；暂不添加不会影响司命使用。"
+      action={(
+        <Button
+          loading={pathSetupRunning}
+          onClick={() => void addOpenCodeToPath().catch(() => undefined)}
+        >
+          添加到 PATH
+        </Button>
+      )}
+    />
+  ) : null
   const availableModel = status.global_model || status.available_model
   const activeModel = availableModel
     ? `${availableModel.provider}:${availableModel.model}`
@@ -371,12 +464,20 @@ export function GettingStartedPanel() {
               </Button>
               <Button disabled={mcpSetupRunning} onClick={deferMcpSetup}>暂时跳过</Button>
             </Space>
+            {pathSetupNotice}
           </section>
         </div>
       </div>
     )
   }
-  if (ready) return <FirstIdea modelReady model={activeModel} />
+  if (ready) {
+    return (
+      <div className="getting-started-ready-stack">
+        {pathSetupNotice}
+        <FirstIdea modelReady model={activeModel} />
+      </div>
+    )
+  }
 
   const running = Boolean(job && ['pending', 'running'].includes(job.status))
   const downloaded = formatBytes(job?.bytes_downloaded)

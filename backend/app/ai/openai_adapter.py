@@ -4,10 +4,10 @@ from typing import Any, AsyncGenerator, Optional
 from urllib.parse import urlparse
 
 import httpx
-from openai import AsyncOpenAI, APIError, APITimeoutError, APIConnectionError, AuthenticationError
+from openai import APIConnectionError, APIError, APITimeoutError, AsyncOpenAI, AuthenticationError
 
-from .base import BaseAdapter
 from ..core.exceptions import LLMError
+from .base import BaseAdapter
 
 
 class OpenAIClientProxy:
@@ -57,6 +57,50 @@ def _extract_tool_calls(message) -> list[dict] | None:
             },
         })
     return result or None
+
+
+def normalize_openai_tool_call_delta(
+    tool_call: object,
+    buffers: dict[int, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Normalize one OpenAI-compatible tool delta without losing its name.
+
+    Some providers send id, function name, and short arguments in one frame,
+    while others split them across several frames. Emit the name exactly once
+    for either shape so every downstream collector sees the same protocol.
+    """
+
+    index = int(getattr(tool_call, "index", 0) or 0)
+    call_id = str(getattr(tool_call, "id", "") or "")
+    function = getattr(tool_call, "function", None)
+    incoming_name = str(getattr(function, "name", "") or "")
+    arguments_delta = str(getattr(function, "arguments", "") or "")
+    buffer = buffers.setdefault(index, {
+        "id": "",
+        "name": "",
+        "arguments": "",
+        "name_emitted": False,
+    })
+    if call_id:
+        buffer["id"] = call_id
+    if incoming_name:
+        buffer["name"] = incoming_name
+    if arguments_delta:
+        buffer["arguments"] += arguments_delta
+
+    name_delta = None
+    if buffer["name"] and not buffer["name_emitted"]:
+        name_delta = buffer["name"]
+        buffer["name_emitted"] = True
+    if not (call_id or name_delta or arguments_delta):
+        return None
+    return {
+        "type": "tool_call_delta",
+        "index": index,
+        "id": buffer["id"],
+        "name": name_delta,
+        "arguments_delta": arguments_delta,
+    }
 
 
 def message_reasoning_content(message: object) -> str:
@@ -422,18 +466,26 @@ class OpenAIAdapter(BaseAdapter):
                 response = getattr(event, "response", None)
                 error = getattr(response, "error", None)
                 raise LLMError(str(getattr(error, "message", None) or error or "Responses API generation failed"))
-            if event_type == "response.completed":
+            if event_type in {"response.completed", "response.incomplete"}:
                 response = getattr(event, "response", None)
                 completed = True
                 yield {
                     "type": "done",
-                    "finish_reason": str(getattr(response, "status", "completed") or "completed"),
+                    "finish_reason": str(
+                        getattr(response, "status", None)
+                        or ("incomplete" if event_type == "response.incomplete" else "completed")
+                    ),
                     "usage": _responses_usage(response),
                     "provider_state": _responses_provider_state(response),
                 }
 
         if not completed:
-            yield {"type": "done", "finish_reason": "stop", "usage": None, "provider_state": []}
+            yield {
+                "type": "done",
+                "finish_reason": "incomplete",
+                "usage": None,
+                "provider_state": [],
+            }
 
     async def chat_completion(
         self,
@@ -503,6 +555,7 @@ class OpenAIAdapter(BaseAdapter):
         extra_body: Optional[dict] = None,
     ) -> AsyncGenerator[str, None]:
         """Text-only streaming — no tool calls surfaced. Use stream_chat_completion_with_tools for tools."""
+        self.last_stream_finish_reason = None
         try:
             if self.api_protocol == "responses":
                 async for chunk in self._stream_responses_completion(
@@ -515,6 +568,10 @@ class OpenAIAdapter(BaseAdapter):
                 ):
                     if chunk.get("type") == "content_delta":
                         yield str(chunk.get("delta") or "")
+                    elif chunk.get("type") == "done":
+                        self.last_stream_finish_reason = str(
+                            chunk.get("finish_reason") or "stop"
+                        )
                 return
             client = self._get_client()
             kwargs = compact_openai_kwargs(dict(
@@ -532,9 +589,12 @@ class OpenAIAdapter(BaseAdapter):
                 choices = getattr(chunk, "choices", None) or []
                 if not choices:
                     continue
+                if getattr(choices[0], "finish_reason", None):
+                    self.last_stream_finish_reason = str(choices[0].finish_reason)
                 delta = getattr(getattr(choices[0], "delta", None), "content", None)
                 if delta:
                     yield delta
+            self.last_stream_finish_reason = self.last_stream_finish_reason or "incomplete"
         except AuthenticationError as e:
             raise LLMError(f"OpenAI API Key 无效: {e}")
         except APITimeoutError as e:
@@ -633,34 +693,15 @@ class OpenAIAdapter(BaseAdapter):
                 tool_calls = getattr(delta, "tool_calls", None)
                 if tool_calls:
                     for tc in tool_calls:
-                        idx = tc.index
-                        if idx not in tool_call_buffers:
-                            tool_call_buffers[idx] = {"id": tc.id or "", "name": "", "arguments": ""}
-                        buf = tool_call_buffers[idx]
-                        if tc.id:
-                            buf["id"] = tc.id
-                        if tc.function and tc.function.name:
-                            buf["name"] = tc.function.name
-                        if tc.function and tc.function.arguments:
-                            buf["arguments"] += tc.function.arguments
-                            yield {
-                                "type": "tool_call_delta",
-                                "index": idx,
-                                "id": buf["id"],
-                                "name": None,
-                                "arguments_delta": tc.function.arguments,
-                            }
-                        elif tc.id:
-                            # Initial chunk with just the id
-                            yield {
-                                "type": "tool_call_delta",
-                                "index": idx,
-                                "id": tc.id,
-                                "name": tc.function.name if tc.function else None,
-                                "arguments_delta": "",
-                            }
+                        event = normalize_openai_tool_call_delta(tc, tool_call_buffers)
+                        if event:
+                            yield event
 
-            yield {"type": "done", "finish_reason": finish_reason or "stop", "usage": usage}
+            yield {
+                "type": "done",
+                "finish_reason": finish_reason or "incomplete",
+                "usage": usage,
+            }
 
         except AuthenticationError as e:
             raise LLMError(f"OpenAI API Key 无效: {e}")

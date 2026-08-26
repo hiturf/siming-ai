@@ -10,6 +10,7 @@ import com.siming.mobile.data.MobileCatalogingProgress
 import com.siming.mobile.data.MobileExportFile
 import com.siming.mobile.data.MobileNovelImportFile
 import com.siming.mobile.data.creation.CreationExecutionRoute
+import com.siming.mobile.data.creation.CreationAgentProgressEvent
 import com.siming.mobile.data.creation.CreationStartInput
 import com.siming.mobile.data.toUserFacingMessage
 import com.siming.mobile.data.local.LocalConflict
@@ -44,6 +45,7 @@ data class MobileUiState(
     val pairing: VerifiedPairing? = null,
     val pairingStatus: String? = null,
     val assistantOutput: String = "",
+    val assistantReasoning: String = "",
     val assistantActivity: String = "",
     val assistantRunning: Boolean = false,
     val directApi: DirectApiSummary? = null,
@@ -51,6 +53,8 @@ data class MobileUiState(
     val activeCreationId: String? = null,
     val creationRunning: Boolean = false,
     val creationActivity: String = "",
+    val creationReplyDelta: String = "",
+    val creationProgressEvents: List<CreationAgentProgressEvent> = emptyList(),
     val pendingCatalogingProjectId: String? = null,
     val importedChapterCount: Int = 0,
     val catalogingProjectId: String? = null,
@@ -122,9 +126,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val sessionId = started["id"]?.jsonPrimitive?.contentOrNull
                 ?: error("立项草稿缺少 id")
             uiState.value = uiState.value.copy(activeCreationId = sessionId)
-            repository.runCreationAgentTurn(sessionId, input.brief) { activity ->
-                uiState.value = uiState.value.copy(creationActivity = activity)
-            }
+            repository.runCreationAgentTurn(sessionId, input.brief, ::showCreationProgress)
             "Creation Agent 已边聊边写入第一轮立项资料"
         }
     }
@@ -140,9 +142,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun sendCreationMessage(sessionId: String, message: String) {
         if (message.isBlank()) return
         launchCreation("Creation Agent 正在处理…") {
-            repository.runCreationAgentTurn(sessionId, message) { activity ->
-                uiState.value = uiState.value.copy(creationActivity = activity)
-            }
+            repository.runCreationAgentTurn(sessionId, message, ::showCreationProgress)
             "本轮已完成；确定事实已立即写入结构化立项资料"
         }
     }
@@ -291,6 +291,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         apiKey: String,
         model: String,
         protocol: String,
+        availableModels: List<String>,
+        taskModels: Map<String, String>,
         onConfigured: () -> Unit,
     ) {
         viewModelScope.launch {
@@ -300,8 +302,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 error = null,
             )
             try {
+                var discovered = uiState.value.discoveredModels
                 val effectiveModel = model.trim().ifBlank {
                     val models = repository.discoverDirectModels(baseUrl, apiKey)
+                    discovered = models
                     uiState.value = uiState.value.copy(discoveredModels = models)
                     models.firstOrNull()
                         ?: error("接口没有返回可用模型，请手动填写模型名后重试")
@@ -312,6 +316,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     apiKey,
                     effectiveModel,
                     protocol,
+                    (availableModels + discovered + effectiveModel).distinct(),
+                    taskModels,
                 )
                 uiState.value = uiState.value.copy(
                     busy = false,
@@ -741,7 +747,6 @@ private fun updateCatalogingProgress(
 
     fun runAssistant(
         projectId: String,
-        scope: String,
         prompt: String,
         modelRoute: AssistantModelRoute,
     ) {
@@ -750,11 +755,12 @@ private fun updateCatalogingProgress(
             uiState.value = uiState.value.copy(
                 assistantRunning = true,
                 assistantOutput = "",
+                assistantReasoning = "",
                 assistantActivity = "正在加载与 PC 同源的工作区流程…",
                 error = null,
             )
             try {
-                val route = repository.runAssistant(projectId, scope, prompt, modelRoute) { event ->
+                val route = repository.runAssistant(projectId, prompt, modelRoute) { event ->
                     val update = parseAssistantEvent(event)
                     val current = uiState.value
                     uiState.value = uiState.value.copy(
@@ -762,6 +768,11 @@ private fun updateCatalogingProgress(
                             update.output == null -> current.assistantOutput
                             update.replaceOutput -> update.output
                             else -> current.assistantOutput + update.output
+                        },
+                        assistantReasoning = when {
+                            update.reasoning == null -> current.assistantReasoning
+                            update.replaceReasoning -> update.reasoning
+                            else -> current.assistantReasoning + update.reasoning
                         },
                         assistantActivity = update.activity ?: current.assistantActivity,
                     )
@@ -872,6 +883,8 @@ private fun updateCatalogingProgress(
             uiState.value = uiState.value.copy(
                 creationRunning = true,
                 creationActivity = label,
+                creationReplyDelta = "",
+                creationProgressEvents = emptyList(),
                 error = null,
             )
             try {
@@ -888,6 +901,22 @@ private fun updateCatalogingProgress(
         }
     }
 
+    private suspend fun showCreationProgress(event: CreationAgentProgressEvent) {
+        val current = uiState.value
+        val duplicate = event.sequence > 0 && current.creationProgressEvents.any {
+            it.clientTurnId == event.clientTurnId && it.sequence == event.sequence
+        }
+        if (duplicate) return
+        val delta = (event.data["delta"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+        uiState.value = current.copy(
+            creationActivity = event.message.ifBlank { current.creationActivity },
+            creationReplyDelta = if (event.type == "reply_delta") {
+                current.creationReplyDelta + delta
+            } else current.creationReplyDelta,
+            creationProgressEvents = (current.creationProgressEvents + event).takeLast(80),
+        )
+    }
+
     private fun showError(error: Throwable) {
         uiState.value = uiState.value.copy(error = error.toUserFacingMessage())
     }
@@ -902,16 +931,28 @@ private fun updateCatalogingProgress(
         val message = event["message"]?.jsonPrimitive?.contentOrNull
         val detail = event["detail"]?.jsonPrimitive?.contentOrNull
         val tool = event["tool"]?.jsonPrimitive?.contentOrNull
+        val delta = event["delta"]?.jsonPrimitive?.contentOrNull.orEmpty()
 
         when (type) {
-            "content" -> AssistantEventUpdate(output = directContent.orEmpty())
+            "content_delta" -> AssistantEventUpdate(output = delta)
+            "reasoning_delta" -> AssistantEventUpdate(
+                reasoning = delta,
+                activity = "模型正在思考…",
+            )
             "complete" -> {
                 val data = event["data"] as? JsonObject
                 val reply = data?.get("reply")?.jsonPrimitive?.contentOrNull
                     ?: (data?.get("message") as? JsonObject)
                         ?.get("content")?.jsonPrimitive?.contentOrNull
                     ?: directContent.orEmpty()
-                AssistantEventUpdate(output = reply, replaceOutput = true, activity = "")
+                val reasoning = data?.get("reasoning_content")?.jsonPrimitive?.contentOrNull
+                AssistantEventUpdate(
+                    output = reply,
+                    replaceOutput = true,
+                    reasoning = reasoning,
+                    replaceReasoning = reasoning != null,
+                    activity = "",
+                )
             }
             "done" -> AssistantEventUpdate(activity = "")
             "error", "permission_required" -> AssistantEventUpdate(
@@ -919,7 +960,6 @@ private fun updateCatalogingProgress(
                 replaceOutput = true,
                 activity = "",
             )
-            "thinking", "thinking_delta" -> AssistantEventUpdate(activity = "模型正在生成回复…")
             "tool_call" -> AssistantEventUpdate(activity = "模型准备调用：${tool ?: "工作区工具"}")
             "tool", "search_result", "write_result" -> AssistantEventUpdate(
                 activity = detail ?: message ?: tool?.let { "$it 已执行" } ?: "工作区工具已执行",
@@ -942,6 +982,8 @@ private fun updateCatalogingProgress(
 private data class AssistantEventUpdate(
     val output: String? = null,
     val replaceOutput: Boolean = false,
+    val reasoning: String? = null,
+    val replaceReasoning: Boolean = false,
     val activity: String? = null,
 )
 

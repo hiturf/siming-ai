@@ -1,7 +1,6 @@
 """Workspace assistant services."""
 from .executor import execute_workspace_action
 from .registry import registry
-from .types import WorkspaceActionDependencies
 from .utils import (
     WORLD_DIMENSIONS,
     _character_ids_from_names,
@@ -30,7 +29,6 @@ from .utils import (
 
 __all__ = [
     "registry",
-    "WorkspaceActionDependencies",
     "WORLD_DIMENSIONS",
     "execute_workspace_action",
     "character_payload",

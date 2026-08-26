@@ -36,13 +36,11 @@ from app.services.novel_creation_task_runtime import invoke_durable_creation_act
 from app.services.novel_creation_workspace import serialize_session
 from app.services.workspace.run_log import resolve_assistant_model
 from app.routers.novel_creation import (
-    CreationConversationCommandRequest,
     NovelCreationConfirmAndGenerateRequest,
     NovelCreationStageRetryRequest,
     NovelCreationStageConfirmRequest,
     confirm_and_generate_recommended,
     confirm_creation_stage,
-    creation_conversation_command,
     retry_creation_stage_run,
 )
 from app.services.novel_creation_workspace import initialize_session_draft, save_stage
@@ -180,7 +178,10 @@ def test_retry_uses_the_selected_original_or_latest_input_snapshot(
     )
     db.add(session)
     db.flush()
-    previous = create_run(db, session, "characters", {"model": "openai:first"})
+    previous = create_run(db, session, "characters", {
+        "model": "openai:first",
+        "context_manifest_id": "old-small-budget",
+    })
     previous.status = "failed"
     session.draft_json = {"marker": "latest", "stages": {}}
     session.revision = 3
@@ -204,39 +205,9 @@ def test_retry_uses_the_selected_original_or_latest_input_snapshot(
     assert run.request_json["input_snapshot"]["marker"] == expected_marker
     assert run.request_json["retry_mode"] == expected_mode
     assert run.request_json["model"] == "openai:retry"
+    assert "context_manifest_id" not in run.request_json
+    assert run.context_manifest_id is None
     schedule.assert_called_once()
-
-
-def test_chat_command_starts_targeted_creation_run_without_navigation() -> None:
-    db = _db()
-    session = NovelCreationSession(
-        mode="internal_llm",
-        status="drafting",
-        revision=4,
-        draft_json={"stages": {}},
-    )
-    db.add(session)
-    db.commit()
-
-    def capture_task(coro):
-        coro.close()
-        return MagicMock()
-
-    with patch("app.routers.novel_creation.asyncio.create_task", side_effect=capture_task):
-        response = asyncio.run(creation_conversation_command(
-            CreationConversationCommandRequest(
-                session_id=session.id,
-                stage="characters",
-                instruction="主角不动，重做反派",
-                action="refine_artifact",
-            ),
-            db,
-        ))
-
-    assert response.data["run"]["stage"] == "characters"
-    assert response.data["run"]["operation"] == "refine"
-    assert response.data["ui_directive"]["navigate"] is False
-    assert db.query(NovelCreationRunClaim).filter_by(session_id=session.id).count() == 1
 
 
 def test_creation_run_supports_durable_pause_and_checkpoint_resume() -> None:

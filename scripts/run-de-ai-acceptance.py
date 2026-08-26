@@ -348,7 +348,6 @@ def _style_context() -> str:
 def _generate_source(base_url: str, model: str, scenario: dict) -> dict:
     system = CHAPTER_PACK.build_system_prompt(
         style_context="叙事视角服从本轮大纲。文风自然、克制，人物说话符合身份。",
-        writing_directives="本次只生成基础正文，不执行去除AI味或质量评审。",
     )
     user = (
         f"请根据下列细纲写一章完整正文，正文目标2200至2600个中文字符。不要写章节标题，"

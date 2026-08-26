@@ -1,6 +1,7 @@
 """Shared database query helpers used by routers."""
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -14,6 +15,16 @@ def get_project_or_404(db: Session, project_id: str) -> Project:
     if not project:
         raise NotFoundError("作品不存在")
     return project
+
+
+def existing_project_ids(db: Session, project_ids: Iterable[str]) -> set[str]:
+    values = {str(value).strip() for value in project_ids if str(value).strip()}
+    if not values:
+        return set()
+    return {
+        str(row[0])
+        for row in db.query(Project.id).filter(Project.id.in_(values)).all()
+    }
 
 
 def get_character_or_404(db: Session, project_id: str, character_id: str) -> Character:

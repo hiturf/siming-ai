@@ -21,7 +21,6 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.round
 
 /** Standalone execution of the same V3 interview/stage prompt contract as PC. */
 internal class MobileCreationAgent(
@@ -95,7 +94,7 @@ internal class MobileCreationAgent(
             put("source_project_id", JsonNull)
             put("created_project_id", JsonNull)
             put("status", "drafting")
-            put("mode", "hybrid")
+            put("mode", "internal_llm")
             put("schema_version", contract.schemaVersion)
             put("current_stage", "constraints")
             put("revision", 0)
@@ -139,7 +138,6 @@ internal class MobileCreationAgent(
     var sourceLabel = "model"
     var warning = ""
     var repairMethod = ""
-    var rawResponsePreview = ""
     val data = try {
         parseStageData(stage, raw, stageBaseline, source.objectValue("draft"))
     } catch (initialError: Exception) {
@@ -159,26 +157,24 @@ internal class MobileCreationAgent(
             )
         } catch (error: CancellationException) {
             throw error
-        } catch (_: Exception) {
-            null
+        } catch (repairError: Exception) {
+            throw IllegalArgumentException(
+                "模型阶段输出无效，且同模型结构修复失败：${repairError.message.orEmpty()}",
+                initialError,
+            )
         }
-        val repairedData = repaired?.let { repairedRaw ->
-            runCatching {
-                parseStageData(stage, repairedRaw, stageBaseline, source.objectValue("draft"))
-            }.getOrNull()
+        val repairedData = try {
+            parseStageData(stage, repaired, stageBaseline, source.objectValue("draft"))
+        } catch (repairError: Exception) {
+            throw IllegalArgumentException(
+                "模型阶段输出无效，且同模型结构修复后仍不符合工具契约：${repairError.message.orEmpty()}",
+                initialError,
+            )
         }
-        if (repairedData != null) {
-            sourceLabel = "model_repaired"
-            warning = "模型返回的结构已自动修复；请像 PC 端一样先审阅再确认。"
-            repairMethod = "model_json"
-            repairedData
-        } else {
-            sourceLabel = "contract_fallback"
-            warning = "模型回复格式不可用，已保留可编辑安全草稿；请重点检查后再确认。"
-            repairMethod = "safe_partial_draft"
-            rawResponsePreview = raw.take(4_000)
-            safeFallbackData(source, stage, raw)
-        }
+        sourceLabel = "model_repaired"
+        warning = "模型返回的结构已自动修复；请像 PC 端一样先审阅再确认。"
+        repairMethod = "model_json"
+        repairedData
     }
     return writeStage(
         source,
@@ -188,7 +184,6 @@ internal class MobileCreationAgent(
         sourceLabel = sourceLabel,
         warning = warning,
         repairMethod = repairMethod,
-        rawResponsePreview = rawResponsePreview,
     )
 }
 
@@ -200,101 +195,14 @@ internal class MobileCreationAgent(
     ): JsonObject {
         val parsed = parseObject(raw)
         val rawData = (parsed["data"] as? JsonObject) ?: parsed
-        if (stage != "concepts") validateAuthorRequirements(stage, rawData, stageBaseline, draft)
         val data = if (stage == "concepts") {
             normalizeConcepts(rawData)
         } else {
             normalizeStage(stage, rawData, stageBaseline)
         }
         validateStage(stage, data)
-        validateAuthorRequirements(stage, data, stageBaseline, draft)
         return data
     }
-
-    internal fun safeFallbackData(source: JsonObject, stage: String, raw: String): JsonObject {
-    require(stage in contract.stageOrder && stage != "constraints") { "未知立项阶段" }
-    val draft = source.objectValue("draft")
-    val stageBaseline = baseline(source, stage)
-    if (stage == "concepts") {
-        safePartialConceptData(raw, draft)?.let { return it }
-        val fallback = normalizeConcepts(buildJsonObject {
-            put("concepts", JsonArray(listOf(safeConceptCard(draft))))
-        })
-        validateStage(stage, fallback)
-        validateAuthorRequirements(stage, fallback, JsonObject(emptyMap()), draft)
-        return fallback
-    }
-    runCatching { parseStageData(stage, raw, stageBaseline, draft) }
-        .getOrNull()
-        ?.let { return it }
-    validateStage(stage, stageBaseline)
-    validateAuthorRequirements(stage, stageBaseline, stageBaseline, draft)
-    return stageBaseline
-}
-
-private fun safePartialConceptData(raw: String, draft: JsonObject): JsonObject? {
-    val parsed = MobileCreationJsonRepair.parseObjectDetailed(raw)?.value ?: return null
-    val payload = (parsed["data"] as? JsonObject) ?: parsed
-    val rows = (payload["concepts"] as? JsonArray)
-        ?: (payload["options"] as? JsonArray)
-        ?: return null
-    val sourceCard = rows.firstOrNull() as? JsonObject ?: return null
-    val baseCard = safeConceptCard(draft)
-    val merged = baseCard.toMutableMap().apply { putAll(sourceCard) }
-    val protagonist = baseCard.objectValue("protagonist_seed").toMutableMap().apply {
-        (sourceCard["protagonist_seed"] as? JsonObject)?.let { putAll(it) }
-    }
-    merged["protagonist_seed"] = JsonObject(protagonist)
-    return try {
-        val data = normalizeConcepts(buildJsonObject {
-            put("concepts", JsonArray(listOf(JsonObject(merged))))
-        })
-        validateStage("concepts", data)
-        validateAuthorRequirements("concepts", data, JsonObject(emptyMap()), draft)
-        data
-    } catch (_: Exception) {
-        null
-    }
-}
-
-private fun safeConceptCard(draft: JsonObject): JsonObject {
-    val form = draft.objectValue("form")
-    val brief = draft.string("author_brief")
-        .ifBlank { form.string("brief") }
-        .ifBlank { "待补充故事方案" }
-    val requirements = draft.arrayValue("locked_requirements")
-        .map(::stringElement)
-        .filter(String::isNotBlank)
-    val lockedSource = buildList {
-        add(brief)
-        addAll(requirements)
-    }.joinToString("；")
-    val protagonistName = Regex("(?:^|[，。；])\\s*([^，。；]{2,20}?)(?:必须是|必须为|是)")
-        .find(lockedSource)
-        ?.groupValues
-        ?.getOrNull(1)
-        ?.trim()
-        .orEmpty()
-        .ifBlank { "待确认主角" }
-    val titleSeed = brief.substringBefore('。').substringBefore('，').take(20).ifBlank { "作者方案" }
-    return buildJsonObject {
-        put("title", titleSeed)
-        put("subtitle", "依据作者原始设定整理，可继续编辑")
-        put("logline", brief.take(120))
-        put("protagonist_seed", buildJsonObject {
-            put("name", protagonistName)
-            put("identity", lockedSource.take(500))
-            put("goal", "落实作者方案中的首要目标")
-            put("lack", "待作者确认")
-        })
-        put("world_hook", lockedSource.take(500))
-        put("core_conflict", lockedSource.take(500))
-        put("story_engine", "遵循作者大纲持续推进")
-        put("opening_hook", "从作者指定的起点切入")
-        put("differentiators", strings(requirements.ifEmpty { listOf("保留作者原始设定") }))
-        put("risks", strings(listOf("这是模型格式异常后的安全草稿，请在继续前检查")))
-    }
-}
 
     internal fun replaceArtifact(
         source: JsonObject,
@@ -304,7 +212,6 @@ private fun safeConceptCard(draft: JsonObject): JsonObject {
     ): JsonObject {
         require(stage in contract.stageOrder) { "未知立项阶段" }
         validateStage(stage, data)
-        validateAuthorRequirements(stage, data, baseline(source, stage), source.objectValue("draft"))
         return writeStage(source, stage, data, status = "generated", sourceLabel = sourceLabel)
     }
 
@@ -343,7 +250,6 @@ private fun safeConceptCard(draft: JsonObject): JsonObject {
         sourceLabel: String,
         warning: String = "",
         repairMethod: String = "",
-        rawResponsePreview: String = "",
     ): JsonObject = updateDraft(source) { draft ->
         val stages = (draft["stages"] as? JsonObject ?: JsonObject(emptyMap())).toMutableMap()
         val previous = stages[stage] as? JsonObject
@@ -366,7 +272,6 @@ private fun safeConceptCard(draft: JsonObject): JsonObject {
             put("source", sourceLabel)
             if (warning.isNotBlank()) put("warning", warning)
             if (repairMethod.isNotBlank()) put("repair_method", repairMethod)
-            if (rawResponsePreview.isNotBlank()) put("raw_response_preview", rawResponsePreview.take(4_000))
             put("updated_at", Instant.now().toString())
         }
         draft["stages"] = JsonObject(stages)
@@ -409,31 +314,33 @@ private fun safeConceptCard(draft: JsonObject): JsonObject {
         val rows = raw["concepts"] as? JsonArray
             ?: raw["options"] as? JsonArray
             ?: error("模型没有返回创意卡数组")
-        require(rows.size == 1) { "PC V3 创意方向必须恰好包含一张卡" }
-        val card = rows.first().jsonObject
-        val protagonist = card.objectValue("protagonist_seed")
-        val normalized = buildJsonObject {
-            put("id", card.string("id").ifBlank { "concept-1" })
-            put("source_index", 0)
-            put("title", card.string("title").ifBlank { "创意方向 1" })
-            put("subtitle", card.string("subtitle"))
-            put("logline", card.string("logline"))
-            put("protagonist_seed", buildJsonObject {
-                put("name", protagonist.string("name").ifBlank { "待命名主角" })
-                put("identity", protagonist.string("identity"))
-                put("goal", protagonist.string("goal"))
-                put("lack", protagonist.string("lack"))
-            })
-            put("world_hook", card.string("world_hook"))
-            put("core_conflict", card.string("core_conflict"))
-            put("story_engine", card.string("story_engine").ifBlank { card.string("core_conflict") })
-            put("opening_hook", card.string("opening_hook"))
-            put("differentiators", card.arrayValue("differentiators").takeArray(3))
-            put("risks", card.arrayValue("risks").takeArray(2))
-            put("coverage", normalizedCoverage(card))
+        require(rows.isNotEmpty()) { "创意方向没有可用的方案卡" }
+        val normalized = rows.mapIndexed { index, rawCard ->
+            val card = rawCard.jsonObject
+            val protagonist = card.objectValue("protagonist_seed")
+            buildJsonObject {
+                put("id", card.string("id").ifBlank { "concept-${index + 1}" })
+                put("source_index", index)
+                put("title", card.string("title").ifBlank { "创意方向 ${index + 1}" })
+                put("subtitle", card.string("subtitle"))
+                put("logline", card.string("logline"))
+                put("protagonist_seed", buildJsonObject {
+                    put("name", protagonist.string("name").ifBlank { "待命名主角" })
+                    put("identity", protagonist.string("identity"))
+                    put("goal", protagonist.string("goal"))
+                    put("lack", protagonist.string("lack"))
+                })
+                put("world_hook", card.string("world_hook"))
+                put("core_conflict", card.string("core_conflict"))
+                put("story_engine", card.string("story_engine").ifBlank { card.string("core_conflict") })
+                put("opening_hook", card.string("opening_hook"))
+                put("differentiators", card.arrayValue("differentiators").takeArray(3))
+                put("risks", card.arrayValue("risks").takeArray(2))
+                put("coverage", normalizedCoverage(card))
+            }
         }
         return buildJsonObject {
-            put("options", JsonArray(listOf(normalized)))
+            put("options", JsonArray(normalized))
             put("selected_concept_id", JsonNull)
         }
     }
@@ -524,8 +431,8 @@ private fun safeConceptCard(draft: JsonObject): JsonObject {
             val baseProfile = base.objectValue("profile")
             val sourceProfile = (item["profile"] as? JsonObject) ?: JsonObject(emptyMap())
             val profile = baseProfile.toMutableMap().apply { putAll(sourceProfile) }
-            val rawRoleType = firstText(source["role_type"], source["role"], base["role_type"])
-            val roleType = normalizeRoleType(rawRoleType, if (index == 0) "protagonist" else "supporting")
+            val rawRoleType = firstText(source["role_type"], base["role_type"])
+            val roleType = normalizeRoleType(rawRoleType, "")
             val goal = firstText(
                 source["goal"],
                 source["current_goal"],
@@ -537,7 +444,7 @@ private fun safeConceptCard(draft: JsonObject): JsonObject {
             item["goal"] = JsonPrimitive(goal)
             item["current_goal"] = JsonPrimitive(goal)
             val background = firstText(item["background"], item["position"], item["status"])
-            item["background"] = appendRoleDescription(background, rawRoleType)?.let(::JsonPrimitive) ?: JsonNull
+            item["background"] = background.take(8_000).takeIf(String::isNotBlank)?.let(::JsonPrimitive) ?: JsonNull
             if (stringElement(profile["core_motivation"]).isBlank()) {
                 profile["core_motivation"] = JsonPrimitive(goal)
             }
@@ -574,12 +481,6 @@ private fun safeConceptCard(draft: JsonObject): JsonObject {
         var sourceVolumes = dictRows(data["volumes"], "title")
         val baseVolumes = dictRows(baseline["volumes"], "title")
         if (sourceVolumes.isEmpty()) sourceVolumes = baseVolumes
-        val requestedCount = baseline.int("requested_volume_count")
-        if (requestedCount > 0) {
-            sourceVolumes = sourceVolumes.take(requestedCount).toMutableList().apply {
-                if (size < requestedCount) addAll(baseVolumes.drop(size).take(requestedCount - size))
-            }
-        }
         val volumes = sourceVolumes.mapIndexed { index, source ->
             val base = baseVolumes.getOrNull(index) ?: JsonObject(emptyMap())
             val item = base.toMutableMap().apply { putAll(source) }
@@ -842,9 +743,9 @@ private fun safeConceptCard(draft: JsonObject): JsonObject {
 
     private fun macroOutlineBaseline(draft: JsonObject, blueprint: JsonObject, form: JsonObject): JsonObject {
         val targetChapters = form.int("target_chapters").takeIf { it > 0 } ?: 240
-        val requestedCount = requestedVolumeCount(draft)
-        val volumeCount = requestedCount ?: min(12, max(3, round(targetChapters / 100.0).toInt()))
-        val volumes = blueprint.arrayValue("volume_outline").mapNotNull { it as? JsonObject }
+        val sourceVolumes = blueprint.arrayValue("volume_outline").mapNotNull { it as? JsonObject }
+        val volumeCount = max(1, sourceVolumes.size)
+        val volumes = sourceVolumes
             .take(volumeCount)
             .toMutableList()
         while (volumes.size < volumeCount) {
@@ -866,7 +767,6 @@ private fun safeConceptCard(draft: JsonObject): JsonObject {
             put("core_conflict", blueprint.string("core_conflict"))
             put("ending_direction", blueprint.string("ending_direction").ifBlank { "主角必须以最终选择回应开篇提出的核心问题" })
             put("target_chapters", targetChapters)
-            put("requested_volume_count", requestedCount?.let(::JsonPrimitive) ?: JsonNull)
             put("volumes", JsonArray(ranged))
             put("stage_plan", buildJsonArray {
                 ranged.forEach { item ->
@@ -1094,42 +994,8 @@ private fun safeConceptCard(draft: JsonObject): JsonObject {
         values.firstNotNullOfOrNull { stringElement(it).takeIf(String::isNotBlank) }.orEmpty()
 
     private fun normalizeRoleType(value: String, default: String): String {
-        val normalized = value.trim().replace(Regex("\\s+"), " ").lowercase()
-        if (normalized.isBlank()) return default
-        if (normalized == "merged_alias") return normalized
-        ROLE_ALIASES[normalized]?.let { return it }
-        val tokens = normalized.split(Regex("[,，、/|;；\\n\\r]+"))
-            .map { it.trim(' ', '(', ')', '（', '）', '[', ']', '【', '】', ':', '\'', '"') }
-        val resolved = tokens.mapNotNull(ROLE_ALIASES::get)
-        listOf("protagonist", "antagonist", "mentor", "supporting", "other").firstOrNull {
-            it in resolved
-        }?.let { return it }
-        if (tokens.any { Regex("^(?:本书|故事)?(?:男|女)?主角(?:身份|定位)?$").matches(it) }) return "protagonist"
-        tokens.forEach { token ->
-            if (listOf("反派", "敌对", "宿敌", "villain", "antagonist").any(token::contains)) return "antagonist"
-            if (listOf("导师", "师父", "师傅", "引路", "mentor").any(token::contains)) return "mentor"
-            if (listOf("配角", "同伴", "伙伴", "亲属", "父亲", "母亲").any(token::contains)) return "supporting"
-        }
-        return default
-    }
-
-    private fun appendRoleDescription(background: String, roleValue: String): String? {
-        val current = background.trim()
-        val details = roleValue.trim().replace(Regex("\\s+"), " ")
-            .split(Regex("[,，、/|;；\\n\\r]+"))
-            .map { it.trim(' ', '(', ')', '（', '）', '[', ']', '【', '】', ':', '\'', '"') }
-            .filter { token ->
-                token.isNotBlank() &&
-                    token.lowercase() !in ROLE_ALIASES &&
-                    token.lowercase() !in setOf("protagonist", "supporting", "antagonist", "mentor", "other") &&
-                    !Regex("^(?:本书|故事)?(?:男|女)?主角(?:身份|定位)?$").matches(token)
-            }
-            .distinct()
-            .joinToString("、")
-        if (details.isBlank()) return current.take(8_000).ifBlank { null }
-        val sentence = "身份补充：$details"
-        if (details in current || sentence in current) return current.take(8_000).ifBlank { null }
-        return listOf(current, sentence).filter(String::isNotBlank).joinToString("\n\n").take(8_000)
+        val normalized = value.trim().lowercase()
+        return normalized.takeIf { it in ROLE_TYPES } ?: default
     }
 
     private fun chapterRange(value: JsonElement?): Pair<Int?, Int?> {
@@ -1156,196 +1022,22 @@ private fun safeConceptCard(draft: JsonObject): JsonObject {
         return Regex("\\d+").find(stringElement(value))?.value?.toIntOrNull() ?: fallback
     }
 
-    private fun requestedVolumeCount(draft: JsonObject): Int? {
-        val source = buildList {
-            add(draft.string("author_outline"))
-            addAll(draft.arrayValue("locked_requirements").map(::stringElement))
-        }.joinToString("\n")
-        val token = Regex("([0-9０-９零〇一二两三四五六七八九十百]+)\\s*卷")
-            .findAll(source).lastOrNull()?.groupValues?.getOrNull(1) ?: return null
-        val ascii = token.map { FULL_WIDTH_DIGITS[it] ?: it }.joinToString("")
-        val value = ascii.toIntOrNull() ?: chineseNumberToInt(ascii)
-        return value?.takeIf { it in 1..100 }
-    }
-
-    private fun chineseNumberToInt(value: String): Int? {
-        if (value.isBlank()) return null
-        val digits = mapOf('零' to 0, '〇' to 0, '一' to 1, '二' to 2, '两' to 2, '三' to 3, '四' to 4,
-            '五' to 5, '六' to 6, '七' to 7, '八' to 8, '九' to 9)
-        var total = 0
-        var current = 0
-        value.forEach { char ->
-            when (char) {
-                '十' -> { total += (if (current == 0) 1 else current) * 10; current = 0 }
-                '百' -> { total += (if (current == 0) 1 else current) * 100; current = 0 }
-                else -> current = digits[char] ?: return null
-            }
-        }
-        return total + current
-    }
-
-    private fun validateAuthorRequirements(
-        stage: String,
-        data: JsonObject,
-        baseline: JsonObject,
-        draft: JsonObject,
-    ) {
-        val requirements = draft.arrayValue("locked_requirements")
-            .map(::stringElement)
-            .filter(String::isNotBlank)
-        val requestedVolumes = requestedVolumeCount(draft)
-        if (stage == "macro_outline" && requestedVolumes != null) {
-            val volumeCount = data.arrayValue("volumes").size
-            require(volumeCount == requestedVolumes) {
-                "作者锁定要求为 $requestedVolumes 卷，模型返回 $volumeCount 卷"
-            }
-        }
-        if (requirements.isEmpty()) return
-        val outputRegions = stageSemanticRegions(stage, data)
-        val baselineText = stageSemanticRegions(stage, baseline).joinToString("")
-        val stageKeywords = mapOf(
-            "characters" to listOf("主角", "角色", "姓名", "名字", "身份"),
-            "world_style" to listOf("世界", "设定", "规则", "基调"),
-            "locations" to listOf("地点", "城市", "势力", "组织"),
-            "macro_outline" to listOf("主线", "核心", "冲突", "结局", "卷"),
-            "opening_outline" to listOf("开篇", "前三章", "前3章", "前十五章", "前15章"),
-        )
-        val missing = mutableListOf<String>()
-        requirements.forEach { requirement ->
-            var relevant = stage == "concepts" || stageKeywords[stage].orEmpty().any(requirement::contains)
-            val anchors = lockedAnchors(requirement)
-            val tokens = anchors.map(::lockText).filter(String::isNotBlank)
-            if (tokens.any(baselineText::contains)) relevant = true
-            if (!relevant || tokens.isEmpty()) return@forEach
-            if (outputRegions.none { region -> tokens.all(region::contains) }) {
-                val absent = anchors.zip(tokens).filter { (_, token) -> outputRegions.none { token in it } }.map { it.first }
-                missing += absent.ifEmpty { listOf(requirement) }
-            }
-        }
-        require(missing.isEmpty()) {
-            "模型结果删除或改写了作者锁定内容：${missing.distinct().joinToString("、")}"
-        }
-    }
-
-    private fun lockedAnchors(requirement: String): List<String> {
-        if (requirement.isBlank()) return emptyList()
-        val anchors = mutableListOf<String>()
-        Regex("[“\\\"「『]([^”\\\"」』]{2,40})[”\\\"」』]")
-            .findAll(requirement).forEach { anchors += it.groupValues[1] }
-        if ('：' in requirement || ':' in requirement) {
-            val tail = requirement.split(Regex("[：:]"), limit = 2).last().trim()
-            if (tail.length in 2..80) anchors += tail
-        }
-        Regex("^(.{2,20}?)(?:必须|不得|不可|不能)").find(requirement)?.groupValues?.getOrNull(1)
-            ?.trim('，', '。', '；', '：', ':', ' ')
-            ?.takeIf { it !in setOf("全书", "故事", "作品", "设定", "核心设定", "结局", "主角", "角色") }
-            ?.let(anchors::add)
-        Regex(
-            "(?:必须(?:保留|叫|名为|是|为|包含|采用)?|不得(?:删除|改写|修改|更名)?|" +
-                "不可(?:删除|改写|修改|更名)?|不能(?:删除|改写|修改|更名)?|保留)\\s*(.{2,80})$",
-        ).find(requirement)?.groupValues?.getOrNull(1)?.let { raw ->
-            val value = raw.replace(Regex("(?:不得|不可|不能)?(?:删除|改写|修改|更名|改变)$"), "")
-                .trim('，', '。', '；', '：', ':', ' ')
-            if (value.isNotBlank() && !Regex("[0-9０-９零〇一二两三四五六七八九十百]+卷").matches(value)) {
-                anchors += value
-            }
-        }
-        val unique = mutableListOf<String>()
-        anchors.forEach { anchor ->
-            val normalized = lockText(anchor)
-            if (normalized.length >= 2 && unique.none { lockText(it) == normalized }) unique += anchor.trim()
-        }
-        return unique
-    }
-
-    private fun lockText(value: JsonElement?): String = lockText(authorText(value))
-    private fun lockText(value: String): String = value
-        .replace(Regex("[\\s，。；：、,.!?！？;:‘’“”\\\"'（）()《》〈〉【】\\[\\]]+"), "")
-        .lowercase()
-
-    private fun semanticRegion(value: JsonObject?, fields: List<String>): String {
-        if (value == null) return ""
-        return lockText(buildJsonObject {
-            fields.forEach { field -> value[field]?.let { put(field, it) } }
-        })
-    }
-
-    private fun stageSemanticRegions(stage: String, data: JsonObject): List<String> {
-        val regions = mutableListOf<String>()
-        when (stage) {
-            "concepts" -> data.arrayValue("options").mapNotNull { it as? JsonObject }.forEach { option ->
-                regions += semanticRegion(
-                    option["protagonist_seed"] as? JsonObject,
-                    listOf("name", "identity", "goal", "lack", "background", "motivation"),
-                )
-                regions += semanticRegion(
-                    option,
-                    listOf("title", "logline", "world_hook", "core_conflict", "story_engine", "opening_hook"),
-                )
-            }
-            "characters" -> {
-                data.arrayValue("characters").mapNotNull { it as? JsonObject }.forEach {
-                    regions += semanticRegion(it, listOf(
-                        "name", "identity", "role_type", "goal", "current_goal", "background",
-                        "personality", "description", "profile",
-                    ))
-                }
-                data.arrayValue("relationships").mapNotNull { it as? JsonObject }.forEach {
-                    regions += semanticRegion(it, listOf(
-                        "source", "target", "source_name", "target_name", "relationship_type",
-                        "relation_type", "description",
-                    ))
-                }
-            }
-            "world_style" -> {
-                regions += semanticRegion(data, listOf(
-                    "writing_style", "world_tone", "story_structure", "pacing", "style_rules", "forbidden_patterns",
-                ))
-                data.arrayValue("worldbuilding").mapNotNull { it as? JsonObject }.forEach {
-                    regions += semanticRegion(it, listOf("title", "dimension", "content", "description", "rules", "summary"))
-                }
-            }
-            "locations" -> {
-                data.arrayValue("entries").mapNotNull { it as? JsonObject }.forEach {
-                    regions += semanticRegion(it, listOf("title", "dimension", "content", "description", "rules", "summary"))
-                }
-                data.arrayValue("relations").mapNotNull { it as? JsonObject }.forEach {
-                    regions += semanticRegion(it, listOf("source_title", "target_title", "relation_type", "description"))
-                }
-            }
-            "macro_outline" -> {
-                regions += semanticRegion(data, listOf("story_overview", "core_conflict", "ending_direction", "stage_plan"))
-                data.arrayValue("volumes").mapNotNull { it as? JsonObject }.forEach {
-                    regions += semanticRegion(it, listOf("title", "summary", "core_conflict", "ending", "goal"))
-                }
-            }
-            "opening_outline" -> {
-                data.arrayValue("chapters").mapNotNull { it as? JsonObject }.forEach {
-                    regions += semanticRegion(it, listOf("title", "summary", "goal", "hook", "chapter_number", "description"))
-                }
-                data.arrayValue("sections").mapNotNull { it as? JsonObject }.forEach {
-                    regions += semanticRegion(it, listOf("title", "summary", "description", "metadata"))
-                }
-            }
-            "final_review" -> regions += semanticRegion(data, listOf("blocking", "warnings", "counts"))
-        }
-        return regions.filter(String::isNotBlank)
-    }
-
     private fun validateStage(stage: String, data: JsonObject) {
         require(data.isNotEmpty()) { "模型没有返回可用的阶段对象" }
         when (stage) {
             "constraints" -> require(data.string("brief").isNotBlank()) { "创作约束缺少作品构想" }
             "concepts" -> {
                 val rows = data["options"] as? JsonArray ?: error("创意方向缺少 options")
-                require(rows.size == 1) { "创意方向必须恰好包含一张方案卡" }
-                val card = rows.first().jsonObject
-                listOf("title", "logline", "world_hook", "core_conflict", "opening_hook").forEach {
-                    require(card.string(it).isNotBlank()) { "创意方向缺少 $it" }
-                }
-                val protagonist = card.objectValue("protagonist_seed")
-                listOf("identity", "goal", "lack").forEach {
-                    require(protagonist.string(it).isNotBlank()) { "主角种子缺少 $it" }
+                require(rows.isNotEmpty()) { "创意方向没有可用的方案卡" }
+                rows.forEach { rawCard ->
+                    val card = rawCard.jsonObject
+                    listOf("title", "logline", "world_hook", "core_conflict", "opening_hook").forEach {
+                        require(card.string(it).isNotBlank()) { "创意方向缺少 $it" }
+                    }
+                    val protagonist = card.objectValue("protagonist_seed")
+                    listOf("identity", "goal", "lack").forEach {
+                        require(protagonist.string(it).isNotBlank()) { "主角种子缺少 $it" }
+                    }
                 }
             }
             "world_style" -> {
@@ -1388,10 +1080,6 @@ private fun safeConceptCard(draft: JsonObject): JsonObject {
                         it.int("start_chapter") > 0 &&
                         it.int("end_chapter") >= it.int("start_chapter")
                 }) { "分卷缺少有效章节范围或摘要" }
-                val requested = data.int("requested_volume_count")
-                require(requested <= 0 || volumes.size == requested) {
-                    "作者锁定要求为 $requested 卷，模型返回 ${volumes.size} 卷"
-                }
             }
             "opening_outline" -> {
                 val chapters = data["chapters"] as? JsonArray ?: error("前三章细纲缺少 chapters")
@@ -1434,25 +1122,6 @@ private fun safeConceptCard(draft: JsonObject): JsonObject {
         listOf(displayName, baseUrl, model).any { it.contains("deepseek", ignoreCase = true) }
 
     private companion object {
-        val FULL_WIDTH_DIGITS = mapOf(
-            '０' to '0', '１' to '1', '２' to '2', '３' to '3', '４' to '4',
-            '５' to '5', '６' to '6', '７' to '7', '８' to '8', '９' to '9',
-        )
-        val ROLE_ALIASES = mapOf(
-            "protagonist" to "protagonist", "primary" to "protagonist", "lead" to "protagonist",
-            "main character" to "protagonist", "主角" to "protagonist", "主人公" to "protagonist",
-            "男主" to "protagonist", "女主" to "protagonist", "核心主角" to "protagonist", "第一主角" to "protagonist",
-            "supporting" to "supporting", "support" to "supporting", "side character" to "supporting",
-            "deuteragonist" to "supporting", "配角" to "supporting", "重要配角" to "supporting",
-            "次要角色" to "supporting", "同伴" to "supporting", "伙伴" to "supporting", "队友" to "supporting",
-            "盟友" to "supporting", "同门" to "supporting", "家人" to "supporting", "亲属" to "supporting",
-            "父亲" to "supporting", "母亲" to "supporting", "爷爷" to "supporting", "奶奶" to "supporting",
-            "antagonist" to "antagonist", "villain" to "antagonist", "rival" to "antagonist",
-            "反派" to "antagonist", "反面角色" to "antagonist", "敌人" to "antagonist",
-            "敌对者" to "antagonist", "对手" to "antagonist", "宿敌" to "antagonist",
-            "mentor" to "mentor", "guide" to "mentor", "导师" to "mentor", "师父" to "mentor",
-            "师傅" to "mentor", "老师" to "mentor", "前辈" to "mentor", "引路人" to "mentor",
-            "other" to "other", "其他" to "other", "路人" to "other", "背景角色" to "other", "工具人" to "other",
-        )
+        val ROLE_TYPES = setOf("protagonist", "supporting", "antagonist", "mentor", "other", "merged_alias")
     }
 }

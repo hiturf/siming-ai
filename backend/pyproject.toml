@@ -7,5 +7,4 @@ select = ["B", "E", "F", "I", "SIM", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
 "alembic/versions/*.py" = ["E501"]
-"app/prompts/workspace_contract.py" = ["SIM905"]
 "tests/*.py" = ["E501"]

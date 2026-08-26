@@ -9,8 +9,8 @@ from app.modules.assistant.application.prompt_compiler import PromptCompiler
 from app.modules.assistant.domain.prompt_spec import PromptSpec
 from app.modules.assistant.infrastructure.runtime import compile_prompt_catalog
 from app.modules.continuity.interfaces.dependencies import (
+    render_cataloging_candidates_prompt,
     render_external_cataloging_prompt,
-    render_merged_cataloging_prompt,
 )
 from app.modules.creation.interfaces.dependencies import render_creation_prompt
 from app.services.workspace.registry import registry
@@ -38,20 +38,16 @@ def test_builtin_prompt_catalog_compiles_against_workspace_tools():
 
     assert set(compiled) == {
         "shared.execution-contract",
-        "assistant.workspace.fast",
         "assistant.workspace.quality",
-        "assistant.chapter.fast",
-        "assistant.chapter.fast.public",
         "assistant.chapter.quality",
         "assistant.chapter.quality.public",
         "creation.novel.stage",
-        "continuity.cataloging.merged",
+        "continuity.cataloging.facts",
+        "continuity.cataloging.candidates",
         "continuity.cataloging.external",
     }
     assert len(compiled["assistant.workspace.quality"].template) < 2_000
     assert len(compiled["assistant.chapter.quality"].template) < 1_500
-    assert len(compiled["assistant.chapter.fast"].template) < 1_500
-    assert compiled["assistant.workspace.fast"].template == compiled["assistant.workspace.quality"].template
 
 
 def test_workspace_prompt_includes_creation_fact_and_revision_contract():
@@ -89,11 +85,12 @@ def test_compiler_rejects_unknown_tools():
 
 
 def test_creation_and_continuity_facades_render_compiled_sources():
-    creation = render_creation_prompt(task_kind="概念", task_rules="返回三案")
-    merged = render_merged_cataloging_prompt()
+    creation = render_creation_prompt(task_kind="概念", task_rules="按作者本轮要求生成")
+    candidates = render_cataloging_candidates_prompt()
     external = render_external_cataloging_prompt()
 
-    assert "概念" in creation and "返回三案" in creation
-    assert "character_state_update" in merged
-    assert "phase=\"merged\"" in external
-    assert merged in external
+    assert "概念" in creation and "按作者本轮要求生成" in creation
+    assert "character_state_update" in candidates
+    assert "phase=\"facts\"" in external
+    assert "phase=\"candidates\"" in external
+    assert candidates in external

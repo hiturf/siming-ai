@@ -63,7 +63,6 @@ class ModelRuntime:
         task_type: str,
         model_override: str | None = None,
         extra_body: dict[str, Any] | None = None,
-        prefer_task_model: bool = False,
     ) -> TaskModelSelection:
         task_type = str(task_type or "").strip()
         override = str(model_override or "").strip()
@@ -72,37 +71,27 @@ class ModelRuntime:
             self._apply_task_context_length(selection, task_type, extra_body)
             return selection
 
-        if extra_body:
-            prefer_task_model = prefer_task_model or bool(
-                extra_body.get("moshu_prefer_task_model") or extra_body.get("moshu_use_task_model")
-            )
-
         setting = self._configurations.task_setting(task_type) if task_type else None
         selected = ""
         source = ""
-        if prefer_task_model and setting and not local_runtime_disabled():
-            selected = f"local_llama_cpp:{setting.model_key}"
+        if (
+            setting
+            and not local_runtime_disabled(setting.provider)
+            and self._configurations.provider(setting.provider) is not None
+        ):
+            selected = setting.model
             source = "task_setting"
         if not selected:
             config = self._configurations.global_default()
             if config and not local_runtime_disabled(config.provider):
                 selected = f"{config.provider}:{config.default_model}"
                 source = "global_default"
-        if not selected and setting and not local_runtime_disabled():
-            selected = f"local_llama_cpp:{setting.model_key}"
-            source = "task_setting_fallback"
         if not selected:
             return TaskModelSelection(model=None, source="unconfigured")
 
         selection = self._selection_from_value(selected, source)
         self._apply_task_context_length(selection, task_type, extra_body)
         return selection
-
-    def record_failure(self, provider: str, error: BaseException | object) -> None:
-        request_provider = active_request_provider()
-        if request_provider is not None and request_provider.provider == provider:
-            return
-        self._configurations.record_failure(provider, error)
 
     def _selection_from_value(self, value: str, source: str) -> TaskModelSelection:
         try:
@@ -131,7 +120,12 @@ class ModelRuntime:
         if extra_body.get("moshu_context_length"):
             return
         setting = self._configurations.task_setting(task_type)
-        if setting and setting.context_length and selection.model_name == setting.model_key:
+        if (
+            setting
+            and setting.provider == "local_llama_cpp"
+            and setting.context_length
+            and selection.model_name == setting.model_name
+        ):
             extra_body["moshu_context_length"] = setting.context_length
 
     @staticmethod

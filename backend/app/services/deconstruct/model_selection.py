@@ -6,7 +6,8 @@ from sqlalchemy.orm import Session
 from ...core.model_limits import ModelSafetyLimits, effective_model_limits
 from ...database.models import APIConfig
 from ...database.session import SessionLocal
-from .constants import CHEAP_MODEL_BY_PROVIDER, DEFAULT_MAP_CONCURRENCY, MAP_MAX_TOKENS, MAX_MAP_CONCURRENCY
+from ...modules.model_runtime.application.execution import model_executor as LLMGateway
+from .constants import DEFAULT_MAP_CONCURRENCY, MAP_MAX_TOKENS, MAX_MAP_CONCURRENCY
 
 
 def module_options_from_payload(payload) -> dict:
@@ -32,18 +33,9 @@ def analysis_mode_from_payload(payload) -> str:
     return "fast"
 
 
-def configured_model_for_provider(provider: Optional[str], db: Session) -> Optional[str]:
-    if provider:
-        cfg = db.query(APIConfig).filter(APIConfig.provider == provider).first()
-        if cfg:
-            return f"{cfg.provider}:{cfg.default_model}"
-    cfg = db.query(APIConfig).filter(APIConfig.is_global_default == True).first()
-    if cfg:
-        return f"{cfg.provider}:{cfg.default_model}"
-    cfg = db.query(APIConfig).order_by(APIConfig.created_at.desc()).first()
-    if cfg:
-        return f"{cfg.provider}:{cfg.default_model}"
-    return None
+def _deconstruct_default_model() -> Optional[str]:
+    selection = LLMGateway.select_model_for_task(task_type="deconstruct")
+    return selection.model
 
 
 def provider_from_model(model: Optional[str], db: Session) -> Optional[str]:
@@ -53,49 +45,16 @@ def provider_from_model(model: Optional[str], db: Session) -> Optional[str]:
         cfg = db.query(APIConfig).filter(APIConfig.default_model == model).first()
         if cfg:
             return cfg.provider
-    default_model = configured_model_for_provider(None, db)
+    default_model = _deconstruct_default_model()
     if default_model and ":" in default_model:
         return default_model.split(":", 1)[0]
     return None
 
 
-def cheapest_model_for(model: Optional[str]) -> Optional[str]:
-    db = SessionLocal()
-    try:
-        provider = provider_from_model(model, db)
-        if not provider:
-            return model or configured_model_for_provider(None, db)
-        cheap_model = CHEAP_MODEL_BY_PROVIDER.get(provider)
-        if not cheap_model:
-            return configured_model_for_provider(provider, db) or model
-        return f"{provider}:{cheap_model}"
-    finally:
-        db.close()
-
-
-def default_configured_model() -> Optional[str]:
-    db = SessionLocal()
-    try:
-        return configured_model_for_provider(None, db)
-    finally:
-        db.close()
-
-
 def models_from_payload(payload) -> tuple[Optional[str], Optional[str]]:
-    if payload.map_model or payload.reduce_model:
-        map_model = payload.map_model or payload.model
-        reduce_model = payload.reduce_model or payload.model or map_model
-        return map_model, reduce_model
-
-    base_model = payload.model
-    mode = analysis_mode_from_payload(payload)
-    if mode == "detailed":
-        selected_model = base_model or default_configured_model()
-        return selected_model, selected_model
-
-    cheap_model = cheapest_model_for(base_model)
-    map_model = cheap_model or base_model
-    reduce_model = cheap_model or base_model or map_model
+    base_model = payload.model or _deconstruct_default_model()
+    map_model = payload.map_model or base_model
+    reduce_model = payload.reduce_model or base_model or map_model
     return map_model, reduce_model
 
 

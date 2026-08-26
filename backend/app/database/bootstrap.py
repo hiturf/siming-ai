@@ -29,6 +29,9 @@ KNOWN_CORE_COLUMNS = {
     "outline_nodes": {"id", "project_id", "title"},
     "worldbuilding_entries": {"id", "project_id", "title"},
 }
+RETIRED_DATA_ONLY_REVISIONS = {
+    "300a19_runtime_readiness": "300a18_user_chapter_cataloging",
+}
 
 
 @dataclass(frozen=True)
@@ -67,6 +70,47 @@ def _head_revision(config: Config) -> str:
     if not head:
         raise RuntimeError("No Alembic head revision is available.")
     return head
+
+
+def _retired_revision_target(config: Config, current: str | None) -> str | None:
+    target = RETIRED_DATA_ONLY_REVISIONS.get(str(current or ""))
+    if not target:
+        return None
+    # Only normalize to a revision that is actually present in this build.
+    if ScriptDirectory.from_config(config).get_revision(target) is None:
+        raise RuntimeError(f"Retired revision target is unavailable: {target}")
+    return target
+
+
+def _normalize_retired_revision(
+    target_engine: Engine,
+    *,
+    current: str,
+    target: str,
+) -> None:
+    """Restamp one shipped data-only revision whose migration file was retired."""
+
+    with target_engine.begin() as connection:
+        result = connection.execute(
+            text(
+                "UPDATE alembic_version SET version_num = :target "
+                "WHERE version_num = :current"
+            ),
+            {"current": current, "target": target},
+        )
+        if result.rowcount != 1:
+            raise RuntimeError(
+                f"Could not normalize retired revision {current!r} to {target!r}."
+            )
+        if "siming_schema_metadata" in inspect(connection).get_table_names():
+            connection.execute(
+                text(
+                    "UPDATE siming_schema_metadata "
+                    "SET value = :target, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE key = 'alembic_revision'"
+                ),
+                {"target": target},
+            )
 
 
 def _classify_unversioned_schema(target_engine: Engine) -> tuple[str, str]:
@@ -150,6 +194,20 @@ def bootstrap_database(
         head = _head_revision(config)
         current = _current_revision(target_engine)
         mode = "versioned"
+        retired_revision = str(current or "")
+        retired_target = _retired_revision_target(config, current)
+        if retired_target:
+            backup_path = backup_sqlite_database(
+                url,
+                reason=f"pre-{APP_VERSION}-retired-revision",
+            )
+            _normalize_retired_revision(
+                target_engine,
+                current=retired_revision,
+                target=retired_target,
+            )
+            current = retired_target
+            mode = "retired_revision_normalized"
         if current is None:
             mode, detail = _classify_unversioned_schema(target_engine)
             if mode == "unknown":
@@ -163,15 +221,21 @@ def bootstrap_database(
             if refresh_current_metadata:
                 _record_schema_epoch(target_engine, head)
             return DatabaseBootstrapResult(
-                mode="ready",
+                mode="migrated" if mode == "retired_revision_normalized" else "ready",
                 schema_revision=head,
-                message="Database schema is current.",
+                message=(
+                    f"Normalized retired database revision {retired_revision} to {head}."
+                    if mode == "retired_revision_normalized"
+                    else "Database schema is current."
+                ),
+                backup_path=str(backup_path) if backup_path else None,
             )
 
-        backup_path = backup_sqlite_database(
-            url,
-            reason=f"pre-{APP_VERSION}",
-        )
+        if backup_path is None:
+            backup_path = backup_sqlite_database(
+                url,
+                reason=f"pre-{APP_VERSION}",
+            )
         with target_engine.begin() as connection:
             config.attributes["connection"] = connection
             command.upgrade(config, "head")

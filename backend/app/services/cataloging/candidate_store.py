@@ -14,7 +14,7 @@ from ..story_granularity import (
     NARRATIVE_STATE_FIELDS,
     has_chapter_narrative_state,
 )
-from .candidate_io import candidate_payload, float_or_none
+from .candidate_io import float_or_none
 from .candidate_validation import inspect_candidate_coverage
 from .constants import VALID_ITEM_TYPES
 from .jsonl import (
@@ -25,7 +25,8 @@ from .jsonl import (
     parse_candidate_response_records,
     parse_json_line,
 )
-from ..character_role_types import append_character_role_description, normalize_character_role_type
+from .repair_identity import has_stable_profile_evidence, is_anonymous_character
+from ..character_role_types import normalize_character_role_type
 
 _SIGNATURE_PAYLOAD_KEYS = (
     "dimension",
@@ -77,7 +78,6 @@ def _normalize_character_role_payload(normalized: dict[str, Any]) -> None:
         return
     if payload.get("role_type") not in (None, ""):
         raw_role = payload.get("role_type")
-        payload["background"] = append_character_role_description(payload.get("background"), raw_role)
         payload["role_type"] = normalize_character_role_type(raw_role)
 
 
@@ -220,6 +220,12 @@ def _skip_reason_for_candidate(normalized: dict[str, Any]) -> str | None:
         identity = _candidate_identity(normalized, "id", "target_id", "target_name", "name", "character_name")
         if _is_placeholder_name(identity):
             return "角色候选缺少可识别姓名或ID，已跳过，避免生成未命名角色"
+        if (
+            item_type in {"character_create", "character_update"}
+            and is_anonymous_character(identity)
+            and not has_stable_profile_evidence(payload)
+        ):
+            return "身份未确认且缺少稳定档案，已保留为章节线索"
         if item_type == "character_state_update" and not _has_any_text(payload, _CHARACTER_STATE_KEYS):
             return f"角色状态候选 {identity} 没有状态字段，已跳过"
         if item_type in {"character_create", "character_update"} and not _has_any_text(
@@ -308,10 +314,8 @@ def _matching_candidate(
     # correct.
     if item_type == "chapter_summary":
         return query.order_by(CatalogingCandidate.sort_order.asc()).first()
-    # One cataloging run owns exactly one chapter-level outline. A summary-only
-    # response may have caused Siming to project it deterministically, and a
-    # later repair call may then provide the model-authored version. Upgrade
-    # that staged card in place instead of creating duplicate chapter nodes.
+    # One cataloging run owns exactly one chapter-level outline. Incremental
+    # model repairs upgrade that staged card instead of creating duplicates.
     if item_type in {"outline_create", "outline_update"}:
         node_type = str(normalized["payload"].get("node_type") or "chapter").lower()
         if node_type == "chapter":
@@ -327,7 +331,52 @@ def _matching_candidate(
     return None
 
 
-def _merge_candidate_payload(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+def _merge_unique_values(existing: list[Any], incoming: list[Any]) -> list[Any]:
+    merged = list(existing)
+    signatures = {
+        json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+        for item in merged
+    }
+    for item in incoming:
+        signature = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+        if signature not in signatures:
+            merged.append(item)
+            signatures.add(signature)
+    return merged
+
+
+def _positive_int(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _merge_coverage_manifest(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    """Only add to an accepted manifest; a retry cannot shrink its contract."""
+
+    merged = dict(existing)
+    for key, value in incoming.items():
+        old_value = merged.get(key)
+        if key == "scene_count":
+            merged[key] = max(_positive_int(old_value), _positive_int(value)) or value
+        elif isinstance(old_value, list) and isinstance(value, list):
+            merged[key] = _merge_unique_values(old_value, value)
+        elif key not in merged or old_value in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
+def _merge_candidate_payload(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+    *,
+    item_type: str = "",
+) -> dict[str, Any]:
     merged = dict(existing)
     for key, value in incoming.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
@@ -338,6 +387,18 @@ def _merge_candidate_payload(existing: dict[str, Any], incoming: dict[str, Any])
         # data that was already staged.
         if key not in merged or value not in (None, "", [], {}):
             merged[key] = value
+    if item_type == "chapter_summary":
+        old_manifest = existing.get("coverage_manifest")
+        new_manifest = incoming.get("coverage_manifest")
+        if isinstance(old_manifest, dict) and isinstance(new_manifest, dict):
+            merged["coverage_manifest"] = _merge_coverage_manifest(
+                old_manifest,
+                new_manifest,
+            )
+        old_scene_count = _positive_int(existing.get("scene_count"))
+        new_scene_count = _positive_int(incoming.get("scene_count"))
+        if old_scene_count or new_scene_count:
+            merged["scene_count"] = max(old_scene_count, new_scene_count)
     return merged
 
 
@@ -376,12 +437,30 @@ def try_create_candidates(
     text = clean_jsonl_text(line)
     if not text:
         return []
+    last_sort_order = (
+        db.query(CatalogingCandidate.sort_order)
+        .filter(CatalogingCandidate.chapter_run_id == run.id)
+        .order_by(CatalogingCandidate.sort_order.desc())
+        .first()
+    )
+    next_sort_order = (
+        int(last_sort_order[0] or 0) + 1
+        if last_sort_order is not None
+        else 0
+    )
+    base_sort_order = max(int(sort_order or 0), next_sort_order)
     try:
         parsed = parse_json_line(text)
         if parsed is None:
             return []
         return [
-            create_candidate_from_raw(db, job, run, record, sort_order + offset)
+            create_candidate_from_raw(
+                db,
+                job,
+                run,
+                record,
+                base_sort_order + offset,
+            )
             for offset, record in enumerate(expand_candidate_records(parsed))
         ]
     except Exception as exc:
@@ -426,104 +505,6 @@ def _existing_recovery_candidates(
         )
         .all()
     )
-
-
-def _required_outline_preview(
-    run: CatalogingChapterRun,
-    items: list[Any],
-) -> dict[str, Any] | None:
-    """Return the deterministic outline card used by recovery coverage."""
-
-    if inspect_candidate_coverage(items).has_chapter_outline or run.chapter is None:
-        return None
-    for item in items:
-        item_type = (
-            str(item.get("item_type") or item.get("type") or "")
-            if isinstance(item, dict)
-            else str(getattr(item, "item_type", "") or "")
-        )
-        if item_type != "chapter_summary":
-            continue
-        payload = (
-            item.get("payload", item)
-            if isinstance(item, dict)
-            else candidate_payload(item)
-        )
-        if not isinstance(payload, dict):
-            continue
-        summary_text = _clean_value(
-            payload.get("summary_text")
-            or payload.get("summary")
-            or payload.get("content")
-        )
-        if not summary_text:
-            continue
-        return {
-            "item_type": "outline_create",
-            "status": "pending",
-            "payload": {
-                "node_type": "chapter",
-                "title": run.chapter.title,
-                "summary": summary_text,
-                "actual_summary": summary_text,
-                "status": "completed",
-            },
-        }
-    return None
-
-
-def ensure_required_chapter_outline(
-    db: Session,
-    job: CatalogingJob,
-    run: CatalogingChapterRun,
-) -> CatalogingCandidate | None:
-    """Project a missing chapter outline from the persisted summary.
-
-    The chapter title is authoritative data and the summary is already a
-    staged review artifact. Creating this structural card does not infer any
-    character, relationship, or setting, and avoids an expensive full model
-    retry when the provider stops after a valid summary.
-    """
-
-    existing = _existing_recovery_candidates(db, run)
-    if inspect_candidate_coverage(existing).has_chapter_outline:
-        return None
-    summary = next(
-        (
-            item
-            for item in existing
-            if item.item_type == "chapter_summary"
-            and _clean_value(
-                candidate_payload(item).get("summary_text")
-                or candidate_payload(item).get("summary")
-            )
-        ),
-        None,
-    )
-    chapter = run.chapter
-    if summary is None or chapter is None:
-        return None
-    payload = candidate_payload(summary)
-    summary_text = _clean_value(payload.get("summary_text") or payload.get("summary"))
-    sort_order = db.query(CatalogingCandidate).filter(
-        CatalogingCandidate.chapter_run_id == run.id,
-    ).count()
-    created = create_candidate_from_raw(
-        db,
-        job,
-        run,
-        {
-            "type": "outline_create",
-            "node_type": "chapter",
-            "title": chapter.title,
-            "summary": summary_text,
-            "actual_summary": summary_text,
-            "status": "completed",
-        },
-        sort_order,
-        source_task="deterministic_required_outline",
-    )
-    return created.get("candidate")
 
 
 def _preview_response_records(
@@ -573,9 +554,6 @@ def recover_candidates_from_response_text(
     )
     existing = _existing_recovery_candidates(db, run)
     proposed = [*existing, *preview]
-    outline_preview = _required_outline_preview(run, proposed)
-    if outline_preview is not None:
-        proposed.append(outline_preview)
     coverage = inspect_candidate_coverage(
         proposed,
         db=db,
@@ -602,9 +580,6 @@ def recover_candidates_from_response_text(
         )
         for offset, record in enumerate(valid_records)
     ]
-    projected_outline = ensure_required_chapter_outline(db, job, run)
-    if projected_outline is not None:
-        results.append({"candidate": projected_outline, "deterministic": True})
     final_coverage = inspect_candidate_coverage(
         _existing_recovery_candidates(db, run),
         db=db,
@@ -640,13 +615,7 @@ def recover_candidates_from_raw_output(
             source_task="raw_output_recovery",
         )
         attempt_items = list(preview)
-        attempt_outline = _required_outline_preview(run, attempt_items)
-        if attempt_outline is not None:
-            attempt_items.append(attempt_outline)
         combined_items = [*existing, *preview]
-        combined_outline = _required_outline_preview(run, combined_items)
-        if combined_outline is not None:
-            combined_items.append(combined_outline)
         attempt_coverage = inspect_candidate_coverage(
             attempt_items,
             db=db,
@@ -718,7 +687,11 @@ def create_candidate_from_raw(
     matching = _matching_candidate(db, job, run, normalized)
     if matching:
         old_payload = _payload_from_candidate(matching)
-        merged_payload = _merge_candidate_payload(old_payload, normalized["payload"])
+        merged_payload = _merge_candidate_payload(
+            old_payload,
+            normalized["payload"],
+            item_type=normalized["item_type"],
+        )
         if merged_payload == old_payload:
             return {"duplicate": True}
         matching.raw_payload = json.dumps(merged_payload, ensure_ascii=False)

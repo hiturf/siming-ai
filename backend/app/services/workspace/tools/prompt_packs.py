@@ -96,9 +96,9 @@ async def get_moshu_usage_guide(
                 "如果需要 Siming 代为启动本机 CLI，调用 start_local_cli_agent_run(task_type='cataloging')，再通过 AgentRun 事件查看进度。",
                 "调用 get_prompt_pack(pack_id='cataloging_external_no_api') 读取建档提示词和输出契约。",
                 "调用 start_external_cataloging_job 创建外部建档任务。",
-                "默认使用融合流程：逐章调用 get_next_external_cataloging_chapter(phase='merged')，读取章节正文和档案镜像。",
-                "直接生成候选并调用 save_external_cataloging_candidates(phase='merged') -> apply_pending_cataloging；不要单独保存 facts。",
-                "每章 apply 后调用 verify_external_cataloging_progress；发现 pending_candidates、chapters_facts_saved 或 warnings 时先处理，不要跳过关键章节。若存在 chapters_facts_saved，说明是旧两阶段残留，只按工具提示补完候选阶段。",
+                "逐章调用 get_next_external_cataloging_chapter(phase='facts')，只读当前章并调用 save_external_cataloging_facts。",
+                "再领取同一章 phase='candidates'，调用 list_cataloging_facts，读取当前档案镜像并调用 save_external_cataloging_candidates -> apply_pending_cataloging。",
+                "每章 apply 后调用 verify_external_cataloging_progress；前一章完成前不得处理下一章。发现缺项时只补工具明确列出的缺项。",
                 "最终调用 get_project_archive_status，确认角色、大纲、世界观、章节摘要数量符合预期后再报告完成。",
             ],
             "forbidden_tools": internal_llm_tools,
@@ -116,12 +116,11 @@ async def get_moshu_usage_guide(
         "writing_no_api": {
             "title": "API-free 写作，由外部 Agent 生成正文",
             "steps": [
-                "如果需要 Siming 代为启动本机 CLI，调用 start_local_cli_agent_run(task_type='writing')，再通过 AgentRun 事件查看进度。",
                 "调用 prepare_external_writing_context 获取大纲、角色、世界观、摘要和基础写作提示词。",
                 "外部 Agent 一次生成基础正文；本任务不执行去除 AI 味改写或质量评审。",
-                "调用 save_external_chapter_draft 保存完整草稿；聊天里不要完整输出正文。",
-                "调用 create_chapter，传入 draft_id/content_ref 和 skip_style_repair=true；正式写入会自动创建统一建档任务。确认返回 cataloging_job.job_id，并按 next_action 继续外部建档或等待后台任务，不要重复生成候选。",
-                "去除 AI 味和质量评审是独立操作，只在用户另行发起时执行。",
+                "调用 save_external_chapter_draft 保存完整的未入库草稿，然后立即结束本轮。",
+                "不得继续写入正式章节、角色或世界观，也不得启动或查询建档。",
+                "正式保存与启动建档由作者在界面选择；去除 AI 味和质量评分直接读取编辑器当前草稿。",
             ],
             "forbidden_tools": internal_llm_tools,
         },
@@ -130,8 +129,8 @@ async def get_moshu_usage_guide(
             "steps": [
                 "只有用户明确授权使用司命内部 API/内部模型时才能进入此流程。",
                 "确认 MCP 权限包为 internal_llm。",
-                "内部写作只执行检索上下文、一次生成正文、保存和写后连续性归档。",
-                "质量模式使用更完整的正文提示词，快速模式使用更短的直写提示词；两者都不自动执行去除 AI 味或质量评审。",
+                "内部写作只执行检索上下文和一次生成正文，并将结果作为未入库草稿载入编辑器后立即结束。",
+                "章节正文只使用质量提示词。正式保存和建档由作者在界面决定。",
                 "去除 AI 味和质量评审是独立操作，只在用户另行发起时执行。",
                 "内部写作会消耗系统设置里的模型 API 额度。",
             ],
@@ -230,7 +229,6 @@ async def get_prompt_pack(
         # Map scope+mode to pack_id
         scope_mode_map = {
             ("chapter_writing", "quality"): "chapter_writing_quality",
-            ("chapter_writing", "fast"): "chapter_writing_fast",
             ("chapter_review", "quality"): "chapter_review_quality",
             ("new_project", ""): "new_project_setup",
             ("character_design", ""): "character_design",
@@ -269,20 +267,12 @@ async def get_prompt_pack(
     system_prompt = pack.system_prompt
     effective_pack_id = pack.pack_id
     requested_pack_id = requested_pack_id or pack.pack_id
-    if pack.pack_id in ("chapter_writing_quality", "chapter_writing_fast"):
-        from app.prompts.prompt_source import (
-            get_public_chapter_fast_system_prompt,
-            get_public_chapter_quality_system_prompt,
-        )
+    if pack.pack_id == "chapter_writing_quality":
+        from app.prompts.prompt_source import get_public_chapter_quality_system_prompt
         from app.prompts.style_prompts import build_style_context
         from app.database.models import Project
 
-        prompt_builder = (
-            get_public_chapter_fast_system_prompt
-            if pack.pack_id == "chapter_writing_fast"
-            else get_public_chapter_quality_system_prompt
-        )
-        system_prompt = prompt_builder()
+        system_prompt = get_public_chapter_quality_system_prompt()
         project = db.query(Project).filter(Project.id == project_id).first() if project_id else None
         if project:
             style_ctx = build_style_context(project, include_anti_ai=False)
@@ -290,7 +280,7 @@ async def get_prompt_pack(
 
     quality_rubric = pack.quality_rubric_json
     forbidden_patterns = pack.forbidden_patterns_json
-    if pack.pack_id in ("chapter_writing_quality", "chapter_writing_fast"):
+    if pack.pack_id == "chapter_writing_quality":
         quality_rubric = None
         forbidden_patterns = []
 

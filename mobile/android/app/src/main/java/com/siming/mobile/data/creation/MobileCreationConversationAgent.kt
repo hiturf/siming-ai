@@ -1,6 +1,7 @@
 package com.siming.mobile.data.creation
 
 import android.content.Context
+import com.siming.mobile.data.network.DirectAgentToolCall
 import com.siming.mobile.data.network.DirectApiClient
 import com.siming.mobile.data.network.DirectApiConfig
 import java.time.Instant
@@ -20,7 +21,11 @@ internal data class MobileCreationConversationResult(
     val session: JsonObject,
     val reply: String,
     val toolResults: JsonArray,
+    val modelMessages: JsonArray,
+    val replayable: Boolean,
+    val status: String,
     val createdProjectId: String? = null,
+    val promptMetrics: JsonArray = JsonArray(emptyList()),
 )
 
 /**
@@ -54,50 +59,155 @@ internal class MobileCreationConversationAgent(
     suspend fun run(
         source: JsonObject,
         message: String,
-        history: List<JsonObject>,
+        turns: List<JsonObject>,
         config: DirectApiConfig,
-        onProgress: suspend (String) -> Unit = {},
+        onProgress: suspend (CreationAgentProgressEvent) -> Unit = {},
     ): MobileCreationConversationResult {
         require(message.isNotBlank()) { "请输入你想告诉 AI 的内容" }
         var working = source
         var createdProjectId: String? = null
         val toolResults = mutableListOf<JsonElement>()
+        val turnProtocolMessages = mutableListOf<JsonElement>()
+        val promptMetrics = mutableListOf<JsonElement>()
         val messages = mutableListOf<JsonObject>()
         messages += chatMessage("system", contract.systemPrompt(source.string("id")))
-        history.takeLast(12).forEach { item ->
-            val role = item.string("role")
-            val content = item.string("content")
-            if (role in setOf("user", "assistant") && content.isNotBlank()) {
-                messages += chatMessage(role, content.take(80_000))
-            }
-        }
-        messages += chatMessage("user", message)
+        messages += CreationAgentTurnRecords.replayMessages(turns)
+        val userMessage = chatMessage("user", message)
+        messages += userMessage
         val extraBody = if (config.isDeepSeek()) buildJsonObject {
             put("thinking", buildJsonObject { put("type", "disabled") })
         } else null
 
         var finalReply = ""
         var iteration = 0
+        var activeCategories = emptyList<String>()
+        var categorySelected = false
+        var successfulWriteCount = 0
+        var failedWriteCount = 0
         while (iteration < contract.maxIterations && finalReply.isBlank()) {
-            onProgress(if (iteration == 0) "正在读取立项数据并理解这句话…" else "正在根据已写入的数据继续判断…")
+            onProgress(CreationAgentProgressEvent(
+                type = "model_step_started",
+                message = if (iteration == 0) "正在判断需要哪些立项能力…" else "正在根据真实工具结果继续处理…",
+                data = buildJsonObject { put("iteration", iteration + 1) },
+            ))
+            val writesClosed = successfulWriteCount >= contract.maxSuccessfulWritesPerTurn ||
+                failedWriteCount >= contract.maxFailedWritesPerTurn
+            val scopedTools = if (categorySelected && writesClosed) {
+                JsonArray(emptyList())
+            } else {
+                contract.toolSchemas(activeCategories)
+            }
             val turn = directApi.agentTurn(
                 config = config,
                 messages = messages,
-                tools = contract.toolSchemas,
+                tools = scopedTools,
+                toolChoice = when {
+                    !categorySelected -> "required"
+                    writesClosed -> null
+                    else -> "auto"
+                },
                 maxOutputTokens = 6_000,
                 temperature = 0.25,
                 extraBody = extraBody,
             )
-            messages += turn.assistantMessage
-            if (turn.toolCalls.isEmpty()) {
+            promptMetrics += promptMetric(
+                iteration = iteration + 1,
+                phase = "standalone",
+                activeCategories = activeCategories,
+                messages = messages,
+                tools = scopedTools,
+                promptTokens = turn.promptTokens,
+            )
+            val calls = turn.toolCalls.take(12)
+            if (calls.isEmpty()) {
+                check(categorySelected) {
+                    "模型没有调用本步骤唯一开放的 set_tool_categories，本轮未接受文字回复"
+                }
                 finalReply = turn.content.trim()
                 break
             }
 
-            for (call in turn.toolCalls.take(12)) {
-                onProgress("正在执行：${toolLabel(call.name)}")
+            val categoryCall = calls.firstOrNull { it.name == contract.categoryController }
+            if (categoryCall != null) {
+                val assistantToolMessage = assistantToolMessage(turn.content, listOf(categoryCall))
+                messages += assistantToolMessage
+                turnProtocolMessages += assistantToolMessage
+                val selected = runCatching {
+                    contract.normalizeCategories(
+                        (categoryCall.arguments["enabled_categories"] as? JsonArray)
+                            .orEmpty()
+                            .mapNotNull { (it as? JsonPrimitive)?.contentOrNull },
+                    )
+                }
+                val categoryResult = selected.fold(
+                    onSuccess = contract::categoryResult,
+                    onFailure = { result(categoryCall.name, "error", it.message ?: "工具类别参数无效") },
+                )
+                toolResults += categoryResult
+                val toolMessage = buildJsonObject {
+                    put("role", "tool")
+                    put("tool_call_id", categoryCall.id)
+                    put("content", categoryResult.toString().take(120_000))
+                }
+                messages += toolMessage
+                turnProtocolMessages += toolMessage
+                selected.getOrNull()?.let { categories ->
+                    activeCategories = categories
+                    categorySelected = true
+                    onProgress(CreationAgentProgressEvent(
+                        type = "tool_categories_changed",
+                        message = categoryResult.string("detail"),
+                        status = "ok",
+                        data = categoryResult["data"] as? JsonObject ?: JsonObject(emptyMap()),
+                    ))
+                }
+                iteration += 1
+                continue
+            }
+
+            val assistantToolMessage = assistantToolMessage(turn.content, calls)
+            messages += assistantToolMessage
+            turnProtocolMessages += assistantToolMessage
+
+            val availableTools = contract.availableToolNames(activeCategories)
+            for (call in calls) {
+                var attemptedWrite = false
                 val execution = try {
-                    execute(working, call.name, call.arguments, config)
+                    when {
+                        call.name !in availableTools -> ToolExecution(
+                            working,
+                            result(call.name, "skipped", "该工具当前未向立项会话开放"),
+                        )
+                        call.name in contract.writeToolNames &&
+                            successfulWriteCount >= contract.maxSuccessfulWritesPerTurn -> ToolExecution(
+                            working,
+                            result(
+                                call.name,
+                                "denied",
+                                "本条用户消息已经成功写入一次；本轮不得继续确认、生成或修改其他资料。请结束回复并等待作者的下一条消息。",
+                                buildJsonObject { put("reason", "successful_write_limit") },
+                            ),
+                        )
+                        call.name in contract.writeToolNames &&
+                            failedWriteCount >= contract.maxFailedWritesPerTurn -> ToolExecution(
+                            working,
+                            result(
+                                call.name,
+                                "denied",
+                                "本轮写入失败已达上限；为避免自动重试循环，本轮写工具已经关闭。",
+                                buildJsonObject { put("reason", "failed_write_limit") },
+                            ),
+                        )
+                        else -> {
+                            attemptedWrite = call.name in contract.writeToolNames
+                            onProgress(CreationAgentProgressEvent(
+                                type = "tool_started",
+                                message = "正在${toolLabel(call.name)}…",
+                                data = buildJsonObject { put("tool", call.name) },
+                            ))
+                            execute(working, call.name, call.arguments, config)
+                        }
+                    }
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Exception) {
@@ -110,44 +220,161 @@ internal class MobileCreationConversationAgent(
                 execution.createdProjectId?.let { createdProjectId = it }
                 toolResults += execution.result
                 if (execution.wrote) persistSession(working)
-                messages += buildJsonObject {
+                if (attemptedWrite) {
+                    if (execution.result.string("status") in setOf("ok", "running")) {
+                        successfulWriteCount += 1
+                    } else {
+                        failedWriteCount += 1
+                    }
+                }
+                onProgress(CreationAgentProgressEvent(
+                    type = "tool_completed",
+                    message = execution.result.string("detail").ifBlank { "${toolLabel(call.name)}完成" },
+                    status = execution.result.string("status").ifBlank { "ok" },
+                    data = buildJsonObject {
+                        put("tool", call.name)
+                        put("label", toolLabel(call.name))
+                    },
+                ))
+                if (attemptedWrite && failedWriteCount == contract.maxFailedWritesPerTurn) {
+                    onProgress(CreationAgentProgressEvent(
+                        type = "tool_completed",
+                        message = "写入连续失败已达上限，本轮已停止自动重试",
+                        status = "denied",
+                        data = buildJsonObject {
+                            put("tool", call.name)
+                            put("turn_boundary", "failed_write_limit")
+                            put("failed_writes", failedWriteCount)
+                        },
+                    ))
+                }
+                val toolMessage = buildJsonObject {
                     put("role", "tool")
                     put("tool_call_id", call.id)
                     put("content", execution.result.toString().take(120_000))
                 }
+                messages += toolMessage
+                turnProtocolMessages += toolMessage
             }
             iteration += 1
         }
 
         if (finalReply.isBlank() && toolResults.isNotEmpty()) {
-            onProgress("正在根据真实写入结果整理回复…")
-            finalReply = runCatching {
+            onProgress(CreationAgentProgressEvent(
+                type = "model_step_started",
+                message = "正在根据真实写入结果整理回复…",
+            ))
+            val summaryMessages = messages + chatMessage(
+                "user",
+                "请根据以上真实工具结果，用两到四句中文说明本轮实际写入/读取了什么，然后提出一个基于当前数据缺口的后续问题。不要声称失败的写入已保存。",
+            )
+            val summaryTurn = runCatching {
                 directApi.agentTurn(
                     config = config,
-                    messages = messages + chatMessage(
-                        "user",
-                        "请根据以上真实工具结果，用两到四句中文说明本轮实际写入/读取了什么，然后提出一个基于当前数据缺口的后续问题。不要声称失败的写入已保存。",
-                    ),
+                    messages = summaryMessages,
                     tools = JsonArray(emptyList()),
                     maxOutputTokens = 1_200,
                     temperature = 0.2,
                     extraBody = extraBody,
-                ).content.trim()
-            }.getOrDefault("")
+                )
+            }.getOrNull()
+            promptMetrics += promptMetric(
+                iteration = promptMetrics.size + 1,
+                phase = "summary",
+                activeCategories = activeCategories,
+                messages = summaryMessages,
+                tools = JsonArray(emptyList()),
+                promptTokens = summaryTurn?.promptTokens,
+            )
+            finalReply = summaryTurn?.content?.trim().orEmpty()
+        }
+        if (createdProjectId != null) {
+            finalReply = "正式作品已创建并进入作品库。请点击下方按钮进入正式作品；进入后项目助手会自动展开，后续正文与项目资料都在那里继续。"
         }
         if (finalReply.isBlank()) {
-            val successes = toolResults.mapNotNull { it as? JsonObject }
-                .filter { it.string("status") in setOf("ok", "running") }
+            val writes = toolResults.mapNotNull { it as? JsonObject }
+                .filter { it.string("tool") in contract.writeToolNames && it.string("status") in setOf("ok", "running") }
                 .map { it.string("detail") }
                 .filter(String::isNotBlank)
                 .take(3)
-            finalReply = if (successes.isNotEmpty()) {
-                "本轮已完成：${successes.joinToString("；")}。接下来你最想补充哪一部分？"
-            } else {
-                "我已经读取当前立项上下文，但这轮没有产生可确认的写入。你可以继续说一个角色、设定、冲突或大纲想法。"
-            }
+            finalReply = if (writes.isNotEmpty()) {
+                "本轮已完成：${writes.joinToString("；")}。接下来你最想补充哪一部分？"
+            } else truthfulNoWrite(toolResults)
         }
-        return MobileCreationConversationResult(working, finalReply, JsonArray(toolResults), createdProjectId)
+        finalReply.chunked(240).forEach { delta ->
+            onProgress(CreationAgentProgressEvent(
+                type = "reply_delta",
+                message = "",
+                status = "ok",
+                data = buildJsonObject { put("delta", delta) },
+            ))
+        }
+        val modelMessages = buildJsonArray {
+            add(userMessage)
+            turnProtocolMessages.forEach(::add)
+            add(chatMessage("assistant", finalReply.take(80_000)))
+        }
+        return MobileCreationConversationResult(
+            working,
+            finalReply,
+            JsonArray(toolResults),
+            modelMessages,
+            replayable = true,
+            status = "completed",
+            createdProjectId = createdProjectId,
+            promptMetrics = JsonArray(promptMetrics),
+        )
+    }
+
+    private fun promptMetric(
+        iteration: Int,
+        phase: String,
+        activeCategories: List<String>,
+        messages: List<JsonObject>,
+        tools: JsonArray,
+        promptTokens: Int?,
+    ): JsonObject {
+        val systemPrompt = messages.firstOrNull { it.string("role") == "system" }
+            ?.string("content")
+            .orEmpty()
+        val requestProjection = buildJsonObject {
+            put("messages", JsonArray(messages))
+            put("tools", tools)
+        }.toString()
+        return buildJsonObject {
+            put("iteration", iteration)
+            put("phase", phase)
+            put("enabled_categories", JsonArray(activeCategories.map(::JsonPrimitive)))
+            put("tool_count", tools.size)
+            put("tool_schema_estimated_tokens", estimateTokens(tools.toString()))
+            put("system_prompt_estimated_tokens", estimateTokens(systemPrompt))
+            put("request_estimated_tokens", estimateTokens(requestProjection))
+            if (promptTokens == null) put("prompt_tokens", JsonNull)
+            else put("prompt_tokens", promptTokens.coerceAtLeast(0))
+            put("usage_reported", promptTokens != null)
+        }
+    }
+
+    private fun estimateTokens(text: String): Int {
+        if (text.isEmpty()) return 0
+        val cjkCount = text.count { char ->
+            char in '\u4E00'..'\u9FFF' || char in '\u3400'..'\u4DBF'
+        }
+        return cjkCount + maxOf(1, (text.length - cjkCount) / 4)
+    }
+
+    private fun truthfulNoWrite(toolResults: List<JsonElement>): String {
+        val results = toolResults.mapNotNull { it as? JsonObject }
+        val failures = results
+            .filter { it.string("status") !in setOf("ok", "running") }
+            .map { it.string("detail").ifBlank { "工具未完成" } }
+        if (failures.isNotEmpty()) return "本轮没有保存任何修改：${failures.last()}。请调整要求后重试。"
+        val readSucceeded = results.any {
+            it.string("status") == "ok" && it.string("tool") !in contract.writeToolNames
+        }
+        if (readSucceeded) return "本轮只完成了立项工具读取，没有保存任何修改。请明确要写入的对象和内容后重试。"
+        if (results.isNotEmpty()) return "本轮执行了立项工具，但没有产生可确认的写入。请调整要求后重试。"
+        return "本轮未执行任何立项工具，因此没有读取或修改立项数据。请重试。"
     }
 
     private suspend fun execute(
@@ -160,7 +387,7 @@ internal class MobileCreationConversationAgent(
             return ToolExecution(source, result(tool, "skipped", "该工具不属于当前立项 Agent 契约"))
         }
         val expected = args.intOrNull("expected_revision")
-        if (tool in REVISION_TOOLS && expected != null && expected != source.int("revision")) {
+        if (tool in contract.revisionToolNames && expected != null && expected != source.int("revision")) {
             return ToolExecution(
                 source,
                 result(tool, "error", "Novel creation session revision conflict", buildJsonObject {
@@ -213,9 +440,15 @@ internal class MobileCreationConversationAgent(
             "delete_creation_entity" -> deleteEntity(source, args)
             "confirm_creation_artifact" -> {
                 val artifact = args.string("artifact")
-                val data = args["data"] as? JsonObject
-                val updated = stageAgent.confirmStage(source, artifact, data)
-                ToolExecution(updated, result(tool, "ok", "${stageLabel(artifact)}已确认", artifactSnapshot(updated, artifact)), wrote = true)
+                if ("data" in args) {
+                    ToolExecution(
+                        source,
+                        result(tool, "error", "确认工具不能同时修改内容；请先保存修改，再由作者确认当前版本"),
+                    )
+                } else {
+                    val updated = stageAgent.confirmStage(source, artifact)
+                    ToolExecution(updated, result(tool, "ok", "${stageLabel(artifact)}已确认", artifactSnapshot(updated, artifact)), wrote = true)
+                }
             }
             "generate_creation_artifact", "refine_creation_artifact", "regenerate_creation_artifact" ->
                 generateArtifact(source, tool, args, config)
@@ -420,7 +653,7 @@ internal class MobileCreationConversationAgent(
         put("status", source.string("status"))
         put("user_brief", source.string("user_brief"))
         put("display_title", source.string("display_title"))
-        put("draft", source.objectValue("draft"))
+        put("draft", CreationAgentTurnRecords.agentVisibleDraft(source))
         put("artifacts", artifactSummaries(source))
     }
 
@@ -476,8 +709,8 @@ internal class MobileCreationConversationAgent(
         ENTITY_FIELDS.forEach { (artifact, mappings) ->
             if (artifactFilter.isNotBlank() && artifact != artifactFilter) return@forEach
             val data = source.stageData(artifact)
-            mappings.forEach { (field, type) ->
-                if (typeFilter.isNotBlank() && type != typeFilter) return@forEach
+            mappings.forEach mapping@{ (field, type) ->
+                if (typeFilter.isNotBlank() && type != typeFilter) return@mapping
                 (data[field] as? JsonArray).orEmpty().mapNotNull { it as? JsonObject }.forEachIndexed { index, row ->
                     result += entityDescriptor(artifact, field, type, index, row)
                 }
@@ -605,6 +838,26 @@ internal class MobileCreationConversationAgent(
         put("content", content)
     }
 
+    private fun assistantToolMessage(
+        content: String,
+        calls: List<DirectAgentToolCall>,
+    ): JsonObject = buildJsonObject {
+        put("role", "assistant")
+        put("content", content)
+        put("tool_calls", buildJsonArray {
+            calls.forEach { call ->
+                add(buildJsonObject {
+                    put("id", call.id)
+                    put("type", "function")
+                    put("function", buildJsonObject {
+                        put("name", call.name)
+                        put("arguments", call.arguments.toString())
+                    })
+                })
+            }
+        })
+    }
+
     private fun stageLabel(stage: String): String = contract.stageLabels[stage] ?: stage
 
     private fun toolLabel(tool: String): String = when (tool) {
@@ -644,12 +897,6 @@ internal class MobileCreationConversationAgent(
     )
 
     private companion object {
-        val REVISION_TOOLS = setOf(
-            "patch_creation_session", "patch_creation_artifact", "lock_creation_fields", "unlock_creation_fields",
-            "undo_creation_artifact", "patch_creation_entity", "delete_creation_entity", "restore_creation_artifact_version",
-            "confirm_creation_artifact", "generate_creation_artifact", "refine_creation_artifact",
-            "regenerate_creation_artifact", "apply_creation_import",
-        )
         val ENTITY_FIELDS = mapOf(
             "world_style" to listOf("worldbuilding" to "worldbuilding"),
             "characters" to listOf("characters" to "character", "relationships" to "relationship"),

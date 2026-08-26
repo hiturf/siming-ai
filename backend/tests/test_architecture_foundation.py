@@ -110,11 +110,11 @@ def test_module_manifest_has_unique_names():
     assert len(names) == len(set(names)) == 8
 
 
-def test_prompt_tool_vocabulary_matches_legacy_registry():
-    from app.prompts.workspace_contract import WORKSPACE_TOOL_NAMES
-    from app.services.workspace.tool_schemas import SEARCH_TOOL_NAMES, WRITE_TOOL_NAMES
+def test_agent_tool_categories_cover_the_workspace_registry():
+    from app.architecture.tool_categories import TOOL_CATEGORY_BY_NAME
+    from app.services.workspace.registry import registry
 
-    assert WORKSPACE_TOOL_NAMES == SEARCH_TOOL_NAMES | WRITE_TOOL_NAMES
+    assert set(TOOL_CATEGORY_BY_NAME) == set(registry.all_names())
 
 
 def test_http_routers_do_not_access_sqlalchemy_models_directly():

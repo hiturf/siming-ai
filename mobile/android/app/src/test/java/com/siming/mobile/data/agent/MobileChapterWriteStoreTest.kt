@@ -40,13 +40,13 @@ class MobileChapterWriteStoreTest {
     }
 
     @Test
-    fun `commit transition and deterministic entity id make retries coalesce`() = runTest {
+    fun `draft journal has no formal chapter commit state`() = runTest {
         val directory = createTempDirectory("siming-mobile-write-").toFile()
         try {
             val manifest = manifest()
             val runId = mobileChapterWriteRunId("p1", "deepseek-chat", manifest)
             val store = MobileChapterWriteStore(directory)
-            val generated = store.save(
+            store.save(
                 MobileChapterWriteRun(
                     id = runId,
                     projectId = "p1",
@@ -57,16 +57,55 @@ class MobileChapterWriteStoreTest {
                     manifest = manifest,
                 ),
             )
-            val entityId = mobileChapterEntityId("p1", runId)
-            store.transition(generated, MobileChapterWriteState.COMMITTING, chapterId = entityId)
-            store.transition(generated, MobileChapterWriteState.COMMITTED, chapterId = entityId)
 
             val recovered = store.load(runId)
             assertNotNull(recovered)
-            assertEquals(MobileChapterWriteState.COMMITTED, recovered.state)
-            assertEquals(entityId, recovered.chapterId)
-            assertEquals(entityId, mobileChapterEntityId("p1", runId))
-            assertNotEquals(entityId, mobileChapterEntityId("p2", runId))
+            assertEquals(MobileChapterWriteState.GENERATED, recovered.state)
+            assertEquals(
+                setOf("generating", "generated", "cancelled", "failed"),
+                MobileChapterWriteState.ALL,
+            )
+            assertEquals(runId, mobileChapterWriteRunId("p1", "deepseek-chat", manifest))
+            assertNotEquals(runId, mobileChapterWriteRunId("p2", "deepseek-chat", manifest))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `cancelled partial text remains a resumable checkpoint`() = runTest {
+        val directory = createTempDirectory("siming-mobile-write-").toFile()
+        try {
+            val manifest = manifest()
+            val runId = mobileChapterWriteRunId("p1", "deepseek-chat", manifest)
+            val store = MobileChapterWriteStore(directory)
+            store.save(
+                MobileChapterWriteRun(
+                    id = runId,
+                    projectId = "p1",
+                    model = "deepseek-chat",
+                    title = "断线重连",
+                    content = "已经确认的前半段",
+                    state = MobileChapterWriteState.CANCELLED,
+                    manifest = manifest,
+                    error = "用户停止",
+                ),
+            )
+
+            val checkpoint = MobileChapterWriteStore(directory).load(runId)
+
+            assertNotNull(checkpoint)
+            assertEquals(MobileChapterWriteState.CANCELLED, checkpoint.state)
+            assertEquals("已经确认的前半段", checkpoint.content)
+            val completed = store.save(
+                checkpoint.copy(
+                    content = checkpoint.content + "，随后从检查点继续。",
+                    state = MobileChapterWriteState.GENERATED,
+                    error = null,
+                ),
+            )
+            assertEquals(runId, completed.id)
+            assertEquals("已经确认的前半段，随后从检查点继续。", completed.content)
         } finally {
             directory.deleteRecursively()
         }

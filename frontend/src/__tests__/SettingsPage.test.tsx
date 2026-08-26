@@ -85,8 +85,19 @@ describe('SettingsPage startup and update controls', () => {
       update_channel: 'stable',
       automatic_updates: false,
       update_available: true,
-      update: { version: '2.8.0', channel: 'stable', source: 'https://example.test/release', download_url: 'https://example.test/Siming.exe', sha256_available: true },
+      update: {
+        version: '2.8.0', channel: 'stable', source: 'https://example.test/release',
+        download_url: 'https://example.test/Siming.exe', sha256_available: true,
+        download_sources: [
+          { key: 'github', label: 'GitHub', download_url: 'https://github.test/Siming-Setup.exe', releases_url: 'https://github.test/releases' },
+          { key: 'gitee', label: 'Gitee 国内镜像', download_url: 'https://gitee.test/Siming-Setup.exe', releases_url: 'https://gitee.test/releases' },
+        ],
+      },
       staged_update: null,
+      manual_download_pages: [
+        { key: 'gitee', label: 'Gitee 镜像下载', url: 'https://gitee.test/releases', description: '大陆网络备用' },
+        { key: 'github', label: 'GitHub 全部版本', url: 'https://github.test/releases', description: '完整历史版本' },
+      ],
     } } })
   })
 
@@ -98,7 +109,57 @@ describe('SettingsPage startup and update controls', () => {
     fireEvent.click(screen.getByRole('tab', { name: '应用与数据' }))
     expect(await screen.findByText('启动方式')).toBeInTheDocument()
     expect(screen.getByText('尚未检查更新。不会有后台下载或静默安装。')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /Gitee 镜像下载/ })).toHaveAttribute(
+      'href',
+      'https://gitee.com/teangtang13/siming-ai/releases',
+    )
+    expect(screen.getByRole('link', { name: /GitHub 全部版本/ })).toBeInTheDocument()
     expect(api.post).not.toHaveBeenCalled()
+  })
+
+  it('assigns a secondary discovered model to a task without changing the global default', async () => {
+    api.get.mockImplementation((url: string) => {
+      if (url === '/config/models') return Promise.resolve({ data: { data: {
+        items: [{
+          id: 'openai-ready', provider: 'openai', default_model: 'gpt-4o',
+          available_models: [
+            { id: 'gpt-4o', display_name: 'GPT 4o' },
+            { id: 'gpt-4.1-mini', display_name: 'GPT Mini' },
+          ],
+          provider_type: 'api', readiness_status: 'ready', readiness_message: '可用',
+          is_usable: true, is_global_default: true,
+        }],
+        task_models: {},
+      } } })
+      if (url === '/config/content-root') return Promise.resolve({ data: { data: {
+        current_path: 'D:/Siming/projects', default_path: 'D:/Siming/projects', is_default: true,
+        exists: true, is_empty: true,
+      } } })
+      if (url === '/config/launcher') return Promise.resolve({ data: { data: launcherSettings } })
+      return Promise.resolve({ data: { data: {} } })
+    })
+    api.put.mockImplementation((url: string, payload: Record<string, unknown>) => {
+      if (url === '/config/task-models/writing') return Promise.resolve({ data: { data: {
+        task_type: 'writing',
+        ...payload,
+        is_usable: true,
+      } } })
+      return Promise.resolve({ data: { data: { ...launcherSettings, ...payload } } })
+    })
+
+    renderSettings()
+    expect(await screen.findByText('按任务选择模型')).toBeInTheDocument()
+    const writingModel = screen.getByRole('combobox', { name: '章节写作默认模型' })
+    await waitFor(() => expect(writingModel).not.toBeDisabled())
+    fireEvent.mouseDown(writingModel)
+    fireEvent.click(await screen.findByText('OpenAI · GPT Mini'))
+
+    await waitFor(() => expect(api.put).toHaveBeenCalledWith('/config/task-models/writing', {
+      provider: 'openai',
+      model: 'gpt-4.1-mini',
+      context_length: null,
+    }))
+    expect(api.put).not.toHaveBeenCalledWith('/config/global-model', expect.anything())
   })
 
   it('scans and configures each CLI only after separate user actions', async () => {
@@ -158,8 +219,15 @@ describe('SettingsPage startup and update controls', () => {
     fireEvent.click(screen.getByRole('button', { name: '检查更新' }))
 
     await waitFor(() => expect(api.post).toHaveBeenCalledWith('/config/update/check'))
-    expect(await screen.findByRole('button', { name: '下载并校验 2.8.0' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: '从Gitee 国内镜像下载并校验 2.8.0' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '从GitHub下载并校验 2.8.0' })).toBeInTheDocument()
+    expect(screen.getByText(/两条线路地位相同/)).toBeInTheDocument()
     expect(screen.getByText('发布页提供，下载后会复核')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '从Gitee 国内镜像下载并校验 2.8.0' }))
+    expect((await screen.findAllByText('通过 Gitee 国内镜像 下载司命 2.8.0？')).length).toBeGreaterThan(0)
+    fireEvent.click(screen.getByRole('button', { name: '下载并校验' }))
+    await waitFor(() => expect(api.post).toHaveBeenCalledWith('/config/update/download', { source: 'gitee' }))
   })
 
   it('saves the preview channel explicitly', async () => {
@@ -313,7 +381,7 @@ describe('SettingsPage startup and update controls', () => {
   it('asks OpenCode CLI itself for available models', async () => {
     api.get.mockImplementation((url: string) => {
       if (url === '/config/models') return Promise.resolve({ data: { data: { items: [{
-        id: 'opencode', provider: 'opencode_cli', default_model: 'opencode/deepseek-v4-flash-free', provider_type: 'local_cli',
+        id: 'opencode', provider: 'opencode_cli', default_model: 'opencode/big-pickle', provider_type: 'local_cli',
         cli_command: 'opencode', cli_args: '', readiness_status: 'unverified', readiness_message: '待验证',
         is_usable: false, is_global_default: false,
       }] } } })
@@ -324,13 +392,13 @@ describe('SettingsPage startup and update controls', () => {
     })
     api.post.mockImplementation((url: string) => {
       if (url === '/config/models/list') return Promise.resolve({ data: { data: { models: [
-        { id: 'opencode/deepseek-v4-flash-free', display_name: 'opencode/deepseek-v4-flash-free' },
-        { id: 'opencode/mimo-v2.5-free', display_name: 'opencode/mimo-v2.5-free' },
-        { id: 'opencode/laguna-s-2.1-free', display_name: 'opencode/laguna-s-2.1-free' },
-        { id: 'opencode/north-mini-code-free', display_name: 'opencode/north-mini-code-free' },
-        { id: 'opencode/nemotron-3-ultra-free', display_name: 'opencode/nemotron-3-ultra-free' },
         { id: 'opencode/big-pickle', display_name: 'opencode/big-pickle' },
-        { id: 'opencode/glm-4.7-free', display_name: 'opencode/glm-4.7-free' },
+        { id: 'opencode/mimo-v2.5-free', display_name: 'opencode/mimo-v2.5-free' },
+        { id: 'opencode/hy3-free', display_name: 'opencode/hy3-free' },
+        { id: 'opencode/nemotron-3-ultra-free', display_name: 'opencode/nemotron-3-ultra-free' },
+        { id: 'opencode/nemotron-3.5-lightning-free', display_name: 'opencode/nemotron-3.5-lightning-free' },
+        { id: 'opencode/x-preview-f-free', display_name: 'opencode/x-preview-f-free' },
+        { id: 'opencode/muse-spark-1.2-contributor-free', display_name: 'opencode/muse-spark-1.2-contributor-free' },
       ] } } })
       return Promise.resolve({ data: { data: {} } })
     })

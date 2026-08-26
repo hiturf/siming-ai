@@ -1,5 +1,4 @@
 # Runtime data and secrets
-AGENTS.md
 .env
 .env.bak
 .crypto_key
@@ -80,6 +79,7 @@ output/
 local-prototype/
 
 # Video production runtime, private captures, and large deliverables
+.video-work/
 video/
 video/**/node_modules/
 video/**/tooling/

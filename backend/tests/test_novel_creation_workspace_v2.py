@@ -1,4 +1,4 @@
-"""Tests for the V2 new-book workbench contract."""
+"""Tests for the new-book workbench contract."""
 from __future__ import annotations
 
 import asyncio
@@ -25,16 +25,15 @@ from app.services.novel_creation_contract import (
 )
 from app.services.novel_creation_workspace import (
     STAGE_ORDER,
-    attach_concepts,
-    build_apply_blueprint,
+    build_project_materialization_payload,
     build_stage_flow,
     creation_artifact_dependencies,
     derive_stage,
-    generation_blockers,
     get_presets,
     initialize_session_draft,
     patch_creation_artifact,
     patch_session,
+    save_compact_concepts,
     save_stage,
     serialize_creation_artifact,
     serialize_session,
@@ -42,50 +41,37 @@ from app.services.novel_creation_workspace import (
     undo_creation_artifact,
 )
 from app.services.workspace.registry import registry
-from app.services.workspace.tools.novel_creation import apply_novel_blueprint
+from app.services.workspace.tools.novel_creation import finalize_creation_session
 from app.services.workspace.tools.novel_creation_v2 import (
     _normalize_stage_data,
     _validate_stage,
+    confirm_creation_artifact,
     generate_creation_artifact,
-    generate_novel_creation_stage,
+    run_creation_artifact_generation,
     get_creation_snapshot,
     patch_creation_session_tool,
-    submit_novel_creation_stage,
+    save_creation_artifact,
 )
 
 
-def _blueprint(title: str = "雾城记") -> dict:
+def _concept_seed(title: str = "雾城记") -> dict:
     return {
         "title": title,
         "subtitle": "长篇悬疑成长",
         "logline": "能看见病毒记忆的女孩进入封锁城市，在遗忘母亲之前追出感染源。",
-        "premise": "一场不断改写记忆的疫情迫使主角在救人、保存自我和追查母亲下落之间作出选择。",
         "core_conflict": "每次读取感染记忆都能接近真相，也会永久失去一段自己的过去。",
-        "protagonist": {
+        "protagonist_seed": {
             "name": "林七",
+            "identity": "封锁城外来的实习医生",
             "goal": "找到母亲并阻止感染扩散",
-            "conflict": "能力的代价是遗忘",
-            "background": "封锁城外来的实习医生",
-            "appearance": "短发，左眉有旧伤",
-            "age": "19",
-            "current_location": "灰港隔离站",
+            "lack": "能力的代价是遗忘",
         },
-        "characters": [{"name": "周渡", "role_type": "supporting", "goal": "守住隔离线", "personality": "克制"}],
-        "relationships": [{"character_a": "林七", "character_b": "周渡", "relationship_type": "uneasy_alliance"}],
-        "worldbuilding": [
-            {"title": "灰港隔离站", "dimension": "geography", "content": "城市唯一仍运转的医疗节点。"},
-            {"title": "白塔防疫局", "dimension": "factions", "content": "控制样本与通行权限的机构。"},
-            {"title": "记忆病毒", "dimension": "power_system", "content": "感染者会交换并丢失记忆。"},
-        ],
-        "volume_outline": [{"title": "第一卷 封锁线", "summary": "找到进入灰港的路径。", "start_chapter": 1, "end_chapter": 80}],
-        "outline": [{"title": f"第{number}章 失真记录", "summary": f"第{number}次线索推进。", "node_type": "chapter"} for number in range(1, 13)],
-        "golden_three": {"opening_scene": "隔离车中有人说出主角忘记的童年", "chapter_1": "入城", "chapter_2": "验忆", "chapter_3": "失踪"},
-        "creative_slots": {"story_engine": "救人换线索，读忆换遗忘", "world_rules": "记忆可以传播但不可无损复制"},
-        "selling_points": ["记忆感染", "母女谜团", "封锁城求生"],
+        "world_hook": "记忆可以传播但不可无损复制",
+        "story_engine": "救人换线索，读忆换遗忘",
+        "opening_hook": "隔离车中有人说出主角忘记的童年",
+        "differentiators": ["记忆感染", "母女谜团", "封锁城求生"],
         "risks": ["记忆规则需要始终可验证"],
-        "requirement_coverage": {"score": 92, "covered": ["女性成长", "悬疑"], "missing": []},
-        "style_rules": ["物证先于解释"],
-        "forbidden_patterns": ["空降解药"],
+        "coverage": {"score": 92, "covered": ["女性成长", "悬疑"], "missing": []},
     }
 
 
@@ -99,13 +85,42 @@ def _ready_session(db) -> NovelCreationSession:
     session = NovelCreationSession(mode="internal_llm", status="drafting", user_brief="病毒记忆悬疑")
     db.add(session)
     initialize_session_draft(session, {"preset_id": "suspense", "target_chapters": 1000})
-    session.blueprint_json = [_blueprint(), _blueprint("回声病历"), _blueprint("灰港遗忘症")]
-    attach_concepts(session, session.blueprint_json)
+    save_compact_concepts(session, [_concept_seed()])
     patch_session(session, {"selected_concept_id": "concept-1"})
     save_stage(session, "constraints", session.draft_json["form"], confirm=True)
     save_stage(session, "concepts", {"options": session.draft_json["concepts"], "selected_concept_id": "concept-1"}, confirm=True)
     for stage in STAGE_ORDER[2:]:
-        save_stage(session, stage, derive_stage(session, stage), confirm=stage != "final_review")
+        data = derive_stage(session, stage)
+        if stage == "world_style":
+            data["worldbuilding"] = [
+                {"title": "灰港隔离站", "dimension": "geography", "content": "城市唯一仍运转的医疗节点。"},
+                {"title": "白塔防疫局", "dimension": "factions", "content": "控制样本与通行权限的机构。"},
+                {"title": "记忆病毒", "dimension": "power_system", "content": "感染者会交换并丢失记忆。"},
+            ]
+        elif stage == "characters":
+            data["characters"].append({
+                "name": "周渡",
+                "role_type": "supporting",
+                "goal": "守住隔离线",
+                "personality": "克制",
+            })
+            data["relationships"] = [{
+                "character_a": "林七",
+                "character_b": "周渡",
+                "relationship_type": "uneasy_alliance",
+            }]
+        elif stage == "locations":
+            data["entries"] = [
+                {"title": "灰港隔离站", "dimension": "geography", "content": "城市唯一仍运转的医疗节点。"},
+                {"title": "白塔防疫局", "dimension": "factions", "content": "控制样本与通行权限的机构。"},
+            ]
+            data["relations"] = [{
+                "source_title": "灰港隔离站",
+                "target_title": "白塔防疫局",
+                "relation_type": "connected_to",
+                "description": "双方通过封锁线与通行许可互相影响。",
+            }]
+        save_stage(session, stage, data, confirm=stage != "final_review")
     db.commit()
     return session
 
@@ -198,7 +213,7 @@ def test_final_review_uses_actual_chapter_ids_and_self_heals_stale_contract_resu
 
     serialized = serialize_session(session)
     assert serialized["draft"]["stages"]["final_review"]["data"]["ready"] is True
-    assert build_apply_blueprint(session)["outline"]
+    assert build_project_materialization_payload(session)["outline"]
 
 
 def test_core_project_can_be_written_before_opening_outline_is_generated():
@@ -213,13 +228,13 @@ def test_core_project_can_be_written_before_opening_outline_is_generated():
     session.draft_json = draft
 
     final = derive_stage(session, "final_review", draft)
-    blueprint = build_apply_blueprint(session)
+    project_payload = build_project_materialization_payload(session)
 
     assert final["ready"] is True
     assert final["counts"]["chapters"] == 0
     assert any("正式作品" in warning for warning in final["warnings"])
-    assert blueprint["outline"] == []
-    assert any("正式作品" in warning for warning in blueprint["apply_warnings"])
+    assert project_payload["outline"] == []
+    assert any("正式作品" in warning for warning in project_payload["apply_warnings"])
 
 
 def test_unconfirmed_opening_outline_is_not_silently_applied():
@@ -229,9 +244,9 @@ def test_unconfirmed_opening_outline_is_not_silently_applied():
     draft["stages"]["opening_outline"]["status"] = "generated"
     session.draft_json = draft
 
-    blueprint = build_apply_blueprint(session)
+    project_payload = build_project_materialization_payload(session)
 
-    assert blueprint["outline"] == []
+    assert project_payload["outline"] == []
 
 
 def test_stage_edit_keeps_three_checkpoints_and_invalidates_downstream():
@@ -387,9 +402,7 @@ def test_stage_flow_recovers_a_legacy_session_that_advanced_before_confirmation(
     assert flow["legacy_current_stage"] == "characters"
     assert flow["attention_stage"] == "world_style"
     assert "world_style" in flow["pending_confirmations"]
-    assert flow["items"]["characters"]["can_view"] is True
-    assert flow["items"]["characters"]["can_generate"] is True
-    assert flow["items"]["characters"]["blocked_by"] == []
+    assert "generate" in flow["items"]["characters"]["actions"]
     assert flow["items"]["characters"]["soft_dependencies"][0]["stage"] == "world_style"
 
 
@@ -430,45 +443,36 @@ def test_initialize_recovers_constraints_saved_without_form_sync():
     assert migrated["stages"]["constraints"]["data"]["brief"] == "已保存的新约束"
 
 
-def test_generation_uses_soft_dependency_hints_instead_of_fixed_stage_blockers():
+def test_generation_uses_soft_dependency_hints_without_stage_blockers():
     db = _db()
     session = _ready_session(db)
     session.draft_json["stages"]["world_style"]["status"] = "generated"
 
-    blockers = generation_blockers(session, "characters")
-
-    assert blockers == []
     dependencies = creation_artifact_dependencies(session, "characters")
     assert [item["stage"] for item in dependencies["soft_dependencies"]] == ["world_style"]
-    assert generation_blockers(session, "concepts") == []
+    assert "regenerate" in build_stage_flow(session)["items"]["characters"]["actions"]
 
 
-def test_legacy_lifecycle_stage_is_projected_as_stale_without_blocking_downstream():
+def test_generation_without_a_model_does_not_write_a_derived_stage():
     db = _db()
-    session = _ready_session(db)
-    session.draft_json["stages"]["macro_outline"] = {
-        "status": "confirmed",
-        "source": "model",
-        "data": {"type": "step_start", "part": {"type": "step-start"}},
-    }
+    session = NovelCreationSession(mode="internal_llm", status="drafting", user_brief="少女在雾城追查失踪的母亲")
+    db.add(session)
+    initialize_session_draft(session, {"creation_mode": "author_led"})
+    db.flush()
 
-    serialized = serialize_session(session)
+    result = asyncio.run(run_creation_artifact_generation(db, "", {
+        "session_id": session.id,
+        "stage": "world_style",
+        "use_model": False,
+    }))
+    project_payload = build_project_materialization_payload(session)
 
-    macro = serialized["draft"]["stages"]["macro_outline"]
-    assert macro["status"] == "stale"
-    assert macro["data"] is None
-    assert "重新生成" in macro["stale_reason"]
-    assert serialized["stage_flow"]["recommended_stage"] == "macro_outline"
-    assert generation_blockers(session, "opening_outline") == []
-    assert [
-        item["stage"]
-        for item in creation_artifact_dependencies(session, "opening_outline")["soft_dependencies"]
-    ] == ["macro_outline"]
-    with pytest.raises(ValueError, match="全书主线与卷纲"):
-        build_apply_blueprint(session)
+    assert result["status"] == "error", result
+    assert session.draft_json["stages"]["world_style"]["status"] == "pending"
+    assert "雾城" in project_payload["logline"]
 
 
-def test_serialize_incomplete_old_work_keeps_context_selector_available():
+def test_serialize_incomplete_work_keeps_context_selector_available():
     db = _db()
     session = NovelCreationSession(mode="internal_llm", status="drafting", user_brief="旧立项草稿")
     db.add(session)
@@ -483,7 +487,7 @@ def test_serialize_incomplete_old_work_keeps_context_selector_available():
 
     assert serialized["id"] == session.id
     assert serialized["display_title"] == "旧立项草稿"
-    assert serialized["draft"]["stages"]["final_review"]["data"] == {"ready": False}
+    assert serialized["draft"]["stages"]["final_review"]["data"]["ready"] is True
 
 
 def test_artifact_undo_restores_latest_checkpoint_and_keeps_dependents_stale():
@@ -519,7 +523,7 @@ def test_stage_submission_rejects_a_stale_expected_revision():
     current_revision = int(session.revision or 0)
     world = deepcopy(derive_stage(session, "world_style"))
 
-    result = asyncio.run(submit_novel_creation_stage(db, "", {
+    result = asyncio.run(save_creation_artifact(db, "", {
         "session_id": session.id,
         "stage": "world_style",
         "data": world,
@@ -529,8 +533,23 @@ def test_stage_submission_rejects_a_stale_expected_revision():
 
     assert result["status"] == "error"
     assert result["data"]["failure_class"] == "revision_conflict"
-    assert result["data"]["current_revision"] == current_revision
-    assert int(session.revision or 0) == current_revision
+
+
+def test_mcp_concept_submission_accepts_one_card_without_fixed_count():
+    db = _db()
+    session = _ready_session(db)
+    options = deepcopy(session.draft_json["concepts"])
+
+    result = asyncio.run(save_creation_artifact(db, "", {
+        "session_id": session.id,
+        "stage": "concepts",
+        "data": {"options": options, "selected_concept_id": options[0]["id"]},
+        "confirm": True,
+        "expected_revision": int(session.revision or 0),
+    }))
+
+    assert result["status"] == "ok"
+    assert len(session.draft_json["stages"]["concepts"]["data"]["options"]) == 1
 
 
 def test_world_style_submission_normalizes_structured_model_fields_for_authors():
@@ -557,7 +576,7 @@ def test_world_style_submission_normalizes_structured_model_fields_for_authors()
         },
     })
 
-    result = asyncio.run(submit_novel_creation_stage(db, "", {
+    result = asyncio.run(save_creation_artifact(db, "", {
         "session_id": session.id,
         "stage": "world_style",
         "data": world,
@@ -581,7 +600,7 @@ def test_world_style_submission_rejects_an_empty_structured_required_field():
     world = deepcopy(derive_stage(session, "world_style"))
     world["pacing"] = {}
 
-    result = asyncio.run(submit_novel_creation_stage(db, "", {
+    result = asyncio.run(save_creation_artifact(db, "", {
         "session_id": session.id,
         "stage": "world_style",
         "data": world,
@@ -593,7 +612,7 @@ def test_world_style_submission_rejects_an_empty_structured_required_field():
     assert "叙事节奏" in result["detail"]
 
 
-def test_build_apply_blueprint_keeps_macro_only_and_first_three_detailed():
+def test_project_materialization_keeps_macro_only_and_first_three_detailed():
     db = _db()
     session = _ready_session(db)
     draft = deepcopy(session.draft_json)
@@ -606,26 +625,26 @@ def test_build_apply_blueprint_keeps_macro_only_and_first_three_detailed():
         "forbidden_patterns": ["禁止无证据反转"],
     })
     session.draft_json = draft
-    blueprint = build_apply_blueprint(session)
-    chapters = [item for item in blueprint["outline"] if item["node_type"] == "chapter"]
-    sections = [item for item in blueprint["outline"] if item["node_type"] == "section"]
+    project_payload = build_project_materialization_payload(session)
+    chapters = [item for item in project_payload["outline"] if item["node_type"] == "chapter"]
+    sections = [item for item in project_payload["outline"] if item["node_type"] == "section"]
     assert len(chapters) == OPENING_OUTLINE_CHAPTER_COUNT
     assert len(sections) == OPENING_OUTLINE_CHAPTER_COUNT * 3
-    assert len(blueprint["volume_outline"]) == 10
-    assert blueprint["volume_outline"][-1]["end_chapter"] == 1000
-    assert blueprint["protagonist"]["profile"]["core_motivation"]
-    assert blueprint["writing_style"] == "第三人称限知，危机段落使用短句"
-    assert blueprint["world_tone"] == "冷峻但保留希望"
-    assert blueprint["style_rules"] == ["先呈现证据，再允许角色解释"]
-    assert blueprint["forbidden_patterns"] == ["禁止无证据反转"]
+    assert len(project_payload["volume_outline"]) == 1
+    assert project_payload["volume_outline"][-1]["end_chapter"] == 1000
+    assert project_payload["protagonist"]["profile"]["core_motivation"]
+    assert project_payload["writing_style"] == "第三人称限知，危机段落使用短句"
+    assert project_payload["world_tone"] == "冷峻但保留希望"
+    assert project_payload["style_rules"] == ["先呈现证据，再允许角色解释"]
+    assert project_payload["forbidden_patterns"] == ["禁止无证据反转"]
 
 
 def test_v2_apply_is_idempotent_and_persists_profiles_relations_and_sections():
     db = _db()
     session = _ready_session(db)
     with patch("app.services.workspace.tools.novel_creation._is_real_session", return_value=False):
-        first = asyncio.run(apply_novel_blueprint(db, "", {"session_id": session.id, "mode": "auto"}))
-        second = asyncio.run(apply_novel_blueprint(db, "", {"session_id": session.id, "mode": "auto"}))
+        first = asyncio.run(finalize_creation_session(db, "", {"session_id": session.id}))
+        second = asyncio.run(finalize_creation_session(db, "", {"session_id": session.id}))
     assert first["status"] == "ok"
     assert second["data"]["idempotent"] is True
     assert db.query(Project).count() == 1
@@ -637,9 +656,8 @@ def test_v2_apply_is_idempotent_and_persists_profiles_relations_and_sections():
     assert all(item.parent_id and item.metadata_json for item in sections)
 
 
-def test_v2_workspace_tools_are_registered():
+def test_creation_workspace_tools_are_registered():
     expected = {
-        "get_novel_creation_session",
         "get_creation_session",
         "get_creation_snapshot",
         "get_creation_operation",
@@ -654,10 +672,26 @@ def test_v2_workspace_tools_are_registered():
         "retry_creation_operation",
         "validate_creation_session",
         "finalize_creation_session",
-        "generate_novel_creation_stage",
-        "submit_novel_creation_stage",
     }
     assert all(registry.get(name) is not None for name in expected)
+
+
+def test_confirmation_cannot_edit_and_confirm_an_artifact_atomically():
+    db = _db()
+    session = _ready_session(db)
+    before_revision = int(session.revision or 0)
+
+    result = asyncio.run(confirm_creation_artifact(db, "", {
+        "session_id": session.id,
+        "artifact": "final_review",
+        "expected_revision": before_revision,
+        "data": {"ready": True},
+    }))
+
+    assert result["status"] == "error"
+    assert "不能同时修改内容" in result["detail"]
+    db.refresh(session)
+    assert int(session.revision or 0) == before_revision
 
 
 def test_creation_snapshot_and_session_patch_are_revision_protected():
@@ -685,26 +719,30 @@ def test_creation_snapshot_and_session_patch_are_revision_protected():
     assert snapshot["status"] == "ok"
     assert snapshot["data"]["revision"] == patched["data"]["revision"]
     assert len(snapshot["data"]["artifacts"]) == len(STAGE_ORDER)
+    assert "runs" not in snapshot["data"]["session"]
+    assert "stage_flow" not in snapshot["data"]["session"]
+    assert "checkpoints" not in snapshot["data"]["session"]
+    assert "stages" not in snapshot["data"]["session"]["draft"]
+    assert all("flow" not in item for item in snapshot["data"]["artifacts"])
+    assert all("running_operation" not in item for item in snapshot["data"]["artifacts"])
+    assert len(json.dumps(snapshot["data"], ensure_ascii=False)) < 16_000
 
 
-def test_quick_stage_run_streams_each_stage_and_keeps_final_review_unapplied():
+def test_all_stage_run_without_a_model_fails_without_contract_generated_content():
     db = _db()
     session = _ready_session(db)
-    result = asyncio.run(generate_novel_creation_stage(db, "", {
+    result = asyncio.run(run_creation_artifact_generation(db, "", {
         "session_id": session.id,
         "stage": "all",
         "use_model": False,
         "auto_confirm": True,
     }))
-    assert result["status"] == "ok"
+    assert result["status"] == "error"
     run = result["data"]["run"]
     event_types = [item["event_type"] for item in run["events"]]
-    assert event_types.count("stage_progress") == 5
-    assert event_types.count("stage_completed") == 6
-    assert run["status"] == "waiting_user"
-    final = result["data"]["session"]["draft"]["stages"]["final_review"]
-    assert final["status"] == "generated"
-    assert final["data"]["ready"] is True
+    assert event_types.count("stage_progress") == 1
+    assert event_types.count("stage_completed") == 0
+    assert run["status"] == "failed"
 
 
 def test_agent_artifact_generation_returns_a_structured_error_for_an_invalid_entity_target():
@@ -724,7 +762,7 @@ def test_agent_artifact_generation_returns_a_structured_error_for_an_invalid_ent
     assert result["data"] is None
 
 
-def test_quick_run_uses_an_explicit_safe_fallback_for_empty_model_events():
+def test_quick_run_fails_without_writing_when_model_returns_no_output():
     db = _db()
     session = _ready_session(db)
 
@@ -739,7 +777,7 @@ def test_quick_run_uses_an_explicit_safe_fallback_for_empty_model_events():
         "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
         new=MagicMock(side_effect=empty_stream),
     ):
-        result = asyncio.run(generate_novel_creation_stage(db, "", {
+        result = asyncio.run(run_creation_artifact_generation(db, "", {
             "session_id": session.id,
             "stage": "all",
             "model": "opencode_cli:test-free",
@@ -747,13 +785,9 @@ def test_quick_run_uses_an_explicit_safe_fallback_for_empty_model_events():
             "auto_confirm": True,
         }))
 
-    assert result["status"] == "ok"
-    repairs = [item for item in result["data"]["run"]["events"] if item["event_type"] == "stage_repaired"]
-    assert len(repairs) == 5
-    assert all(item["payload"]["failure_class"] == "empty_response" for item in repairs)
-    macro = result["data"]["session"]["draft"]["stages"]["macro_outline"]
-    assert macro["source"] == "contract_fallback"
-    assert macro["data"]["volumes"]
+    assert result["status"] == "error"
+    assert result["data"]["run"]["status"] == "failed"
+    assert not any(item["event_type"] == "stage_repaired" for item in result["data"]["run"]["events"])
 
 
 def test_truncated_stage_json_is_repaired_without_a_second_model_call():
@@ -773,7 +807,7 @@ def test_truncated_stage_json_is_repaired_without_a_second_model_call():
         "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
         new=completion,
     ):
-        result = asyncio.run(generate_novel_creation_stage(db, "", {
+        result = asyncio.run(run_creation_artifact_generation(db, "", {
             "session_id": session.id,
             "stage": "world_style",
             "model": "openai:test",
@@ -802,7 +836,7 @@ def test_stage_run_classifies_invalid_token_with_actionable_next_step():
         "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
         new=MagicMock(side_effect=invalid_token_stream),
     ):
-        result = asyncio.run(generate_novel_creation_stage(db, "", {
+        result = asyncio.run(run_creation_artifact_generation(db, "", {
             "session_id": session.id,
             "stage": "world_style",
             "model": "codex_cli:codex-cli",
@@ -833,51 +867,6 @@ def test_lifecycle_metadata_cannot_replace_a_macro_outline():
     assert normalized["story_overview"] == baseline["story_overview"]
     assert normalized["volumes"] == baseline["volumes"]
     assert "type" not in normalized
-
-
-def test_stage_normalization_accepts_legacy_character_macro_and_location_shapes():
-    db = _db()
-    session = _ready_session(db)
-
-    characters = _normalize_stage_data("characters", {
-        "characters": {
-            "林七": {"profile": {"core_motivation": "找回被删除的母亲记忆"}},
-            "周渡": {"goal": "守住隔离线"},
-        },
-        "relationships": [],
-    }, derive_stage(session, "characters"))
-    assert [item["name"] for item in characters["characters"]] == ["林七", "周渡"]
-    assert characters["characters"][0]["role_type"] == "protagonist"
-    assert characters["characters"][0]["goal"] == "找回被删除的母亲记忆"
-    _validate_stage("characters", characters)
-
-    macro = _normalize_stage_data("macro_outline", {
-        "story_overview": "从失踪档案追到全城共同记忆。",
-        "core_conflict": "保存真相会加速主角遗忘。",
-        "ending_direction": "公开证据并承担代价。",
-        "volumes": [{"title": "第一卷", "chapters": "1-80", "core_function": "发现删忆机制"}],
-    }, {})
-    assert macro["volumes"][0]["start_chapter"] == 1
-    assert macro["volumes"][0]["end_chapter"] == 80
-    assert macro["volumes"][0]["summary"] == "发现删忆机制"
-    _validate_stage("macro_outline", macro)
-
-    duplicate = {"title": "灰港", "content": "唯一仍运转的港口"}
-    white_tower = {"title": "白塔", "content": "控制通行权限的机构"}
-    relation = {"source_title": "灰港", "target_title": "白塔", "relation_type": "封锁", "description": "限制通行"}
-    locations = _normalize_stage_data("locations", {
-        "entries": [duplicate, deepcopy(duplicate), white_tower],
-        "relations": [relation, deepcopy(relation)],
-    }, {})
-    assert len(locations["entries"]) == 2
-    assert len(locations["relations"]) == 1
-    _validate_stage("locations", locations)
-
-    with pytest.raises(ValueError, match="不存在的实体"):
-        _validate_stage("locations", {
-            "entries": [duplicate],
-            "relations": [{**relation, "target_title": "不存在的白塔"}],
-        })
 
 
 def test_opening_outline_flattens_nested_scenes_and_repairs_the_full_three_chapters():

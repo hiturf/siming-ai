@@ -174,10 +174,7 @@ data class MobileProviderEnvelope(
 
 @Serializable
 data class WorkspaceAssistantRequest(
-    val scope: String,
     val message: String,
-    @SerialName("assistant_mode") val assistantMode: String = "quality",
-    @SerialName("auto_apply") val autoApply: Boolean = true,
     @SerialName("model_route") val modelRoute: String = "pc",
     @SerialName("mobile_provider") val mobileProvider: MobileProviderEnvelope? = null,
 )

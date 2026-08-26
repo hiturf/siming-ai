@@ -14,103 +14,12 @@ from app.database.models import (
     AssistantRun,
     AssistantRunStep,
     Chapter,
-    ChapterCharacter,
-    ChapterSnapshot,
-    ChapterSummary,
-    Character,
-    OutlineNode,
-    OutlineNodeCharacter,
 )
-from app.services.chapter_ordering import next_chapter_sort_order
 
 
 class SqlAlchemyAssistantWorkspace:
     def __init__(self, session: Session) -> None:
         self.db = session
-
-    def resolve_characters(
-        self,
-        project_id: str,
-        names: Sequence[str],
-        outline_node_id: str | None,
-        *,
-        limit: int,
-    ) -> list[Any]:
-        resolved: list[Any] = []
-        seen: set[str] = set()
-        clean_names = {name.strip() for name in names if name.strip()}
-        if clean_names:
-            characters = self.db.query(Character).filter(
-                Character.project_id == project_id,
-                Character.name.in_(clean_names),
-            ).all()
-            for character in characters:
-                resolved.append(character)
-                seen.add(character.id)
-        if outline_node_id and len(resolved) < limit:
-            links = self.db.query(OutlineNodeCharacter).join(
-                OutlineNode,
-                OutlineNode.id == OutlineNodeCharacter.outline_node_id,
-            ).filter(
-                OutlineNode.project_id == project_id,
-                OutlineNodeCharacter.outline_node_id == outline_node_id,
-            ).all()
-            for link in links:
-                if link.character and link.character.id not in seen:
-                    resolved.append(link.character)
-                    seen.add(link.character.id)
-                if len(resolved) >= limit:
-                    break
-        if len(resolved) < limit:
-            extras = self.db.query(Character).filter(
-                Character.project_id == project_id
-            ).order_by(
-                Character.role_type.asc(),
-                Character.updated_at.desc(),
-            ).limit(limit * 2).all()
-            for character in extras:
-                if character.id not in seen:
-                    resolved.append(character)
-                    seen.add(character.id)
-                if len(resolved) >= limit:
-                    break
-        return resolved[:limit]
-
-    def create_chapter(self, **values: Any):
-        project_id = str(values.get("project_id") or "").strip()
-        if project_id and values.get("sort_order") is None:
-            values["sort_order"] = next_chapter_sort_order(self.db, project_id)
-        chapter = Chapter(**values)
-        self.db.add(chapter)
-        return chapter
-
-    def create_summary(self, **values: Any):
-        summary = ChapterSummary(**values)
-        self.db.add(summary)
-        return summary
-
-    def create_snapshot(self, **values: Any):
-        snapshot = ChapterSnapshot(**values)
-        self.db.add(snapshot)
-        return snapshot
-
-    def characters_by_names(self, project_id: str, names: set[str]):
-        if not names:
-            return []
-        return self.db.query(Character).filter(
-            Character.project_id == project_id,
-            Character.name.in_(names),
-        ).all()
-
-    def clear_chapter_characters(self, chapter_id: str) -> None:
-        self.db.query(ChapterCharacter).filter(
-            ChapterCharacter.chapter_id == chapter_id
-        ).delete()
-
-    def link_chapter_character(self, **values: Any):
-        link = ChapterCharacter(**values)
-        self.db.add(link)
-        return link
 
     def conversation(self, project_id: str, conversation_id: str):
         return self.db.query(AssistantConversation).filter(

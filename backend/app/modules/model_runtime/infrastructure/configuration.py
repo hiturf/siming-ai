@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from ....architecture.uow import SqlAlchemyUnitOfWork
 from ....core.crypto import decrypt
 from ....database.session import SessionLocal
 from ..application.ports import ModelConfigurationPort
-from ..domain.configuration import LocalTaskModelSetting, ModelProviderConfig
+from ..domain.configuration import ModelProviderConfig, TaskModelSetting
 from ..domain.policy import local_runtime_disabled
-from .models import APIConfig, LocalModelTaskSetting
-from .readiness import is_model_config_usable, mark_model_failure
+from .models import APIConfig, ModelTaskSetting
+from .readiness import is_model_config_usable
 
 
 class SqlAlchemyModelConfiguration(ModelConfigurationPort):
@@ -31,29 +30,21 @@ class SqlAlchemyModelConfiguration(ModelConfigurationPort):
             row = db.query(APIConfig).filter(APIConfig.provider == provider).first()
             return self._snapshot(row)
 
-    def task_setting(self, task_type: str) -> LocalTaskModelSetting | None:
+    def task_setting(self, task_type: str) -> TaskModelSetting | None:
         with SessionLocal() as db:
             row = (
-                db.query(LocalModelTaskSetting)
-                .filter(LocalModelTaskSetting.task_type == task_type)
+                db.query(ModelTaskSetting)
+                .filter(ModelTaskSetting.task_type == task_type)
                 .first()
             )
             if not row:
                 return None
-            return LocalTaskModelSetting(
+            return TaskModelSetting(
                 task_type=row.task_type,
-                model_key=row.model_key,
+                provider=row.provider,
+                model_name=row.model_name,
                 context_length=row.context_length,
             )
-
-    def record_failure(self, provider: str, error: BaseException | object) -> None:
-        try:
-            with SqlAlchemyUnitOfWork(SessionLocal) as uow:
-                row = uow.session.query(APIConfig).filter(APIConfig.provider == provider).first()
-                if row and mark_model_failure(row, error, source="gateway"):
-                    uow.commit()
-        except Exception:
-            return
 
     @staticmethod
     def _snapshot(row: APIConfig | None) -> ModelProviderConfig | None:

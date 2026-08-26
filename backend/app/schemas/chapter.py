@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, model_validator
 
 
 SnapshotTrigger = Literal["manual_save", "ai_insert", "de_ai", "restore"]
+ChapterSaveMode = Literal["save_only", "save_and_catalog"]
 
 
 class ChapterCreate(BaseModel):
@@ -15,6 +16,8 @@ class ChapterCreate(BaseModel):
     outline_node_id: Optional[str] = Field(None, description="Linked outline node ID")
     content: str = Field("", description="Chapter body")
     context_manifest_id: Optional[str] = Field(None, description="Auditable AI task context used for generated content")
+    draft_id: Optional[str] = Field(None, description="Generated draft being explicitly saved")
+    cataloging_mode: ChapterSaveMode = "save_only"
 
 
 class ChapterUpdate(BaseModel):
@@ -25,6 +28,15 @@ class ChapterUpdate(BaseModel):
     content: Optional[str] = None
     trigger_type: SnapshotTrigger = "manual_save"
     context_manifest_id: Optional[str] = None
+    cataloging_mode: ChapterSaveMode = "save_only"
+
+    model_config = {"extra": "forbid"}
+
+
+class ChapterCatalogingRequest(BaseModel):
+    """Explicitly start cataloging for the chapter's current saved version."""
+
+    model: str | None = Field(None, max_length=300)
 
 
 class ChapterReorderRequest(BaseModel):
@@ -86,6 +98,7 @@ class ChapterListItem(BaseModel):
     title: str
     word_count: int
     current_version: int
+    cataloging_required: bool = False
     sort_order: int
     outline_title: Optional[str]
     outline_status: Optional[str]

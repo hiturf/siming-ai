@@ -78,11 +78,16 @@ const PAGE_TITLES: Record<MenuKey, string> = {
 function AiPanelColumn({ aiCollapsed, setAiCollapsed }: { aiCollapsed: boolean; setAiCollapsed: (v: boolean) => void }) {
   const { projectId } = useParams<{ projectId: string }>()
   const navigate = useNavigate()
-  const { modelOptions, defaultModel, loading: modelsLoading, setGlobalModel } = useModelOptions()
+  const {
+    modelOptions,
+    defaultModel,
+    loading: modelsLoading,
+    setTaskModel,
+  } = useModelOptions('assistant')
   const { width: aiWidth, onDragHandleMouseDown: onAiResize, dragging: aiDragging } = usePanelResize({
     initialWidth: Math.min(560, Math.max(280, window.innerWidth * 0.24)),
   })
-  const { selectedOutlineNodeId, selectedCharacterId, selectedText, selectedTextChapterId, triggerRefresh } = useAiPanelContext()
+  const { selectedText, selectedTextChapterId, triggerRefresh } = useAiPanelContext()
   // Keep chat mounted once opened to avoid re-fetching on toggle
   const [hasBeenOpened, setHasBeenOpened] = useState(!aiCollapsed)
 
@@ -101,15 +106,12 @@ function AiPanelColumn({ aiCollapsed, setAiCollapsed }: { aiCollapsed: boolean; 
       {hasBeenOpened && (
         <WorkspaceAssistantChat
           projectId={projectId!}
-          scope="project"
-          selectedOutlineNodeId={selectedOutlineNodeId}
-          selectedCharacterId={selectedCharacterId}
           selectedText={selectedText}
           selectedTextChapterId={selectedTextChapterId}
           defaultModel={defaultModel}
           modelOptions={modelOptions}
           modelsLoading={modelsLoading}
-          onGlobalModelChange={setGlobalModel}
+          onTaskModelChange={setTaskModel}
           onManageModels={() => navigate('/settings')}
           onApplied={triggerRefresh}
         />
@@ -147,6 +149,14 @@ function ProjectWorkspace() {
   const projectQuery = useProject(projectId)
   const requestedView = searchParams.get('view') as MenuKey | null
   const activeKey: MenuKey = requestedView && requestedView in PAGE_TITLES ? requestedView : 'writer'
+
+  useEffect(() => {
+    if (searchParams.get('assistant') !== 'open') return
+    setAiCollapsed(false)
+    const next = new URLSearchParams(searchParams)
+    next.delete('assistant')
+    setSearchParams(next, { replace: true })
+  }, [searchParams, setAiCollapsed, setSearchParams])
 
   const selectView = useCallback((view: MenuKey) => {
     const next = new URLSearchParams(searchParams)

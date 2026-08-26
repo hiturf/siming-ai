@@ -60,7 +60,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             "trigger_examples": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "触发关键词/示例",
+                "description": "使用示例，供 Agent 语义选择时参考",
             },
             "system_prompt": {"type": "string", "description": "技能系统提示词"},
             "recommended_tools": {
@@ -87,7 +87,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="update_skill",
-        description="更新AI技能。可按ID或名称定位，修改触发词、提示词、范围、优先级、启用状态等。",
+        description="更新AI技能。可按ID或名称定位，修改使用示例、提示词、范围、优先级、启用状态等。",
         input_schema={
             "id": {"type": "string", "description": "技能ID"},
             "skill_id": {"type": "string", "description": "兼容字段，同id"},
@@ -96,7 +96,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             "trigger_examples": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "触发关键词/示例",
+                "description": "使用示例，供 Agent 语义选择时参考",
             },
             "system_prompt": {"type": "string", "description": "技能系统提示词"},
             "recommended_tools": {
@@ -141,19 +141,6 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         tool_type="write",
         estimated_cost="free",
         handler_name="reset_skill",
-    ),
-    ToolDef(
-        name="preview_skill_match",
-        description="预览某条用户消息会匹配哪些技能。用于调试技能触发效果。",
-        input_schema={
-            "message": {"type": "string", "description": "用于测试触发的用户消息"},
-            "scope": {"type": "string", "description": "助手范围，默认project"},
-            "candidate": {"type": "object", "description": "未保存技能草案，可选"},
-        },
-        required=["message"],
-        tool_type="analysis",
-        estimated_cost="free",
-        handler_name="preview_skill_match_tool",
     ),
     ToolDef(
         name="list_skill_versions",
@@ -233,7 +220,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
                 "type": "string",
                 "description": "Prompt scope: chapter_writing|chapter_review|new_project|character_design|worldbuilding|outline_planning|cataloging|anti_ai_review",
             },
-            "mode": {"type": "string", "description": "Mode: quality|fast|external_no_api"},
+            "mode": {"type": "string", "description": "Non-writing pack variant, for example external_no_api"},
             "pack_id": {
                 "type": "string",
                 "description": "Direct pack_id lookup (overrides scope/mode)",

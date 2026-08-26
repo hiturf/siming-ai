@@ -49,14 +49,14 @@ class ListMcpToolsByPackTest(unittest.TestCase):
         names = {t.name for t in tools}
         self.assertIn("chapter_writer", names)
         self.assertIn("start_cataloging_job", names)
-        self.assertIn("create_chapter", names)
+        self.assertNotIn("create_chapter", names)
         self.assertNotIn("delete_project", names)
 
-    def test_project_writing_pack_includes_create(self):
+    def test_project_writing_pack_excludes_official_chapter_writes(self):
         tools = list_mcp_tools(permission_pack="project_writing")
         names = {t.name for t in tools}
-        self.assertIn("create_chapter", names)
-        self.assertIn("update_chapter", names)
+        self.assertNotIn("create_chapter", names)
+        self.assertNotIn("update_chapter", names)
 
     def test_project_management_pack_includes_project_crud(self):
         tools = list_mcp_tools(permission_pack="project_management")
@@ -117,8 +117,8 @@ class IsToolAllowedByPackTest(unittest.TestCase):
     def test_generator_not_allowed_in_readonly(self):
         self.assertFalse(is_tool_allowed("chapter_writer", permission_pack="readonly_collaboration"))
 
-    def test_create_allowed_in_project_writing(self):
-        self.assertTrue(is_tool_allowed("create_chapter", permission_pack="project_writing"))
+    def test_official_chapter_write_not_exposed_to_project_writing(self):
+        self.assertFalse(is_tool_allowed("create_chapter", permission_pack="project_writing"))
 
     def test_delete_allowed_in_trusted(self):
         self.assertTrue(is_tool_allowed("delete_project", permission_pack="trusted_local_maintenance"))

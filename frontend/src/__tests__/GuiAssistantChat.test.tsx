@@ -4,13 +4,14 @@ import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { message } from 'antd'
 
-const { mockGet, mockPost, mockPostForm, mockPatch, mockDelete, mockNavigate, modelState } = vi.hoisted(() => ({
+const { mockGet, mockPost, mockPostForm, mockPatch, mockDelete, mockNavigate, mockAgentTurn, modelState } = vi.hoisted(() => ({
   mockGet: vi.fn(),
   mockPost: vi.fn(),
   mockPostForm: vi.fn(),
   mockPatch: vi.fn(),
   mockDelete: vi.fn(),
   mockNavigate: vi.fn(),
+  mockAgentTurn: vi.fn(),
   modelState: { defaultModel: 'openai:test' },
 }))
 
@@ -39,17 +40,61 @@ import GuiAssistantChat from '../components/GuiAssistantChat'
 describe('GuiAssistantChat new-book handoff', () => {
   afterEach(() => {
     message.destroy()
+    message.config({ duration: 3 })
     vi.unstubAllGlobals()
     localStorage.clear()
   })
 
   beforeEach(() => {
+    message.config({ duration: 0 })
     vi.clearAllMocks()
     modelState.defaultModel = 'openai:test'
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    mockAgentTurn.mockImplementation((body: Record<string, unknown>) => ({
+      reply: '已按你的要求读取立项数据并启动局部调整。',
+      run: {
+        id: 'run-characters',
+        session_id: 'session-1',
+        stage: String(body.message || '').includes('角色') ? 'characters' : 'world_style',
+        status: 'running',
+        operation_id: 'operation-characters',
+        current_message: '正在调用立项工具',
+      },
+      tool_results: [],
+      message_status: 'running',
+      conversation_id: 'conversation-1',
+      assistant_message_id: 'assistant-1',
+      turn_persisted: true,
+    }))
+    vi.stubGlobal('fetch', vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      const result = await mockAgentTurn(body)
+      const clientTurnId = String(body.client_turn_id || 'client-turn-test')
+      const events = [
+        { client_turn_id: clientTurnId, sequence: 1, type: 'turn_started', message: '已接收请求，正在准备立项上下文…', data: {} },
+        { client_turn_id: clientTurnId, sequence: 2, type: 'tool_categories_changed', message: '已准备立项资料能力', data: { enabled_categories: ['creation_data'] } },
+        { client_turn_id: clientTurnId, sequence: 3, type: 'reply_delta', message: '', data: { delta: result.reply } },
+        { client_turn_id: clientTurnId, sequence: 4, type: 'complete', message: '本轮立项处理完成', data: result },
+      ]
+      const chunks = events.map((event) => new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`))
+      let index = 0
+      return {
+        ok: true,
+        status: 200,
+        body: {
+          getReader: () => ({
+            read: async () => index < chunks.length
+              ? { done: false, value: chunks[index++] }
+              : { done: true, value: undefined },
+            releaseLock: vi.fn(),
+          }),
+        },
+        json: async () => ({}),
+      }
+    }))
     mockGet.mockImplementation((url: string) => {
       if (url === '/projects') return Promise.resolve({ data: { data: { items: [], total: 0 } } })
-      if (url === '/ai/system-assistant/conversations') return Promise.resolve({ data: { data: { items: [], total: 0 } } })
+      if (url === '/ai/assistant/conversations') return Promise.resolve({ data: { data: { items: [], total: 0 } } })
       if (url === '/novel-creation/sessions') return Promise.resolve({ data: { data: { sessions: [] } } })
       if (url === '/novel-creation/sessions/session-1/artifacts') return Promise.resolve({ data: { data: {
         revision: 7,
@@ -65,7 +110,7 @@ describe('GuiAssistantChat new-book handoff', () => {
             checkpoint_count: 1,
             version_count: 2,
             latest_version_id: 'version-new',
-            flow: { can_view: true, can_generate: true, can_confirm: true, blocked_by: [], soft_dependencies: [] },
+            flow: { can_confirm: true, soft_dependencies: [] },
           },
           {
             artifact: 'characters',
@@ -77,9 +122,7 @@ describe('GuiAssistantChat new-book handoff', () => {
             locked_paths: ['/characters/0'],
             flow: {
               can_view: true,
-              can_generate: true,
               can_confirm: false,
-              blocked_by: [],
               soft_dependencies: [{ stage: 'world_style', label: '文风与世界观', reason: 'not_confirmed', message: '仍可生成' }],
             },
           },
@@ -125,8 +168,11 @@ describe('GuiAssistantChat new-book handoff', () => {
       }
       return Promise.reject(new Error(`unexpected GET ${url}`))
     })
-    mockPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
-      if (url === '/novel-creation/start') return Promise.resolve({ data: { data: { session_id: 'session-1' } } })
+    mockPost.mockImplementation((url: string) => {
+      if (url === '/novel-creation/start') return Promise.resolve({ data: { data: {
+        session_id: 'session-1',
+        session: { id: 'session-1', user_brief: '', status: 'drafting', revision: 1 },
+      } } })
       if (url === '/novel-creation/sessions/session-1/interview/next') {
         return Promise.resolve({
           data: {
@@ -156,33 +202,6 @@ describe('GuiAssistantChat new-book handoff', () => {
           current_message: '正在生成创意方向',
         } } } })
       }
-      if (url === '/novel-creation/conversation-command') {
-        return Promise.resolve({ data: { data: {
-          summary: '已开始角色与关系调整',
-          run: {
-            id: 'run-characters',
-            session_id: 'session-1',
-            stage: 'characters',
-            status: 'running',
-            operation_id: 'operation-characters',
-            current_message: '正在调整角色与关系',
-          },
-        } } })
-      }
-      if (url === '/novel-creation/agent-turn') {
-        return Promise.resolve({ data: { data: {
-          reply: '已按你的要求读取立项数据并启动局部调整。',
-          run: {
-            id: 'run-characters',
-            session_id: 'session-1',
-            stage: String(body?.message || '').includes('角色') ? 'characters' : 'world_style',
-            status: 'running',
-            operation_id: 'operation-characters',
-            current_message: '正在调用立项工具',
-          },
-          tool_results: [],
-        } } })
-      }
       if (url === '/novel-creation/sessions/session-1/stages/concepts/confirm') {
         return Promise.resolve({ data: { data: { id: 'session-1', revision: 8 } } })
       }
@@ -192,13 +211,13 @@ describe('GuiAssistantChat new-book handoff', () => {
       if (url === '/novel-creation/artifact-versions/version-old/restore') {
         return Promise.resolve({ data: { data: { artifact: { artifact: 'concepts', revision: 8 } } } })
       }
-      if (url === '/ai/system-assistant/conversations') {
+      if (url === '/ai/assistant/conversations') {
         return Promise.resolve({ data: { data: { conversation: { id: 'conversation-1', title: '新书' } } } })
       }
-      if (url === '/ai/system-assistant/conversations/conversation-1/turns') {
+      if (url === '/ai/assistant/conversations/conversation-1/turns') {
         return Promise.resolve({ data: { data: { conversation: { id: 'conversation-1', title: '新书' } } } })
       }
-      if (url === '/ai/system-assistant/conversations/conversation-1/turns/start') {
+      if (url === '/ai/assistant/conversations/conversation-1/turns/start') {
         return Promise.resolve({ data: { data: {
           conversation: { id: 'conversation-1', title: '新书', scope_type: 'creation', creation_session_id: 'session-1' },
           messages: [{ id: 'user-1' }, { id: 'assistant-1' }],
@@ -215,17 +234,17 @@ describe('GuiAssistantChat new-book handoff', () => {
       if (url === '/projects') {
         return Promise.resolve({ data: { data: { items: [{ id: 'project-1', title: '测试作品' }], total: 1 } } })
       }
-      if (url === '/ai/system-assistant/conversations') {
+      if (url === '/ai/assistant/conversations') {
         return Promise.resolve({ data: { data: { items: [], total: 0 } } })
       }
       return Promise.reject(new Error(`unexpected GET ${url}`))
     })
     mockPost.mockImplementation((url: string, body: any) => {
-      if (url === '/ai/system-assistant/conversations') {
+      if (url === '/ai/assistant/conversations') {
         expect(body).toMatchObject({ scope_type: 'project', scope_id: 'project-1' })
         return Promise.resolve({ data: { data: { conversation: { id: 'project-conversation-1', title: '讨论' } } } })
       }
-      if (url === '/ai/system-assistant/conversations/project-conversation-1/turns/start') {
+      if (url === '/ai/assistant/conversations/project-conversation-1/turns/start') {
         expect(body).toMatchObject({ scope_type: 'project', scope_id: 'project-1', user_content: '调整主角动机' })
         return Promise.resolve({ data: { data: {
           conversation: { id: 'project-conversation-1', title: '讨论', scope_type: 'project', scope_id: 'project-1' },
@@ -235,7 +254,15 @@ describe('GuiAssistantChat new-book handoff', () => {
       return Promise.reject(new Error(`unexpected POST ${url}`))
     })
     const stream = [
-      'data: ' + JSON.stringify({ type: 'complete', data: { reply: '已调整主角动机', run: { id: 'run-1', operation_id: 'operation-1' } } }),
+      'data: ' + JSON.stringify({ type: 'reasoning_delta', delta: '先读取角色档案，再核对当前目标。', iteration: 1 }),
+      'data: ' + JSON.stringify({
+        type: 'complete',
+        data: {
+          reply: '已调整主角动机',
+          reasoning_content: '先读取角色档案，再核对当前目标。',
+          run: { id: 'run-1', operation_id: 'operation-1' },
+        },
+      }),
       'data: [DONE]',
       '',
     ].join('\n\n')
@@ -250,8 +277,12 @@ describe('GuiAssistantChat new-book handoff', () => {
     await user.type(screen.getByRole('textbox', { name: '给司命的消息' }), '调整主角动机')
     await user.click(screen.getByRole('button', { name: /发送/ }))
 
+    const reasoning = await screen.findByRole('button', { name: /模型思考摘要.*已完成/ })
+    await user.click(reasoning)
+    expect(await screen.findByText('先读取角色档案，再核对当前目标。')).toBeInTheDocument()
+
     await waitFor(() => expect(mockPatch).toHaveBeenCalledWith(
-      '/ai/system-assistant/conversations/project-conversation-1/turns/assistant-1',
+      '/ai/assistant/conversations/project-conversation-1/turns/assistant-1',
       expect.objectContaining({
         assistant_content: '已调整主角动机',
         status: 'completed',
@@ -259,6 +290,7 @@ describe('GuiAssistantChat new-book handoff', () => {
         scope_id: 'project-1',
         run_id: 'run-1',
         operation_id: 'operation-1',
+        payload: expect.objectContaining({ reasoning_content: '先读取角色档案，再核对当前目标。' }),
       }),
     ))
   })
@@ -273,7 +305,7 @@ describe('GuiAssistantChat new-book handoff', () => {
     expect(mockNavigate).toHaveBeenCalledWith('/getting-started')
   })
 
-  it('creates structured context immediately and lets the agent read and update it from the first turn', async () => {
+  it('creates a creation context before the first unbound Agent turn', async () => {
     const user = userEvent.setup()
     render(<MemoryRouter><GuiAssistantChat /></MemoryRouter>)
 
@@ -281,60 +313,150 @@ describe('GuiAssistantChat new-book handoff', () => {
     await user.click(screen.getByRole('button', { name: /发送/ }))
 
     expect(await screen.findByText('已按你的要求读取立项数据并启动局部调整。')).toBeInTheDocument()
-    expect(mockPost).toHaveBeenCalledWith('/novel-creation/start', expect.objectContaining({
-      creation_mode: 'author_led',
-    }))
-    expect(mockPost).toHaveBeenCalledWith('/novel-creation/agent-turn', expect.objectContaining({
+    await user.click(await screen.findByText('运行过程（2）'))
+    expect(await screen.findByText('已准备立项资料能力')).toBeInTheDocument()
+    expect(screen.queryByText('set_tool_categories')).not.toBeInTheDocument()
+    expect(mockPost).toHaveBeenCalledWith('/novel-creation/start', {
+      mode: 'internal_llm',
+      user_brief: '',
+    })
+    expect(mockAgentTurn).toHaveBeenCalledWith(expect.objectContaining({
       session_id: 'session-1',
       message: '我要创建新的小说',
+      conversation_id: 'conversation-1',
+      assistant_message_id: 'assistant-1',
     }))
+    const agentRequest = mockAgentTurn.mock.calls[0]?.[0]
+    expect(agentRequest).not.toHaveProperty('history')
+    expect(agentRequest).toHaveProperty('client_turn_id')
+    expect(mockPatch).not.toHaveBeenCalledWith(
+      '/ai/assistant/conversations/conversation-1/turns/assistant-1',
+      expect.anything(),
+    )
     expect(mockPost).not.toHaveBeenCalledWith('/novel-creation/sessions/session-1/interview/next', expect.anything(), expect.anything())
   })
 
-  it.skip('offers distinct original-input and latest-content retries for a failed legacy interview run', async () => {
-    const basePost = mockPost.getMockImplementation()
-    mockPost.mockImplementation((url: string, ...args: unknown[]) => {
-      if (url === '/novel-creation/sessions/session-1/runs') {
-        return Promise.resolve({ data: { data: { run: {
-          id: 'run-failed',
-          session_id: 'session-1',
-          stage: 'concepts',
-          status: 'failed',
-          operation_id: 'operation-failed',
-          current_message: '模型调用失败',
-        } } } })
+  it('hands a completed formal work off to its project page with the project assistant open', async () => {
+    const baseGet = mockGet.getMockImplementation()
+    let finalized = false
+    mockGet.mockImplementation((url: string, ...args: unknown[]) => {
+      if (url === '/projects') {
+        return Promise.resolve({ data: { data: {
+          items: finalized ? [{ id: 'formal-project-1', title: '灰港遗忘症' }] : [],
+          total: finalized ? 1 : 0,
+        } } })
       }
-      if (url === '/novel-creation/runs/run-failed/retry') {
-        return Promise.resolve({ data: { data: { run: {
-          id: 'run-retry',
-          session_id: 'session-1',
-          stage: 'concepts',
-          status: 'running',
-          operation_id: 'operation-retry',
-          current_message: '正在按原输入重试',
-        } } } })
+      if (url === '/novel-creation/sessions') {
+        return Promise.resolve({ data: { data: { sessions: finalized ? [{
+          id: 'session-1', status: 'completed', revision: 8,
+          display_title: '灰港遗忘症', created_project_id: 'formal-project-1',
+        }] : [] } } })
       }
-      return basePost?.(url, ...args)
+      return baseGet?.(url, ...args)
+    })
+    mockAgentTurn.mockImplementation(() => {
+      finalized = true
+      return {
+        reply: '项目建好了，我们继续在这里写第一章。',
+        run: null,
+        tool_results: [{
+          tool: 'finalize_creation_session', status: 'ok', data: { project_id: 'formal-project-1' },
+        }],
+        created_project_id: 'formal-project-1',
+        message_status: 'completed',
+        conversation_id: 'conversation-1',
+        assistant_message_id: 'assistant-1',
+        turn_persisted: true,
+      }
     })
 
     const user = userEvent.setup()
     render(<MemoryRouter><GuiAssistantChat /></MemoryRouter>)
-    await user.type(await screen.findByRole('textbox', { name: '给司命的消息' }), '我要创建新的小说')
+    await user.type(await screen.findByRole('textbox', { name: '给司命的消息' }), '确认创建正式作品')
     await user.click(screen.getByRole('button', { name: /发送/ }))
 
-    await waitFor(() => expect(mockPost).toHaveBeenCalledWith(
-      '/novel-creation/sessions/session-1/runs',
-      expect.anything(),
+    await waitFor(() => expect(mockAgentTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ session_id: 'session-1' }),
     ))
-    expect(await screen.findByText('模型调用失败')).toBeInTheDocument()
-    expect(await screen.findByRole('button', { name: /按原输入重试/ })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /按最新内容重试/ })).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: /按原输入重试/ }))
+    expect(await screen.findByText(/正式作品已创建并进入作品库/)).toBeInTheDocument()
+    const handoff = await screen.findByRole('button', { name: '进入正式作品并展开项目助手' })
+    expect(screen.getByText('灰港遗忘症')).toBeInTheDocument()
+    expect(screen.queryByText('项目建好了，我们继续在这里写第一章。')).not.toBeInTheDocument()
+    expect(screen.queryByText('打开完整编辑器')).not.toBeInTheDocument()
+    await user.click(handoff)
+    expect(mockNavigate).toHaveBeenCalledWith('/project/formal-project-1?assistant=open')
+  })
 
-    expect(mockPost).toHaveBeenCalledWith('/novel-creation/runs/run-failed/retry', {
-      use_latest_draft: false,
-      model: 'openai:test',
+  it('does not render deleted works, their creation data, or their conversations anywhere', async () => {
+    localStorage.setItem('siming.gui.assistant.sidebarCollapsed', '0')
+    localStorage.setItem('siming.gui.assistant.projectId', 'deleted-project')
+    mockGet.mockImplementation((url: string, params?: Record<string, unknown>) => {
+      if (url === '/projects') return Promise.resolve({ data: { data: {
+        items: [{ id: 'live-project', title: '仍在作品库' }], total: 1,
+      } } })
+      if (url === '/novel-creation/sessions') return Promise.resolve({ data: { data: { sessions: [
+        {
+          id: 'deleted-session', status: 'completed', revision: 9,
+          display_title: '已经删除的作品', created_project_id: 'deleted-project',
+        },
+        {
+          id: 'deleted-source-session', status: 'drafting', revision: 4,
+          display_title: '已删除作品的立项资料', source_project_id: 'deleted-project',
+        },
+        {
+          id: 'active-session', status: 'drafting', revision: 3,
+          display_title: '仍在筹备', created_project_id: null,
+        },
+        {
+          id: 'live-source-session', status: 'drafting', revision: 2,
+          display_title: '仍有效的作品立项', source_project_id: 'live-project',
+        },
+      ] } } })
+      if (url === '/ai/assistant/conversations' && params?.scope_type === 'creation') {
+        return Promise.resolve({ data: { data: { items: [
+          {
+            id: 'deleted-conversation', title: '已删除作品的对话', scope_type: 'creation',
+            scope_id: 'deleted-session', creation_session_id: 'deleted-session',
+          },
+          {
+            id: 'deleted-source-conversation', title: '已删除作品的立项对话', scope_type: 'creation',
+            scope_id: 'deleted-source-session', creation_session_id: 'deleted-source-session',
+          },
+          {
+            id: 'active-conversation', title: '保留的立项对话', scope_type: 'creation',
+            scope_id: 'active-session', creation_session_id: 'active-session',
+          },
+          {
+            id: 'live-source-conversation', title: '保留的作品立项对话', scope_type: 'creation',
+            scope_id: 'live-source-session', creation_session_id: 'live-source-session',
+          },
+        ], total: 4 } } })
+      }
+      if (url === '/ai/assistant/conversations') {
+        return Promise.resolve({ data: { data: { items: [], total: 0 } } })
+      }
+      return Promise.reject(new Error(`unexpected GET ${url}`))
     })
+
+    const user = userEvent.setup()
+    render(
+      <MemoryRouter initialEntries={['/?creationSession=deleted-source-session']}>
+        <GuiAssistantChat />
+      </MemoryRouter>,
+    )
+
+    expect(await screen.findByText('保留的立项对话')).toBeInTheDocument()
+    expect(localStorage.getItem('siming.gui.assistant.projectId')).toBeNull()
+    expect(screen.getByText('保留的作品立项对话')).toBeInTheDocument()
+    expect(screen.queryByText('已删除作品的对话')).not.toBeInTheDocument()
+    expect(screen.queryByText('已删除作品的立项对话')).not.toBeInTheDocument()
+    expect(screen.queryByRole('complementary', { name: '作品资料' })).not.toBeInTheDocument()
+    expect(mockGet).not.toHaveBeenCalledWith('/novel-creation/sessions/deleted-source-session/artifacts')
+    await user.click(screen.getByRole('combobox', { name: '选择作品上下文' }))
+    expect(await screen.findByText('仍在筹备 · 筹备中')).toBeInTheDocument()
+    expect(screen.getByText('仍有效的作品立项 · 筹备中')).toBeInTheDocument()
+    expect(screen.queryByText('已经删除的作品 · 筹备中')).not.toBeInTheDocument()
+    expect(screen.queryByText('已删除作品的立项资料 · 筹备中')).not.toBeInTheDocument()
   })
 
   it('keeps structured creation data visible beside the conversation and confirms it in place', async () => {
@@ -364,7 +486,6 @@ describe('GuiAssistantChat new-book handoff', () => {
 
   it('uses the confirmed artifact as the source of truth over a stale waiting task snapshot', async () => {
     const baseGet = mockGet.getMockImplementation()
-    const basePost = mockPost.getMockImplementation()
     mockGet.mockImplementation((url: string, ...args: unknown[]) => {
       if (url === '/novel-creation/sessions/session-1/artifacts') {
         return Promise.resolve({ data: { data: {
@@ -377,29 +498,28 @@ describe('GuiAssistantChat new-book handoff', () => {
             source: 'author',
             revision: 8,
             locked_paths: [],
-            flow: { can_view: true, can_generate: true, can_confirm: false, blocked_by: [], soft_dependencies: [] },
+            flow: { can_confirm: false, soft_dependencies: [] },
           }],
         } } })
       }
       return baseGet?.(url, ...args)
     })
-    mockPost.mockImplementation((url: string, ...args: unknown[]) => {
-      if (url === '/novel-creation/agent-turn') {
-        return Promise.resolve({ data: { data: {
-          reply: '创意方案已生成。',
-          run: {
-            id: 'run-waiting',
-            session_id: 'session-1',
-            stage: 'concepts',
-            status: 'waiting_user',
-            operation_id: 'operation-waiting',
-            current_message: '阶段结果已保存，等待作者确认',
-          },
-          tool_results: [],
-        } } })
-      }
-      return basePost?.(url, ...args)
-    })
+    mockAgentTurn.mockImplementation(() => ({
+      reply: '创意方案已生成。',
+      run: {
+        id: 'run-waiting',
+        session_id: 'session-1',
+        stage: 'concepts',
+        status: 'waiting_user',
+        operation_id: 'operation-waiting',
+        current_message: '阶段结果已保存，等待作者确认',
+      },
+      tool_results: [],
+      message_status: 'completed',
+      conversation_id: 'conversation-1',
+      assistant_message_id: 'assistant-1',
+      turn_persisted: true,
+    }))
 
     const user = userEvent.setup()
     render(<MemoryRouter><GuiAssistantChat /></MemoryRouter>)
@@ -425,27 +545,29 @@ describe('GuiAssistantChat new-book handoff', () => {
             source: 'assistant',
             revision: 8,
             locked_paths: [],
-            flow: { can_view: true, can_generate: true, can_confirm: true, blocked_by: [], soft_dependencies: [] },
+            flow: { can_confirm: true, soft_dependencies: [] },
           }],
         } } })
       }
       return baseGet?.(url, ...args)
     })
+    mockAgentTurn.mockImplementation(() => ({
+      reply: '同时写了 4 条关系，其余内容未改动。',
+      run: {
+        id: 'run-characters-failed',
+        session_id: 'session-1',
+        stage: 'characters',
+        status: 'failed',
+        operation_id: 'operation-characters-failed',
+        current_message: '请先选择一个创意方向',
+      },
+      tool_results: [],
+      message_status: 'completed',
+      conversation_id: 'conversation-1',
+      assistant_message_id: 'assistant-1',
+      turn_persisted: true,
+    }))
     mockPost.mockImplementation((url: string, ...args: unknown[]) => {
-      if (url === '/novel-creation/agent-turn') {
-        return Promise.resolve({ data: { data: {
-          reply: '同时写了 4 条关系，其余内容未改动。',
-          run: {
-            id: 'run-characters-failed',
-            session_id: 'session-1',
-            stage: 'characters',
-            status: 'failed',
-            operation_id: 'operation-characters-failed',
-            current_message: '请先选择一个创意方向',
-          },
-          tool_results: [],
-        } } })
-      }
       if (url === '/novel-creation/runs/run-characters-failed/card-presentation') {
         return Promise.resolve({ data: { data: { run: {
           id: 'run-characters-failed',
@@ -505,7 +627,7 @@ describe('GuiAssistantChat new-book handoff', () => {
               input_revision: 7,
               current_revision: 9,
             },
-            flow: { can_view: true, can_generate: true, can_confirm: false, blocked_by: [], soft_dependencies: [] },
+            flow: { can_confirm: false, soft_dependencies: [] },
           }],
         } } })
       }
@@ -564,7 +686,7 @@ describe('GuiAssistantChat new-book handoff', () => {
     await user.click(screen.getByRole('button', { name: /发送/ }))
 
     await waitFor(() => {
-      expect(mockPost).toHaveBeenCalledWith('/novel-creation/agent-turn', expect.objectContaining({
+      expect(mockAgentTurn).toHaveBeenCalledWith(expect.objectContaining({
         session_id: 'session-1',
         message: '主角保持不变，重做反派和人物关系',
       }))
@@ -584,7 +706,7 @@ describe('GuiAssistantChat new-book handoff', () => {
     await user.click(screen.getByRole('button', { name: /发送/ }))
 
     await waitFor(() => {
-      expect(mockPost).toHaveBeenCalledWith('/novel-creation/agent-turn', expect.objectContaining({
+      expect(mockAgentTurn).toHaveBeenCalledWith(expect.objectContaining({
         session_id: 'session-1',
         message: '创建两个新的反派角色',
       }))
@@ -636,152 +758,10 @@ describe('GuiAssistantChat new-book handoff', () => {
     expect(screen.getByRole('heading', { name: '创意方案' })).toBeVisible()
   })
 
-  it.skip('shows actual runtime diagnostics after a legacy interview response', async () => {
-    const user = userEvent.setup()
-    render(<MemoryRouter><GuiAssistantChat /></MemoryRouter>)
-
-    await user.type(await screen.findByRole('textbox', { name: '给司命的消息' }), '\u6211\u60f3\u521b\u5efa\u4e00\u672c\u65b0\u7684\u5c0f\u8bf4')
-    await user.click(screen.getByRole('button', { name: /\u53d1\u9001/ }))
-
-    await user.click(screen.getByRole('button', { name: '\u67e5\u770b\u5f53\u524d\u6a21\u578b\u4e0e\u8fd0\u884c\u72b6\u6001' }))
-    await waitFor(() => {
-      const runtime = screen.getByLabelText('\u5f53\u524d\u6a21\u578b\u8fd0\u884c\u72b6\u6001')
-      expect(runtime).toHaveTextContent('\u63d0\u4f9b\u5546')
-      expect(runtime).toHaveTextContent('openai')
-      expect(runtime).toHaveTextContent('openai:test')
-      expect(runtime).toHaveTextContent('\u5168\u5c40\u9ed8\u8ba4')
-      expect(runtime).toHaveTextContent('\u52a8\u6001\u91c7\u8bbf JSON')
-      expect(runtime).toHaveTextContent('30 \u79d2')
-    })
-  })
-
-  it.skip('marks a failed legacy system chat as an error instead of a completion', async () => {
-    const user = userEvent.setup()
-    render(<MemoryRouter><GuiAssistantChat /></MemoryRouter>)
-
-    await user.type(await screen.findByRole('textbox', { name: '给司命的消息' }), '你好')
-    await user.click(screen.getByRole('button', { name: /发送/ }))
-
-    const errorMessage = await screen.findByRole('alert')
-    expect(errorMessage).toHaveAttribute('data-message-status', 'error')
-    expect(errorMessage).toHaveTextContent('unexpected POST /novel-creation/system-chat')
-  })
-
-  it.skip('marks an empty legacy system chat reply as an error instead of a completion', async () => {
-    mockPost.mockImplementation((url: string) => {
-      if (url === '/novel-creation/system-chat') return Promise.resolve({ data: { data: { reply: '' } } })
-      return Promise.reject(new Error(`unexpected POST ${url}`))
-    })
-    const user = userEvent.setup()
-    render(<MemoryRouter><GuiAssistantChat /></MemoryRouter>)
-
-    await user.type(await screen.findByRole('textbox', { name: '给司命的消息' }), '你好')
-    await user.click(screen.getByRole('button', { name: /发送/ }))
-
-    const errorMessage = await screen.findByRole('alert')
-    expect(errorMessage).toHaveAttribute('data-message-status', 'error')
-    expect(errorMessage).toHaveTextContent('当前模型没有返回文字回复')
-  })
-
-  it.skip('marks a failed legacy interview skip as an error instead of a completion', async () => {
-    mockPost.mockImplementation((url: string) => {
-      if (url === '/novel-creation/start') return Promise.resolve({ data: { data: { session_id: 'session-1' } } })
-      if (url === '/novel-creation/sessions/session-1/interview/next') {
-        const priorCalls = mockPost.mock.calls.filter(([calledUrl]) => calledUrl === url).length
-        if (priorCalls === 1) {
-          return Promise.resolve({
-            data: {
-              data: {
-                session_id: 'session-1',
-                state: 'question',
-                question: { question: '主角最想得到什么？', type: 'choice', options: ['自由'] },
-                history: [],
-              },
-            },
-          })
-        }
-        return Promise.reject(new Error('模型额度已耗尽'))
-      }
-      return Promise.reject(new Error(`unexpected POST ${url}`))
-    })
-
-    const user = userEvent.setup()
-    render(<MemoryRouter><GuiAssistantChat /></MemoryRouter>)
-
-    await user.type(await screen.findByRole('textbox', { name: '给司命的消息' }), '我想创建一本新的小说')
-    await user.click(screen.getByRole('button', { name: /发送/ }))
-    await user.click(await screen.findByRole('button', { name: '跳过并生成创意方向' }))
-
-    const errorMessage = await screen.findByRole('alert')
-    expect(errorMessage).toHaveAttribute('data-message-status', 'error')
-    expect(errorMessage).toHaveTextContent('模型额度已耗尽')
-    expect(errorMessage).toHaveTextContent('执行失败')
-    expect(screen.queryByText('主角最想得到什么？')).not.toBeInTheDocument()
-  })
-
-  it.skip('renders quota exhaustion in the retired interview-only flow', async () => {
-    let interviewCalls = 0
-    mockPost.mockImplementation((url: string) => {
-      if (url === '/novel-creation/start') return Promise.resolve({ data: { data: { session_id: 'session-1' } } })
-      if (url === '/novel-creation/sessions/session-1/interview/next') {
-        interviewCalls += 1
-        if (interviewCalls === 1) {
-          return Promise.resolve({
-            data: {
-              data: {
-                session_id: 'session-1',
-                state: 'question',
-                question: { question: '\u5f00\u5c40\u7684\u4ee3\u4ef7\u662f\u4ec0\u4e48\uff1f', type: 'text' },
-                history: [],
-              },
-            },
-          })
-        }
-        return Promise.reject({
-          response: {
-            data: {
-              detail: {
-                message: 'Free usage exceeded, retrying in 9h',
-                failure_class: 'quota_or_rate_limit',
-                next_action: '\u5207\u6362\u6709\u989d\u5ea6\u7684\u6a21\u578b\u540e\u91cd\u8bd5\u3002',
-                runtime: {
-                  effective_model: 'opencode_cli:free-model',
-                  provider: 'opencode_cli',
-                  model_source: 'conversation_override',
-                  tool_mode: 'local_cli_text_json',
-                  timeout_seconds: 45,
-                  quota_status: 'exhausted_or_limited',
-                },
-              },
-            },
-          },
-        })
-      }
-      return Promise.reject(new Error(`unexpected POST ${url}`))
-    })
-
-    const user = userEvent.setup()
-    render(<MemoryRouter><GuiAssistantChat /></MemoryRouter>)
-
-    await user.type(await screen.findByRole('textbox', { name: '给司命的消息' }), '\u6211\u60f3\u521b\u5efa\u4e00\u672c\u65b0\u7684\u5c0f\u8bf4')
-    await user.click(screen.getByRole('button', { name: /\u53d1\u9001/ }))
-    await user.click(await screen.findByRole('button', { name: '\u8df3\u8fc7\u5e76\u751f\u6210\u521b\u610f\u65b9\u5411' }))
-
-    await user.click(screen.getByRole('button', { name: '\u67e5\u770b\u5f53\u524d\u6a21\u578b\u4e0e\u8fd0\u884c\u72b6\u6001' }))
-    await waitFor(() => {
-      const errorMessage = screen.getByRole('alert')
-      expect(errorMessage).toHaveAttribute('data-message-status', 'error')
-      expect(errorMessage).toHaveTextContent('Free usage exceeded')
-      expect(screen.getByLabelText('\u5f53\u524d\u6a21\u578b\u8fd0\u884c\u72b6\u6001')).toHaveTextContent('\u5df2\u8017\u5c3d\u6216\u9650\u6d41')
-      expect(screen.getByLabelText('\u5f53\u524d\u6a21\u578b\u8fd0\u884c\u72b6\u6001')).toHaveTextContent('opencode_cli:free-model')
-      expect(screen.getByLabelText('\u5f53\u524d\u6a21\u578b\u8fd0\u884c\u72b6\u6001')).toHaveTextContent('45 \u79d2')
-    })
-  })
-
   it('uploads creation material as a durable binary import and applies a selected preview', async () => {
     mockGet.mockImplementation((url: string) => {
       if (url === '/projects') return Promise.resolve({ data: { data: { items: [], total: 0 } } })
-      if (url === '/ai/system-assistant/conversations') return Promise.resolve({ data: { data: { items: [], total: 0 } } })
+      if (url === '/ai/assistant/conversations') return Promise.resolve({ data: { data: { items: [], total: 0 } } })
       if (url === '/novel-creation/sessions/session-1/imports') return Promise.resolve({ data: { data: { imports: [] } } })
       if (url === '/novel-creation/sessions/session-1/artifacts') return Promise.resolve({ data: { data: { artifacts: [{ artifact: 'characters', label: '角色与关系', status: 'pending', revision: 1 }] } } })
       if (url === '/novel-creation/imports/import-1') return Promise.resolve({ data: { data: {
@@ -857,8 +837,8 @@ describe('GuiAssistantChat new-book handoff', () => {
         } } })
       }
       if (url === '/novel-creation/start') return Promise.resolve({ data: { data: { session_id: 'session-1' } } })
-      if (url === '/ai/system-assistant/conversations') return Promise.resolve({ data: { data: { conversation: { id: 'conversation-1', title: '长文本' } } } })
-      if (url === '/ai/system-assistant/conversations/conversation-1/turns/start') {
+      if (url === '/ai/assistant/conversations') return Promise.resolve({ data: { data: { conversation: { id: 'conversation-1', title: '长文本' } } } })
+      if (url === '/ai/assistant/conversations/conversation-1/turns/start') {
         expect(body.user_content).toBe(longText)
         return Promise.resolve({ data: { data: {
           conversation: { id: 'conversation-1', title: '长文本' },
@@ -935,20 +915,18 @@ describe('GuiAssistantChat new-book handoff', () => {
   it('can ask more than once without losing the original TXT', async () => {
     const fileText = '林野来到灰港。'
     let routeCalls = 0
-    mockPost.mockImplementation((url: string, body?: any) => {
-      if (url === '/ai/system-assistant/conversations') {
-        return Promise.resolve({ data: { data: { conversation: { id: 'conversation-1', title: '灰港.txt' } } } })
+    mockAgentTurn.mockImplementation((body: Record<string, unknown>) => {
+      expect(String(body.message || '')).toContain(fileText)
+      expect(String(body.message || '')).toContain('总结这份内容')
+      return {
+        reply: '这段内容讲述林野来到灰港。',
+        run: null,
+        tool_results: [],
+        message_status: 'completed',
+        conversation_id: 'conversation-1',
+        assistant_message_id: 'assistant-1',
+        turn_persisted: true,
       }
-      if (url === '/ai/system-assistant/conversations/conversation-1/turns') {
-        return Promise.resolve({ data: { data: { conversation: { id: 'conversation-1', title: '灰港.txt' } } } })
-      }
-      if (url === '/novel-creation/system-chat') {
-        expect(body.message).toContain(fileText)
-        expect(body.message).toContain('总结这份内容')
-        expect(body.context.readOnly).toBe(true)
-        return Promise.resolve({ data: { data: { reply: '这段内容讲述林野来到灰港。' } } })
-      }
-      return Promise.reject(new Error(`unexpected POST ${url}`))
     })
     mockPostForm.mockImplementation((url: string, body: FormData) => {
       if (url !== '/novel-creation/assistant-input/route-file') {
@@ -1002,7 +980,7 @@ describe('GuiAssistantChat new-book handoff', () => {
   })
 
   it('does not treat a pasted local path as consent and asks for a read-only snapshot', async () => {
-    modelState.defaultModel = 'opencode_cli:opencode/deepseek-v4-flash-free'
+    modelState.defaultModel = 'opencode_cli:opencode/big-pickle'
     const user = userEvent.setup()
     render(<MemoryRouter><GuiAssistantChat /></MemoryRouter>)
 
@@ -1016,6 +994,6 @@ describe('GuiAssistantChat new-book handoff', () => {
     expect(screen.getByText('C:\\Novel Notes\\人物设定.md')).toBeInTheDocument()
     expect(screen.getByText(/路径文字本身不会被当作授权/)).toBeInTheDocument()
     expect(screen.getByText(/不能访问原路径、父目录或相邻文件/)).toBeInTheDocument()
-    expect(mockPost).not.toHaveBeenCalledWith('/novel-creation/agent-turn', expect.anything())
+    expect(mockAgentTurn).not.toHaveBeenCalled()
   })
 })

@@ -76,7 +76,7 @@ class StartNovelCreationSessionTest(unittest.TestCase):
         }))
         checklist = result["data"]["checklist"]
         self.assertTrue(checklist["complete"])
-        self.assertEqual(checklist["next_action"], "draft_blueprints")
+        self.assertEqual(checklist["next_action"], "continue_with_agent")
 
 
 if __name__ == "__main__":

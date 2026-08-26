@@ -98,7 +98,7 @@ def storage_health(db: Session, project: Project, *, since: datetime | None = No
         ),
         "warning": (
             "Detected chapter mirror files that are not in the database. "
-            "The frontend only shows database chapters; import explicitly or recreate through create_chapter."
+            "The frontend only shows database chapters; import the mirror explicitly from the chapter management UI."
             if orphan_chapter_files else None
         ) or (
             "The database update succeeded, but one or more mirror updates need retrying."

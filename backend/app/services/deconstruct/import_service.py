@@ -5,7 +5,7 @@ import json
 
 from sqlalchemy.orm import Session
 
-from ..character_role_types import append_character_role_description, normalize_character_role_type
+from ..character_role_types import normalize_character_role_type
 
 from ...core.exceptions import ValidationError
 from ...database.models import (
@@ -116,10 +116,6 @@ def import_deconstruct_report(
             )
             abilities = char.get("abilities") if isinstance(char.get("abilities"), list) else []
             background = merge_character_background(char)
-            background = append_character_role_description(
-                background,
-                char.get("role_type") or char.get("role"),
-            )
             character = existing_characters.get(name)
             created = False
             appearance = str(char.get("appearance") or "") or None

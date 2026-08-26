@@ -8,24 +8,20 @@ from app.architecture.tool_definition import ToolDef
 TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ToolDef(
         name="start_local_cli_agent_run",
-        description="Start a Siming-managed local CLI Agent worker (Claude/Codex/opencode) only when Siming itself must launch a new process. Never call this from an already-running external MCP client; use start_agent_run and the external writing tools there. Returns an Agent run_id whose events can be streamed in the UI.",
+        description="Start a Siming-managed local CLI Agent worker for general project work or cataloging only. Chapter writing uses the assistant's direct API/CLI draft path. Never call this from an already-running external MCP client.",
         input_schema={
-            "task_type": {"type": "string", "description": "general|cataloging|writing"},
+            "task_type": {
+                "type": "string",
+                "enum": ["general", "cataloging"],
+                "description": "general|cataloging",
+            },
             "user_request": {
                 "type": "string",
                 "description": "User request for the local CLI agent",
             },
             "provider": {
                 "type": "string",
-                "description": "Optional local CLI provider id, e.g. claude_cli/codex_cli/opencode_cli/mimocode_cli/cursor_cli/kilocode_cli/qwen_code_cli/hermes_cli/openclaw_cli",
-            },
-            "outline_node_id": {
-                "type": "string",
-                "description": "Writing target outline node for the governed baseline",
-            },
-            "rewrite": {
-                "type": "boolean",
-                "description": "True only when replacing an existing chapter through its version flow",
+                "description": "Optional local CLI provider id, e.g. claude_cli/codex_cli/opencode_cli/mimocode_cli/cursor_cli/kilocode_cli/qwen_code_cli/hermes_cli/openclaw_cli/dsh_cli",
             },
             "chapter_id": {
                 "type": "string",
@@ -52,16 +48,11 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="wait_local_cli_agent_run",
-        description="Wait for a Siming-managed local CLI Agent run to finish and validate that writes landed in the database. For writing runs, detects direct file edits/orphan chapter mirror files and fails the plan instead of reporting false success.",
+        description="Wait for a Siming-managed general or cataloging CLI Agent run to finish.",
         input_schema={
             "run_id": {
                 "type": "string",
                 "description": "Agent run ID returned by start_local_cli_agent_run",
-            },
-            "task_type": {"type": "string", "description": "general|cataloging|writing"},
-            "outline_node_id": {
-                "type": "string",
-                "description": "Expected target outline node for writing validation",
             },
             "timeout_seconds": {
                 "type": "integer",

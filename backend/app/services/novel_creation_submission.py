@@ -15,7 +15,7 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
-async def submit_creation_stage(
+async def save_creation_stage_data(
     db: Session,
     args: dict[str, Any],
     *,
@@ -25,9 +25,9 @@ async def submit_creation_stage(
     session_id, stage = _text(args.get("session_id")), _text(args.get("stage"))
     session = novel_creation_session_store(db).session(session_id)
     if not session:
-        return {"tool": "submit_novel_creation_stage", "status": "skipped", "detail": "Session not found", "data": None}
+        return {"tool": "save_creation_artifact", "status": "skipped", "detail": "Session not found", "data": None}
     if stage not in STAGE_ORDER:
-        return {"tool": "submit_novel_creation_stage", "status": "skipped", "detail": "Unknown stage", "data": None}
+        return {"tool": "save_creation_artifact", "status": "skipped", "detail": "Unknown stage", "data": None}
     confirmation = assess_creation_confirmation(
         session,
         stage,
@@ -36,7 +36,7 @@ async def submit_creation_stage(
     )
     if confirmation.action == "already_confirmed":
         return {
-            "tool": "submit_novel_creation_stage",
+            "tool": "save_creation_artifact",
             "status": "ok",
             "detail": f"{STAGE_LABELS[stage]}已经确认",
             "data": serialize_session(session),
@@ -44,7 +44,7 @@ async def submit_creation_stage(
     expected_revision = args.get("expected_revision")
     if expected_revision is not None and int(session.revision or 0) != int(expected_revision):
         return {
-            "tool": "submit_novel_creation_stage",
+            "tool": "save_creation_artifact",
             "status": "error",
             "detail": "Novel creation session revision conflict",
             "data": {
@@ -57,7 +57,7 @@ async def submit_creation_stage(
         save_exact_confirmation(session, stage, confirmation, source=_text(args.get("source")) or "author")
         commit_session(db)
         return {
-            "tool": "submit_novel_creation_stage",
+            "tool": "save_creation_artifact",
             "status": "ok",
             "detail": f"{STAGE_LABELS[stage]}已确认",
             "data": serialize_session(session),
@@ -77,11 +77,11 @@ async def submit_creation_stage(
         )
         commit_session(db)
         return {
-            "tool": "submit_novel_creation_stage",
+            "tool": "save_creation_artifact",
             "status": "ok",
             "detail": f"{STAGE_LABELS[stage]}已保存",
             "data": serialize_session(session),
         }
     except Exception as exc:
         db.rollback()
-        return {"tool": "submit_novel_creation_stage", "status": "error", "detail": str(exc), "data": None}
+        return {"tool": "save_creation_artifact", "status": "error", "detail": str(exc), "data": None}

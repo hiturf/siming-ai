@@ -18,6 +18,7 @@ def resolve_siming_mcp_server(
     permission_pack: str,
     project_id: str = "",
     creation_session_id: str = "",
+    tool_category_state_file: str = "",
 ) -> dict[str, Any]:
     """Return an executable MCP spec for persistent or process-scoped clients."""
 
@@ -26,6 +27,8 @@ def resolve_siming_mcp_server(
         scope_args.extend(["--project-id", project_id])
     if creation_session_id:
         scope_args.extend(["--creation-session-id", creation_session_id])
+    if tool_category_state_file:
+        scope_args.extend(["--tool-category-state-file", tool_category_state_file])
 
     if getattr(sys, "frozen", False):
         return {

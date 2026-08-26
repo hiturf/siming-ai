@@ -21,7 +21,10 @@ TRAINING_MODEL_IDS = {
     "qwen3.5-4b-q4": "Qwen/Qwen3.5-4B",
     "qwen3.5-9b-q4": "Qwen/Qwen3.5-9B",
     "qwen3.5-27b-q4": "Qwen/Qwen3.5-27B",
+    "qwen3.8-27b-q4": "Qwen/Qwen3.8-27B",
 }
+
+LARGE_TRAINING_MODEL_KEYS = {"qwen3.5-27b-q4", "qwen3.8-27b-q4"}
 
 _WORKERS: dict[str, threading.Thread] = {}
 _PROCESSES: dict[str, subprocess.Popen] = {}
@@ -121,8 +124,8 @@ def create_training_job(
         raise ValueError("LoRA 训练 Beta 需要至少 8GB 显存的 NVIDIA 显卡")
     if base_model_key not in TRAINING_MODEL_IDS:
         raise ValueError("当前基座不支持内置 QLoRA 训练")
-    if base_model_key == "qwen3.5-27b-q4" and profile.vram_gb < 24:
-        raise ValueError("14B QLoRA 建议至少 24GB 显存；当前设备请使用 4B 或 8B")
+    if base_model_key in LARGE_TRAINING_MODEL_KEYS and profile.vram_gb < 24:
+        raise ValueError("27B QLoRA 建议至少 24GB 显存；当前设备请使用 4B 或 9B")
     with SessionLocal() as db:
         dataset = db.query(TrainingDataset).filter(TrainingDataset.id == dataset_id).first()
         if not dataset or not dataset.rights_confirmed:

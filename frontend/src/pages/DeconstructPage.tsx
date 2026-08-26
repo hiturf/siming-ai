@@ -68,7 +68,7 @@ function DeconstructPage({ projectId }: DeconstructPageProps) {
   const [reduceStreamText, setReduceStreamText] = useState('')
   const [reduceStreaming, setReduceStreaming] = useState(false)
   const [streamDisconnected, setStreamDisconnected] = useState(false)
-  const { modelOptions, defaultModel, loading: modelsLoading } = useModelOptions()
+  const { modelOptions, defaultModel, loading: modelsLoading } = useModelOptions('deconstruct')
 
   const appendReduceStatus = (line: string) => {
     setReduceStreamText((prev) => {

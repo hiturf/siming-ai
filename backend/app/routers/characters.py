@@ -36,7 +36,7 @@ from ..services.character_merge_service import (
     find_duplicate_character_candidates,
     merge_characters,
 )
-from ..services.character_role_types import append_character_role_description, normalize_character_role_type
+from ..services.character_role_types import normalize_character_role_type
 
 router = APIRouter(tags=["characters"])
 
@@ -59,13 +59,12 @@ def create_character(
     """Create a character."""
     db = command.session
     get_project_or_404(db, project_id)
-    background = append_character_role_description(payload.background, payload.role_type)
     character = character_workspace(db).create_character(
         project_id=project_id,
         name=payload.name,
         appearance=payload.appearance,
         personality=payload.personality,
-        background=background,
+        background=payload.background,
         abilities=dumps_list(payload.abilities),
         role_type=normalize_character_role_type(payload.role_type),
         age=payload.age,
@@ -215,10 +214,6 @@ def update_character(
     change_summary = update_data.pop("change_summary", None)
     if "role_type" in update_data:
         raw_role_type = update_data["role_type"]
-        update_data["background"] = append_character_role_description(
-            update_data.get("background", character.background),
-            raw_role_type,
-        )
         update_data["role_type"] = normalize_character_role_type(
             raw_role_type,
             default=character.role_type or "other",

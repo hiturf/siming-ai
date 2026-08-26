@@ -119,13 +119,12 @@ def get_api_free_mode_rules() -> str:
 
 API-free 工具（可以自由使用）：
 - 所有 search_*/list_* 查询工具
-- 所有 create_*/update_*/delete_* 写入工具
+- 非正文写作任务中明确授权的 create_*/update_*/delete_* 写入工具
 - prepare_external_writing_context → 获取写作上下文
-- save_external_chapter_draft → 保存草稿
+- save_external_chapter_draft → 保存一份未入库草稿；成功后立即结束本轮
 - record_external_quality_review → 可选的独立质量评审记录；基础写作任务不要调用
-- create_chapter / update_chapter → 正式写入成功后自动创建单章节统一建档任务；按返回的 cataloging_job.next_action 继续或等待
-- start_external_cataloging_job / get_next_external_cataloging_chapter(phase="merged") / save_external_cataloging_candidates(phase="merged") / apply_pending_cataloging / verify_external_cataloging_progress → 外部融合编目全套
-- save_external_cataloging_facts / list_cataloging_facts → 仅用于恢复旧两阶段编目任务
+- start_external_cataloging_job / get_next_external_cataloging_chapter(phase="facts") / save_external_cataloging_facts → 外部建档事实阶段
+- get_next_external_cataloging_chapter(phase="candidates") / list_cataloging_facts / save_external_cataloging_candidates / apply_pending_cataloging / verify_external_cataloging_progress → 外部建档候选、应用与验证阶段
 - get_project_archive_status → 验证数据
 - get_prompt_pack → 获取写作方法论
 - remember / recall / forget → 记忆管理
@@ -134,10 +133,10 @@ API-free 工具（可以自由使用）：
 
 长内容处理规则：
 1. 不要在聊天回复里完整输出长正文、完整章节、完整角色档案、完整世界观档案或大量候选 JSON；聊天里只写摘要、数量、关键警告和下一步。
-2. 写章节正文时，先调用 save_external_chapter_draft 保存完整正文，再把返回的 draft_id/content_ref 传给 create_chapter；不要把整章正文再次塞进 create_chapter.content。
-3. 重写或扩写长文本时，优先把完整结果写入 save_external_chapter_draft 或对应写入工具；回复用户时只报告保存位置、字数和标题。
-4. 建档时默认使用融合流程：调用 get_next_external_cataloging_chapter(phase="merged") 领取当前章节，自己读取章节正文和档案镜像，然后用 save_external_cataloging_candidates(phase="merged") 直接保存候选；不要把完整 candidates 数组贴在聊天回复里。
-5. 外部建档必须按章节顺序串行生成并应用候选；不要并行处理后续章节。只有工具明确提示当前任务是旧两阶段残留时，才使用 phase="facts" / phase="candidates" 和 save_external_cataloging_facts。
+2. 写章节正文时，只调用 save_external_chapter_draft 保存完整的未入库草稿，然后立即停止。不得在同一 AI 回合写入正式章节；作者会在界面选择“保存并建档”或“仅保存”。
+3. 新章草稿只能关联尚未写入正式正文的章级大纲。已有正式章节的改写不走章节写作草稿路径；应由作者在编辑器中修改，或另行发起可审核的独立修订。
+4. 建档按章节顺序执行 facts → candidates → apply → verify：facts 阶段只读当前章并保存事实，candidates 阶段读取事实与当前档案并保存完整候选；不要把完整 facts 或 candidates 数组贴在聊天回复里。
+5. 前一章应用并验证完成后才能处理下一章；不要并行抽取后续章节，也不要跳过事实阶段直接保存候选。
 6. 如果需要让用户确认长内容，只展示摘要、差异点和可编辑字段；完整内容以 draft_id、chapter_id、candidate_id 或工具返回数据为准。
 
 工作方式：
@@ -178,29 +177,6 @@ def get_public_chapter_quality_system_prompt() -> str:
 
     return render_prompt(
         "assistant.chapter.quality.public",
-        writing_directives="遵守本轮项目上下文与作者要求。",
-        style_context="{style_context}",
-    )
-
-
-def get_internal_chapter_fast_system_prompt() -> str:
-    """Render the internal fast contract from the compiled PromptSpec catalog."""
-    from ..modules.assistant.infrastructure.runtime import render_prompt
-
-    return render_prompt(
-        "assistant.chapter.fast",
-        writing_directives="遵守本轮项目上下文与作者要求。",
-        style_context="{style_context}",
-    )
-
-
-def get_public_chapter_fast_system_prompt() -> str:
-    """Render the public fast contract from the compiled PromptSpec catalog."""
-    from ..modules.assistant.infrastructure.runtime import render_prompt
-
-    return render_prompt(
-        "assistant.chapter.fast.public",
-        writing_directives="遵守本轮项目上下文与作者要求。",
         style_context="{style_context}",
     )
 

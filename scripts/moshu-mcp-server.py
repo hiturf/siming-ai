@@ -106,6 +106,11 @@ def main() -> None:
         help="Required one-session boundary when --permission-pack creation_session is used.",
     )
     parser.add_argument(
+        "--tool-category-state-file",
+        default="",
+        help="Process-scoped model-selected tool category state for one managed Agent turn.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging to stderr.",
@@ -150,6 +155,7 @@ def main() -> None:
             project_id=args.project_id,
             permission_pack=args.permission_pack,
             creation_session_id=args.creation_session_id,
+            tool_category_state_file=args.tool_category_state_file,
         )
     finally:
         db.close()

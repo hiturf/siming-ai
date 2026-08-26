@@ -65,11 +65,14 @@ class ExternalCatalogingPackTest(unittest.TestCase):
         prompt = pack["system_prompt"]
         self.assertIn("get_prompt_pack", prompt)
         self.assertIn("start_external_cataloging_job", prompt)
+        self.assertIn("save_external_cataloging_facts", prompt)
+        self.assertIn("list_cataloging_facts", prompt)
         self.assertIn("save_external_cataloging_candidates", prompt)
         self.assertIn("apply_pending_cataloging", prompt)
-        self.assertIn("phase=\"merged\"", prompt)
+        self.assertIn("phase=\"facts\"", prompt)
+        self.assertIn("phase=\"candidates\"", prompt)
         self.assertIn("读取章节正文和档案镜像", prompt)
-        self.assertIn("旧两阶段残留", prompt)
+        self.assertNotIn("merged", prompt)
 
     def test_pack_requires_unified_outline_granularity(self):
         pack = next(p for p in BUILTIN_PACKS if p["pack_id"] == "cataloging_external_no_api")
@@ -104,11 +107,9 @@ class ExternalCatalogingPackTest(unittest.TestCase):
         self.assertIn("不能只返回摘要后结束", prompt)
         self.assertIn("空数组是合法结果", prompt)
 
-    def test_seed_contains_no_second_legacy_cataloging_workflow(self):
+    def test_seed_contains_one_cataloging_workflow(self):
         source = Path(__file__).resolve().parents[1] / "app" / "services" / "prompt_packs" / "seed.py"
         text = source.read_text(encoding="utf-8")
-        self.assertNotIn('"name": "extract_facts"', text)
-        self.assertNotIn("save_external_cataloging_facts / save_external_cataloging_candidates", text)
         self.assertEqual(text.count('"pack_id": "cataloging_external_no_api"'), 1)
 
     def test_pack_requires_verification(self):
@@ -118,7 +119,7 @@ class ExternalCatalogingPackTest(unittest.TestCase):
         self.assertIn("status", prompt)
 
     def test_total_pack_count(self):
-        self.assertEqual(len(BUILTIN_PACKS), 13)
+        self.assertEqual(len(BUILTIN_PACKS), 12)
 
 
 if __name__ == "__main__":

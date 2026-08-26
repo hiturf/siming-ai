@@ -21,8 +21,10 @@ from app.database.models import APIConfig, Base, OpenCodeActivationJob
 from app.routers.getting_started import (
     OpenCodeActivateRequest,
     OpenCodeConfigureRequest,
+    OpenCodePathConfigureRequest,
     activate_opencode,
     configure_opencode,
+    configure_opencode_path,
     get_getting_started_status,
 )
 from app.schemas.config import ConnectionTestRequest
@@ -30,15 +32,16 @@ from app.services import opencode_onboarding, opencode_release_catalog
 
 
 def test_free_model_detection_covers_current_opencode_labels():
-    assert opencode_onboarding.is_free_opencode_model("opencode/deepseek-v4-flash-free")
-    assert opencode_onboarding.is_free_opencode_model("opencode/laguna-s-2.1-free")
+    assert opencode_onboarding.is_free_opencode_model("opencode/x-preview-f-free")
+    assert opencode_onboarding.is_free_opencode_model("opencode/hy3-free")
     assert opencode_onboarding.is_free_opencode_model("opencode/big-pickle")
+    assert not opencode_onboarding.is_free_opencode_model("opencode/deepseek-v4-flash-free")
     assert not opencode_onboarding.is_free_opencode_model("opencode/minimax-m2.7")
 
 
 def test_inspect_opencode_prefers_live_free_models():
     models = [
-        {"id": "opencode/deepseek-v4-flash-free", "display_name": "DeepSeek V4 Flash Free"},
+        {"id": "opencode/big-pickle", "display_name": "Big Pickle"},
         {"id": "opencode/paid-model", "display_name": "Paid"},
     ]
     with patch.object(opencode_onboarding, "resolve_opencode_command", return_value=r"C:\tools\opencode.exe"), patch.object(
@@ -48,12 +51,12 @@ def test_inspect_opencode_prefers_live_free_models():
 
     assert status["installed"] is True
     assert status["model_source"] == "cli"
-    assert [item["id"] for item in status["free_models"]] == ["opencode/deepseek-v4-flash-free"]
-    assert status["recommended_model"] == "opencode/deepseek-v4-flash-free"
+    assert [item["id"] for item in status["free_models"]] == ["opencode/big-pickle"]
+    assert status["recommended_model"] == "opencode/big-pickle"
 
 
 def test_inspect_opencode_caches_cli_probes_until_refresh():
-    models = [{"id": "opencode/deepseek-v4-flash-free", "display_name": "Free"}]
+    models = [{"id": "opencode/big-pickle", "display_name": "Free"}]
     opencode_onboarding.clear_opencode_inspection_cache()
     with patch.object(opencode_onboarding, "resolve_opencode_command", return_value=r"C:\tools\opencode.exe"), patch.object(
         opencode_onboarding, "_inspection_cache_key", return_value=(r"C:\tools\opencode.exe", 1)
@@ -66,6 +69,66 @@ def test_inspect_opencode_caches_cli_probes_until_refresh():
 
     assert version_probe.call_count == 2
     assert model_probe.call_count == 2
+
+
+def test_managed_opencode_path_is_added_to_current_user_only_and_is_idempotent():
+    registry = {"value": r"%SystemRoot%\System32;C:\Tools", "type": 2}
+
+    def read_path():
+        return registry["value"], registry["type"]
+
+    def write_path(value, value_type):
+        registry["value"] = value
+        registry["type"] = value_type
+
+    with TemporaryDirectory() as temporary_dir:
+        command = Path(temporary_dir) / "managed-cli" / "opencode" / "bin" / "opencode.exe"
+        command.parent.mkdir(parents=True)
+        command.write_bytes(b"managed-opencode")
+        with patch.dict(opencode_onboarding.os.environ, {"PATH": r"C:\Windows"}, clear=False), patch.object(
+            opencode_onboarding, "_path_integration_supported", return_value=True
+        ), patch.object(
+            opencode_onboarding, "managed_opencode_command", return_value=command
+        ), patch.object(
+            opencode_onboarding, "_read_current_user_path", side_effect=read_path
+        ), patch.object(
+            opencode_onboarding, "_write_current_user_path", side_effect=write_path
+        ) as write, patch.object(
+            opencode_onboarding, "_broadcast_environment_change"
+        ) as broadcast:
+            first = opencode_onboarding.configure_managed_opencode_path(enabled=True)
+            second = opencode_onboarding.configure_managed_opencode_path(enabled=True)
+
+        target = str(command.parent)
+        assert registry["value"] == rf"%SystemRoot%\System32;C:\Tools;{target}"
+        assert opencode_onboarding._windows_path_contains(registry["value"], target)
+        assert first["configured"] is True
+        assert first["scope"] == "user"
+        assert first["changed"] is True
+        assert second["changed"] is False
+        write.assert_called_once()
+        broadcast.assert_called_once()
+
+
+def test_path_configuration_endpoint_requires_explicit_opt_in():
+    configured = {
+        "supported": True,
+        "managed_install": True,
+        "configured": True,
+        "directory": r"C:\Users\writer\Siming\managed-cli\opencode\bin",
+        "scope": "user",
+        "requires_new_terminal": True,
+        "changed": True,
+    }
+    with patch(
+        "app.routers.getting_started.configure_managed_opencode_path",
+        return_value=configured,
+    ) as configure:
+        result = configure_opencode_path(OpenCodePathConfigureRequest(enabled=True))
+
+    configure.assert_called_once_with(enabled=True)
+    assert result.data == configured
+    assert "新终端" in result.message
 
 
 def test_extract_opencode_uses_only_expected_executable():
@@ -108,23 +171,23 @@ def test_configure_opencode_saves_cli_without_making_it_global_before_test():
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     inspected = {
-        "models": [{"id": "opencode/deepseek-v4-flash-free"}],
+        "models": [{"id": "opencode/big-pickle"}],
         "model_source": "cli",
         "installed": True,
         "command": r"C:\managed\opencode.exe",
         "free_models": [],
-        "recommended_model": "opencode/deepseek-v4-flash-free",
+        "recommended_model": "opencode/big-pickle",
     }
     with Session() as db, patch("app.routers.getting_started.resolve_opencode_command", return_value=inspected["command"]), patch(
         "app.routers.getting_started.inspect_opencode", return_value=inspected
     ), patch("app.services.external_agent.mcp_auto_config.auto_configure_mcp_for_provider") as auto_configure:
         result = configure_opencode(
-            OpenCodeConfigureRequest(model="opencode/deepseek-v4-flash-free"),
+            OpenCodeConfigureRequest(model="opencode/big-pickle"),
             db,
         )
         saved = db.query(APIConfig).filter(APIConfig.provider == "opencode_cli").one()
 
-    assert result.data["model"] == "opencode/deepseek-v4-flash-free"
+    assert result.data["model"] == "opencode/big-pickle"
     assert saved.provider_type == "local_cli"
     assert saved.is_global_default is False
     assert saved.readiness_status == "unverified"
@@ -238,7 +301,7 @@ def test_startup_does_not_resume_activation_when_a_model_is_already_usable():
 def test_onboarding_connection_test_can_request_a_shorter_timeout():
     payload = ConnectionTestRequest(
         provider="opencode_cli",
-        model="opencode/deepseek-v4-flash-free",
+        model="opencode/big-pickle",
         timeout_seconds=60,
     )
     assert payload.timeout_seconds == 60
@@ -595,7 +658,7 @@ def test_concurrent_activation_requests_share_one_persistent_job():
 
         workers = [threading.Thread(target=activate) for _ in range(2)]
         with patch("app.database.session.SessionLocal", Session), patch.object(
-            opencode_onboarding, "os", SimpleNamespace(name="nt")
+            opencode_onboarding, "os", SimpleNamespace(name="nt", environ={})
         ), patch.object(
             opencode_onboarding.threading, "Thread", DeferredWorker
         ):

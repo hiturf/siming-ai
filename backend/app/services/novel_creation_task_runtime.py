@@ -20,7 +20,7 @@ from app.services.operation_runtime import (
     unregister_operation_actions,
     update_operation,
 )
-from app.services.workspace.tools.novel_creation_v2 import generate_novel_creation_stage
+from app.services.workspace.tools.novel_creation_v2 import run_creation_artifact_generation
 from app.modules.model_runtime.domain.configuration import ModelProviderConfig
 
 _CREATION_TASKS: dict[str, asyncio.Task[Any]] = {}
@@ -65,7 +65,7 @@ async def _execute_creation_stage(
             heartbeat_task = asyncio.create_task(heartbeat_loop(operation_id))
         if request_provider is None:
             with activate_operation(operation_id):
-                await generate_novel_creation_stage(
+                await run_creation_artifact_generation(
                     db,
                     "",
                     {**request, "session_id": session_id, "_run_id": run_id},
@@ -77,7 +77,7 @@ async def _execute_creation_stage(
             from app.modules.model_runtime.application.request_override import use_request_provider
 
             with use_request_provider(request_provider), activate_operation(operation_id):
-                await generate_novel_creation_stage(
+                await run_creation_artifact_generation(
                     db,
                     "",
                     {**request, "session_id": session_id, "_run_id": run_id},

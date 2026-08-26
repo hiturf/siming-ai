@@ -9,7 +9,6 @@ from ..database.session import get_db
 from ..schemas.skill import (
     SkillCreate,
     SkillDraftRequest,
-    SkillMatchPreviewRequest,
     SkillUpdate,
 )
 from ..services.skills.service import (
@@ -20,7 +19,6 @@ from ..services.skills.service import (
     list_skill_tools,
     list_skill_versions,
     list_skills,
-    preview_skill_match,
     reset_skill_to_builtin,
     update_skill,
 )
@@ -78,25 +76,6 @@ def draft_project_skill(
         scope=payload.scope,
     )
     return ApiResponse.success(data=draft, message="技能草案已生成")
-
-
-@router.post("/projects/{project_id}/skills/preview-match")
-def preview_project_skill_match(
-    project_id: str,
-    payload: SkillMatchPreviewRequest,
-    db: Session = Depends(get_db),
-):
-    """Preview which skills would be selected for a user message."""
-    get_project_or_404(db, project_id)
-    candidate = payload.candidate.model_dump() if payload.candidate else None
-    preview = preview_skill_match(
-        db,
-        project_id,
-        message=payload.message,
-        scope=payload.scope,
-        candidate=candidate,
-    )
-    return ApiResponse.success(data=preview)
 
 
 @router.get("/projects/{project_id}/skills/{skill_id}/versions")

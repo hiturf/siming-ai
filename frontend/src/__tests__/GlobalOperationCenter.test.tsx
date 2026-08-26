@@ -47,7 +47,7 @@ const operation = {
   phase: 'chapter_archive',
   current_message: '正在检查第151章的角色状态',
   progress: { mode: 'indeterminate', current: null, total: null, percent: null },
-  model_source: 'opencode_cli:opencode/deepseek-v4-flash-free',
+  model_source: 'opencode_cli:opencode/big-pickle',
   next_action: '可以继续等待，或只重试当前章节',
   resume_url: '/project/project-1?view=cataloging',
   can_pause: true,
@@ -80,7 +80,7 @@ describe('GlobalOperationCenter', () => {
     expect(screen.getByText('正在等待下一条真实活动，不估算完成百分比')).toBeInTheDocument()
     expect(screen.getByText(/^最近活动 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)).toBeInTheDocument()
     expect(screen.queryByText(/最近活动.*小时前/)).not.toBeInTheDocument()
-    expect(screen.getByText(/opencode_cli:opencode\/deepseek-v4-flash-free/)).toBeInTheDocument()
+    expect(screen.getByText(/opencode_cli:opencode\/big-pickle/)).toBeInTheDocument()
     expect(screen.queryByText(/\d+%/)).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: /重试当前单元/ }))
@@ -96,6 +96,43 @@ describe('GlobalOperationCenter', () => {
 
     expect(await screen.findByText('进度流正在重新连接，已改用状态轮询')).toBeInTheDocument()
     expect(screen.getByText('作品建档 · 第151章')).toBeInTheDocument()
+  })
+
+  it('renders and refreshes the latest streamed model-output snapshot', async () => {
+    const liveOperation = {
+      ...operation,
+      health_status: 'active',
+      current_message: '模型正在生成 · 已输出 1,200 字',
+      process_metrics: {
+        kind: 'model_output',
+        output_chars: 1200,
+        output_preview: '正在整理第一章场景',
+        attempt: 1,
+      },
+    }
+    api.get.mockResolvedValue({ data: { data: { items: [liveOperation] } } })
+
+    renderCenter()
+    fireEvent.click(await screen.findByRole('button', { name: /全局任务中心/ }))
+    expect(await screen.findByText('已输出 1,200 字')).toBeInTheDocument()
+    expect(screen.getByText('正在整理第一章场景')).toBeInTheDocument()
+
+    const heartbeat = FakeEventSource.last?.listeners.get('heartbeat')
+    act(() => heartbeat?.(new MessageEvent('heartbeat', {
+      data: JSON.stringify({
+        ...liveOperation,
+        current_message: '模型正在生成 · 已输出 2,400 字',
+        process_metrics: {
+          kind: 'model_output',
+          output_chars: 2400,
+          output_preview: '正在整理第二章场景',
+          attempt: 1,
+        },
+      }),
+    })))
+
+    expect(await screen.findByText('已输出 2,400 字')).toBeInTheDocument()
+    expect(screen.getByText('正在整理第二章场景')).toBeInTheDocument()
   })
 
   it('shows a persistent author action instead of a running spinner while waiting for confirmation', async () => {

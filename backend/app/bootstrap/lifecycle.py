@@ -77,10 +77,14 @@ def _run_legacy_startup_recovery() -> None:
     from ..modules.assistant.infrastructure.system_conversations import (
         SqlAlchemySystemConversationStore,
     )
+    from ..modules.model_runtime.infrastructure.readiness import (
+        repair_runtime_readiness_demotions,
+    )
     from ..modules.story.infrastructure.content_sync import (
         recover_content_sync_queue,
     )
     from ..services.cataloging.job_control import reconcile_cataloging_operation_projections
+    from ..services.cataloging.launcher import mark_interrupted_cataloging_jobs
     from ..services.novel_creation_imports import mark_interrupted_material_imports
     from ..services.novel_creation_runs import mark_interrupted_novel_creation_runs
     from ..services.operation_runtime import mark_interrupted_operations
@@ -89,6 +93,7 @@ def _run_legacy_startup_recovery() -> None:
     recover_content_sync_queue()
     _recover_gateway_sync_capture_queue()
     with SqlAlchemyUnitOfWork(SessionLocal) as uow:
+        repair_runtime_readiness_demotions(uow.session)
         mark_interrupted_assistant_runs(uow.session)
         # Creation runs own their durable result state. Reconcile them before
         # projecting generic operations so saved output remains reviewable.
@@ -97,6 +102,7 @@ def _run_legacy_startup_recovery() -> None:
         # CatalogingJob is authoritative.  Repair legacy/local-CLI projection
         # drift before generic recovery can mistake finished work for an
         # interrupted process.
+        mark_interrupted_cataloging_jobs(uow.session)
         reconcile_cataloging_operation_projections(uow.session)
         mark_interrupted_operations(uow.session)
         SqlAlchemySystemConversationStore(uow.session).interrupt_running_messages()

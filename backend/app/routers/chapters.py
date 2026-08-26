@@ -6,28 +6,55 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
-from ..core.response import ApiResponse
 from ..architecture.uow import commit_session
+from ..core.exceptions import ValidationError
+from ..core.response import ApiResponse
 from ..database.session import get_db
 from ..modules.story.application.chapters import ChapterWorkspace
 from ..modules.story.application.commands import StoryCommandContext
 from ..modules.story.interfaces.chapter_dependencies import get_chapter_workspace
 from ..modules.story.interfaces.dependencies import get_story_command
 from ..schemas.chapter import (
+    ChapterCatalogingRequest,
     ChapterCreate,
     ChapterDeAiPreviewRequest,
     ChapterQualityScoreRequest,
     ChapterReorderRequest,
     ChapterUpdate,
 )
+from ..services.cataloging.launcher import (
+    CHAPTER_SAVE_SOURCE,
+    cancel_superseded_chapter_cataloging_jobs,
+    create_and_queue_cataloging_job,
+)
 from ..services.chapter_quality import preview_chapter_quality
 from ..services.chapter_revision import preview_de_ai_revision
-from ..services.cataloging.launcher import (
-    AUTO_CHAPTER_WRITE_SOURCE,
-    create_and_queue_cataloging_job,
+from ..services.workspace.generated_drafts import (
+    chapter_draft_result_data,
+    ensure_generated_draft_outline_is_unused,
+    find_chapter_draft,
+    latest_pending_chapter_draft,
+    mark_chapter_draft_saved,
+    update_chapter_draft,
 )
 
 router = APIRouter(tags=["chapters"])
+
+
+def _draft_or_error(db: Session, project_id: str, draft_id: str):
+    draft = find_chapter_draft(db, project_id, draft_id)
+    if not draft:
+        raise ValidationError("章节草稿不存在")
+    return draft
+
+
+def _save_message(data: dict) -> str:
+    launch = data.get("cataloging_job")
+    if isinstance(launch, dict):
+        if launch.get("started"):
+            return "章节已保存并启动建档"
+        return "章节已保存，但建档启动失败"
+    return "章节已保存，尚未建档"
 
 
 def _start_chapter_cataloging(
@@ -35,9 +62,9 @@ def _start_chapter_cataloging(
     project_id: str,
     data: dict,
     *,
-    should_start: bool = True,
+    model: str | None = None,
 ) -> dict:
-    if not should_start or int(data.get("word_count") or 0) <= 0:
+    if int(data.get("word_count") or 0) <= 0:
         return data
     try:
         _job, launch = create_and_queue_cataloging_job(
@@ -45,13 +72,14 @@ def _start_chapter_cataloging(
             project_id,
             [str(data.get("id") or data.get("chapter_id"))],
             execution_mode="auto",
-            trigger_source=AUTO_CHAPTER_WRITE_SOURCE,
+            model_override=model,
+            trigger_source=CHAPTER_SAVE_SOURCE,
             run_now=True,
         )
         data["cataloging_job"] = launch
     except Exception as exc:
         data["cataloging_job"] = {
-            "auto_started": False,
+            "started": False,
             "status": "failed_to_start",
             "error": str(exc)[:2000],
         }
@@ -66,6 +94,16 @@ def list_chapters(
     return ApiResponse.success(data=workspace.list(project_id))
 
 
+@router.get("/projects/{project_id}/chapter-drafts/pending")
+def get_pending_chapter_draft(
+    project_id: str,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """Restore the latest author-visible unsaved draft after a page reload."""
+    draft = latest_pending_chapter_draft(db, project_id)
+    return ApiResponse.success(data=chapter_draft_result_data(draft) if draft else None)
+
+
 @router.post("/projects/{project_id}/chapters")
 async def create_chapter(
     project_id: str,
@@ -74,11 +112,39 @@ async def create_chapter(
     command: Annotated[StoryCommandContext, Depends(get_story_command)],
     db: Annotated[Session, Depends(get_db)],
 ):
-    result = workspace.create(project_id, payload.model_dump())
+    values = payload.model_dump()
+    draft_id = values.pop("draft_id", None)
+    cataloging_mode = values.pop("cataloging_mode", "save_only")
+    draft = None
+    if draft_id:
+        existing_draft = _draft_or_error(db, project_id, draft_id)
+        if existing_draft.status == "saved" and existing_draft.saved_chapter_id:
+            data = workspace.detail(project_id, existing_draft.saved_chapter_id)
+            if cataloging_mode == "save_and_catalog" and data.get("cataloging_required"):
+                data = _start_chapter_cataloging(db, project_id, data)
+            return ApiResponse.success(data=data, message=_save_message(data))
+        ensure_generated_draft_outline_is_unused(
+            db,
+            project_id,
+            values.get("outline_node_id"),
+        )
+        draft = update_chapter_draft(
+            db,
+            project_id,
+            draft_id,
+            title=values["title"],
+            outline_node_id=values.get("outline_node_id"),
+            content=values.get("content") or "",
+        )
+    result = workspace.create(project_id, values)
     command.queue_all(result.sync_intents)
+    if draft is not None:
+        mark_chapter_draft_saved(db, draft, str(result.data["id"]))
     command.finish()
-    data = _start_chapter_cataloging(db, project_id, result.data)
-    return ApiResponse.success(data=data, message="章节已创建，正式建档任务已启动")
+    data = result.data
+    if cataloging_mode == "save_and_catalog":
+        data = _start_chapter_cataloging(db, project_id, data)
+    return ApiResponse.success(data=data, message=_save_message(data))
 
 
 @router.put("/projects/{project_id}/chapters/reorder")
@@ -112,19 +178,41 @@ async def save_chapter(
     command: Annotated[StoryCommandContext, Depends(get_story_command)],
     db: Annotated[Session, Depends(get_db)],
 ):
-    result = workspace.save(
-        project_id, chapter_id, payload.model_dump(exclude_unset=True)
-    )
+    values = payload.model_dump(exclude_unset=True)
+    cataloging_mode = values.pop("cataloging_mode", "save_only")
+    result = workspace.save(project_id, chapter_id, values)
     command.queue_all(result.sync_intents)
     command.finish()
+    data = result.data
+    if data.get("narrative_content_changed"):
+        cancel_superseded_chapter_cataloging_jobs(db, project_id, [chapter_id])
+    if cataloging_mode == "save_and_catalog":
+        data = _start_chapter_cataloging(db, project_id, data)
+    return ApiResponse.success(data=data, message=_save_message(data))
+
+
+@router.post("/projects/{project_id}/chapters/{chapter_id}/cataloging")
+async def start_chapter_cataloging(
+    project_id: str,
+    chapter_id: str,
+    payload: ChapterCatalogingRequest | None,
+    workspace: Annotated[ChapterWorkspace, Depends(get_chapter_workspace)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    data = workspace.detail(project_id, chapter_id)
     data = _start_chapter_cataloging(
         db,
         project_id,
-        result.data,
-        should_start=bool(result.data.get("narrative_content_changed")),
+        data,
+        model=payload.model if payload else None,
     )
-    message = "章节已保存，正式建档任务已启动" if data.get("cataloging_job") else "章节已保存"
-    return ApiResponse.success(data=data, message=message)
+    if not data.get("cataloging_job"):
+        raise ValidationError("章节正文为空，无法启动建档")
+    if not data["cataloging_job"].get("started"):
+        raise ValidationError(
+            str(data["cataloging_job"].get("error") or "章节建档启动失败")
+        )
+    return ApiResponse.success(data=data, message="章节建档已启动")
 
 
 @router.post("/projects/{project_id}/chapters/{chapter_id}/de-ai-preview")
@@ -172,6 +260,49 @@ async def quality_score_preview(
     )
     commit_session(db)
     return ApiResponse.success(data=data, message="章节质量评分已完成并写入质量曲线")
+
+
+@router.post("/projects/{project_id}/chapter-drafts/{draft_id}/de-ai-preview")
+async def draft_de_ai_preview(
+    project_id: str,
+    draft_id: str,
+    payload: ChapterDeAiPreviewRequest,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """Run de-AI against the editor text without requiring an official chapter."""
+    _draft_or_error(db, project_id, draft_id)
+    data = await preview_de_ai_revision(
+        db,
+        project_id,
+        None,
+        content=payload.content,
+        original_content=payload.original_content,
+        revision_round=payload.revision_round,
+        model=payload.model,
+    )
+    data["draft_id"] = draft_id
+    return ApiResponse.success(data=data, message="草稿去除 AI 味候选已生成；尚未保存")
+
+
+@router.post("/projects/{project_id}/chapter-drafts/{draft_id}/quality-score-preview")
+async def draft_quality_score_preview(
+    project_id: str,
+    draft_id: str,
+    payload: ChapterQualityScoreRequest,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """Score the current editor draft without creating chapter metadata."""
+    _draft_or_error(db, project_id, draft_id)
+    data = await preview_chapter_quality(
+        db,
+        project_id,
+        None,
+        content=payload.content,
+        title=payload.title,
+        model=payload.model,
+    )
+    data["draft_id"] = draft_id
+    return ApiResponse.success(data=data, message="草稿质量评分已完成；草稿仍未保存")
 
 
 @router.delete("/projects/{project_id}/chapters/{chapter_id}")
@@ -235,5 +366,4 @@ async def restore_chapter_snapshot(
     result = workspace.restore(project_id, chapter_id, snapshot_id)
     command.queue_all(result.sync_intents)
     command.finish()
-    data = _start_chapter_cataloging(db, project_id, result.data)
-    return ApiResponse.success(data=data, message="章节已恢复，正式建档任务已启动")
+    return ApiResponse.success(data=result.data, message="章节已恢复，尚未建档")

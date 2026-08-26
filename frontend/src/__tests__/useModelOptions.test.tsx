@@ -5,9 +5,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mockGet = vi.hoisted(() => vi.fn())
 const mockPut = vi.hoisted(() => vi.fn())
+const mockDelete = vi.hoisted(() => vi.fn())
 
 vi.mock('../api/client', () => ({
-  apiClient: { get: mockGet, put: mockPut },
+  apiClient: { delete: mockDelete, get: mockGet, put: mockPut },
 }))
 
 import { useModelOptions } from '../hooks/useModelOptions'
@@ -59,6 +60,65 @@ describe('useModelOptions readiness filtering', () => {
     expect(result.current.defaultModel).toBeUndefined()
     expect(result.current.hasModels).toBe(false)
     expect(result.current.hasDetectedModels).toBe(true)
+  })
+
+  it('exposes every discovered provider model and applies the task default', async () => {
+    mockGet.mockResolvedValue({ data: { data: {
+      items: [{
+        id: 'openai-ready', provider: 'openai', default_model: 'gpt-4o',
+        available_models: [
+          { id: 'gpt-4o', display_name: 'GPT 4o' },
+          { id: 'gpt-4.1-mini', display_name: 'GPT 4.1 Mini' },
+        ],
+        is_global_default: true, readiness_status: 'ready', is_usable: true,
+      }],
+      task_models: {
+        writing: {
+          task_type: 'writing', provider: 'openai', model: 'gpt-4.1-mini', is_usable: true,
+        },
+      },
+    } } })
+
+    const { result } = renderHook(() => useModelOptions('writing'), { wrapper: createWrapper() })
+
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.modelOptions.map((option) => option.value)).toEqual([
+      'openai:gpt-4o',
+      'openai:gpt-4.1-mini',
+    ])
+    expect(result.current.globalModel).toBe('openai:gpt-4o')
+    await waitFor(() => expect(result.current.taskModel).toBe('openai:gpt-4.1-mini'))
+    expect(result.current.defaultModel).toBe('openai:gpt-4.1-mini')
+  })
+
+  it('persists and clears the model for its declared task family', async () => {
+    mockGet.mockResolvedValue({ data: { data: { items: [{
+      id: 'openai-ready', provider: 'openai', default_model: 'gpt-4o',
+      available_models: [{ id: 'gpt-4.1-mini', display_name: 'GPT 4.1 Mini' }],
+      is_global_default: true, readiness_status: 'ready', is_usable: true,
+    }] } } })
+    mockPut.mockResolvedValue({ data: { data: {
+      task_type: 'writing', provider: 'openai', model: 'gpt-4.1-mini', is_usable: true,
+    } } })
+    mockDelete.mockResolvedValue({ data: { data: null } })
+    const { result } = renderHook(() => useModelOptions('writing'), { wrapper: createWrapper() })
+    await waitFor(() => expect(result.current.modelOptions).toHaveLength(2))
+
+    await act(async () => {
+      await result.current.setTaskModel('openai:gpt-4.1-mini')
+    })
+    expect(mockPut).toHaveBeenCalledWith('/config/task-models/writing', {
+      provider: 'openai',
+      model: 'gpt-4.1-mini',
+      context_length: null,
+    })
+    await waitFor(() => expect(result.current.taskModel).toBe('openai:gpt-4.1-mini'))
+
+    await act(async () => {
+      await result.current.setTaskModel(undefined)
+    })
+    expect(mockDelete).toHaveBeenCalledWith('/config/task-models/writing')
+    await waitFor(() => expect(result.current.defaultModel).toBe('openai:gpt-4o'))
   })
 
   it('switches only to a ready model and synchronizes every mounted consumer', async () => {

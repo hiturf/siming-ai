@@ -39,6 +39,7 @@ export function RunStatusPanels({
   onAcceptResult,
   onRegenerateLatest,
 }: RunStatusPanelsProps) {
+  const streamProgress = activeRun?.stream_progress
   return (
     <>
       {busy && (
@@ -51,11 +52,19 @@ export function RunStatusPanels({
               {activeRun && <Tag>阶段：{stageLabels[activeRun.stage] || activeRun.stage}</Tag>}
               {activeRun && <Tag>实际模型：{activeRun.model_source || '等待任务上报'}</Tag>}
               {activeRun && <Tag>尝试次数：{runAttempt(activeRun) ?? '等待任务上报'}</Tag>}
+              {streamProgress?.output_chars ? <Tag color="cyan">已输出：{streamProgress.output_chars.toLocaleString()} 字</Tag> : null}
+              {streamProgress?.max_output_tokens ? <Tag>输出预算：{streamProgress.max_output_tokens.toLocaleString()} tokens</Tag> : null}
               {activeRun?.input_revision != null && <Tag>基于草稿 v{activeRun.input_revision}</Tag>}
             </Space>
             {activeRun?.stage === 'all' && runProgress > 0
               ? <Progress percent={runProgress} status="active" showInfo />
               : <div className="creation-run-indeterminate"><Spin size="small" /><Text type="secondary">模型正在推进；无法准确估算时不显示虚假百分比</Text></div>}
+            {streamProgress?.output_preview ? (
+              <div className="creation-run-stream-preview" aria-live="polite">
+                <Text type="secondary">实时输出</Text>
+                <Text>{streamProgress.output_preview}</Text>
+              </div>
+            ) : null}
             {editedDuringRun && <Text type="warning">你刚才的修改会保存为下一版，不会改变当前这次生成。</Text>}
           </div>
           <Space wrap>

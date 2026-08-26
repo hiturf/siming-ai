@@ -12,6 +12,7 @@ from ...database.models import (
     CatalogingChapterRun,
     CatalogingFact,
     CatalogingJob,
+    Chapter,
     OperationRun,
 )
 
@@ -88,6 +89,22 @@ def refresh_job_progress(db: Session, job: CatalogingJob) -> None:
         .count()
     )
     job.updated_at = datetime.utcnow()
+    if job.status == "completed":
+        completed_runs = db.query(CatalogingChapterRun).filter(
+            CatalogingChapterRun.job_id == job.id,
+            CatalogingChapterRun.status.in_(["completed", "completed_with_warnings"]),
+        ).all()
+        for run in completed_runs:
+            chapter = db.query(Chapter).filter(
+                Chapter.id == run.chapter_id,
+                Chapter.project_id == job.project_id,
+            ).first()
+            if (
+                chapter is not None
+                and run.chapter_version is not None
+                and int(run.chapter_version) == int(chapter.current_version or 1)
+            ):
+                chapter.cataloging_required = False
     if job.operation_id:
         from ..operation_runtime import update_operation
 

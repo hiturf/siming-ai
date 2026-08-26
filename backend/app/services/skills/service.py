@@ -6,7 +6,6 @@ from app.architecture.uow import commit_session
 import json
 import logging
 import re
-from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -18,11 +17,6 @@ from .tool_catalog import get_tool_catalog
 logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────
-
-MAX_SINGLE_SKILL_PROMPT_CHARS = 1500
-MAX_TOTAL_SKILL_PROMPT_CHARS = 4000
-MAX_SKILLS_PER_REQUEST = 3
-MIN_SCORE_THRESHOLD = 4
 
 VALID_SCOPES = {"global", "project", "writing", "outline", "characters", "worldbuilding", "cataloging", "research"}
 
@@ -102,32 +96,6 @@ SKILL_TEMPLATES: list[dict[str, Any]] = [
         ),
     },
 ]
-
-# Direct scope mapping: assistant scope → matching skill scopes
-SCOPE_MAP: dict[str, set[str]] = {
-    "outline": {"outline", "global"},
-    "characters": {"characters", "global"},
-    "worldbuilding": {"worldbuilding", "global"},
-    "project": {"project", "global"},
-}
-
-# Intent keywords for scope override when payload.scope=project
-INTENT_SCOPE_KEYWORDS: dict[str, list[str]] = {
-    "writing": ["写", "续写", "章节", "正文", "对白", "段落", "改写", "扩写"],
-    "outline": ["大纲", "剧情", "结构", "走向", "规划"],
-    "characters": ["角色", "人物", "性格", "主角", "配角", "反派"],
-    "worldbuilding": ["世界观", "设定", "修炼", "势力", "功法", "地图"],
-    "research": ["搜索", "查找", "整理", "查一下", "找一下"],
-    "cataloging": ["建档", "归档", "梳理"],
-}
-
-# Synonym expansion for trigger matching
-TRIGGER_SYNONYMS: dict[str, list[str]] = {
-    "续写": ["继续写", "接着写", "往下写", "写下去"],
-    "审校": ["审阅", "校对", "检查"],
-    "角色扮演": ["cosplay", "代入角色"],
-    "大纲": ["目录", "框架"],
-}
 
 # Dangerous prompt patterns (combined verb + object)
 _DANGEROUS_PATTERNS: list[tuple[str, str]] = [
@@ -346,46 +314,6 @@ def build_skill_draft(requirements: str, template_key: str | None = None, scope:
     return draft
 
 
-def preview_skill_match(
-    db: Session,
-    project_id: str,
-    *,
-    message: str,
-    scope: str = "project",
-    candidate: dict | None = None,
-) -> dict:
-    """Preview which skills would be injected for a user message."""
-    matched = select_relevant_skills(db, project_id, message, scope)
-    candidate_score = None
-    candidate_included = False
-
-    if candidate:
-        fake_skill = SimpleNamespace(
-            name=candidate.get("name") or "",
-            description=candidate.get("description") or "",
-            trigger_examples=dump_json_list(candidate.get("trigger_examples") or []),
-            scope=candidate.get("scope") or "global",
-        )
-        candidate_score = _compute_skill_score(
-            fake_skill, message, _resolve_matching_scopes(scope, message)
-        )
-        candidate_included = candidate_score >= MIN_SCORE_THRESHOLD
-
-    section, info = build_skill_prompt_section(matched)
-    # Attach per-skill prompt fragment to each matched skill
-    for skill_dict, info_item in zip(matched, info):
-        skill_dict["_prompt_fragment"] = info_item.get("prompt_fragment", "")
-    return {
-        "matched_skills": matched,
-        "skill_prompt_preview": section,
-        "skill_prompt_info": info,
-        "candidate_score": candidate_score,
-        "candidate_would_match": candidate_included,
-        "threshold": MIN_SCORE_THRESHOLD,
-        "max_skills": MAX_SKILLS_PER_REQUEST,
-    }
-
-
 def list_skills(db: Session, project_id: str) -> list[dict]:
     """List all skills for a project, seeding built-ins if none exist."""
     ensure_builtin_skills(db, project_id)
@@ -488,7 +416,7 @@ def update_skill(db: Session, project_id: str, skill_id: str, data: dict) -> dic
         for key, label in (
             ("name", "名称"),
             ("description", "描述"),
-            ("trigger_examples", "触发示例"),
+            ("trigger_examples", "使用示例"),
             ("system_prompt", "系统提示词"),
             ("recommended_tools", "推荐工具"),
             ("forbidden_tools", "禁用工具"),
@@ -554,7 +482,7 @@ def reset_skill_to_builtin(db: Session, project_id: str, skill_id: str) -> dict:
         for key, label in (
             ("name", "名称"),
             ("description", "描述"),
-            ("trigger_examples", "触发示例"),
+            ("trigger_examples", "使用示例"),
             ("system_prompt", "系统提示词"),
             ("recommended_tools", "推荐工具"),
             ("scope", "适用范围"),
@@ -574,214 +502,6 @@ def reset_skill_to_builtin(db: Session, project_id: str, skill_id: str) -> dict:
     return skill_to_dict(skill)
 
 
-# ── Skill Selection ────────────────────────────────────────────────────
-
-def _resolve_matching_scopes(assistant_scope: str, user_message: str) -> set[str]:
-    """Resolve which skill scopes match the current context.
-
-    Combines direct scope mapping with intent-based override from user message.
-    """
-    scopes = set(SCOPE_MAP.get(assistant_scope, {"global"}))
-
-    # Intent-based scope override when assistant scope is "project"
-    if assistant_scope == "project":
-        msg_lower = user_message.lower()
-        for skill_scope, keywords in INTENT_SCOPE_KEYWORDS.items():
-            for kw in keywords:
-                if kw in msg_lower:
-                    scopes.add(skill_scope)
-                    break
-
-    return scopes
-
-
-def _compute_skill_score(
-    skill: Skill,
-    user_message: str,
-    matching_scopes: set[str],
-) -> int:
-    """Compute a relevance score for a skill against the user message.
-
-    Scoring:
-      - name substring hit: +5
-      - trigger_examples substring hit: +4
-      - description keyword hit: +2
-      - synonym hit: +2
-      - scope match: +2
-    """
-    score = 0
-    msg_lower = user_message.lower()
-
-    # Name substring
-    if skill.name and skill.name.lower() in msg_lower:
-        score += 5
-
-    # Trigger examples
-    examples = parse_json_list(skill.trigger_examples)
-    for ex in examples:
-        if ex.lower() in msg_lower:
-            score += 4
-            break
-
-    # Description keywords (split by common delimiters, check each word)
-    if skill.description:
-        desc_words = re.split(r"[，。、；\s,;]+", skill.description)
-        for word in desc_words:
-            if len(word) >= 2 and word.lower() in msg_lower:
-                score += 2
-                break
-
-    # Synonym expansion
-    for trigger_word, synonyms in TRIGGER_SYNONYMS.items():
-        if trigger_word.lower() in msg_lower:
-            for syn in synonyms:
-                if syn.lower() in msg_lower:
-                    score += 2
-                    break
-            break
-
-    # Scope match
-    skill_scope = skill.scope or "global"
-    if skill_scope in matching_scopes:
-        score += 2
-
-    return score
-
-
-def select_relevant_skills(
-    db: Session,
-    project_id: str,
-    user_message: str,
-    assistant_scope: str = "project",
-) -> list[dict]:
-    """Select enabled skills via deterministic scoring.
-
-    Returns at most MAX_SKILLS_PER_REQUEST skills, sorted by
-    priority DESC then score DESC. Each returned dict includes
-    the computed score.
-    """
-    ensure_builtin_skills(db, project_id)
-
-    skills = (
-        db.query(Skill)
-        .filter(Skill.project_id == project_id, Skill.enabled == True)
-        .order_by(Skill.priority.desc())
-        .all()
-    )
-
-    matching_scopes = _resolve_matching_scopes(assistant_scope, user_message)
-
-    scored: list[tuple[Skill, int]] = []
-    for skill in skills:
-        score = _compute_skill_score(skill, user_message, matching_scopes)
-        if score >= MIN_SCORE_THRESHOLD:
-            scored.append((skill, score))
-
-    # Sort by priority DESC, score DESC
-    scored.sort(key=lambda x: (x[0].priority or 0, x[1]), reverse=True)
-
-    # Take top N
-    result = []
-    for skill, score in scored[:MAX_SKILLS_PER_REQUEST]:
-        d = skill_to_dict(skill)
-        d["_score"] = score
-        result.append(d)
-
-    return result
-
-
-# ── Prompt Building ────────────────────────────────────────────────────
-
-def _build_tool_recommendation_line(skill: dict) -> str:
-    """Build a tool recommendation/forbid line for a skill prompt."""
-    recommended = skill.get("recommended_tools") or []
-    forbidden = skill.get("forbidden_tools") or []
-    parts: list[str] = []
-    if recommended:
-        parts.append(f"推荐工具：{', '.join(recommended)}")
-    if forbidden:
-        parts.append(f"禁用工具：{', '.join(forbidden)}")
-    return "\n".join(parts)
-
-
-def build_skill_prompt_section(matched_skills: list[dict]) -> tuple[str, list[dict]]:
-    """Build the skill prompt section to inject into the system prompt.
-
-    Returns (prompt_text, skill_info_list) where skill_info_list contains
-    name, description, truncated, warnings, recommended_tools,
-    prompt_fragment for each skill.
-
-    Enforces:
-      - Single skill prompt: MAX_SINGLE_SKILL_PROMPT_CHARS
-      - Total section: MAX_TOTAL_SKILL_PROMPT_CHARS
-      - Max skills: MAX_SKILLS_PER_REQUEST
-    """
-    if not matched_skills:
-        return "", []
-
-    sections: list[str] = []
-    skill_info: list[dict] = []
-    total_chars = 0
-
-    for skill in matched_skills[:MAX_SKILLS_PER_REQUEST]:
-        name = skill["name"]
-        prompt = skill["system_prompt"]
-        truncated = False
-        warnings: list[str] = []
-
-        # Build tool recommendation line
-        tool_line = _build_tool_recommendation_line(skill)
-        if tool_line:
-            prompt = f"{prompt}\n{tool_line}"
-
-        # Truncate single skill prompt if needed
-        if len(prompt) > MAX_SINGLE_SKILL_PROMPT_CHARS:
-            prompt = prompt[:MAX_SINGLE_SKILL_PROMPT_CHARS]
-            truncated = True
-            warnings.append(f"技能提示词已截断至 {MAX_SINGLE_SKILL_PROMPT_CHARS} 字符")
-
-        section = f"【技能：{name}】\n{prompt}"
-        section_chars = len(section)
-
-        # Check total budget
-        if total_chars + section_chars > MAX_TOTAL_SKILL_PROMPT_CHARS:
-            remaining = MAX_TOTAL_SKILL_PROMPT_CHARS - total_chars
-            if remaining < 100:
-                # Not enough space, skip
-                warnings.append("总技能提示词空间不足，该技能未注入")
-                skill_info.append({
-                    "name": name,
-                    "description": skill.get("description", ""),
-                    "truncated": True,
-                    "warnings": warnings,
-                    "recommended_tools": skill.get("recommended_tools", []),
-                    "forbidden_tools": skill.get("forbidden_tools", []),
-                    "injected": False,
-                    "prompt_fragment": "",
-                })
-                continue
-            # Truncate to fit
-            section = section[:remaining]
-            truncated = True
-            warnings.append(f"技能提示词因总空间限制被截断至 {remaining} 字符")
-
-        sections.append(section)
-        total_chars += len(section)
-
-        skill_info.append({
-            "name": name,
-            "description": skill.get("description", ""),
-            "truncated": truncated,
-            "warnings": warnings,
-            "recommended_tools": skill.get("recommended_tools", []),
-            "forbidden_tools": skill.get("forbidden_tools", []),
-            "injected": True,
-            "prompt_fragment": prompt,
-        })
-
-    return "\n\n".join(sections), skill_info
-
-
 # ── Built-in Skills ───────────────────────────────────────────────────
 
 BUILTIN_SKILLS: list[dict] = [
@@ -798,7 +518,7 @@ BUILTIN_SKILLS: list[dict] = [
             "4. 在续写开头自然衔接上文，不要生硬重复。\n"
             "5. 推进剧情的同时埋下伏笔或制造悬念。"
         ),
-        "recommended_tools": ["search_outline", "search_chapters", "search_characters", "chapter_writer", "create_chapter"],
+        "recommended_tools": ["search_outline", "search_chapters", "search_characters", "chapter_writer"],
         "scope": "writing",
         "priority": 80,
     },

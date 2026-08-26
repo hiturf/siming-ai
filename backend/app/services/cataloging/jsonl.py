@@ -59,7 +59,7 @@ _AGGREGATE_CANDIDATE_KEYS = {
 }
 _RESPONSE_COLLECTION_KEYS = ("candidates", "items", "results", "output", "response")
 _CANDIDATE_ATTEMPT_MARKER = re.compile(
-    r"(?m)^=== (?:MERGED CATALOGING|CANDIDATE RESOLUTION)(?: RETRY \d+)? ===\s*$"
+    r"(?m)^=== CANDIDATE RESOLUTION(?: RETRY \d+)? ===\s*$"
 )
 _JSON_FENCE = re.compile(r"```(?:jsonl?)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 

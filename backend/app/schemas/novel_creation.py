@@ -42,7 +42,6 @@ class NovelCreationSessionRead(BaseModel):
     locked_requirements: list[str] = Field(default_factory=list)
     current_stage: Optional[str] = None
     revision: int = 0
-    blueprint_json: Optional[Any] = None
     review_json: Optional[Any] = None
     draft_json: Optional[Any] = None
     checkpoints_json: Optional[Any] = None
@@ -83,6 +82,14 @@ class NovelCreationRunCardPresentation(BaseModel):
     route: Optional[Literal["api", "cli", "unknown"]] = None
 
 
+class NovelCreationModelStreamProgress(BaseModel):
+    kind: Literal["model_output"] = "model_output"
+    output_chars: int = Field(ge=0)
+    output_preview: Optional[str] = None
+    max_output_tokens: Optional[int] = Field(default=None, ge=1)
+    attempt: Optional[int] = Field(default=None, ge=1)
+
+
 class NovelCreationStageRunResponse(BaseModel):
     """Stable wire contract for one durable novel-creation stage run."""
 
@@ -108,6 +115,7 @@ class NovelCreationStageRunResponse(BaseModel):
     result_mode: Optional[str] = None
     warning: Optional[str] = None
     diagnostic_count: int = 0
+    stream_progress: Optional[NovelCreationModelStreamProgress] = None
     current_message: Optional[str] = None
     card_presentation: Optional[NovelCreationRunCardPresentation] = None
     created_at: Optional[datetime] = None

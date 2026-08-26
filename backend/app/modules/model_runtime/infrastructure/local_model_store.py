@@ -15,7 +15,6 @@ from .legacy_models import (
     TrainingDataset,
     TrainingJob,
 )
-from .models import LocalModelTaskSetting
 
 
 class SqlAlchemyLocalModelStore:
@@ -30,9 +29,6 @@ class SqlAlchemyLocalModelStore:
             LocalRuntimeInstallation.runtime_key == runtime_key
         ).first()
 
-    def task_settings(self):
-        return self.session.query(LocalModelTaskSetting).all()
-
     def installed_models(self):
         return self.session.query(LocalModel).filter(LocalModel.status == "installed").all()
 
@@ -46,16 +42,6 @@ class SqlAlchemyLocalModelStore:
 
     def model(self, model_key: str):
         return self.session.query(LocalModel).filter(LocalModel.model_key == model_key).first()
-
-    def task_setting(self, task_type: str):
-        return self.session.query(LocalModelTaskSetting).filter(
-            LocalModelTaskSetting.task_type == task_type
-        ).first()
-
-    def create_task_setting(self, task_type: str, model_key: str):
-        row = LocalModelTaskSetting(task_type=task_type, model_key=model_key)
-        self.session.add(row)
-        return row
 
     def delete(self, value: Any) -> None:
         self.session.delete(value)

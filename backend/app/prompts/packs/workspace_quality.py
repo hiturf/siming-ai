@@ -2,27 +2,18 @@
 from __future__ import annotations
 
 from ...modules.assistant.infrastructure.runtime import render_prompt
-from ..workspace_contract import SCOPE_LABELS, WORKSPACE_TOOL_NAMES
 from . import PromptPack
-
-ALL_WORKSPACE_TOOL_NAMES = WORKSPACE_TOOL_NAMES
 
 
 def _build_system(
     *,
-    scope: str,
     outline_batch_count: int,
-    auto_apply: bool,
-    tool_names: list[str] | set[str] | None = None,
+    **_: object,
 ) -> str:
-    """Render the unified controller prompt for the tools in this turn."""
-    available = set(tool_names) if tool_names is not None else ALL_WORKSPACE_TOOL_NAMES
+    """Render the entrypoint-neutral project Agent prompt."""
     return render_prompt(
         "assistant.workspace.quality",
-        scope_label=SCOPE_LABELS.get(scope, "项目规划"),
         outline_batch_count=outline_batch_count,
-        auto_apply="是" if auto_apply else "否",
-        tool_names=", ".join(sorted(available)),
     )
 
 
@@ -31,21 +22,20 @@ PACK = PromptPack(
     version="3.1.0",
     pack_type="workspace",
     description="Compiled workspace controller with truthful tool outcomes",
-    input_fields=["scope", "outline_batch_count", "auto_apply"],
+    input_fields=["outline_batch_count"],
     max_token_budget=4000,
     output_format="text_reply",
     output_schema=None,
-    available_tools=sorted(ALL_WORKSPACE_TOOL_NAMES),
+    available_tools=[],
     unavailable_tools=[],
     forbidden_behaviors=[
         "禁止在信息不充分时输出最终回复",
-        "禁止在基础写作中自动追加去除 AI 味或质量评审轮次",
         "禁止用文件写入冒充数据库写入",
         "禁止把失败、跳过或空结果说成已完成",
         "禁止重复执行历史对话中的操作",
     ],
     default_temperature=0.3,
     default_max_tokens=4000,
-    tool_policy="full",
+    tool_policy="dynamic_selected",
     build_system_prompt=_build_system,
 )

@@ -16,25 +16,20 @@ class MCPExternalWritingToolsTest(unittest.TestCase):
         names = {t.name for t in tools}
         self.assertIn("prepare_external_writing_context", names)
 
-    def test_draft_tools_in_readonly(self):
-        tools = list_mcp_tools(permission_pack="readonly_collaboration")
-        names = {t.name for t in tools}
-        self.assertIn("save_external_chapter_draft", names)
-        self.assertIn("get_external_chapter_draft", names)
+    def test_draft_save_requires_write_permission(self):
+        readonly = {t.name for t in list_mcp_tools(permission_pack="readonly_collaboration")}
+        drafting = {t.name for t in list_mcp_tools(permission_pack="chapter_drafting")}
+        self.assertNotIn("save_external_chapter_draft", readonly)
+        self.assertIn("get_external_chapter_draft", readonly)
+        self.assertIn("save_external_chapter_draft", drafting)
 
     def test_review_tool_in_readonly(self):
         tools = list_mcp_tools(permission_pack="readonly_collaboration")
         names = {t.name for t in tools}
         self.assertIn("record_external_quality_review", names)
 
-    def test_formal_chapter_writes_in_project_writing(self):
+    def test_formal_chapter_writes_are_not_agent_tools(self):
         tools = list_mcp_tools(permission_pack="project_writing")
-        names = {t.name for t in tools}
-        self.assertIn("create_chapter", names)
-        self.assertIn("update_chapter", names)
-
-    def test_formal_chapter_writes_not_in_readonly(self):
-        tools = list_mcp_tools(permission_pack="readonly_collaboration")
         names = {t.name for t in tools}
         self.assertNotIn("create_chapter", names)
         self.assertNotIn("update_chapter", names)

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
 from app.core.json_repair import parse_json_object
@@ -20,98 +19,7 @@ DEFAULT_CLARIFICATION_QUESTION = (
     "整理到作品资料中，还是作为一部新作品导入？"
 )
 ROUTING_VIEW_CHAR_LIMIT = 16_000
-INTENT_CANDIDATE_CHAR_LIMIT = 8_000
 
-_INTENT_STRONG_PATTERNS = (
-    re.compile(r"(?:给|交给|请|让)(?:司命|AI|ai|模型|助手|你)"),
-    re.compile(r"(?:任务|处理|操作|输出|用户|写作)(?:目标|要求|说明|指令)"),
-    re.compile(r"(?:请|需要|务必|帮我|替我|希望你).{0,18}(?:分析|总结|审阅|点评|改写|润色|翻译|整理|提取|导入|创建|续写|生成|忽略)"),
-    re.compile(r"(?:作为|导入为|创建为).{0,12}(?:新作品|作品资料|参考资料)"),
-)
-_INTENT_HEADING_PATTERN = re.compile(
-    r"^(?:#{1,6}\s*)?(?:任务|要求|处理方式|操作说明|输出要求|给司命|给AI|给助手)\s*[:：]?",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-
-def build_document_intent_candidates(
-    source_text: str,
-    *,
-    char_limit: int = INTENT_CANDIDATE_CHAR_LIMIT,
-) -> tuple[str, dict[str, Any]]:
-    """Find instruction-like paragraphs across the entire source.
-
-    This pass only gathers evidence; it never decides the route.  The model
-    still distinguishes real submission instructions from dialogue, quoted
-    prompts, examples, or hostile prompt-injection text.
-    """
-
-    text = str(source_text or "")
-    limit = max(1_000, int(char_limit or INTENT_CANDIDATE_CHAR_LIMIT))
-    evidence_patterns = ((_INTENT_HEADING_PATTERN, 6),) + tuple(
-        (pattern, 4 if index < 2 else 3)
-        for index, pattern in enumerate(_INTENT_STRONG_PATTERNS)
-    )
-    match_count = 0
-    # Keep the strongest match in each small source bucket.  This bounds memory
-    # while every character is still scanned, including one-line TXT exports.
-    bucket_matches: dict[int, tuple[int, int, int]] = {}
-    for pattern, base_score in evidence_patterns:
-        for match in pattern.finditer(text):
-            match_count += 1
-            score = base_score
-            nearby = text[max(0, match.start() - 80) : min(len(text), match.end() + 160)]
-            if _INTENT_HEADING_PATTERN.search(nearby):
-                score += 3
-            if re.search(r"(?:^|[。！？!?；;])\s*请", nearby):
-                score += 1
-            bucket = match.start() // 500
-            previous = bucket_matches.get(bucket)
-            if previous is None or score > previous[0]:
-                bucket_matches[bucket] = (score, match.start(), match.end())
-
-    candidates: list[tuple[int, int, int, str]] = []
-    seen_ranges: set[tuple[int, int]] = set()
-    for score, match_start, match_end in bucket_matches.values():
-        left_floor = max(0, match_start - 500)
-        paragraph_start = text.rfind("\n\n", left_floor, match_start)
-        line_start = text.rfind("\n", left_floor, match_start)
-        start = max(left_floor, paragraph_start + 2, line_start + 1)
-        right_ceiling = min(len(text), match_end + 900)
-        paragraph_end = text.find("\n\n", match_end, right_ceiling)
-        line_end = text.find("\n", match_end, right_ceiling)
-        available_ends = [value for value in (paragraph_end, line_end) if value >= 0]
-        end = min(available_ends) if available_ends else right_ceiling
-        content = text[start:end].strip()
-        if content and (start, end) not in seen_ranges:
-            seen_ranges.add((start, end))
-            candidates.append((score, start, end, content[:1_500]))
-
-    # Prefer strong evidence, then restore source order so the model sees the
-    # selected passages in their document sequence.
-    selected: list[tuple[int, int, int, str]] = []
-    used = 0
-    for candidate in sorted(candidates, key=lambda item: (-item[0], item[1])):
-        rendered_size = len(candidate[3]) + 80
-        if selected and used + rendered_size > limit:
-            continue
-        selected.append(candidate)
-        used += rendered_size
-        if used >= limit:
-            break
-    selected.sort(key=lambda item: item[1])
-    view = "\n\n".join(
-        f"[全文指令候选 · 字符 {start + 1}-{end} · 证据分 {score}]\n{content}"
-        for score, start, end, content in selected
-    )
-    return view, {
-        "source_scanned_chars": len(text),
-        "candidate_count": len(candidates),
-        "pattern_match_count": match_count,
-        "included_candidate_count": len(selected),
-        "included_chars": sum(len(item[3]) for item in selected),
-        "truncated": len(selected) < len(candidates),
-    }
 
 
 def build_document_routing_view(
@@ -184,9 +92,6 @@ def _routing_system_prompt() -> str:
 2. TXT、Markdown、DOCX、JSON 或粘贴长文本本身；
 3. 最近对话和当前作品/立项上下文；
 4. 如果已经追问过，还要结合完整的追问与回答历史。
-5. “全文指令候选”来自对整份原文的证据扫描。
-   它仍可能是小说对白、引用或示例，必须结合上下文判断真伪。
-
 用户的处理意图可能直接写在文件标题、开头、正文说明、附录或结尾中。只要文件内存在面向司命、AI、助手或本次提交的明确处理要求，就把它视为有效用户意图；不要因为聊天框为空就判为不明确。小说正文中的人物对白、引用文字或故事情节不等同于用户操作指令。
 
 route 只能是以下五种之一：
@@ -257,11 +162,8 @@ async def classify_assistant_data_input(
     source_text: str,
     source_kind: str,
     user_instruction: str,
-    clarification_question: str = "",
-    clarification_answer: str = "",
-    clarification_already_asked: bool = False,
     clarification_history: list[dict[str, Any]] | None = None,
-    context_scope: str = "system",
+    context_scope: str = "creation",
     active_project_id: str = "",
     creation_session_id: str = "",
     history: list[dict[str, Any]] | None = None,
@@ -275,16 +177,15 @@ async def classify_assistant_data_input(
     """
 
     source_view, coverage = build_document_routing_view(source_text)
-    intent_candidates, candidate_coverage = build_document_intent_candidates(source_text)
-    routing_evidence_budget = 24_000
-    if len(source_view) + len(intent_candidates) > routing_evidence_budget:
-        source_budget = max(8_000, routing_evidence_budget - len(intent_candidates))
-        source_view = source_view[:source_budget]
-        coverage = {
-            **coverage,
-            "routing_view_truncated_for_candidates": True,
-            "routing_view_chars": len(source_view),
+    clarification_entries = [
+        {
+            "question": str(item.get("question") or "")[:500],
+            "answer": str(item.get("answer") or "")[:20_000],
         }
+        for item in (clarification_history or [])[-50:]
+        if isinstance(item, dict)
+    ]
+    latest_answer = clarification_entries[-1]["answer"] if clarification_entries else ""
     recent_history = [
         {
             "role": str(item.get("role") or "")[:20],
@@ -301,29 +202,15 @@ async def classify_assistant_data_input(
             "text_length": len(source_text or ""),
             "coverage": coverage,
             "content_view": source_view,
-            "intent_candidates": intent_candidates,
-            "intent_candidate_coverage": candidate_coverage,
         },
         "conversation_context": {
-            "scope": str(context_scope or "system"),
+            "scope": str(context_scope or "creation"),
             "active_project_id": str(active_project_id or "") or None,
             "creation_session_id": str(creation_session_id or "") or None,
             "recent_history": recent_history,
         },
         "clarification": {
-            "already_asked": bool(clarification_already_asked or clarification_history),
-            "history": [
-                {
-                    "question": str(item.get("question") or "")[:500],
-                    "answer": str(item.get("answer") or "")[:20_000],
-                }
-                for item in (clarification_history or [])[-50:]
-                if isinstance(item, dict)
-            ],
-            # Keep the legacy latest-pair fields for older clients while the
-            # full history becomes the source of truth.
-            "latest_question": str(clarification_question or ""),
-            "latest_answer": str(clarification_answer or ""),
+            "history": clarification_entries,
         },
     }
     try:
@@ -352,26 +239,24 @@ async def classify_assistant_data_input(
         decision = _normalize_decision(
             parsed,
             user_instruction=user_instruction,
-            clarification_answer=clarification_answer,
+            clarification_answer=latest_answer,
         )
         decision["classification_status"] = "model"
     except Exception as exc:
         decision = _normalize_decision(
             {"route": "clarify", "reason": f"路由模型暂不可用：{str(exc)[:200]}"},
             user_instruction=user_instruction,
-            clarification_answer=clarification_answer,
+            clarification_answer=latest_answer,
         )
         decision["classification_status"] = "safe_fallback"
     decision["source_context"] = source_view
     decision["source_coverage"] = coverage
-    decision["intent_candidate_coverage"] = candidate_coverage
     return decision
 
 
 __all__ = [
     "DEFAULT_CLARIFICATION_QUESTION",
     "ROUTE_ACTIONS",
-    "build_document_intent_candidates",
     "build_document_routing_view",
     "classify_assistant_data_input",
 ]

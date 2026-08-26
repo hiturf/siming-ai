@@ -1,12 +1,10 @@
 """Workspace tool handlers grouped by domain."""
 from .chapter_writer import chapter_writer
 from .chapters import (
-    create_chapter,
     delete_chapter,
     diff_chapter_versions,
     list_chapter_versions,
     restore_chapter_version,
-    update_chapter,
 )
 from .context_preview import preview_writing_context
 from .character_writer import character_writer
@@ -73,7 +71,6 @@ from .skills import (
     list_skill_tools_tool,
     list_skill_versions_tool,
     list_skills,
-    preview_skill_match_tool,
     reset_skill,
     update_skill,
 )
@@ -108,14 +105,13 @@ from .project_status import get_project_archive_status
 from .prompt_packs import get_moshu_usage_guide
 from .local_cli_agent import start_local_cli_agent_run, wait_local_cli_agent_run
 from .story_granularity import get_narrative_ledger, inspect_story_granularity, repair_story_granularity, update_narrative_ledger_entry
+from .novel_creation import finalize_creation_session
 from .novel_creation_v2 import (
     apply_creation_import,
     cancel_creation_operation,
     confirm_creation_artifact,
     delete_creation_entity_tool,
-    finalize_creation_session,
     generate_creation_artifact,
-    generate_novel_creation_stage,
     get_creation_operation,
     get_creation_session,
     get_creation_snapshot,
@@ -125,7 +121,6 @@ from .novel_creation_v2 import (
     get_creation_entity_tool,
     get_creation_dependencies,
     get_creation_dependency_graph_tool,
-    get_novel_creation_session,
     list_creation_artifact_versions_tool,
     list_creation_artifacts_tool,
     list_creation_entities_tool,
@@ -140,7 +135,6 @@ from .novel_creation_v2 import (
     resume_creation_operation,
     restore_creation_artifact_version_tool,
     retry_creation_operation,
-    submit_novel_creation_stage,
     undo_creation_artifact_tool,
     unlock_creation_fields,
     validate_creation_session,
@@ -160,8 +154,6 @@ __all__ = [
     "character_writer",
     "outline_writer",
     "worldbuilding_writer",
-    "create_chapter",
-    "update_chapter",
     "delete_chapter",
     "list_chapter_versions",
     "restore_chapter_version",
@@ -234,7 +226,6 @@ __all__ = [
     "update_skill",
     "delete_skill",
     "reset_skill",
-    "preview_skill_match_tool",
     "list_skill_versions_tool",
     "ensure_builtin_skills_tool",
     "export_project",
@@ -274,7 +265,6 @@ __all__ = [
     "update_narrative_ledger_entry",
     "inspect_story_granularity",
     "repair_story_granularity",
-    "get_novel_creation_session",
     "get_creation_session",
     "get_creation_snapshot",
     "get_creation_operation",
@@ -287,7 +277,6 @@ __all__ = [
     "lock_creation_fields",
     "unlock_creation_fields",
     "undo_creation_artifact_tool",
-    "generate_novel_creation_stage",
     "generate_creation_artifact",
     "refine_creation_artifact",
     "regenerate_creation_artifact",
@@ -309,7 +298,6 @@ __all__ = [
     "get_creation_artifact_diff_tool",
     "restore_creation_artifact_version_tool",
     "validate_creation_consistency_tool",
-    "submit_novel_creation_stage",
     "get_narrative_governance",
     "apply_narrative_governance_candidates",
     "list_narrative_checkpoints",

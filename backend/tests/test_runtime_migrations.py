@@ -12,14 +12,11 @@ from sqlalchemy import create_engine, inspect, text
 from app.database.backup import backup_sqlite_database, sqlite_database_path
 from app.database.migrations import ensure_runtime_schema, runtime_schema_needs_sync
 from app.database.models import (  # noqa: F401 - importing models populates metadata
-    AgentPlan,
-    AgentPlanStep,
     AssistantConversation,
     AssistantMessage,
     AssistantRun,
     AssistantRunStep,
     Base,
-    ChapterWriteClaim,
     OperationRun,
 )
 from app.services.workspace.run_log import create_assistant_run, mark_interrupted_assistant_runs
@@ -170,7 +167,7 @@ class RuntimeMigrationTestCase(unittest.TestCase):
             "local_runtime_installations",
             "model_download_tasks",
             "model_adapters",
-            "local_model_task_settings",
+            "model_task_settings",
             "training_datasets",
             "training_jobs",
             "novel_creation_stage_runs",
@@ -246,68 +243,6 @@ class RuntimeMigrationTestCase(unittest.TestCase):
                 value = connection.execute("SELECT value FROM legacy_data").fetchone()[0]
             self.assertEqual(value, "preserved")
 
-    def test_agent_plan_tables_created_with_correct_schema(self):
-        engine = create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(bind=engine)
-        ensure_runtime_schema(engine)
-
-        inspector = inspect(engine)
-        table_names = set(inspector.get_table_names())
-
-        self.assertIn("agent_plans", table_names)
-        self.assertIn("agent_plan_steps", table_names)
-
-        # Verify agent_plans columns
-        plan_columns = {col["name"] for col in inspector.get_columns("agent_plans")}
-        for col in (
-            "id",
-            "project_id",
-            "conversation_id",
-            "assistant_run_id",
-            "assistant_message_id",
-            "name",
-            "status",
-            "graph_json",
-            "model",
-            "error",
-            "created_at",
-            "updated_at",
-            "completed_at",
-        ):
-            self.assertIn(col, plan_columns, f"agent_plans missing column: {col}")
-
-        # Verify agent_plan_steps columns
-        step_columns = {col["name"] for col in inspector.get_columns("agent_plan_steps")}
-        for col in (
-            "id",
-            "plan_id",
-            "project_id",
-            "step_key",
-            "tool",
-            "args_json",
-            "depends_on_json",
-            "status",
-            "retry_policy",
-            "idempotency_key",
-            "result_json",
-            "output_refs",
-            "detail",
-            "error",
-            "attempt_no",
-            "retry_of_step_id",
-            "resolved_step_id",
-            "started_at",
-            "completed_at",
-            "created_at",
-            "updated_at",
-        ):
-            self.assertIn(col, step_columns, f"agent_plan_steps missing column: {col}")
-
-        # Verify indexes exist
-        step_indexes = {idx["name"] for idx in inspector.get_indexes("agent_plan_steps")}
-        self.assertIn("ix_agent_plan_steps_plan_key", step_indexes)
-        self.assertIn("ix_agent_plan_steps_idempotency", step_indexes)
-
     def test_running_assistant_runs_are_marked_interrupted_on_startup(self):
         engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(bind=engine)
@@ -342,29 +277,7 @@ class RuntimeMigrationTestCase(unittest.TestCase):
                 step_type="write",
                 status="running",
             )
-            plan = AgentPlan(
-                project_id="p1",
-                assistant_run_id=run.id,
-                name="fast_chapter",
-                status="running",
-                graph_json='{"name":"fast_chapter","steps":{}}',
-            )
-            db.add_all([run_step, plan])
-            db.flush()
-            plan_step = AgentPlanStep(
-                plan_id=plan.id,
-                project_id="p1",
-                step_key="write",
-                tool="chapter_writer",
-                status="running",
-            )
-            db.add(plan_step)
-            db.add(ChapterWriteClaim(
-                project_id="p1",
-                target_key="outline:outline-1",
-                idempotency_key="create_chapter:p1:outline-1",
-                status="running",
-            ))
+            db.add(run_step)
             db.commit()
             changed = mark_interrupted_assistant_runs(db)
             self.assertEqual(changed, 1)
@@ -372,14 +285,9 @@ class RuntimeMigrationTestCase(unittest.TestCase):
             self.assertEqual(run.status, "interrupted")
             self.assertIn("服务重启", run.error)
             self.assertEqual(db.get(AssistantRunStep, run_step.id).status, "interrupted")
-            self.assertEqual(db.get(AgentPlan, plan.id).status, "interrupted")
-            self.assertEqual(db.get(AgentPlanStep, plan_step.id).status, "interrupted")
             recovered_message = db.get(AssistantMessage, message.id)
             self.assertEqual(recovered_message.status, "error")
             self.assertEqual(json.loads(recovered_message.payload_json)["run"]["status"], "interrupted")
-            claim = db.query(ChapterWriteClaim).first()
-            self.assertEqual(claim.status, "failed")
-            self.assertIn("安全重试", claim.error)
         finally:
             db.close()
 
@@ -410,7 +318,6 @@ class RuntimeMigrationTestCase(unittest.TestCase):
                 user_message_id=None,
                 assistant_message_id=message.id,
                 scope="project",
-                assistant_mode="fast",
                 model="test-model",
             )
 

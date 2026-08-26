@@ -46,6 +46,29 @@ class MobileContextManifestTest {
     }
 
     @Test
+    fun `volume target cannot satisfy the chapter writing anchor`() {
+        val base = inputs()
+        fun asVolume(row: JsonObject): JsonObject = if (row.string("id") == "o1") {
+            buildJsonObject {
+                row.forEach { (key, value) -> put(key, value) }
+                put("node_type", "volume")
+            }
+        } else {
+            row
+        }
+        val manifest = engine().prepare(
+            base.copy(
+                primaryRecords = base.primaryRecords.map(::asVolume),
+                rawRecords = base.rawRecords.map(::asVolume),
+            ),
+        )
+
+        assertEquals("needs_confirmation", manifest.status)
+        assertEquals("missing", manifest.coverage.getValue("target_outline").status)
+        assertTrue(manifest.warnings.any { "target_outline" in it })
+    }
+
+    @Test
     fun `local lexical fallback selects relevant worldbuilding`() {
         val manifest = engine().prepare(
             inputs(request = request(requirements = "这一章要切断病毒网络并防止尸潮扩散")),

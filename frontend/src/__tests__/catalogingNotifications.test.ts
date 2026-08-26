@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { OperationRun } from '../shared/api/contracts'
-import { projectAutoCatalogingMessages } from '../components/assistant/catalogingNotifications'
+import { projectCatalogingMessages } from '../components/assistant/catalogingNotifications'
 
 function operation(overrides: Partial<OperationRun> = {}): OperationRun {
   return {
@@ -8,7 +8,7 @@ function operation(overrides: Partial<OperationRun> = {}): OperationRun {
     source_kind: 'cataloging',
     source_id: 'job-1',
     project_id: 'project-1',
-    title: '《第二章 吐纳》自动建档',
+    title: '《第二章 吐纳》章节建档',
     status: 'running',
     health_status: 'active',
     can_pause: true,
@@ -16,20 +16,20 @@ function operation(overrides: Partial<OperationRun> = {}): OperationRun {
     can_retry: true,
     elapsed_seconds: 0,
     progress: { mode: 'determinate', current: 0, total: 1 },
-    tool_mode: 'auto_chapter_write:internal_llm',
+    tool_mode: 'chapter_save:internal_llm',
     created_at: '2026-08-12T10:00:00Z',
     updated_at: '2026-08-12T10:00:01Z',
     ...overrides,
   }
 }
 
-describe('projectAutoCatalogingMessages', () => {
-  it('announces the quality warning while auto cataloging is running', () => {
-    const messages = projectAutoCatalogingMessages([operation()], 'project-1')
+describe('projectCatalogingMessages', () => {
+  it('announces the hard writing fence after the author starts cataloging', () => {
+    const messages = projectCatalogingMessages([operation()], 'project-1')
 
     expect(messages).toHaveLength(1)
-    expect(messages[0].content).toContain('正在自动建档')
-    expect(messages[0].content).toContain('立即生成下一章可能影响上下文质量')
+    expect(messages[0].content).toContain('建档已经开始')
+    expect(messages[0].content).toContain('下一章写作已锁定')
     expect(messages[0].navigation_action).toEqual({
       label: '查看建档进度',
       to: '/project/project-1?view=cataloging',
@@ -37,7 +37,7 @@ describe('projectAutoCatalogingMessages', () => {
   })
 
   it('adds a durable completion notification', () => {
-    const messages = projectAutoCatalogingMessages([
+    const messages = projectCatalogingMessages([
       operation({
         status: 'completed',
         completed_at: '2026-08-12T10:00:20Z',
@@ -46,14 +46,14 @@ describe('projectAutoCatalogingMessages', () => {
     ], 'project-1')
 
     expect(messages).toHaveLength(1)
-    expect(messages[0].content).toContain('自动建档已完成')
+    expect(messages[0].content).toContain('建档已完成')
     expect(messages[0].content).toContain('现在可以继续生成下一章')
     expect(messages[0].data?.outcome).toBe('completed_with_tools')
     expect(messages[0].navigation_action?.label).toBe('查看建档结果')
   })
 
   it('does not leak another project or manual cataloging task into chat', () => {
-    const messages = projectAutoCatalogingMessages([
+    const messages = projectCatalogingMessages([
       operation({ project_id: 'project-2' }),
       operation({ id: 'manual', tool_mode: 'internal_llm' }),
     ], 'project-1')
@@ -62,7 +62,7 @@ describe('projectAutoCatalogingMessages', () => {
   })
 
   it('reports an incomplete task as blocked instead of success', () => {
-    const messages = projectAutoCatalogingMessages([
+    const messages = projectCatalogingMessages([
       operation({ status: 'paused', next_action: '缺少角色关系候选' }),
     ], 'project-1')
 
@@ -73,7 +73,7 @@ describe('projectAutoCatalogingMessages', () => {
   })
 
   it('uses the operation action URL when the backend provides one', () => {
-    const messages = projectAutoCatalogingMessages([
+    const messages = projectCatalogingMessages([
       operation({
         status: 'waiting_user',
         attention: {
@@ -90,7 +90,7 @@ describe('projectAutoCatalogingMessages', () => {
   })
 
   it('orders the live reminder by latest task activity so it follows the writer reply', () => {
-    const messages = projectAutoCatalogingMessages([
+    const messages = projectCatalogingMessages([
       operation({
         created_at: '2026-08-12T10:00:00Z',
         updated_at: '2026-08-12T10:00:30Z',
@@ -101,10 +101,10 @@ describe('projectAutoCatalogingMessages', () => {
   })
 
   it('does not repeat the backend running notice inside the synthesized message', () => {
-    const messages = projectAutoCatalogingMessages([
-      operation({ current_message: '《第二章 吐纳》已保存，正在自动建档。' }),
+    const messages = projectCatalogingMessages([
+      operation({ current_message: '《第二章 吐纳》已保存，作者已启动建档。' }),
     ], 'project-1')
 
-    expect(messages[0].content.match(/正在自动建档/g)).toHaveLength(1)
+    expect(messages[0].content).not.toContain('作者已启动建档')
   })
 })

@@ -2,7 +2,7 @@ import type { OperationRun } from '../../shared/api/contracts'
 import { apiDateTimeMs } from '../../utils/dateTime'
 import type { WorkspaceAssistantMessage, WorkspaceAssistantOutcome } from './types'
 
-const AUTO_CATALOGING_MODE = 'auto_chapter_write:'
+const CHAPTER_SAVE_CATALOGING_MODE = 'chapter_save:'
 
 function operationTime(operation: OperationRun) {
   const value = operation.created_at || operation.updated_at || ''
@@ -11,12 +11,16 @@ function operationTime(operation: OperationRun) {
 }
 function chapterLabel(operation: OperationRun) {
   const title = String(operation.title || '').trim()
-  const withoutSuffix = title.replace(/自动建档.*$/, '').trim()
+  const withoutSuffix = title.replace(/章节建档.*$/, '').trim()
   return withoutSuffix || '当前章节'
 }
 
 function appendDetail(content: string, detail: string) {
-  const repeatsRunningNotice = content.includes('正在自动建档') && detail.includes('正在自动建档')
+  const contentIsRunning = content.includes('建档已经开始') || content.includes('正在建档')
+  const detailIsRunning = detail.includes('启动建档')
+    || detail.includes('建档已经开始')
+    || detail.includes('正在建档')
+  const repeatsRunningNotice = contentIsRunning && detailIsRunning
   return detail && !content.includes(detail) && !repeatsRunningNotice
     ? `${content}\n${detail}`
     : content
@@ -69,39 +73,39 @@ function operationMessage(operation: OperationRun, projectId: string): Workspace
 
   if (operation.status === 'completed') {
     const content = appendDetail(
-      `${label}自动建档已完成，建档结果已同步到作品资料和任务中心。现在可以继续生成下一章。`,
+      `${label}建档已完成，建档结果已同步到作品资料和任务中心。现在可以继续生成下一章。`,
       detail,
     )
     return assistantMessage(operation, content, 'completed', projectId, '查看建档结果', 'completed_with_tools')
   }
   if (operation.status === 'waiting_user') {
     const content = appendDetail(
-      `${label}自动建档需要你确认候选后才能完成。请先打开“作品建档”处理，暂时不要继续生成下一章。`,
+      `${label}建档需要你确认候选后才能完成。请先打开“作品建档”处理，暂时不能继续生成下一章。`,
       detail,
     )
     return assistantMessage(operation, content, 'blocked', projectId, '前往处理建档', 'waiting_user')
   }
   if (operation.status === 'paused') {
     const content = appendDetail(
-      `${label}自动建档已暂停，数据尚未形成完整闭环。请在“作品建档”重试或处理当前问题。`,
+      `${label}建档已暂停，数据尚未形成完整闭环。请在“作品建档”重试或处理当前问题。`,
       detail,
     )
     return assistantMessage(operation, content, 'error', projectId, '前往处理建档', 'blocked')
   }
   if (operation.status === 'cancelled') {
-    const content = appendDetail(`${label}自动建档已取消；本章档案可能仍是旧版本。`, detail)
+    const content = appendDetail(`${label}建档已取消；当前版本仍未完成建档，下一章保持锁定。`, detail)
     return assistantMessage(operation, content, 'aborted', projectId, '查看建档记录', 'cancelled')
   }
   if (operation.status === 'interrupted') {
     const content = appendDetail(
-      `${label}自动建档被中断，尚未完成数据一致性校验。请从任务中心恢复或重试。`,
+      `${label}建档被中断，尚未完成数据一致性校验。请从任务中心恢复或重试。`,
       detail,
     )
     return assistantMessage(operation, content, 'error', projectId, '前往处理建档', 'interrupted')
   }
   if (operation.status === 'failed') {
     const content = appendDetail(
-      `${label}自动建档失败，系统没有把不完整候选当作成功写入。请在“作品建档”查看原因并重试。`,
+      `${label}建档失败，系统没有把不完整候选当作成功写入。请在“作品建档”查看原因并重试。`,
       detail,
     )
     return assistantMessage(operation, content, 'error', projectId, '前往处理建档', 'failed')
@@ -110,14 +114,14 @@ function operationMessage(operation: OperationRun, projectId: string): Workspace
     ? `（${operation.progress.current || 0}/${operation.progress.total}）`
     : ''
   const content = appendDetail(
-    `${label}已保存，正在自动建档${progress}。立即生成下一章可能影响上下文质量，请耐心等待建档完成。`,
+    `${label}已保存，建档已经开始${progress}。下一章写作已锁定；只有当前版本建档完成后才会解锁。`,
     detail,
   )
   return assistantMessage(operation, content, 'running', projectId, '查看建档进度')
 }
 
-/** Project auto-cataloging operations rendered as durable chat notifications. */
-export function projectAutoCatalogingMessages(
+/** Author-started chapter cataloging rendered as durable chat notifications. */
+export function projectCatalogingMessages(
   operations: OperationRun[],
   projectId: string,
 ): WorkspaceAssistantMessage[] {
@@ -125,7 +129,7 @@ export function projectAutoCatalogingMessages(
     .filter((operation) => (
       operation.project_id === projectId
       && operation.source_kind === 'cataloging'
-      && String(operation.tool_mode || '').startsWith(AUTO_CATALOGING_MODE)
+      && String(operation.tool_mode || '').startsWith(CHAPTER_SAVE_CATALOGING_MODE)
     ))
     .sort((a, b) => operationTime(a) - operationTime(b))
     .slice(-3)

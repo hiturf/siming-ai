@@ -96,14 +96,7 @@ const ROLE_OPTIONS = [
 
 const canonicalRoleType = (value?: string) => {
   const text = String(value || '').trim().toLowerCase()
-  if (!text) return 'other'
-  if (ROLE_OPTIONS.some((option) => option.value === text)) return text
-  const tokens = text.split(/[,，、/|;；\n]+/).map((item) => item.trim())
-  if (tokens.some((item) => ['主角', '主人公', '男主', '女主', 'lead', 'protagonist'].includes(item))) return 'protagonist'
-  if (tokens.some((item) => /反派|敌对|宿敌|antagonist|villain/.test(item))) return 'antagonist'
-  if (tokens.some((item) => /导师|师父|师傅|引路人|mentor/.test(item))) return 'mentor'
-  if (tokens.some((item) => /配角|同伴|伙伴|家人|亲属|support/.test(item))) return 'supporting'
-  return 'other'
+  return ROLE_OPTIONS.some((option) => option.value === text) ? text : 'other'
 }
 
 const roleTypeLabel = (value?: string) => ROLE_OPTIONS.find((option) => option.value === canonicalRoleType(value))?.label || '其他'
@@ -152,8 +145,8 @@ function CharactersPage({ projectId }: CharactersPageProps) {
   const [mergePreview, setMergePreview] = useState<MergePreview | null>(null)
   const [mergePreviewLoading, setMergePreviewLoading] = useState(false)
   const [mergeApplying, setMergeApplying] = useState(false)
-  const { setAiContext, refreshKey } = useAiPanelContext()
-  const { modelOptions, loading: modelsLoading } = useModelOptions()
+  const { refreshKey } = useAiPanelContext()
+  const { modelOptions, loading: modelsLoading } = useModelOptions('writing')
   const {
     saveStatus,
     saveError,
@@ -224,11 +217,6 @@ function CharactersPage({ projectId }: CharactersPageProps) {
   }, [aiConfigForm, projectId])
 
   useEffect(() => { fetchCharacters(); fetchNetwork() }, [fetchCharacters, fetchNetwork])
-
-  // Sync character selection to AI context
-  useEffect(() => {
-    setAiContext({ selectedCharacterId: selectedId })
-  }, [selectedId, setAiContext])
 
   // Refresh data when AI applies changes
   useEffect(() => {
@@ -618,7 +606,7 @@ function CharactersPage({ projectId }: CharactersPageProps) {
                     options={modelOptions}
                     loading={modelsLoading}
                     optionFilterProp="label"
-                    placeholder={modelOptions.length ? '选择角色专用模型（留空用全局默认）' : '请先在系统设置配置模型'}
+                    placeholder={modelOptions.length ? '选择角色专用模型（留空用章节写作任务默认）' : '请先在系统设置配置模型'}
                     notFoundContent={modelsLoading ? '加载模型中...' : '暂无已配置模型'}
                   />
                 </Form.Item>

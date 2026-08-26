@@ -118,10 +118,4 @@ export interface CatalogResponse {
   items: LocalModel[]
   runtime: RuntimeStatus
   model_root: string
-  task_settings: Record<string, {
-    model_key: string
-    adapter_ids: string[]
-    context_length?: number | null
-    allow_api_fallback: boolean
-  }>
 }

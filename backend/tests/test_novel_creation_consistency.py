@@ -13,7 +13,7 @@ from app.services.novel_creation_consistency import (
     validate_creation_consistency,
 )
 from app.services.novel_creation_stage_execution import _merge_entity_generation
-from app.services.workspace.tools.novel_creation_v2 import generate_novel_creation_stage
+from app.services.workspace.tools.novel_creation_v2 import run_creation_artifact_generation
 from tests.test_novel_creation_workspace_v2 import _db, _ready_session
 
 
@@ -136,7 +136,7 @@ def test_entity_target_generation_runs_end_to_end_without_rewriting_siblings():
         "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
         new=MagicMock(side_effect=stream),
     ):
-        result = asyncio.run(generate_novel_creation_stage(db, "", {
+        result = asyncio.run(run_creation_artifact_generation(db, "", {
             "session_id": session.id,
             "stage": "characters",
             "model": "openai:test",

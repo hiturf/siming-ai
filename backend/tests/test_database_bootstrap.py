@@ -12,8 +12,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.orm import sessionmaker
 
 from app.database.bootstrap import SCHEMA_EPOCH, bootstrap_database
+from app.database.models import AssistantRun, AssistantRunStep
 
 
 def _database_url(path: Path) -> str:
@@ -37,7 +39,7 @@ def test_fresh_database_is_initialized_and_versioned():
                 ).scalar_one()
             assert result.mode == "initialized"
             assert result.read_only is False
-            assert result.schema_revision == revision == "300a17_chapter_sort_order"
+            assert result.schema_revision == revision == "300a22_provider_task_models"
             assert epoch == SCHEMA_EPOCH
             assert {
                 "projects",
@@ -83,7 +85,7 @@ def test_recognized_legacy_database_is_backed_up_and_preserved():
                     text("SELECT version_num FROM alembic_version")
                 ).scalar_one()
             assert title == "Legacy Story"
-            assert revision == "300a17_chapter_sort_order"
+            assert revision == "300a22_provider_task_models"
         finally:
             engine.dispose()
 
@@ -130,6 +132,171 @@ def test_current_database_bootstrap_is_idempotent():
             engine.dispose()
 
 
+def test_overlay_upgrade_migrates_legacy_concepts_and_drops_retired_columns():
+    with TemporaryDirectory() as temp_dir:
+        database_path = Path(temp_dir) / "legacy-concepts.db"
+        url = _database_url(database_path)
+        engine = create_engine(url)
+        try:
+            bootstrap_database(engine, database_url=url)
+            legacy = json.dumps(
+                [{
+                    "title": "雾城记",
+                    "logline": "林七进入雾城追查记忆病毒。",
+                    "protagonist": {"name": "林七", "goal": "找到母亲"},
+                    "creative_slots": {"world_rules": "记忆可以传播但不能无损复制"},
+                }],
+                ensure_ascii=False,
+            )
+            with engine.begin() as connection:
+                connection.execute(text(
+                    "ALTER TABLE novel_creation_sessions ADD COLUMN blueprint_json JSON"
+                ))
+                connection.execute(text(
+                    "ALTER TABLE system_assistant_conversations ADD COLUMN blueprint_json JSON"
+                ))
+                connection.execute(
+                    text(
+                        "INSERT INTO novel_creation_sessions "
+                        "(id, status, mode, schema_version, revision, blueprint_json, created_at) "
+                        "VALUES ('legacy-session', 'reviewing', 'internal_llm', 2, 1, "
+                        ":legacy, CURRENT_TIMESTAMP)"
+                    ),
+                    {"legacy": legacy},
+                )
+                connection.execute(text(
+                    "UPDATE alembic_version SET version_num = '300a18_user_chapter_cataloging'"
+                ))
+
+            result = bootstrap_database(engine, database_url=url)
+
+            inspector = inspect(engine)
+            assert result.mode == "migrated"
+            assert result.read_only is False
+            assert result.schema_revision == "300a22_provider_task_models"
+            assert "blueprint_json" not in {
+                item["name"] for item in inspector.get_columns("novel_creation_sessions")
+            }
+            assert "blueprint_json" not in {
+                item["name"] for item in inspector.get_columns("system_assistant_conversations")
+            }
+            with engine.connect() as connection:
+                draft = json.loads(connection.execute(text(
+                    "SELECT draft_json FROM novel_creation_sessions WHERE id = 'legacy-session'"
+                )).scalar_one())
+            assert draft["concepts"][0]["title"] == "雾城记"
+            assert draft["concept_seeds"]["concept-1"]["protagonist_seed"]["name"] == "林七"
+        finally:
+            engine.dispose()
+
+
+def test_legacy_truncated_run_step_json_is_repaired_before_retry():
+    with TemporaryDirectory() as temp_dir:
+        database_path = Path(temp_dir) / "truncated-run-step.db"
+        url = _database_url(database_path)
+        engine = create_engine(url)
+        try:
+            initialized = bootstrap_database(engine, database_url=url)
+            assert initialized.schema_revision == "300a22_provider_task_models"
+
+            Session = sessionmaker(bind=engine)
+            with Session() as db:
+                run = AssistantRun(project_id="project-1", status="error", phase="tool")
+                db.add(run)
+                db.flush()
+                step = AssistantRunStep(
+                    run_id=run.id,
+                    project_id=run.project_id,
+                    step_type="tool",
+                    tool="search_chapters",
+                    status="error",
+                    request_json='{"query":"' + ("x" * 80_000) + "...[truncated]",
+                    result_json='{"data":"' + ("y" * 80_000) + "...[truncated]",
+                )
+                db.add(step)
+                db.commit()
+                step_id = step.id
+
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE alembic_version SET version_num = '300a20_remove_blueprints'"
+                    )
+                )
+
+            migrated = bootstrap_database(engine, database_url=url)
+
+            assert migrated.mode == "migrated"
+            assert migrated.schema_revision == "300a22_provider_task_models"
+            with engine.connect() as connection:
+                row = connection.execute(
+                    text(
+                        "SELECT request_json, result_json FROM assistant_run_steps WHERE id = :step_id"
+                    ),
+                    {"step_id": step_id},
+                ).one()
+            request_payload = json.loads(row.request_json)
+            result_payload = json.loads(row.result_json)
+            assert request_payload["_siming_run_log"]["kind"] == "unrecoverable_request"
+            assert result_payload["_siming_run_log"]["kind"] == "truncated_result"
+            assert request_payload["_truncated"] is True
+            assert result_payload["_truncated"] is True
+        finally:
+            engine.dispose()
+
+
+def test_retired_data_only_revision_is_backed_up_and_normalized():
+    with TemporaryDirectory() as temp_dir:
+        database_path = Path(temp_dir) / "retired-revision.db"
+        url = _database_url(database_path)
+        engine = create_engine(url)
+        try:
+            initialized = bootstrap_database(engine, database_url=url)
+            assert initialized.schema_revision == "300a22_provider_task_models"
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "INSERT INTO projects (id, title, description, created_at, updated_at) "
+                        "VALUES ('retired-project', '保留作品', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "UPDATE alembic_version "
+                        "SET version_num = '300a19_runtime_readiness'"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "UPDATE siming_schema_metadata "
+                        "SET value = '300a19_runtime_readiness' "
+                        "WHERE key = 'alembic_revision'"
+                    )
+                )
+
+            result = bootstrap_database(engine, database_url=url)
+
+            assert result.mode == "migrated"
+            assert result.read_only is False
+            assert result.schema_revision == "300a22_provider_task_models"
+            assert result.backup_path and Path(result.backup_path).is_file()
+            with engine.connect() as connection:
+                assert connection.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one() == "300a22_provider_task_models"
+                assert connection.execute(
+                    text(
+                        "SELECT value FROM siming_schema_metadata "
+                        "WHERE key = 'alembic_revision'"
+                    )
+                ).scalar_one() == "300a22_provider_task_models"
+                assert connection.execute(
+                    text("SELECT title FROM projects WHERE id = 'retired-project'")
+                ).scalar_one() == "保留作品"
+        finally:
+            engine.dispose()
+
+
 def test_stamped_300a12_database_repairs_missing_resolution_evidence_columns():
     """A briefly shipped 300a12 schema was stamped before this column existed."""
 
@@ -158,7 +325,7 @@ def test_stamped_300a12_database_repairs_missing_resolution_evidence_columns():
 
             inspector = inspect(engine)
             assert result.mode == "migrated"
-            assert result.schema_revision == "300a17_chapter_sort_order"
+            assert result.schema_revision == "300a22_provider_task_models"
             for table_name in ("foreshadowings", "causal_edges", "narrative_debts"):
                 assert "resolution_evidence" in {
                     column["name"] for column in inspector.get_columns(table_name)
@@ -212,7 +379,7 @@ def test_stamped_300a13_database_repairs_cataloged_outline_hierarchy_only():
                     )).mappings()
                 }
             volumes = [row for row in rows.values() if row.node_type == "volume"]
-            assert result.schema_revision == "300a17_chapter_sort_order"
+            assert result.schema_revision == "300a22_provider_task_models"
             assert len(volumes) == 1
             assert rows["chapter-3"].parent_id == volumes[0].id
             assert rows["section-3"].parent_id == "chapter-3"
@@ -267,7 +434,7 @@ def test_stamped_300a14_database_canonicalizes_free_form_character_roles():
                         "SELECT id, role_type, background FROM characters ORDER BY id"
                     )).mappings()
                 }
-            assert result.schema_revision == "300a17_chapter_sort_order"
+            assert result.schema_revision == "300a22_provider_task_models"
             assert {key: row.role_type for key, row in rows.items()} == {
                 "elder": "other",
                 "hero": "protagonist",
@@ -375,10 +542,71 @@ def test_alpha1_database_upgrades_through_gateway_sync():
             result = bootstrap_database(engine, database_url=url)
 
             assert result.mode == "migrated"
-            assert result.schema_revision == "300a17_chapter_sort_order"
+            assert result.schema_revision == "300a22_provider_task_models"
             assert {"content_sync_jobs", "gateway_devices", "sync_changes"} <= set(
                 inspect(engine).get_table_names()
             )
+        finally:
+            engine.dispose()
+
+
+def test_provider_task_model_migration_replaces_legacy_local_only_settings():
+    with TemporaryDirectory() as temp_dir:
+        database_path = Path(temp_dir) / "legacy-task-models.db"
+        url = _database_url(database_path)
+        engine = create_engine(url)
+        try:
+            bootstrap_database(engine, database_url=url)
+            with engine.begin() as connection:
+                connection.execute(text("DROP TABLE model_task_settings"))
+                connection.execute(text("ALTER TABLE api_configs DROP COLUMN available_models_json"))
+                connection.execute(text(
+                    "CREATE TABLE local_model_task_settings ("
+                    "id VARCHAR(36) PRIMARY KEY, task_type VARCHAR(30) NOT NULL UNIQUE, "
+                    "model_key VARCHAR(512) NOT NULL, adapter_ids JSON, context_length INTEGER, "
+                    "allow_api_fallback BOOLEAN NOT NULL DEFAULT 0, "
+                    "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+                ))
+                connection.execute(text(
+                    "INSERT INTO local_model_task_settings "
+                    "(id, task_type, model_key, context_length, created_at, updated_at) "
+                    "VALUES ('legacy-writing', 'writing', 'qwen-local', 32768, "
+                    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), "
+                    "('legacy-chat', 'chat', 'qwen-chat', 16384, "
+                    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ))
+                connection.execute(text(
+                    "UPDATE alembic_version SET version_num = '300a21_valid_step_json'"
+                ))
+
+            result = bootstrap_database(engine, database_url=url)
+
+            inspector = inspect(engine)
+            assert result.schema_revision == "300a22_provider_task_models"
+            assert "local_model_task_settings" not in inspector.get_table_names()
+            assert "model_task_settings" in inspector.get_table_names()
+            assert "available_models_json" in {
+                column["name"] for column in inspector.get_columns("api_configs")
+            }
+            with engine.connect() as connection:
+                rows = connection.execute(text(
+                    "SELECT task_type, provider, model_name, context_length "
+                    "FROM model_task_settings ORDER BY task_type"
+                )).mappings().all()
+            assert [dict(row) for row in rows] == [
+                {
+                    "task_type": "assistant",
+                    "provider": "local_llama_cpp",
+                    "model_name": "qwen-chat",
+                    "context_length": 16384,
+                },
+                {
+                    "task_type": "writing",
+                    "provider": "local_llama_cpp",
+                    "model_name": "qwen-local",
+                    "context_length": 32768,
+                },
+            ]
         finally:
             engine.dispose()
 

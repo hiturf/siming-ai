@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import suppress
+from dataclasses import dataclass
+from inspect import isawaitable
 from typing import TypeVar
+from uuid import uuid4
 
 from app.ai.anthropic_adapter import AnthropicAdapter
 from app.ai.base import BaseAdapter
@@ -53,17 +58,226 @@ ADAPTER_MAP: dict[str, type[BaseAdapter]] = {
     "qwen_code_cli": LocalCLIAdapter,
     "hermes_cli": LocalCLIAdapter,
     "openclaw_cli": LocalCLIAdapter,
+    "dsh_cli": LocalCLIAdapter,
     "custom_cli": LocalCLIAdapter,
     "local_llama_cpp": LocalRuntimeAdapter,
 }
 
 DEFAULT_TIMEOUT = 120
 MAX_RETRIES = 3
+DEFAULT_STREAM_RESUMES = 8
+STREAM_RESUME_ANCHOR_CHARS = 64
 T = TypeVar("T")
 
 
-def record_gateway_failure(provider: str, error: BaseException | object) -> None:
-    get_model_runtime().record_failure(provider, error)
+class _ResumeHandshakeError(LLMError):
+    """The replacement stream did not prove that it starts at our checkpoint."""
+
+
+@dataclass
+class _ResumeHandshake:
+    expected_prefix: str
+    buffered: str = ""
+    verified: bool = False
+
+    def consume(self, chunk: str) -> str:
+        if self.verified:
+            return chunk
+        self.buffered += chunk
+        candidate = self.buffered.lstrip()
+        if len(candidate) < len(self.expected_prefix):
+            if not self.expected_prefix.startswith(candidate):
+                raise _ResumeHandshakeError("模型没有按检查点恢复协议继续输出")
+            return ""
+        if not candidate.startswith(self.expected_prefix):
+            raise _ResumeHandshakeError("模型没有按检查点恢复协议继续输出")
+        self.verified = True
+        suffix = candidate[len(self.expected_prefix):]
+        self.buffered = ""
+        return suffix
+
+    def require_verified(self) -> None:
+        if not self.verified:
+            raise _ResumeHandshakeError("模型恢复响应在检查点握手完成前结束")
+
+
+def _normalize_stream_resumes(resume: int | None) -> int:
+    try:
+        value = int(resume or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return max(0, min(value, 32))
+
+
+def _append_system_instruction(messages: list[dict], instruction: str) -> list[dict]:
+    rendered = [dict(message) for message in messages]
+    for index, message in enumerate(rendered):
+        if message.get("role") != "system":
+            continue
+        updated = dict(message)
+        updated["content"] = f"{str(message.get('content') or '').rstrip()}\n\n{instruction}"
+        rendered[index] = updated
+        return rendered
+    return [{"role": "system", "content": instruction}, *rendered]
+
+
+def _resume_messages(
+    messages: list[dict],
+    committed_text: str,
+    *,
+    tool_mode: bool,
+) -> tuple[list[dict], _ResumeHandshake | None]:
+    """Build a fresh model request that can be joined without guessing overlap."""
+
+    marker = f"[SIMING_RESUME_{uuid4().hex}]"
+    if committed_text:
+        anchor = committed_text[-STREAM_RESUME_ANCHOR_CHARS:]
+        expected_prefix = marker + anchor
+        instruction = (
+            "这是运行时恢复协议，不是新的用户意图。上一条 assistant 输出因传输中断，"
+            "已输出内容由运行时保存。收到恢复请求时，必须先逐字输出指定恢复标记和断点锚点，"
+            "随后从锚点后的下一个字符继续；不得重复更早内容，也不得解释恢复协议。"
+        )
+        if tool_mode:
+            instruction += (
+                "上一条未完成的工具调用已被丢弃；若仍需工具，"
+                "必须从头发出一条完整工具调用。"
+            )
+        rendered = _append_system_instruction(messages, instruction)
+        rendered.extend([
+            {"role": "assistant", "content": committed_text},
+            {
+                "role": "user",
+                "content": (
+                    "继续刚才因传输中断的同一响应。回复开头必须严格等于下面一行，"
+                    "不能添加代码块、空格或说明；之后紧接尚未输出的内容：\n"
+                    + expected_prefix
+                ),
+            },
+        ])
+        return rendered, _ResumeHandshake(expected_prefix)
+
+    instruction = (
+        "这是运行时恢复协议，不是新的用户意图。上一条模型响应在完成前中断，且没有任何最终文本被提交。"
+    )
+    if tool_mode:
+        instruction += (
+            "任何未完成工具参数都已被丢弃；重新判断原任务，"
+            "并从头发出完整、有效的工具调用。"
+        )
+    else:
+        instruction += "重新处理原任务并返回完整响应。"
+    rendered = _append_system_instruction(messages, instruction)
+    rendered.append({"role": "user", "content": "继续中断的同一模型步骤。"})
+    return rendered, None
+
+
+def _tool_delta_events_complete(events: list[dict]) -> bool:
+    if not events:
+        return True
+    calls: dict[int, dict[str, str]] = {}
+    for event in events:
+        index = int(event.get("index") or 0)
+        call = calls.setdefault(index, {"name": "", "arguments": ""})
+        if event.get("name"):
+            call["name"] = str(event["name"])
+        if event.get("arguments_delta"):
+            call["arguments"] += str(event["arguments_delta"])
+    for call in calls.values():
+        if not call["name"]:
+            return False
+        try:
+            arguments = json.loads(call["arguments"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(arguments, dict):
+            return False
+    return True
+
+
+def _validate_tool_stream_completion(
+    done_event: dict | None,
+    buffered_tool_events: list[dict],
+    handshake: _ResumeHandshake | None,
+    content_seen: bool,
+    usage_totals: dict[str, int],
+    has_usage: bool,
+) -> bool:
+    if handshake and content_seen:
+        handshake.require_verified()
+    if done_event is None:
+        raise _ResumeHandshakeError("模型工具流在正式结束帧到达前停止")
+    raw_usage = done_event.get("usage")
+    if isinstance(raw_usage, dict):
+        has_usage = True
+        for key in usage_totals:
+            usage_totals[key] += max(0, int(raw_usage.get(key) or 0))
+    finish_reason = str(done_event.get("finish_reason") or "").lower()
+    if finish_reason in {"length", "max_tokens", "token_limit", "incomplete"}:
+        raise _ResumeHandshakeError("模型输出达到单次长度上限，正在从检查点继续")
+    if not _tool_delta_events_complete(buffered_tool_events):
+        raise _ResumeHandshakeError("工具调用在参数完整前结束")
+    if handshake and not content_seen and not buffered_tool_events:
+        handshake.require_verified()
+    return has_usage
+
+
+def _record_stream_resume(
+    *,
+    provider: str,
+    resume_attempt: int,
+    checkpoint_chars: int,
+    tool_mode: bool,
+) -> None:
+    try:
+        from app.modules.operations.interfaces.runtime import current_operation_id
+        from app.services.operation_runtime import record_operation_signal
+
+        operation_id = current_operation_id()
+        if operation_id:
+            record_operation_signal(
+                operation_id,
+                "stream_resume",
+                {
+                    "resume_attempt": resume_attempt,
+                    "checkpoint_chars": checkpoint_chars,
+                    "tool_mode": tool_mode,
+                    "provider": provider,
+                },
+                message=(
+                    "模型连接中断，正在从已验证检查点继续"
+                    if checkpoint_chars else "模型工具响应中断，正在重新获取完整工具调用"
+                ),
+            )
+    except Exception:
+        # Progress projection must never change model execution semantics.
+        pass
+
+
+async def _notify_stream_resume(
+    callback: Callable[[dict], Awaitable[None] | None] | None,
+    *,
+    provider: str,
+    resume_attempt: int,
+    checkpoint_chars: int,
+    tool_mode: bool,
+) -> None:
+    payload = {
+        "resume_attempt": resume_attempt,
+        "checkpoint_chars": checkpoint_chars,
+        "tool_mode": tool_mode,
+        "provider": provider,
+    }
+    _record_stream_resume(**payload)
+    if callback is None:
+        return
+    try:
+        result = callback(dict(payload))
+        if isawaitable(result):
+            await result
+    except Exception:
+        # UI/progress projection is advisory; checkpoint recovery is not.
+        pass
 
 
 def _is_auth_error(error: BaseException) -> bool:
@@ -185,19 +399,12 @@ class LLMGateway:
         task_type: str,
         model_override: str | None = None,
         extra_body: dict | None = None,
-        prefer_task_model: bool = False,
     ) -> TaskModelSelection:
-        """Resolve a task model without letting local task settings hide globals.
-
-        Priority: explicit model > explicit task-local opt-in > global default >
-        task-local fallback. The fallback keeps old offline-only installs usable,
-        while configured API/CLI defaults remain the normal path.
-        """
+        """Resolve one model by explicit override, task default, then global default."""
         return get_model_runtime().select_for_task(
             task_type=task_type,
             model_override=model_override,
             extra_body=extra_body,
-            prefer_task_model=prefer_task_model,
         )
 
     @classmethod
@@ -389,11 +596,9 @@ class LLMGateway:
                             tool_choice=None,
                         ),
                     )
-                except LLMError as retry_error:
-                    record_gateway_failure(provider, retry_error)
+                except LLMError:
                     raise
             else:
-                record_gateway_failure(provider, exc)
                 raise
 
         result.setdefault("model", model_name)
@@ -410,6 +615,8 @@ class LLMGateway:
         timeout: int | None = None,
         retry: int = MAX_RETRIES,
         extra_body: dict | None = None,
+        resume: int = DEFAULT_STREAM_RESUMES,
+        on_resume: Callable[[dict], Awaitable[None] | None] | None = None,
     ) -> AsyncGenerator[str, None]:
         messages, extra_body, max_tokens = _apply_active_context_manifest(
             messages,
@@ -436,13 +643,23 @@ class LLMGateway:
             timeout_seconds,
         )
         attempts = normalize_retry_count(retry)
+        raw_retries_remaining = attempts - 1
+        resumes_remaining = _normalize_stream_resumes(resume)
+        resume_attempt = 0
         last_error: BaseException | None = None
+        committed_parts: list[str] = []
+        request_messages = messages
+        handshake: _ResumeHandshake | None = None
 
-        for attempt in range(1, attempts + 1):
-            produced = False
+        while True:
+            raw_produced = False
+            error_cause: BaseException | None = None
+            non_retryable = False
+            gen: AsyncGenerator[str, None] | None = None
             try:
+                adapter.last_stream_finish_reason = None
                 gen = adapter.stream_chat_completion(
-                    messages=messages,
+                    messages=request_messages,
                     model=model_name,
                     temperature=temperature,
                     max_tokens=max_tokens,
@@ -452,42 +669,82 @@ class LLMGateway:
                     try:
                         chunk = await cls._next_stream_item(gen, wait_timeout_seconds)
                     except StopAsyncIteration:
-                        return
-                    produced = True
-                    yield chunk
-            except TimeoutError:
+                        break
+                    raw_produced = True
+                    outgoing = handshake.consume(str(chunk)) if handshake else str(chunk)
+                    if outgoing:
+                        committed_parts.append(outgoing)
+                        yield outgoing
+                if handshake:
+                    handshake.require_verified()
+                finish_reason = str(adapter.last_stream_finish_reason or "").lower()
+                if finish_reason in {"length", "max_tokens", "token_limit", "incomplete"}:
+                    raise _ResumeHandshakeError(
+                        "模型输出达到单次长度上限，正在从检查点继续"
+                    )
+                return
+            except TimeoutError as exc:
                 last_error = LLMError(f"流式请求超时（{timeout_seconds or '未限制'}秒）")
+                error_cause = exc
             except LLMError as exc:
                 last_error = exc
-                if _is_non_retryable(exc) or produced:
-                    record_gateway_failure(provider, exc)
-                    raise
+                error_cause = exc
+                non_retryable = _is_non_retryable(exc)
             except Exception as exc:
                 last_error = LLMError(f"流式调用失败: {exc}")
-                if produced:
-                    record_gateway_failure(provider, last_error)
-                    raise last_error from exc
+                error_cause = exc
+            finally:
+                if gen is not None:
+                    with suppress(Exception):
+                        await gen.aclose()
 
-            if attempt < attempts:
-                await asyncio.sleep(min(8, attempt * 1.5))
+            if non_retryable:
+                raise last_error from error_cause
+            if not raw_produced and raw_retries_remaining > 0:
+                raw_retries_remaining -= 1
+                await asyncio.sleep(min(8, (attempts - raw_retries_remaining) * 1.5))
+                continue
 
-        final_error = last_error or LLMError("流式请求失败，已达到最大重试次数")
-        record_gateway_failure(provider, final_error)
-        raise final_error
+            committed_text = "".join(committed_parts)
+            can_resume = resumes_remaining > 0 and (
+                raw_produced or handshake is not None or bool(committed_text)
+            )
+            if can_resume:
+                resumes_remaining -= 1
+                resume_attempt += 1
+                request_messages, handshake = _resume_messages(
+                    messages,
+                    committed_text,
+                    tool_mode=False,
+                )
+                await _notify_stream_resume(
+                    on_resume,
+                    provider=provider,
+                    resume_attempt=resume_attempt,
+                    checkpoint_chars=len(committed_text),
+                    tool_mode=False,
+                )
+                await asyncio.sleep(min(8, resume_attempt * 1.5))
+                continue
+
+            final_error = last_error or LLMError("流式请求失败，已达到最大重试次数")
+            if error_cause is not None:
+                raise final_error from error_cause
+            raise final_error
 
     @classmethod
-    async def stream_chat_completion_with_tools(
+    def _prepare_tool_stream(
         cls,
         messages: list[dict],
-        model: str | None = None,
-        temperature: float = 0.7,
-        max_tokens: int | None = None,
-        timeout: int | None = None,
-        retry: int = MAX_RETRIES,
-        extra_body: dict | None = None,
-        tools: list[dict] | None = None,
-        tool_choice: str | dict | None = None,
-    ) -> AsyncGenerator[dict, None]:
+        model: str | None,
+        max_tokens: int | None,
+        timeout: int | None,
+        retry: int,
+        resume: int,
+        extra_body: dict | None,
+        tools: list[dict] | None,
+        tool_choice: str | dict | None,
+    ) -> tuple:
         messages, extra_body, max_tokens = _apply_active_context_manifest(
             messages,
             extra_body,
@@ -513,14 +770,57 @@ class LLMGateway:
             timeout_seconds,
         )
         attempts = normalize_retry_count(retry)
-        safe_tools, safe_tool_choice, notes = sanitize_tool_request(provider, tools, tool_choice)
-        last_error: BaseException | None = None
+        safe_tools, safe_tool_choice, notes = sanitize_tool_request(
+            provider,
+            tools,
+            tool_choice,
+        )
+        return (
+            messages, model_name, provider, adapter, max_tokens, timeout_seconds,
+            call_extra_body, wait_timeout_seconds, attempts,
+            _normalize_stream_resumes(resume), safe_tools, safe_tool_choice, notes,
+        )
 
-        for attempt in range(1, attempts + 1):
-            produced = False
+    @classmethod
+    async def stream_chat_completion_with_tools(
+        cls,
+        messages: list[dict],
+        model: str | None = None,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+        timeout: int | None = None,
+        retry: int = MAX_RETRIES,
+        extra_body: dict | None = None,
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
+        resume: int = DEFAULT_STREAM_RESUMES,
+        on_resume: Callable[[dict], Awaitable[None] | None] | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        (messages, model_name, provider, adapter, max_tokens, timeout_seconds,
+         call_extra_body, wait_timeout_seconds, attempts, resumes_remaining,
+         safe_tools, safe_tool_choice, notes) = cls._prepare_tool_stream(
+            messages, model, max_tokens, timeout, retry, resume, extra_body, tools, tool_choice,
+        )
+        raw_retries_remaining = attempts - 1
+        resume_attempt = 0
+        last_error: BaseException | None = None
+        committed_parts: list[str] = []
+        request_messages = messages
+        handshake: _ResumeHandshake | None = None
+        usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        has_usage = False
+
+        while True:
+            raw_produced = False
+            content_seen = False
+            buffered_tool_events: list[dict] = []
+            done_event: dict | None = None
+            error_cause: BaseException | None = None
+            non_retryable = False
+            gen: AsyncGenerator[dict, None] | None = None
             try:
                 gen = adapter.stream_chat_completion_with_tools(
-                    messages=messages,
+                    messages=request_messages,
                     model=model_name,
                     temperature=temperature,
                     max_tokens=max_tokens,
@@ -532,34 +832,103 @@ class LLMGateway:
                     try:
                         chunk = await cls._next_stream_item(gen, wait_timeout_seconds)
                     except StopAsyncIteration:
-                        return
-                    produced = True
-                    if chunk.get("type") == "done":
-                        chunk.setdefault("request_meta", request_meta(provider, model_name, notes))
-                    yield chunk
-            except TimeoutError:
+                        break
+                    raw_produced = True
+                    event_type = chunk.get("type")
+                    if event_type == "content_delta":
+                        delta = str(chunk.get("delta") or "")
+                        content_seen = content_seen or bool(delta)
+                        outgoing = handshake.consume(delta) if handshake else delta
+                        if outgoing:
+                            committed_parts.append(outgoing)
+                            yielded = dict(chunk)
+                            yielded["delta"] = outgoing
+                            yield yielded
+                    elif event_type == "tool_call_delta":
+                        buffered_tool_events.append(dict(chunk))
+                    elif event_type == "done":
+                        done_event = dict(chunk)
+                        with suppress(Exception):
+                            await gen.aclose()
+                        break
+                    else:
+                        yield chunk
+
+                has_usage = _validate_tool_stream_completion(
+                    done_event,
+                    buffered_tool_events,
+                    handshake,
+                    content_seen,
+                    usage_totals,
+                    has_usage,
+                )
+
+                for tool_event in buffered_tool_events:
+                    yield tool_event
+                if done_event is not None:
+                    if has_usage:
+                        done_event["usage"] = dict(usage_totals)
+                    if resume_attempt:
+                        notes.append(f"流式响应已从检查点续传 {resume_attempt} 次")
+                    done_event.setdefault("request_meta", request_meta(provider, model_name, notes))
+                    yield done_event
+                return
+            except TimeoutError as exc:
                 last_error = LLMError(f"流式请求超时（{timeout_seconds or '未限制'}秒）")
+                error_cause = exc
             except LLMError as exc:
                 last_error = exc
+                error_cause = exc
                 if (
                     safe_tool_choice is not None
                     and should_retry_without_tool_choice(exc)
-                    and not produced
+                    and not raw_produced
                 ):
                     notes.append("接口拒绝 tool_choice，已自动去掉该参数重试")
                     safe_tool_choice = None
-                elif _is_non_retryable(exc) or produced:
-                    record_gateway_failure(provider, exc)
-                    raise
+                else:
+                    non_retryable = _is_non_retryable(exc)
             except Exception as exc:
                 last_error = LLMError(f"流式调用失败: {exc}")
-                if produced:
-                    record_gateway_failure(provider, last_error)
-                    raise last_error from exc
+                error_cause = exc
+            finally:
+                if gen is not None:
+                    with suppress(Exception):
+                        await gen.aclose()
 
-            if attempt < attempts:
-                await asyncio.sleep(min(8, attempt * 1.5))
+            if non_retryable:
+                raise last_error from error_cause
+            if not raw_produced and raw_retries_remaining > 0:
+                raw_retries_remaining -= 1
+                await asyncio.sleep(min(8, (attempts - raw_retries_remaining) * 1.5))
+                continue
 
-        final_error = last_error or LLMError("流式请求失败，已达到最大重试次数")
-        record_gateway_failure(provider, final_error)
-        raise final_error
+            committed_text = "".join(committed_parts)
+            can_resume = resumes_remaining > 0 and (
+                raw_produced
+                or handshake is not None
+                or bool(committed_text)
+                or bool(buffered_tool_events)
+            )
+            if can_resume:
+                resumes_remaining -= 1
+                resume_attempt += 1
+                request_messages, handshake = _resume_messages(
+                    messages,
+                    committed_text,
+                    tool_mode=True,
+                )
+                await _notify_stream_resume(
+                    on_resume,
+                    provider=provider,
+                    resume_attempt=resume_attempt,
+                    checkpoint_chars=len(committed_text),
+                    tool_mode=True,
+                )
+                await asyncio.sleep(min(8, resume_attempt * 1.5))
+                continue
+
+            final_error = last_error or LLMError("流式请求失败，已达到最大重试次数")
+            if error_cause is not None:
+                raise final_error from error_cause
+            raise final_error

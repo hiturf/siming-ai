@@ -19,8 +19,8 @@ def _prompt_service() -> ContinuityPromptService:
     return ContinuityPromptService(get_prompt_compiler())
 
 
-def render_merged_cataloging_prompt() -> str:
-    return _prompt_service().render_merged_cataloging()
+def render_cataloging_candidates_prompt() -> str:
+    return _prompt_service().render_cataloging_candidates()
 
 
 def render_external_cataloging_prompt() -> str:
@@ -30,5 +30,5 @@ def render_external_cataloging_prompt() -> str:
 __all__ = [
     "configure_continuity_prompt_service",
     "render_external_cataloging_prompt",
-    "render_merged_cataloging_prompt",
+    "render_cataloging_candidates_prompt",
 ]

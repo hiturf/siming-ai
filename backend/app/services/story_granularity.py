@@ -726,7 +726,7 @@ def _relationship_identities(value: Any) -> set[str]:
 def _has_meaningful_character_profile(payload: dict[str, Any]) -> bool:
     """Reject identity-only character cards that would leave a blank profile."""
 
-    for field in (
+    for attribute in (
         "aliases",
         "role_type",
         "personality",
@@ -736,23 +736,23 @@ def _has_meaningful_character_profile(payload: dict[str, Any]) -> bool:
         "catchphrases",
         "verbosity",
         "emotion_tendency",
-        "custom_system_prompt",
+        "custom_system_prompt", "appearance", "age",
     ):
-        value = payload.get(field)
+        value = payload.get(attribute)
         if value not in (None, "", [], {}):
             return True
     profile = payload.get("profile")
     if not isinstance(profile, dict):
         profile = payload.get("profile_json")
     if isinstance(profile, dict) and any(
-        profile.get(field) not in (None, "", [], {})
-        for field in CHARACTER_PROFILE_FIELDS
+        profile.get(attribute) not in (None, "", [], {})
+        for attribute in CHARACTER_PROFILE_FIELDS
     ):
         return True
     ai_config = payload.get("ai_config")
     return isinstance(ai_config, dict) and any(
-        ai_config.get(field) not in (None, "", [], {})
-        for field in (
+        ai_config.get(attribute) not in (None, "", [], {})
+        for attribute in (
             "tone_style",
             "catchphrases",
             "verbosity",

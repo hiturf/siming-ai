@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
-from array import array
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,8 +19,13 @@ from typing import Any
 from sqlalchemy import event, or_
 from sqlalchemy.orm import Session
 
+from ..core.model_limits import (
+    DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS,
+    effective_model_limits,
+)
 from ..core.legacy_env import get_compatible_env
 from ..database.models import (
+    APIConfig,
     AssistantMemory,
     CausalEdge,
     Chapter,
@@ -40,7 +43,7 @@ from ..database.models import (
     ContextRebuildProject,
     Foreshadowing,
     LocalModel,
-    LocalModelTaskSetting,
+    ModelTaskSetting,
     ModelContextProfile,
     NarrativeDebt,
     NovelCreationSession,
@@ -62,15 +65,23 @@ from ..modules.context.application.runtime import (
 )
 from ..modules.model_runtime.application.runtime import resolve_model_identity
 from .character_archive import character_archive_text
+from .context_semantics import (
+    LOCAL_EMBEDDING_MODEL,
+    LocalSemanticRuntime,
+    cosine_similarity as _cosine,
+    normalise_score as _normalise_score,
+    pack_float32 as _pack_float32,
+    unpack_float32 as _unpack_float32,
+)
 from .rag.context_packer import ContextBudget, estimate_tokens
 from .rag.indexer import _get_source_content_hash, reindex_project
 from .rag.retriever import search_chunks
 
 CONTEXT_POLICY_VERSION = 1
 CONTEXT_INDEX_VERSION = 1
-DEFAULT_CONTEXT_WINDOW_TOKENS = 16_384
+DEFAULT_CONTEXT_WINDOW_TOKENS = DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS
+DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS = 16_384
 DEFAULT_SAFETY_MARGIN_TOKENS = 512
-LOCAL_EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
 MANIFEST_STATUSES = {
     "ready",
     "needs_confirmation",
@@ -99,18 +110,6 @@ def _clean_text(value: Any, limit: int) -> str:
 
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
-
-
-def _normalise_score(value: float | None, values: Sequence[float]) -> float:
-    if value is None:
-        return 0.0
-    if not values:
-        return 0.0
-    low = min(values)
-    high = max(values)
-    if math.isclose(low, high):
-        return 1.0 if value > 0 else 0.0
-    return max(0.0, min(1.0, (value - low) / (high - low)))
 
 
 def _task_key(task_type: str) -> str:
@@ -226,82 +225,6 @@ class ManifestCandidate:
     @property
     def estimated_tokens(self) -> int:
         return estimate_tokens(self.content)
-
-
-class LocalSemanticRuntime:
-    """Optional local FastEmbed runtime.
-
-    Importing FastEmbed is intentionally the only prerequisite check.  No
-    cloud embedding endpoint is used.  A model download, if the author has
-    installed FastEmbed and selected semantic indexing, remains a local model
-    runtime operation handled by FastEmbed itself.
-    """
-
-    _model: Any = None
-    _initialisation_error: str | None = None
-
-    @classmethod
-    def status(cls) -> dict[str, Any]:
-        try:
-            import fastembed  # noqa: F401
-        except Exception as exc:
-            return {
-                "available": False,
-                "model": LOCAL_EMBEDDING_MODEL,
-                "reason": f"FastEmbed unavailable: {exc.__class__.__name__}",
-            }
-        if cls._initialisation_error:
-            return {
-                "available": False,
-                "model": LOCAL_EMBEDDING_MODEL,
-                "reason": cls._initialisation_error,
-            }
-        return {"available": True, "model": LOCAL_EMBEDDING_MODEL, "reason": ""}
-
-    @classmethod
-    def _get_model(cls):
-        if cls._model is not None:
-            return cls._model
-        try:
-            from fastembed import TextEmbedding
-
-            cls._model = TextEmbedding(model_name=LOCAL_EMBEDDING_MODEL)
-            return cls._model
-        except Exception as exc:
-            cls._initialisation_error = f"FastEmbed could not initialise: {exc}"
-            raise RuntimeError(cls._initialisation_error) from exc
-
-    @classmethod
-    def embed(cls, texts: Sequence[str]) -> list[list[float]]:
-        if not texts:
-            return []
-        model = cls._get_model()
-        vectors = model.embed(list(texts))
-        return [[float(value) for value in vector] for vector in vectors]
-
-
-def _pack_float32(vector: Sequence[float]) -> bytes:
-    values = array("f", (float(value) for value in vector))
-    return values.tobytes()
-
-
-def _unpack_float32(blob: bytes, dimension: int) -> list[float]:
-    if not blob or dimension <= 0:
-        return []
-    values = array("f")
-    values.frombytes(blob)
-    return [float(value) for value in values[:dimension]]
-
-
-def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
-    if not left or not right or len(left) != len(right):
-        return 0.0
-    dot = sum(a * b for a, b in zip(left, right))
-    left_norm = math.sqrt(sum(a * a for a in left))
-    right_norm = math.sqrt(sum(b * b for b in right))
-    if left_norm <= 0 or right_norm <= 0:
-        return 0.0
-    return dot / (left_norm * right_norm)
 
 
 def _project_style_text(
@@ -633,13 +556,16 @@ class ContextOrchestrator:
         capacity = max(0, int(model.context_length or 0)) if model else 0
         local_task = self._local_task_type(task_type)
         setting = (
-            self.db.query(LocalModelTaskSetting)
-            .filter(LocalModelTaskSetting.task_type == local_task)
+            self.db.query(ModelTaskSetting)
+            .filter(
+                ModelTaskSetting.task_type == local_task,
+                ModelTaskSetting.provider == "local_llama_cpp",
+            )
             .first()
         )
         if (
             setting
-            and setting.model_key == model_name
+            and setting.model_name == model_name
             and int(setting.context_length or 0) > 0
         ):
             requested = int(setting.context_length)
@@ -696,6 +622,24 @@ class ContextOrchestrator:
             if provider == "local_llama_cpp"
             else None
         )
+        provider_config = (
+            self.db.query(APIConfig)
+            .filter(APIConfig.provider == provider)
+            .first()
+        )
+        configured_output_limit = (
+            int(provider_config.max_output_tokens)
+            if provider_config and provider_config.max_output_tokens
+            else None
+        )
+
+        def output_limit(profile_limit: int | None = None) -> int:
+            return effective_model_limits(
+                provider,
+                model_name,
+                max_output_tokens=profile_limit or configured_output_limit,
+            ).max_output_tokens
+
         if profile:
             configured_window = max(
                 1,
@@ -709,8 +653,13 @@ class ContextOrchestrator:
                     if local_context
                     else configured_window
                 ),
-                max_output_tokens=int(profile.max_output_tokens) if profile.max_output_tokens else None,
-                safety_margin_tokens=max(0, int(profile.safety_margin_tokens or DEFAULT_SAFETY_MARGIN_TOKENS)),
+                max_output_tokens=output_limit(
+                    int(profile.max_output_tokens) if profile.max_output_tokens else None
+                ),
+                safety_margin_tokens=max(
+                    0,
+                    int(profile.safety_margin_tokens or DEFAULT_SAFETY_MARGIN_TOKENS),
+                ),
                 known=True,
             )
         if local_context:
@@ -718,15 +667,19 @@ class ContextOrchestrator:
                 provider=provider,
                 model_name=model_name,
                 context_window_tokens=local_context,
-                max_output_tokens=None,
+                max_output_tokens=output_limit(),
                 safety_margin_tokens=DEFAULT_SAFETY_MARGIN_TOKENS,
                 known=True,
             )
         return ResolvedModelContextProfile(
             provider=provider,
             model_name=model_name,
-            context_window_tokens=DEFAULT_CONTEXT_WINDOW_TOKENS,
-            max_output_tokens=None,
+            context_window_tokens=(
+                DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
+                if provider == "local_llama_cpp"
+                else DEFAULT_CONTEXT_WINDOW_TOKENS
+            ),
+            max_output_tokens=output_limit(),
             safety_margin_tokens=DEFAULT_SAFETY_MARGIN_TOKENS,
             known=False,
         )
@@ -1486,7 +1439,17 @@ class ContextOrchestrator:
         if missing:
             warnings.append("Required context is missing: " + ", ".join(missing))
         if not manifest.contract_json.get("model_profile_known"):
-            warnings.append("Unknown model context profile: conservative 16K window was used.")
+            if manifest.provider == "local_llama_cpp":
+                warnings.append(
+                    "No exact local model context profile is configured; "
+                    "the 16K local safety default was used."
+                )
+            else:
+                warnings.append(
+                    "No exact model context profile is configured; "
+                    "the platform 1M context default was used. "
+                    "Configure a profile when the provider exposes a lower limit."
+                )
 
         for order, candidate in enumerate(selected):
             item = ContextManifestItem(

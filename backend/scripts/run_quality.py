@@ -17,7 +17,7 @@ RUFF_TARGETS = [
     "app/database/schema_models.py",
     "app/core/numbers.py",
     "app/core/legacy_env.py",
-    "app/prompts/workspace_contract.py",
+    "app/architecture/tool_categories.py",
     "app/modules/assistant",
     "app/modules/creation",
     "app/modules/continuity",

@@ -2,3 +2,4 @@
 
 APP_VERSION = "3.3.2"
 DEFAULT_UPDATE_REPO = "teangtang1122/siming-ai"
+DEFAULT_UPDATE_MIRROR_REPO = "teangtang13/siming-ai"

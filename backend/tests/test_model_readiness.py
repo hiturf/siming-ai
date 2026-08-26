@@ -14,8 +14,9 @@ from app.core.response import ApiResponse
 from app.database.models import APIConfig, Base
 from app.routers import config as config_router
 from app.services.model_readiness import (
-    mark_model_failure,
     mark_model_ready,
+    mark_model_verification_failure,
+    repair_runtime_readiness_demotions,
     readiness_payload,
     sanitize_readiness_message,
 )
@@ -54,12 +55,58 @@ def test_failure_class_updates_readiness_and_revokes_global_default():
         readiness_status="ready",
     )
 
-    changed = mark_model_failure(config, LLMError("Free usage exceeded, retrying later"), source="test")
+    changed = mark_model_verification_failure(
+        config,
+        LLMError("Free usage exceeded, retrying later"),
+        source="test",
+    )
 
     assert changed is True
     assert config.readiness_status == "quota_limited"
     assert config.is_global_default is False
     assert readiness_payload(config)["failure_class"] == "quota_or_rate_limit"
+
+
+def test_startup_repairs_only_historical_runtime_demotions():
+    db = _session()
+    runtime_demoted = APIConfig(
+        provider="opencode_cli",
+        api_key_encrypted=encrypt("__local_cli__"),
+        default_model="opencode/big-pickle",
+        provider_type="local_cli",
+        readiness_status="unavailable",
+        readiness_json=(
+            '{"source":"gateway","failure_class":"timeout",'
+            '"message":"本机 CLI 请求超时（91秒）",'
+            '"last_success_at":"2026-08-22T04:00:00"}'
+        ),
+        is_global_default=False,
+    )
+    explicitly_rejected = APIConfig(
+        provider="openai",
+        api_key_encrypted=encrypt("secret"),
+        default_model="gpt-test",
+        readiness_status="unavailable",
+        readiness_json=(
+            '{"source":"manual_verify","failure_class":"network",'
+            '"message":"连接测试失败"}'
+        ),
+        is_global_default=False,
+    )
+    db.add_all([runtime_demoted, explicitly_rejected])
+    db.commit()
+
+    assert repair_runtime_readiness_demotions(db) == 1
+    db.commit()
+    db.refresh(runtime_demoted)
+    db.refresh(explicitly_rejected)
+
+    assert runtime_demoted.readiness_status == "ready"
+    assert runtime_demoted.is_global_default is True
+    assert "runtime_failure_repair" in (runtime_demoted.readiness_json or "")
+    assert explicitly_rejected.readiness_status == "unavailable"
+    assert explicitly_rejected.is_global_default is False
+    assert repair_runtime_readiness_demotions(db) == 0
 
 
 def test_saved_config_verification_marks_ready_and_assigns_first_global():

@@ -6,6 +6,14 @@ Adding a new tool requires only one change: register a ToolDef here.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from dataclasses import replace
+
+from ...architecture.tool_categories import (
+    TOOL_CATEGORY_BY_NAME,
+    normalize_tool_categories,
+    tool_category_for_name,
+)
 from ...architecture.tool_definition import ToolDef, ToolHandler
 from ...architecture.tool_permissions import classify_tool_definitions
 from ...architecture.tool_spec import ToolSpec
@@ -19,7 +27,7 @@ from ...modules.context.interfaces.tool_definitions import (
 from ...modules.continuity.interfaces.tool_definitions import (
     TOOL_DEFINITIONS as CONTINUITY_TOOL_DEFINITIONS,
 )
-from ...modules.creation.interfaces.agent_scope import CREATION_AGENT_TOOL_NAMES
+from ...modules.creation.interfaces.agent_scope import CREATION_DIRECT_MCP_TOOL_NAMES
 from ...modules.creation.interfaces.tool_definitions import (
     TOOL_DEFINITIONS as CREATION_TOOL_DEFINITIONS,
 )
@@ -75,10 +83,18 @@ class ToolRegistry(ToolSpecRegistryMixin):
         *,
         tool_types: set[str] | None = None,
         exclude_types: set[str] | None = None,
+        categories: Iterable[str] | None = None,
     ) -> list[dict]:
         """Return OpenAI function-calling format dicts, optionally filtered by type."""
+        selected_categories = (
+            set(normalize_tool_categories(list(categories)))
+            if categories is not None
+            else None
+        )
         result: list[dict] = []
         for td in self._tools.values():
+            if selected_categories is not None and td.agent_category not in selected_categories:
+                continue
             if tool_types and td.tool_type not in tool_types:
                 continue
             if exclude_types and td.tool_type in exclude_types:
@@ -117,11 +133,19 @@ class ToolRegistry(ToolSpecRegistryMixin):
         *,
         tool_types: set[str] | None = None,
         exclude_types: set[str] | None = None,
+        categories: Iterable[str] | None = None,
     ) -> list[ToolDef]:
         """Return tools available to the internal project assistant."""
+        selected_categories = (
+            set(normalize_tool_categories(list(categories)))
+            if categories is not None
+            else None
+        )
         result = []
         for td in self._tools.values():
             if not td.expose_to_internal_agent:
+                continue
+            if selected_categories is not None and td.agent_category not in selected_categories:
                 continue
             if tool_types and td.tool_type not in tool_types:
                 continue
@@ -138,8 +162,38 @@ class ToolRegistry(ToolSpecRegistryMixin):
         self,
         *,
         permission_pack: str = "readonly_collaboration",
+        categories: Iterable[str] | None = None,
     ) -> list[ToolDef]:
         """Return tools available to MCP clients for a given permission pack."""
+        selected_categories = (
+            set(normalize_tool_categories(list(categories)))
+            if categories is not None
+            else None
+        )
+
+        def category_allowed(tool: ToolDef) -> bool:
+            return selected_categories is None or tool.agent_category in selected_categories
+
+        if permission_pack == "chapter_drafting":
+            # A chapter-writing CLI may read project context and persist one
+            # unsaved draft. It cannot write official chapters, derived
+            # archives, or query/start cataloging in the same model turn.
+            allowed_names = {
+                name
+                for name, tool in self._tools.items()
+                if tool.tool_type == "read" and "cataloging" not in name
+            } | {
+                "prepare_external_writing_context",
+                "save_external_chapter_draft",
+                "report_agent_progress",
+                "report_context_selected",
+            }
+            return [
+                tool
+                for name, tool in self._tools.items()
+                if name in allowed_names and tool.expose_to_mcp and category_allowed(tool)
+            ]
+
         if permission_pack == "cataloging_worker":
             # Managed single-chapter cataloging CLIs read project files
             # directly. Keep their MCP surface deliberately small so every
@@ -157,16 +211,20 @@ class ToolRegistry(ToolSpecRegistryMixin):
                 "apply_pending_cataloging",
             }
             return [
-                td for name, td in self._tools.items() if name in allowed_names and td.expose_to_mcp
+                td for name, td in self._tools.items()
+                if name in allowed_names and td.expose_to_mcp and category_allowed(td)
             ]
 
         if permission_pack == "creation_session":
-            # A one-turn local CLI grant receives only the creation assistant's
-            # surface, never the wider project-management or filesystem tools.
+            # The current CLI writes its own structured result. Model-spawning
+            # creation tools are deliberately absent so MCP cannot recursively
+            # launch another CLI while the first one waits.
             return [
                 td
                 for name, td in self._tools.items()
-                if name in CREATION_AGENT_TOOL_NAMES and td.expose_to_mcp
+                if name in CREATION_DIRECT_MCP_TOOL_NAMES
+                and td.expose_to_mcp
+                and category_allowed(td)
             ]
 
         # Non-linear pack inclusion.
@@ -202,6 +260,8 @@ class ToolRegistry(ToolSpecRegistryMixin):
         result = []
         for td in self._tools.values():
             if not td.expose_to_mcp:
+                continue
+            if not category_allowed(td):
                 continue
             pack = self._derive_mcp_pack(td)
             if pack in allowed_packs:
@@ -287,7 +347,6 @@ _TOOL_REGISTRATION_ORDER = (
     "update_skill",
     "delete_skill",
     "reset_skill",
-    "preview_skill_match",
     "list_skill_versions",
     "ensure_builtin_skills",
     "search_characters",
@@ -312,8 +371,6 @@ _TOOL_REGISTRATION_ORDER = (
     "create_relationship",
     "update_relationship",
     "delete_relationship",
-    "create_chapter",
-    "update_chapter",
     "list_chapter_versions",
     "restore_chapter_version",
     "diff_chapter_versions",
@@ -369,10 +426,6 @@ _TOOL_REGISTRATION_ORDER = (
     "inspect_story_granularity",
     "repair_story_granularity",
     "start_novel_creation_session",
-    "draft_novel_blueprint",
-    "review_novel_blueprint",
-    "apply_novel_blueprint",
-    "get_novel_creation_session",
     "get_creation_session",
     "get_creation_snapshot",
     "get_creation_operation",
@@ -393,8 +446,6 @@ _TOOL_REGISTRATION_ORDER = (
     "list_creation_artifact_versions",
     "get_creation_artifact_diff",
     "restore_creation_artifact_version",
-    "generate_novel_creation_stage",
-    "submit_novel_creation_stage",
     "confirm_creation_artifact",
     "generate_creation_artifact",
     "refine_creation_artifact",
@@ -454,7 +505,20 @@ def _register_all() -> None:
     ]
     order = {name: index for index, name in enumerate(_TOOL_REGISTRATION_ORDER)}
     for definition in sorted(definitions, key=lambda item: order[item.name]):
-        registry.register(definition.bind(resolve_handler))
+        categorized = replace(
+            definition,
+            agent_category=tool_category_for_name(definition.name),
+        )
+        registry.register(categorized.bind(resolve_handler))
+
+    registered_names = set(registry.all_names())
+    catalog_names = set(TOOL_CATEGORY_BY_NAME)
+    if registered_names != catalog_names:
+        missing = sorted(registered_names - catalog_names)
+        extra = sorted(catalog_names - registered_names)
+        raise RuntimeError(
+            f"Agent 工具类别目录与注册表不一致；未分类={missing}，无对应工具={extra}"
+        )
 
 
 _register_all()

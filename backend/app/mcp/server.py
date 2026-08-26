@@ -13,10 +13,29 @@ import sys
 from typing import Any, TextIO
 
 from app.architecture.uow import commit_session
+from app.architecture.tool_categories import (
+    TOOL_CATEGORY_CONTROLLER,
+    tool_category_controller_schema,
+)
 from app.core.legacy_env import get_compatible_env
 from app.mcp.adapter import execute_tool, list_mcp_tools
 from app.mcp.prompts import list_prompts, render_prompt
 from app.mcp.schemas import McpToolResult, make_text_result
+from app.modules.creation.interfaces.agent_progress import (
+    creation_tool_completed_event,
+    creation_tool_started_event,
+)
+from app.modules.creation.interfaces.agent_scope import CREATION_AGENT_WRITE_TOOL_NAMES
+from app.services.tool_category_state import (
+    append_tool_category_audit,
+    append_tool_category_event,
+    creation_turn_write_denial_for_state,
+    creation_turn_write_tools_closed,
+    read_tool_category_state,
+    record_creation_turn_write_result,
+    replace_tool_categories,
+)
+from app.services.workspace.registry import registry
 from app.version import APP_VERSION
 
 logger = logging.getLogger(__name__)
@@ -77,6 +96,7 @@ def handle_message(
     allowed_tiers: set[str] | None = None,
     permission_pack: str | None = None,
     creation_session_id: str = "",
+    tool_category_state_file: str = "",
 ) -> str:
     """Process one JSON-RPC message and return the response string.
 
@@ -106,7 +126,12 @@ def handle_message(
     if method == "initialize":
         return _handle_initialize(msg_id, params)
     elif method == "tools/list":
-        return _handle_tools_list(msg_id, allowed_tiers, permission_pack)
+        return _handle_tools_list(
+            msg_id,
+            allowed_tiers,
+            permission_pack,
+            tool_category_state_file,
+        )
     elif method == "tools/call":
         return _handle_tools_call(
             msg_id,
@@ -116,6 +141,7 @@ def handle_message(
             allowed_tiers,
             permission_pack,
             creation_session_id,
+            tool_category_state_file,
         )
     elif method == "prompts/list":
         if permission_pack == "creation_session":
@@ -151,10 +177,35 @@ def _handle_initialize(msg_id: Any, params: dict) -> str:
     return _jsonrpc_result(msg_id, result)
 
 
-def _handle_tools_list(msg_id: Any, allowed_tiers: set[str], permission_pack: str | None = None) -> str:
+def _handle_tools_list(
+    msg_id: Any,
+    allowed_tiers: set[str],
+    permission_pack: str | None = None,
+    tool_category_state_file: str = "",
+) -> str:
     """Handle tools/list request."""
     tools = list_mcp_tools(allowed_tiers=allowed_tiers, permission_pack=permission_pack)
+    if tool_category_state_file:
+        try:
+            state = read_tool_category_state(tool_category_state_file)
+        except ValueError as exc:
+            return _jsonrpc_error(msg_id, PERMISSION_DENIED, str(exc))
+        enabled = set(state.get("active_categories") or [])
+        tools = [
+            tool for tool in tools
+            if (definition := registry.get(tool.name)) is not None
+            and definition.agent_category in enabled
+        ]
+        if permission_pack == "creation_session" and creation_turn_write_tools_closed(state):
+            tools = [tool for tool in tools if tool.name not in CREATION_AGENT_WRITE_TOOL_NAMES]
     tool_dicts = []
+    if tool_category_state_file:
+        controller = tool_category_controller_schema()["function"]
+        tool_dicts.append({
+            "name": controller["name"],
+            "description": controller["description"],
+            "inputSchema": controller["parameters"],
+        })
     for t in tools:
         tool_dicts.append({
             "name": t.name,
@@ -212,6 +263,156 @@ def _handle_prompts_get(msg_id: Any, params: dict, db: Any) -> str:
     })
 
 
+def _category_scoped_call_result(
+    tool_name: str,
+    arguments: dict[str, Any],
+    tool_category_state_file: str,
+) -> McpToolResult | None:
+    """Handle the category controller and reject tools outside the active set."""
+
+    try:
+        state = read_tool_category_state(tool_category_state_file)
+    except ValueError as exc:
+        return make_text_result(json.dumps({"status": "denied", "detail": str(exc)}, ensure_ascii=False), is_error=True)
+    if tool_name == TOOL_CATEGORY_CONTROLLER:
+        try:
+            payload = replace_tool_categories(
+                tool_category_state_file,
+                arguments.get("enabled_categories"),
+            )
+        except ValueError as exc:
+            payload = {
+                "tool": tool_name,
+                "status": "error",
+                "detail": str(exc),
+                "data": None,
+            }
+        append_tool_category_audit(tool_category_state_file, {
+            "tool": tool_name,
+            "arguments": arguments,
+            "status": payload.get("status"),
+            "result": payload,
+        })
+        return make_text_result(
+            json.dumps(payload, ensure_ascii=False),
+            is_error=payload.get("status") != "ok",
+        )
+    definition = registry.get(tool_name)
+    enabled = set(state.get("active_categories") or [])
+    category_change_pending = int(state.get("active_version") or 0) < int(state.get("version") or 0)
+    if category_change_pending or definition is None or definition.agent_category not in enabled:
+        payload = {
+            "tool": tool_name,
+            "status": "denied",
+            "detail": (
+                "工具类别已经切换，当前模型步骤已结束"
+                if category_change_pending
+                else "该工具所属类别当前未开放"
+            ),
+        }
+        append_tool_category_audit(tool_category_state_file, {
+            "tool": tool_name,
+            "arguments": arguments,
+            "status": "denied",
+            "result": payload,
+        })
+        return make_text_result(
+            json.dumps(payload, ensure_ascii=False),
+            is_error=True,
+        )
+    return None
+
+
+def _tool_result_payload(result: McpToolResult, tool_name: str) -> dict[str, Any]:
+    for block in result.content:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        try:
+            payload = json.loads(str(block.get("text") or ""))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {
+        "tool": tool_name,
+        "status": "error" if result.is_error else "ok",
+        "detail": "工具执行失败" if result.is_error else "工具执行完成",
+    }
+
+
+def _creation_turn_write_scoped_call_result(
+    tool_name: str,
+    arguments: dict[str, Any],
+    tool_category_state_file: str,
+) -> McpToolResult | None:
+    """Enforce the one-user-message mutation boundary before execution."""
+
+    if tool_name not in CREATION_AGENT_WRITE_TOOL_NAMES:
+        return None
+    try:
+        payload = creation_turn_write_denial_for_state(
+            tool_category_state_file,
+            tool_name,
+        )
+    except ValueError as exc:
+        payload = {
+            "tool": tool_name,
+            "status": "denied",
+            "detail": str(exc),
+            "data": {"reason": "invalid_turn_state"},
+        }
+    if payload is None:
+        return None
+    append_tool_category_audit(tool_category_state_file, {
+        "tool": tool_name,
+        "arguments": arguments,
+        "status": "denied",
+        "result": payload,
+    })
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    append_tool_category_event(tool_category_state_file, {
+        "type": "tool_completed",
+        "message": str(payload.get("detail") or "本轮写工具已经关闭"),
+        "data": {
+            "tool": tool_name,
+            "status": "denied",
+            "turn_boundary": str(data.get("reason") or "write_limit"),
+        },
+    })
+    return make_text_result(json.dumps(payload, ensure_ascii=False), is_error=True)
+
+
+def _record_scoped_tool_result(
+    *,
+    tool_category_state_file: str,
+    permission_pack: str | None,
+    tool_name: str,
+    arguments: dict[str, Any],
+    result_payload: dict[str, Any],
+) -> None:
+    """Audit one scoped result and advance the shared creation write budget."""
+
+    append_tool_category_audit(tool_category_state_file, {
+        "tool": tool_name,
+        "arguments": arguments,
+        "status": result_payload.get("status"),
+        "result": result_payload,
+    })
+    if permission_pack != "creation_session":
+        return
+    append_tool_category_event(
+        tool_category_state_file,
+        creation_tool_completed_event(tool_name, arguments, result_payload),
+    )
+    boundary_event = record_creation_turn_write_result(
+        tool_category_state_file,
+        tool_name,
+        result_payload,
+    )
+    if boundary_event is not None:
+        append_tool_category_event(tool_category_state_file, boundary_event)
+
+
 async def _handle_tools_call_async(
     msg_id: Any,
     params: dict,
@@ -220,6 +421,7 @@ async def _handle_tools_call_async(
     allowed_tiers: set[str],
     permission_pack: str | None = None,
     creation_session_id: str = "",
+    tool_category_state_file: str = "",
 ) -> str:
     """Handle tools/call request — async version for actual execution."""
     tool_name = params.get("name", "")
@@ -227,6 +429,27 @@ async def _handle_tools_call_async(
 
     if not isinstance(arguments, dict):
         arguments = {}
+
+    if tool_category_state_file:
+        scoped_result = _category_scoped_call_result(
+            tool_name,
+            arguments,
+            tool_category_state_file,
+        )
+        if scoped_result is not None:
+            return _jsonrpc_result(msg_id, _tool_result_to_dict(scoped_result))
+        if permission_pack == "creation_session":
+            write_scoped_result = _creation_turn_write_scoped_call_result(
+                tool_name,
+                arguments,
+                tool_category_state_file,
+            )
+            if write_scoped_result is not None:
+                return _jsonrpc_result(msg_id, _tool_result_to_dict(write_scoped_result))
+            append_tool_category_event(
+                tool_category_state_file,
+                creation_tool_started_event(tool_name, arguments),
+            )
 
     # Validate db is available
     if db is None:
@@ -242,6 +465,15 @@ async def _handle_tools_call_async(
         permission_pack=permission_pack,
         creation_session_id=creation_session_id,
     )
+    if tool_category_state_file:
+        result_payload = _tool_result_payload(result, tool_name)
+        _record_scoped_tool_result(
+            tool_category_state_file=tool_category_state_file,
+            permission_pack=permission_pack,
+            tool_name=tool_name,
+            arguments=arguments,
+            result_payload=result_payload,
+        )
     return _jsonrpc_result(msg_id, _tool_result_to_dict(result))
 
 
@@ -253,6 +485,7 @@ def _handle_tools_call(
     allowed_tiers: set[str],
     permission_pack: str | None = None,
     creation_session_id: str = "",
+    tool_category_state_file: str = "",
 ) -> str:
     """Handle tools/call request — sync wrapper.
 
@@ -264,6 +497,27 @@ def _handle_tools_call(
 
     if not isinstance(arguments, dict):
         arguments = {}
+
+    if tool_category_state_file:
+        scoped_result = _category_scoped_call_result(
+            tool_name,
+            arguments,
+            tool_category_state_file,
+        )
+        if scoped_result is not None:
+            return _jsonrpc_result(msg_id, _tool_result_to_dict(scoped_result))
+        if permission_pack == "creation_session":
+            write_scoped_result = _creation_turn_write_scoped_call_result(
+                tool_name,
+                arguments,
+                tool_category_state_file,
+            )
+            if write_scoped_result is not None:
+                return _jsonrpc_result(msg_id, _tool_result_to_dict(write_scoped_result))
+            append_tool_category_event(
+                tool_category_state_file,
+                creation_tool_started_event(tool_name, arguments),
+            )
 
     # If no db session, return error
     if db is None:
@@ -291,6 +545,15 @@ def _handle_tools_call(
             permission_pack=permission_pack,
             creation_session_id=creation_session_id,
         ))
+    if tool_category_state_file:
+        result_payload = _tool_result_payload(result, tool_name)
+        _record_scoped_tool_result(
+            tool_category_state_file=tool_category_state_file,
+            permission_pack=permission_pack,
+            tool_name=tool_name,
+            arguments=arguments,
+            result_payload=result_payload,
+        )
     return _jsonrpc_result(msg_id, _tool_result_to_dict(result))
 
 
@@ -309,6 +572,7 @@ def serve_stdio(
     allowed_tiers: set[str] | None = None,
     permission_pack: str | None = None,
     creation_session_id: str = "",
+    tool_category_state_file: str = "",
 ) -> None:
     """Run the MCP server over stdio (blocking).
 
@@ -328,6 +592,11 @@ def serve_stdio(
     resolved_pack = permission_pack
     if permission_pack == "creation_session" and not creation_session_id:
         raise ValueError("creation_session permission pack requires --creation-session-id")
+    if permission_pack == "creation_session":
+        if not tool_category_state_file:
+            raise ValueError("creation_session permission pack requires --tool-category-state-file")
+    if tool_category_state_file:
+        read_tool_category_state(tool_category_state_file)
     managed_agent_kind = get_compatible_env("SIMING_MANAGED_AGENT_KIND").strip().lower()
     if managed_agent_kind == "cataloging":
         resolved_pack = "cataloging_worker"
@@ -359,6 +628,7 @@ def serve_stdio(
             allowed_tiers=allowed_tiers,
             permission_pack=resolved_pack,
             creation_session_id=creation_session_id,
+            tool_category_state_file=tool_category_state_file,
         )
         stdout.write(response + "\n")
         stdout.flush()

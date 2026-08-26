@@ -44,7 +44,7 @@ os.environ["DATABASE_URL"] = "sqlite:///./test_novel_agent.db"
 from fastapi.testclient import TestClient
 from app.main import app
 from app.database.session import Base, engine, SessionLocal
-from app.database.models import APIConfig
+from app.database.models import APIConfig, ModelTaskSetting
 from app.core.crypto import encrypt, decrypt
 from app.ai.gateway import LLMGateway, ADAPTER_MAP
 from app.ai.openai_adapter import OpenAIAdapter
@@ -232,6 +232,25 @@ class TestAPIConfigCreateAPI(unittest.TestCase):
         # API key must not be in response
         self.assertNotIn("api_key", data)
 
+    def test_create_config_persists_all_discovered_models(self):
+        response = self.client.post(
+            f"{API_PREFIX}/config/models",
+            json={
+                "provider": "openai",
+                "api_key": "sk-model-catalog",
+                "default_model": "gpt-4o",
+                "available_models": [
+                    {"id": "gpt-4.1-mini", "display_name": "GPT 4.1 Mini"},
+                    {"id": "gpt-4o", "display_name": "GPT 4o"},
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        models = response.json()["data"]["available_models"]
+        self.assertEqual([item["id"] for item in models], ["gpt-4o", "gpt-4.1-mini"])
+        self.assertEqual(models[1]["display_name"], "GPT 4.1 Mini")
+
     # ------------------------------------------------------------------
     # TC-06: Create config for all supported providers
     # ------------------------------------------------------------------
@@ -327,6 +346,11 @@ class TestAPIConfigCreateAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["data"]["models"][0]["id"], "gpt-new")
         self.assertEqual(verification.list_models.await_args.args[0].api_key, "sk-saved-key")
+        listed = self.client.get(f"{API_PREFIX}/config/models").json()["data"]["items"][0]
+        self.assertEqual(
+            [item["id"] for item in listed["available_models"]],
+            ["gpt-4o", "gpt-new"],
+        )
 
     # ------------------------------------------------------------------
     # TC-08: Create custom provider without base URL
@@ -643,6 +667,98 @@ class TestAPIConfigDeleteAPI(unittest.TestCase):
         # Verify only one
         list_resp = self.client.get(f"{API_PREFIX}/config/models")
         self.assertEqual(list_resp.json()["data"]["total"], 1)
+
+
+class TestTaskModelAPI(unittest.TestCase):
+    """Provider model catalogs can be assigned to individual task families."""
+
+    @classmethod
+    def setUpClass(cls):
+        Base.metadata.create_all(bind=engine)
+        cls.client = TestClient(app)
+
+    @classmethod
+    def tearDownClass(cls):
+        Base.metadata.drop_all(bind=engine)
+        try:
+            os.remove("test_novel_agent.db")
+        except OSError:
+            pass
+
+    def setUp(self):
+        db = SessionLocal()
+        try:
+            db.query(ModelTaskSetting).delete()
+            db.query(APIConfig).delete()
+            db.commit()
+        finally:
+            db.close()
+
+        response = self.client.post(
+            f"{API_PREFIX}/config/models",
+            json={
+                "provider": "openai",
+                "api_key": "sk-task-model",
+                "default_model": "gpt-4o",
+                "available_models": [
+                    {"id": "gpt-4o", "display_name": "GPT 4o"},
+                    {"id": "gpt-4.1-mini", "display_name": "GPT 4.1 Mini"},
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        _mark_config_ready("openai")
+        global_response = self.client.put(
+            f"{API_PREFIX}/config/global-model",
+            json={"provider": "openai", "model": "gpt-4o"},
+        )
+        self.assertEqual(global_response.status_code, 200)
+
+    def test_task_model_uses_secondary_model_and_clear_returns_to_global(self):
+        response = self.client.put(
+            f"{API_PREFIX}/config/task-models/writing",
+            json={"provider": "openai", "model": "gpt-4.1-mini"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["model"], "gpt-4.1-mini")
+        model_data = self.client.get(f"{API_PREFIX}/config/models").json()["data"]
+        self.assertEqual(model_data["task_models"]["writing"]["provider"], "openai")
+        selected = LLMGateway.select_model_for_task(task_type="writing")
+        self.assertEqual(selected.model, "openai:gpt-4.1-mini")
+        self.assertEqual(selected.source, "task_setting")
+
+        clear_response = self.client.delete(f"{API_PREFIX}/config/task-models/writing")
+        self.assertEqual(clear_response.status_code, 200)
+        fallback = LLMGateway.select_model_for_task(task_type="writing")
+        self.assertEqual(fallback.model, "openai:gpt-4o")
+        self.assertEqual(fallback.source, "global_default")
+
+    def test_task_model_rejects_unknown_model_and_task_type(self):
+        unknown_model = self.client.put(
+            f"{API_PREFIX}/config/task-models/writing",
+            json={"provider": "openai", "model": "not-in-catalog"},
+        )
+        unknown_task = self.client.put(
+            f"{API_PREFIX}/config/task-models/translation",
+            json={"provider": "openai", "model": "gpt-4o"},
+        )
+
+        self.assertEqual(unknown_model.status_code, 400)
+        self.assertIn("模型列表", unknown_model.json()["message"])
+        self.assertEqual(unknown_task.status_code, 400)
+
+    def test_deleting_provider_removes_its_task_defaults(self):
+        self.client.put(
+            f"{API_PREFIX}/config/task-models/cataloging",
+            json={"provider": "openai", "model": "gpt-4.1-mini"},
+        )
+
+        response = self.client.delete(f"{API_PREFIX}/config/models/openai")
+
+        self.assertEqual(response.status_code, 200)
+        task_models = self.client.get(f"{API_PREFIX}/config/task-models").json()["data"]
+        self.assertEqual(task_models["items"], [])
 
 
 class TestAPIConfigCryptoVerification(unittest.TestCase):
@@ -1146,6 +1262,7 @@ class TestLLMGatewayModelParsing(unittest.TestCase):
             "qwen_code_cli",
             "hermes_cli",
             "openclaw_cli",
+            "dsh_cli",
             "custom_cli",
             "local_llama_cpp",
         }
@@ -1156,8 +1273,8 @@ class TestLLMGatewayModelParsing(unittest.TestCase):
         adapter_cls = LLMGateway._get_adapter("claude_cli")
         self.assertEqual(adapter_cls.__name__, "LocalCLIAdapter")
 
-    def test_local_cli_provider_does_not_support_tool_calling(self):
-        """Local CLI providers must use text/plan orchestration instead of OpenAI tools."""
+    def test_agent_clis_use_native_mcp_not_openai_tool_calling(self):
+        """Managed llama.cpp tools must not be disabled just because the model is local."""
         self.assertFalse(LLMGateway.supports_tool_calling("claude_cli:claude-code"))
         self.assertFalse(LLMGateway.supports_tool_calling("codex_cli:codex-cli"))
         self.assertFalse(LLMGateway.supports_tool_calling("opencode_cli:opencode-cli"))
@@ -1167,7 +1284,8 @@ class TestLLMGatewayModelParsing(unittest.TestCase):
         self.assertFalse(LLMGateway.supports_tool_calling("qwen_code_cli:qwen-code-cli"))
         self.assertFalse(LLMGateway.supports_tool_calling("hermes_cli:hermes-agent"))
         self.assertFalse(LLMGateway.supports_tool_calling("openclaw_cli:openclaw-agent"))
-        self.assertFalse(LLMGateway.supports_tool_calling("local_llama_cpp:qwen3-8b-q4"))
+        self.assertFalse(LLMGateway.supports_tool_calling("dsh_cli:dsh-cli"))
+        self.assertTrue(LLMGateway.supports_tool_calling("local_llama_cpp:qwen3.8-27b-q4"))
 
 
 class TestLLMGatewayChatCompletion(unittest.TestCase):

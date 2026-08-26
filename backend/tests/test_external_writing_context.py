@@ -3,7 +3,8 @@ import asyncio
 import sys
 import os
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -39,115 +40,96 @@ class PrepareExternalWritingContextTest(unittest.TestCase):
         result = asyncio.run(prepare_external_writing_context(db, "nonexistent", {}))
         self.assertEqual(result["status"], "skipped")
 
-    def test_returns_context_sections(self):
+    @patch("app.services.prompt_packs.seed.ensure_builtin_packs")
+    @patch("app.services.context_orchestrator.ContextOrchestrator")
+    def test_returns_one_manifest_context_without_duplicate_mirrors(
+        self,
+        orchestrator_class,
+        _ensure_builtin_packs,
+    ):
         from app.services.workspace.tools.external_writing import prepare_external_writing_context
 
-        # Mock project
         project = MagicMock()
         project.id = "p1"
         project.title = "Test Novel"
         project.writing_style = "natural"
-        project.forbidden_sentence_patterns = "仿佛\n不由得"
+        project.forbidden_sentence_patterns = ""
         project.narrative_perspective = "third_person"
 
-        # Mock character
-        char = MagicMock()
-        char.id = "c1"
-        char.name = "Hero"
-        char.aliases = []
-        char.role_type = "protagonist"
-        char.age = "adult"
-        char.appearance = "Scarred"
-        char.personality = "Brave"
-        char.background = "Guard of the northern gate"
-        char.abilities = '["swordsmanship"]'
-        char.current_location = "Castle"
-        char.current_goal = "Save world"
-        char.life_status = "alive"
-        char.realm_or_level = "captain"
-        char.physical_state = "healthy"
-        char.mental_state = "alert"
-        char.active_conflict = "invading army"
-        char.abilities_state = "ready"
-        char.items_or_assets = "family sword"
-        char.profile_json = {
-            "core_motivation": "protect civilians",
-            "voice": "brief commands",
-        }
-        char.ai_config = MagicMock()
-        char.ai_config.tone_style = "restrained"
-        char.ai_config.catchphrases = '["Hold the line"]'
-        char.ai_config.verbosity = "brief"
-        char.ai_config.emotion_tendency = "calm"
-        char.ai_config.model_override = None
-        char.ai_config.custom_system_prompt = "Act only on verified threats."
-
-        # Mock worldbuilding
-        wb = MagicMock()
-        wb.id = "w1"
-        wb.title = "Magic System"
-        wb.dimension = "power_system"
-        wb.content = "Magic requires mana"
-
-        # Mock prompt pack
-        pack = MagicMock()
-        pack.pack_id = "chapter_writing_quality"
-        pack.version = "1.0.0"
-        pack.title = "Quality Writing"
-        pack.system_prompt = "Write well..."
-        pack.workflow_json = [{"step": 1}]
-        pack.quality_rubric_json = {"dimensions": []}
-        pack.forbidden_patterns_json = ["仿佛"]
+        outline = SimpleNamespace(
+            id="outline-1",
+            node_type="chapter",
+            title="Chapter 1",
+        )
+        pack = SimpleNamespace(
+            pack_id="chapter_writing_quality",
+            version="1.0.0",
+            title="Quality Writing",
+        )
 
         def query_side_effect(model):
-            q = MagicMock()
-            q.filter.return_value = q
-            q.order_by.return_value = q
-            q.limit.return_value = q
-            model_name = model.__name__ if hasattr(model, '__name__') else str(model)
+            query = MagicMock()
+            query.filter.return_value = query
+            model_name = model.__name__ if hasattr(model, "__name__") else str(model)
             if "Project" in model_name:
-                q.first.return_value = project
+                query.first.return_value = project
             elif "PublicPromptPack" in model_name:
-                q.first.return_value = pack
-            elif "Character" in model_name and "Relationship" not in model_name:
-                q.all.return_value = [char]
-                q.first.return_value = char
-            elif "WorldbuildingEntry" in model_name:
-                q.all.return_value = [wb]
-            elif "Chapter" in model_name:
-                q.all.return_value = []
-            elif "CharacterRelationship" in model_name:
-                q.all.return_value = []
+                query.first.return_value = pack
             elif "OutlineNode" in model_name:
-                q.first.return_value = None
+                query.first.return_value = outline
             else:
-                q.first.return_value = None
-                q.all.return_value = []
-            return q
+                query.first.return_value = None
+            return query
 
         db = MagicMock()
         db.query.side_effect = query_side_effect
+        manifest = SimpleNamespace(
+            id="manifest-1",
+            status="ready",
+            estimated_input_tokens=1400,
+            input_budget_tokens=8500,
+            rendered_context="One governed context containing Hero and Magic System.",
+        )
+        orchestrator = MagicMock()
+        orchestrator.prepare.return_value = manifest
+        orchestrator.manifest_payload.return_value = {
+            "budget": {"estimated_input_tokens": 1400, "input_budget_tokens": 8500},
+            "coverage": {"target_outline": {"status": "covered"}},
+            "warnings": [],
+            "items": [
+                {
+                    "source_id": "outline-1",
+                    "source_hash": "sha256:outline",
+                    "title": "Chapter 1",
+                }
+            ],
+        }
+        orchestrator_class.return_value = orchestrator
 
-        result = asyncio.run(prepare_external_writing_context(
-            db,
-            "p1",
-            {"mode": "quality", "involved_characters": ["Hero"]},
-        ))
+        result = asyncio.run(
+            prepare_external_writing_context(
+                db,
+                "p1",
+                {"outline_node_id": outline.id},
+            )
+        )
+
         self.assertEqual(result["status"], "ok")
         data = result["data"]
-        self.assertIn("prompt_pack", data)
-        self.assertIn("characters", data)
-        self.assertIn("worldbuilding", data)
-        self.assertIn("warnings", data)
-        self.assertIn("next_tool_suggestions", data)
-        self.assertEqual(data["effective_mode"], "quality")
-        self.assertNotIn("analysis_prompts", data)
-        self.assertEqual(data["forbidden_patterns"], [])
-        self.assertIsNone(data["quality_rubric"])
-        self.assertEqual(data["workflow_boundaries"]["de_ai_revision"], "separate_user_action")
+        self.assertEqual(data["context_manifest_id"], "manifest-1")
+        self.assertEqual(data["writing_context"], manifest.rendered_context)
+        self.assertEqual(data["evidence_sources"], orchestrator.manifest_payload.return_value["items"])
+        self.assertEqual(
+            set(data["prompt_pack"]),
+            {"pack_id", "version", "title", "system_prompt"},
+        )
+        self.assertNotIn("characters", data)
+        self.assertNotIn("worldbuilding", data)
+        self.assertNotIn("recent_summaries", data)
+        self.assertNotIn("selected_context", data)
+        self.assertNotIn("context_manifest", data)
         next_tools = {item["tool"] for item in data["next_tool_suggestions"]}
-        self.assertNotIn("record_external_quality_review", next_tools)
-        self.assertNotIn("evaluate_chapter", next_tools)
+        self.assertEqual(next_tools, {"submit_context_evidence", "save_external_chapter_draft"})
 
     def test_real_context_exposes_complete_character_card_and_relationship(self):
         from sqlalchemy import create_engine
@@ -214,67 +196,22 @@ class PrepareExternalWritingContextTest(unittest.TestCase):
             result = asyncio.run(prepare_external_writing_context(
                 db,
                 project.id,
-                {"mode": "quality", "outline_node_id": outline.id},
+                {"outline_node_id": outline.id},
             ))
 
             self.assertEqual(result["status"], "ok")
-            card = result["data"]["characters"][0]
-            self.assertEqual(card["profile"]["core_motivation"], "保护边荒城")
-            self.assertEqual(card["ai_config"]["verbosity"], "brief")
-            self.assertEqual(card["mental_state"], "警惕")
-            self.assertIn("师友", card["context"])
-            self.assertEqual(result["data"]["relationships"][0]["target_name"], "石翁")
+            writing_context = result["data"]["writing_context"]
+            self.assertIn("姜尘", writing_context)
+            self.assertIn("保护边荒城", writing_context)
+            self.assertIn("brief", writing_context)
+            self.assertIn("警惕", writing_context)
+            self.assertIn("师友", writing_context)
+            self.assertIn("石翁", writing_context)
         finally:
             db.close()
             Base.metadata.drop_all(engine)
             engine.dispose()
 
-    def test_fast_request_uses_fast_prompt(self):
-        from app.services.workspace.tools.external_writing import prepare_external_writing_context
-
-        project = MagicMock()
-        project.id = "p1"
-        project.title = "Test Novel"
-        project.writing_style = "natural"
-        project.forbidden_sentence_patterns = ""
-        project.narrative_perspective = "third_person"
-
-        pack = MagicMock()
-        pack.pack_id = "chapter_writing_fast"
-        pack.version = "1.0.0"
-        pack.title = "Fast Writing"
-        pack.workflow_json = [{"step": 1}]
-        pack.quality_rubric_json = {"dimensions": []}
-        pack.forbidden_patterns_json = ["仿佛"]
-
-        def query_side_effect(model):
-            q = MagicMock()
-            q.filter.return_value = q
-            q.order_by.return_value = q
-            q.limit.return_value = q
-            model_name = model.__name__ if hasattr(model, '__name__') else str(model)
-            if "Project" in model_name:
-                q.first.return_value = project
-            elif "PublicPromptPack" in model_name:
-                q.first.return_value = pack
-            else:
-                q.first.return_value = None
-                q.all.return_value = []
-            return q
-
-        db = MagicMock()
-        db.query.side_effect = query_side_effect
-
-        result = asyncio.run(prepare_external_writing_context(db, "p1", {"mode": "fast"}))
-        self.assertEqual(result["status"], "ok")
-        data = result["data"]
-        self.assertEqual(data["requested_mode"], "fast")
-        self.assertEqual(data["effective_mode"], "fast")
-        self.assertEqual(data["prompt_pack"]["pack_id"], "chapter_writing_fast")
-        self.assertIn("快速模式定位", data["prompt_pack"]["system_prompt"])
-        self.assertEqual(data["prompt_pack"]["forbidden_patterns"], [])
-        self.assertIsNone(data["prompt_pack"]["quality_rubric"])
-        self.assertNotIn("去AI味硬规则", data["prompt_pack"]["system_prompt"])
 
     def test_no_llm_call(self):
         """Verify the tool does not call LLMGateway."""

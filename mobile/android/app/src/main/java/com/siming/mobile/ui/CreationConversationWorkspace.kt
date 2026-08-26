@@ -35,6 +35,7 @@ import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -47,6 +48,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.siming.mobile.data.creation.CreationAgentTurnRecords
+import com.siming.mobile.data.creation.CreationAgentProgressEvent
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -62,6 +65,8 @@ internal fun CreationConversationWorkspace(
     stages: List<Pair<String, String>>,
     running: Boolean,
     activity: String,
+    replyDelta: String,
+    progressEvents: List<CreationAgentProgressEvent>,
     onBack: () -> Unit,
     onOpenDossier: () -> Unit,
     onSend: (String) -> Unit,
@@ -69,7 +74,7 @@ internal fun CreationConversationWorkspace(
     onOpenProject: (String) -> Unit,
 ) {
     val draft = session.objectValue("draft")
-    val messages = (draft["agent_history"] as? JsonArray).orEmpty().mapNotNull { it as? JsonObject }
+    val messages = CreationAgentTurnRecords.displayMessages(session)
     var input by rememberSaveable(session.string("id")) { mutableStateOf("") }
     val projectId = session.string("created_project_id")
     val route = draft.string("execution_route")
@@ -180,7 +185,14 @@ internal fun CreationConversationWorkspace(
             }
         } else {
             items(messages, key = { it.string("id").ifBlank { "${it.string("role")}:${it.string("created_at")}:${it.string("content").hashCode()}" } }) { message ->
-                AgentBubble(message.string("role"), message.string("content"))
+                AgentBubble(
+                    role = message.string("role"),
+                    content = message.string("content"),
+                    progress = (message["progress_events"] as? JsonArray).orEmpty().mapNotNull { event ->
+                        val item = event as? JsonObject ?: return@mapNotNull null
+                        ProgressLine(item.string("type"), item.string("message"))
+                    },
+                )
             }
         }
 
@@ -196,7 +208,17 @@ internal fun CreationConversationWorkspace(
                         Spacer(Modifier.width(11.dp))
                         Column {
                             Text("Creation Agent 正在工作", color = Color.White, fontWeight = FontWeight.Bold)
-                            Text(activity.ifBlank { "正在读取资料、执行工具并写入确定事实…" }, color = Color.White.copy(alpha = 0.72f), style = MaterialTheme.typography.bodySmall)
+                            Text(
+                                replyDelta.ifBlank { activity.ifBlank { "正在读取资料、执行工具并写入确定事实…" } },
+                                color = Color.White.copy(alpha = 0.72f),
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            ProgressTimeline(
+                                progressEvents
+                                    .filter { it.type != "reply_delta" }
+                                    .map { ProgressLine(it.type, it.message) },
+                                dark = true,
+                            )
                         }
                     }
                 }
@@ -272,8 +294,10 @@ internal fun CreationConversationWorkspace(
     }
 }
 
+private data class ProgressLine(val type: String, val message: String)
+
 @Composable
-private fun AgentBubble(role: String, content: String) {
+private fun AgentBubble(role: String, content: String, progress: List<ProgressLine> = emptyList()) {
     if (content.isBlank()) return
     val isUser = role == "user"
     Row(
@@ -289,6 +313,41 @@ private fun AgentBubble(role: String, content: String) {
             Column(Modifier.padding(13.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(if (isUser) "你" else "司命", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.SemiBold)
                 Text(content, lineHeight = 22.sp)
+                if (!isUser) ProgressTimeline(progress)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProgressTimeline(lines: List<ProgressLine>, dark: Boolean = false) {
+    val visibleLines = lines.filter { it.message.isNotBlank() }.takeLast(30)
+    if (visibleLines.isEmpty()) return
+    var expanded by rememberSaveable(visibleLines.lastOrNull()?.message) { mutableStateOf(false) }
+    val textColor = if (dark) Color.White.copy(alpha = 0.76f) else MaterialTheme.colorScheme.onSurfaceVariant
+    TextButton(
+        onClick = { expanded = !expanded },
+        contentPadding = PaddingValues(0.dp),
+    ) {
+        Text(
+            if (expanded) "收起运行过程" else "运行过程（${visibleLines.size}）",
+            color = textColor,
+            style = MaterialTheme.typography.labelSmall,
+        )
+    }
+    if (expanded) {
+        Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            visibleLines.forEach { line ->
+                val marker = when (line.type) {
+                    "tool_completed", "complete" -> "✓"
+                    "error" -> "!"
+                    else -> "•"
+                }
+                Text(
+                    "$marker ${line.message}",
+                    color = textColor,
+                    style = MaterialTheme.typography.labelSmall,
+                )
             }
         }
     }

@@ -19,6 +19,7 @@ LEGACY_HANDLER_MODULES = (
     "app.services.workspace.tools.external_cataloging",
     "app.services.workspace.tools.external_writing",
     "app.services.workspace.tools.import_tools",
+    "app.services.workspace.tools.imported_files",
     "app.services.workspace.tools.local_cli_agent",
     "app.services.workspace.tools.mcp_status",
     "app.services.workspace.tools.memory",

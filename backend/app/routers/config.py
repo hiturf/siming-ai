@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
-import webbrowser
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -26,7 +24,6 @@ from ..ai.local_runtime_policy import local_runtime_disabled, local_runtime_disa
 from ..core.config import get_settings
 from ..core.crypto import decrypt, encrypt
 from ..core.exceptions import AppException, LLMError, NotFoundError, ValidationError
-from ..core.legacy_env import set_compatible_env
 from ..core.model_limits import limits_payload
 from ..core.response import ApiResponse
 from ..version import APP_VERSION
@@ -42,18 +39,10 @@ from ..schemas.config import (
     ConnectionTestRequest,
     GlobalModelSetting,
     ModelListRequest,
-)
-from ..services.application_settings import (
-    app_home as _app_home,
-)
-from ..services.application_settings import (
-    load_launcher_settings as _load_launcher_settings,
-)
-from ..services.application_settings import (
-    save_launcher_settings as _save_launcher_settings,
+    TASK_MODEL_TYPES,
+    TaskModelSettingUpdate,
 )
 from ..services.content_store import content_root as resolve_content_root
-from ..services.content_store import migrate_projects_to_content_root
 from ..services.external_agent.mcp_auto_config import (
     configure_cli_integration,
     restore_cli_integration,
@@ -61,10 +50,10 @@ from ..services.external_agent.mcp_auto_config import (
 )
 from ..services.model_readiness import (
     is_model_config_usable,
-    mark_model_failure,
+    mark_model_verification_failure,
     mark_model_ready,
     mark_model_testing,
-    mark_model_unavailable,
+    mark_model_verification_unavailable,
     mark_model_unverified,
     readiness_payload,
 )
@@ -72,8 +61,10 @@ from .application_updates import (
     LauncherSettingsUpdateRequest,  # noqa: F401 - compatibility export
     update_launcher_settings,  # noqa: F401 - compatibility export
 )
+from .config_storage import router as storage_router
 
 router = APIRouter(tags=["config"])
+router.include_router(storage_router)
 
 
 @router.get("/config/app-info")
@@ -90,10 +81,6 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = Field(0.7, ge=0, le=2.0)
     max_tokens: int | None = Field(None, ge=1)
     extra_body: dict | None = None
-
-
-class ContentRootUpdateRequest(BaseModel):
-    path: str = Field(..., min_length=1)
 
 
 PROVIDER_DEFAULT_BASE_URLS: dict[str, str] = {
@@ -119,6 +106,7 @@ PROVIDER_LABELS: dict[str, str] = {
     "qwen_code_cli": "Qwen Code CLI",
     "hermes_cli": "Hermes Agent CLI",
     "openclaw_cli": "OpenClaw CLI",
+    "dsh_cli": "DeepSeek Harness CLI",
     "custom_cli": "Custom Local CLI",
     "local_llama_cpp": "Siming Local AI",
 }
@@ -132,146 +120,6 @@ LOCAL_RUNTIME_PLACEHOLDER_KEY = "__local_runtime__"
 API_PROTOCOL_AUTO = "auto"
 API_PROTOCOL_CHAT = "chat_completions"
 API_PROTOCOL_RESPONSES = "responses"
-
-
-def _default_content_root() -> Path:
-    return (_app_home() / "projects").expanduser().resolve()
-
-
-def _path_is_empty(path: Path) -> bool:
-    if not path.exists():
-        return True
-    ignored = {".DS_Store", "Thumbs.db", "desktop.ini"}
-    return not any(item.name not in ignored for item in path.iterdir())
-
-
-def _looks_like_siming_content_root(path: Path) -> bool:
-    if not path.exists() or not path.is_dir():
-        return False
-    for child in path.iterdir():
-        if child.is_dir() and (child / "moshu-project.json").exists():
-            return True
-    return False
-
-
-def _content_root_payload(extra: dict | None = None) -> dict:
-    settings = _load_launcher_settings()
-    configured = settings.get("content_root")
-    current = resolve_content_root()
-    default = _default_content_root()
-    looks_like_root = _looks_like_siming_content_root(current)
-    payload = {
-        "current_path": str(current),
-        "configured_path": configured,
-        "default_path": str(default),
-        "is_default": not configured and current == default,
-        "exists": current.exists(),
-        "is_empty": _path_is_empty(current),
-        "looks_like_siming_root": looks_like_root,
-        "looks_like_moshu_root": looks_like_root,
-    }
-    if extra:
-        payload.update(extra)
-    return payload
-
-
-def _apply_content_root(db: Session, raw_path: str) -> dict:
-    target = Path(raw_path).expanduser().resolve()
-    target.mkdir(parents=True, exist_ok=True)
-    current = resolve_content_root()
-    if target != current and not _path_is_empty(target) and not _looks_like_siming_content_root(target):
-        raise ValidationError("小说数据目录必须是空文件夹，或已经是 Siming 小说数据目录")
-    settings = _load_launcher_settings()
-    previous = current
-    set_compatible_env("SIMING_CONTENT_ROOT", str(target))
-    settings["content_root"] = str(target)
-    _save_launcher_settings(settings)
-    migration = migrate_projects_to_content_root(db, target, previous_root=previous, cleanup_old=True)
-    commit_session(db)
-    return _content_root_payload({"migration": migration})
-
-
-def _pick_empty_content_root() -> Path | None:
-    try:
-        import tkinter
-        from tkinter import filedialog, messagebox
-
-        root = tkinter.Tk()
-        root.withdraw()
-        while True:
-            selected = filedialog.askdirectory(title="选择 Siming 小说数据目录")
-            if not selected:
-                root.destroy()
-                return None
-            path = Path(selected).expanduser().resolve()
-            path.mkdir(parents=True, exist_ok=True)
-            if _path_is_empty(path) or _looks_like_siming_content_root(path):
-                root.destroy()
-                return path
-            messagebox.showwarning(
-                "Siming 小说数据目录",
-                "请选择空目录，或已经由 Siming 创建过的小说数据目录。",
-            )
-    except Exception as exc:
-        raise ValidationError(f"无法打开文件夹选择器：{exc}")
-
-
-@router.post("/system/open-home")
-def open_home_in_default_browser(request: Request):
-    """Open the Siming web home in the user's default browser."""
-
-    home_url = str(request.base_url).rstrip("/") + "/"
-    webbrowser.open(home_url)
-    return ApiResponse.success(data={"url": home_url}, message="Siming home opened in the default browser")
-
-
-@router.get("/config/content-root")
-def get_content_root_settings():
-    """Return the current Siming 2.x novel data directory setting."""
-    return ApiResponse.success(data=_content_root_payload())
-
-
-@router.put("/config/content-root")
-def update_content_root_settings(payload: ContentRootUpdateRequest, db: Session = Depends(get_db)):
-    """Set the Siming novel data directory and migrate existing project files."""
-    return ApiResponse.success(data=_apply_content_root(db, payload.path), message="小说数据目录已更新")
-
-
-@router.post("/config/content-root/pick")
-def pick_content_root_settings(db: Session = Depends(get_db)):
-    """Open a native folder picker and set the selected Siming data directory."""
-    selected = _pick_empty_content_root()
-    if not selected:
-        return ApiResponse.success(data=_content_root_payload({"cancelled": True}), message="已取消选择")
-    return ApiResponse.success(data=_apply_content_root(db, str(selected)), message="小说数据目录已更新")
-
-
-@router.get("/system/logs")
-def get_system_logs(lines: int = 200):
-    """Read the last N lines of the launcher log file."""
-
-    log_path = _app_home() / "logs" / "launcher.log"
-    if not log_path.exists():
-        local_app_data = os.environ.get("LOCALAPPDATA", "")
-        if local_app_data:
-            legacy = Path(local_app_data) / "NovelWritingAgent" / "logs" / "launcher.log"
-            if legacy.exists():
-                log_path = legacy
-    if not log_path.exists():
-        return ApiResponse.success(data={"path": str(log_path), "content": "(log file not found)", "lines": 0})
-
-    try:
-        with log_path.open("r", encoding="utf-8", errors="replace") as f:
-            all_lines = f.readlines()
-        tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
-        return ApiResponse.success(data={
-            "path": str(log_path),
-            "content": "".join(tail),
-            "lines": len(tail),
-            "total": len(all_lines),
-        })
-    except Exception as exc:
-        return ApiResponse.success(data={"path": str(log_path), "content": f"(read failed: {exc})", "lines": 0})
 
 
 def _mask_key(key: str) -> str:
@@ -383,7 +231,67 @@ def _normalize_model_list_for_provider(
     ]
 
 
-def _config_payload(cfg: Any, include_masked_key: bool = False) -> dict:
+def _normalized_model_options(
+    provider: str,
+    models: list[Any] | None,
+    *,
+    default_model: str,
+) -> list[dict[str, str]]:
+    """Normalize and de-duplicate models while keeping the configured default visible."""
+
+    by_id: dict[str, dict[str, str]] = {}
+    for raw in models or []:
+        if hasattr(raw, "model_dump"):
+            raw = raw.model_dump()
+        if isinstance(raw, str):
+            model_id = raw
+            display_name = raw
+        elif isinstance(raw, dict):
+            model_id = str(raw.get("id") or raw.get("model") or "")
+            display_name = str(raw.get("display_name") or raw.get("name") or model_id)
+        else:
+            continue
+        model_id = _normalize_model_for_provider(provider, model_id.strip(), strict=False)
+        if not model_id:
+            continue
+        by_id[model_id] = {
+            "id": model_id,
+            "display_name": display_name.strip() or model_id,
+        }
+
+    normalized_default = _normalize_model_for_provider(
+        provider,
+        default_model,
+        strict=False,
+    )
+    default_option = by_id.pop(normalized_default, None) or {
+        "id": normalized_default,
+        "display_name": normalized_default,
+    }
+    return [default_option, *by_id.values()]
+
+
+def _available_model_options(cfg: Any, db: Session | None = None) -> list[dict[str, str]]:
+    models = list(getattr(cfg, "available_models_json", None) or [])
+    if cfg.provider == "local_llama_cpp" and db is not None:
+        models = [
+            {"id": item.model_key, "display_name": item.display_name}
+            for item in model_config_crud(db).list_local_models()
+            if item.status == "installed"
+        ]
+    return _normalized_model_options(
+        cfg.provider,
+        models,
+        default_model=cfg.default_model,
+    )
+
+
+def _config_payload(
+    cfg: Any,
+    include_masked_key: bool = False,
+    *,
+    db: Session | None = None,
+) -> dict:
     default_model = _normalize_model_for_provider(cfg.provider, cfg.default_model, strict=False)
     data = {
         "id": cfg.id,
@@ -395,6 +303,7 @@ def _config_payload(cfg: Any, include_masked_key: bool = False) -> dict:
         "provider_type": getattr(cfg, "provider_type", None) or _normalize_provider_type(cfg.provider),
         "cli_command": getattr(cfg, "cli_command", None),
         "cli_args": getattr(cfg, "cli_args", None),
+        "available_models": _available_model_options(cfg, db),
         "api_key_configured": bool(getattr(cfg, "api_key_encrypted", None)),
         "created_at": cfg.created_at.isoformat() if cfg.created_at else None,
         "updated_at": cfg.updated_at.isoformat() if cfg.updated_at else None,
@@ -435,7 +344,7 @@ def _validate_cli_command(command: str | None) -> str:
 def list_model_configs(db: Session = Depends(get_db)):
     configs = model_config_crud(db).list_configs()
     items = [
-        _config_payload(cfg)
+        _config_payload(cfg, db=db)
         for cfg in configs
         if not local_runtime_disabled(cfg.provider)
         and (
@@ -446,7 +355,134 @@ def list_model_configs(db: Session = Depends(get_db)):
             )
         )
     ]
+    task_models = {
+        setting.task_type: {
+            "task_type": setting.task_type,
+            "provider": setting.provider,
+            "model": _normalize_model_for_provider(
+                setting.provider,
+                setting.model_name,
+                strict=False,
+            ),
+            "context_length": setting.context_length,
+        }
+        for setting in model_config_crud(db).list_task_settings()
+    }
+    return ApiResponse.success(
+        data={"items": items, "total": len(items), "task_models": task_models}
+    )
+
+
+def _require_task_model_type(task_type: str) -> str:
+    normalized = str(task_type or "").strip()
+    if normalized not in TASK_MODEL_TYPES:
+        raise ValidationError(
+            "不支持的任务类型；可选值为 " + ", ".join(TASK_MODEL_TYPES)
+        )
+    return normalized
+
+
+def _task_model_payload(setting: Any, db: Session) -> dict[str, Any]:
+    config = model_config_crud(db).get_provider(setting.provider)
+    return {
+        "task_type": setting.task_type,
+        "provider": setting.provider,
+        "model": _normalize_model_for_provider(
+            setting.provider,
+            setting.model_name,
+            strict=False,
+        ),
+        "context_length": setting.context_length,
+        "is_usable": bool(config and is_model_config_usable(config)),
+    }
+
+
+@router.get("/config/task-models")
+def list_task_models(db: Session = Depends(get_db)):
+    items = [
+        _task_model_payload(setting, db)
+        for setting in model_config_crud(db).list_task_settings()
+    ]
     return ApiResponse.success(data={"items": items, "total": len(items)})
+
+
+@router.put("/config/task-models/{task_type}")
+def set_task_model(
+    task_type: str,
+    payload: TaskModelSettingUpdate,
+    db: Session = Depends(get_db),
+):
+    task_type = _require_task_model_type(task_type)
+    _require_provider_available(payload.provider)
+    if local_runtime_disabled(payload.provider):
+        raise ValidationError(local_runtime_disabled_message())
+
+    crud = model_config_crud(db)
+    config = crud.get_provider(payload.provider)
+    if not config or not is_model_config_usable(config):
+        raise ValidationError("所选提供商尚未通过真实对话测试，请先测试并启用")
+
+    model_name = _normalize_model_for_provider(payload.provider, payload.model)
+    available_ids = {
+        option["id"] for option in _available_model_options(config, db)
+    }
+    if model_name not in available_ids:
+        raise ValidationError("所选模型不在该提供商已获取的模型列表中，请先刷新模型列表")
+
+    context_length = payload.context_length
+    if payload.provider == "local_llama_cpp":
+        local_model = next(
+            (
+                item
+                for item in crud.list_local_models()
+                if item.model_key == model_name and item.status == "installed"
+            ),
+            None,
+        )
+        if local_model is None:
+            raise ValidationError("所选本地模型尚未安装")
+        if context_length and context_length > int(local_model.context_length or 0):
+            raise ValidationError(
+                f"任务上下文 {context_length} 超过模型容量 {local_model.context_length}"
+            )
+    elif context_length is not None:
+        raise ValidationError("上下文启动长度只适用于司命本地模型")
+
+    setting = crud.get_task_setting(task_type)
+    if setting is None:
+        setting = crud.create_task_setting(
+            task_type=task_type,
+            provider=payload.provider,
+            model_name=model_name,
+            context_length=context_length,
+            adapter_ids=[],
+        )
+    else:
+        changed_model = (
+            setting.provider != payload.provider or setting.model_name != model_name
+        )
+        setting.provider = payload.provider
+        setting.model_name = model_name
+        setting.context_length = context_length
+        if changed_model:
+            setting.adapter_ids = []
+    commit_session(db)
+    db.refresh(setting)
+    return ApiResponse.success(
+        data=_task_model_payload(setting, db),
+        message="任务默认模型已保存",
+    )
+
+
+@router.delete("/config/task-models/{task_type}")
+def clear_task_model(task_type: str, db: Session = Depends(get_db)):
+    task_type = _require_task_model_type(task_type)
+    crud = model_config_crud(db)
+    setting = crud.get_task_setting(task_type)
+    if setting is not None:
+        crud.delete(setting)
+        commit_session(db)
+    return ApiResponse.success(message="任务默认模型已清除，将跟随全局默认模型")
 
 
 @router.post("/config/models")
@@ -495,6 +531,11 @@ def create_or_update_model_config(payload: APIConfigCreate, db: Session = Depend
         cli_args = None
 
     default_model = _normalize_model_for_provider(payload.provider, payload.default_model)
+    available_models = _normalized_model_options(
+        payload.provider,
+        payload.available_models,
+        default_model=default_model,
+    )
     encrypted_key = encrypt(api_key)
 
     if existing:
@@ -508,11 +549,12 @@ def create_or_update_model_config(payload: APIConfigCreate, db: Session = Depend
         existing.max_output_tokens = payload.max_output_tokens
         existing.deconstruct_input_char_limit = payload.deconstruct_input_char_limit
         existing.deconstruct_item_char_limit = payload.deconstruct_item_char_limit
+        existing.available_models_json = available_models
         mark_model_unverified(existing, source="manual_edit")
         commit_session(db)
         db.refresh(existing)
         return ApiResponse.success(
-            data=_config_payload(existing),
+            data=_config_payload(existing, db=db),
             message=f"{payload.provider} 配置已更新",
         )
 
@@ -530,11 +572,12 @@ def create_or_update_model_config(payload: APIConfigCreate, db: Session = Depend
         max_output_tokens=payload.max_output_tokens,
         deconstruct_input_char_limit=payload.deconstruct_input_char_limit,
         deconstruct_item_char_limit=payload.deconstruct_item_char_limit,
+        available_models_json=available_models,
     )
     commit_session(db)
     db.refresh(config)
     return ApiResponse.success(
-        data=_config_payload(config),
+        data=_config_payload(config, db=db),
         message=f"{payload.provider} 配置已添加",
     )
 
@@ -578,7 +621,7 @@ def get_model_config_detail(provider: str, db: Session = Depends(get_db)):
     config = model_config_crud(db).get_provider(provider)
     if not config:
         raise NotFoundError(f"Provider config '{provider}' not found")
-    return ApiResponse.success(data=_config_payload(config, include_masked_key=True))
+    return ApiResponse.success(data=_config_payload(config, include_masked_key=True, db=db))
 
 
 @router.post("/config/models/list")
@@ -624,6 +667,30 @@ async def list_provider_models(payload: ModelListRequest, db: Session = Depends(
         warning = "该接口返回了空模型列表，请手动填写服务商支持的模型名"
 
     models = _normalize_model_list_for_provider(payload.provider, models, db)
+    if saved:
+        same_saved_connection = (
+            not payload.api_key
+            and (
+                payload.base_url_override is None
+                or (payload.base_url_override or "").rstrip("/")
+                == (getattr(saved, "base_url_override", None) or "").rstrip("/")
+            )
+            and (
+                not payload.cli_command
+                or payload.cli_command == getattr(saved, "cli_command", None)
+            )
+            and (
+                not payload.cli_args
+                or payload.cli_args == getattr(saved, "cli_args", None)
+            )
+        )
+        if same_saved_connection:
+            saved.available_models_json = _normalized_model_options(
+                payload.provider,
+                models,
+                default_model=saved.default_model,
+            )
+            commit_session(db)
     return ApiResponse.success(
         data={
             "models": models,
@@ -713,8 +780,8 @@ async def verify_saved_model_config(provider: str, db: Session = Depends(get_db)
     try:
         test_result = await test_connection(payload, db)
     except Exception as exc:
-        if not mark_model_failure(config, exc, source="manual_verify"):
-            mark_model_unavailable(config, exc, source="manual_verify")
+        if not mark_model_verification_failure(config, exc, source="manual_verify"):
+            mark_model_verification_unavailable(config, exc, source="manual_verify")
         commit_session(db)
         raise
 
@@ -734,7 +801,7 @@ async def verify_saved_model_config(provider: str, db: Session = Depends(get_db)
     db.refresh(config)
     return ApiResponse.success(
         data={
-            "config": _config_payload(config),
+            "config": _config_payload(config, db=db),
             "test": test_result.data,
             "became_global_default": became_global,
         },
@@ -788,6 +855,7 @@ def delete_model_config(provider: str, db: Session = Depends(get_db)):
     config = crud.get_provider(provider)
     if not config:
         raise NotFoundError(f"Provider config '{provider}' not found")
+    crud.delete_task_settings_for_provider(provider)
     crud.delete(config)
     commit_session(db)
     return ApiResponse.success(message=f"{provider} 配置已删除")
@@ -829,8 +897,7 @@ def set_global_model(payload: GlobalModelSetting, db: Session = Depends(get_db))
 
     crud.clear_global()
     config.is_global_default = True
-    if payload.model:
-        config.default_model = _normalize_model_for_provider(payload.provider, payload.model)
+    config.default_model = _normalize_model_for_provider(payload.provider, payload.model)
     commit_session(db)
     db.refresh(config)
     return ApiResponse.success(

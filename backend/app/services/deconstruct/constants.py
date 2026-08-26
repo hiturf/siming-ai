@@ -17,14 +17,6 @@ REDUCE_BRIEF_MIN_CHARS_PER_CHUNK = 80
 REDUCE_BRIEF_MAX_CHARS_PER_CHUNK = 420
 FINAL_OUTPUT_ARRAY_MAX_ITEMS = 400
 
-CHEAP_MODEL_BY_PROVIDER = {
-    "deepseek": "deepseek-v4-flash",
-    "openai": "gpt-4o-mini",
-    "anthropic": "claude-3-5-haiku-latest",
-    "qwen": "qwen-turbo",
-    "gemini": "gemini-2.5-flash-lite",
-}
-
 REDUCE_INPUT_PROFILES = [
     {
         "name": "normal",

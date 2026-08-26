@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
+from app.architecture.uow import commit_session
+
 from .registry import registry
 
 
@@ -60,6 +62,9 @@ async def execute_workspace_action(
         )
     usable, detail = orchestrator.validate(manifest)
     if not usable:
+        # Validation may mark the manifest stale. Persist that short mutation
+        # before returning so no writer lease leaks into caller-side work.
+        commit_session(db)
         return {
             "tool": tool,
             "status": manifest.status if manifest.status in {"needs_confirmation", "blocked_rebuild", "stale"} else "needs_confirmation",
@@ -71,9 +76,13 @@ async def execute_workspace_action(
         }
     governed_args = {**args, "context_manifest_id": manifest.id}
     with activate_context_manifest(manifest):
+        # prepare()/validate() both flush audit state. The governed handler may
+        # await a remote model for minutes, so close this transaction first.
+        commit_session(db)
         result = await handler(db, project_id, governed_args)
     if result.get("status") == "ok":
         orchestrator.mark_consumed(manifest)
+        commit_session(db)
     if isinstance(result.get("data"), dict):
         result["data"].setdefault("context_manifest_id", manifest.id)
     return result

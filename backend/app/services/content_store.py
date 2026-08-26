@@ -40,7 +40,7 @@ from .character_service import (
     snapshot_character,
     sync_character_aliases,
 )
-from .character_role_types import append_character_role_description, normalize_character_role_type
+from .character_role_types import normalize_character_role_type
 from .hot_cache import invalidate_project
 
 STORE_VERSION = 1
@@ -496,8 +496,6 @@ def refresh_project_from_files(db: Session, project_id: str) -> None:
             db.flush()
         raw_role_type = data.get("role_type") if "role_type" in data else None
         imported_background = data.get("background") if "background" in data else character.background
-        if raw_role_type is not None:
-            imported_background = append_character_role_description(imported_background, raw_role_type)
         for field in (
             "name", "appearance", "personality", "background", "role_type", "age",
             "life_status", "current_location", "realm_or_level", "physical_state",

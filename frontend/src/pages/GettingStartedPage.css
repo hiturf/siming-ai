@@ -152,6 +152,21 @@
   text-align: left;
 }
 
+.getting-started-ready-stack {
+  display: grid;
+  gap: 16px;
+}
+
+.getting-started-path-notice {
+  margin: 12px auto 0;
+  max-width: 920px;
+  width: 100%;
+}
+
+.getting-started-work .getting-started-path-notice {
+  margin: 24px 0 0;
+}
+
 .getting-started-first-idea h3,
 .getting-started-first-idea p {
   margin: 0;

@@ -1,9 +1,14 @@
 """AI Writing Engine — narrator, character dialogue, dialogue battle, text ops, conflict, changes."""
+from app.architecture.tool_categories import (
+    TOOL_CATEGORY_CONTROLLER,
+    TOOL_CATEGORY_METADATA,
+    normalize_tool_categories,
+    tool_category_controller_schema,
+    tool_names_for_categories,
+)
 from app.architecture.uow import commit_session
 import json
 import asyncio
-import re
-import time
 from datetime import datetime, timedelta
 from typing import Any, AsyncGenerator, Optional
 from fastapi import APIRouter, Depends, Request
@@ -14,57 +19,38 @@ from ..modules.model_runtime.application.execution import model_executor as LLMG
 from ..core.db_helpers import get_project_or_404
 from ..core.exceptions import NotFoundError, ValidationError, LLMError
 from ..core.response import ApiResponse
-from ..core.utils import utc_isoformat
 from ..database.session import get_db
 from ..modules.assistant.application.system_conversations import SystemConversationStore
 from ..modules.assistant.interfaces.system_conversation_dependencies import (
     get_system_conversation_store,
 )
 from ..modules.assistant.interfaces.workspace_dependencies import assistant_workspace
-from ..services.project_creation_context import (
-    get_project_creation_context,
-    resolve_project_creation_session,
-)
-from ..services.context_builders import (
-    _build_character_ai_context,
-    _build_character_context,
-    _build_character_relationships,
-    _build_character_timeline,
-    _count_words,
-    _get_outline_node_or_404,
-)
 from ..services.content_store import ensure_project_folder
 from ..prompts.workspace_assistant import (
     build_workspace_assistant_initial_user_message,
-    format_tool_result_message,
-    format_previous_search_context,
-    format_memory_context,
     redact_tool_result_for_model,
     _compress_search_result,
     MAX_ITERATIONS,
 )
-from ..services.agent.prompt_builder import build_system_prompt, get_workspace_pack, inject_assistant_mode
-from ..ai.local_cli_adapter import CLIPermissionRequiredError, is_local_cli_provider
-from ..services.skills.service import select_relevant_skills, build_skill_prompt_section
-from ..prompts.style_prompts import build_style_context
+from ..services.agent.prompt_builder import build_system_prompt, get_workspace_pack
+from ..ai.local_cli_adapter import is_local_cli_provider
+from ..ai.local_cli_prompt import supports_direct_mcp
 from ..services.style_rules import (
     _detect_forbidden_sentence_violations,
     _mechanical_repair_forbidden_sentences,  # noqa: F401 - compatibility export
     _repair_forbidden_sentence_text,
 )
 from ..services.workspace.tool_schemas import (
-    SEARCH_TOOL_NAMES,
-    WRITE_TOOL_NAMES,
     build_workspace_tool_schemas,
     select_workspace_tool_names,
 )
 from ..services.workspace.registry import registry
-from ..services.workspace import (
-    _character_payload,
-    _find_character_by_name_or_id,
-    _find_outline_by_title_or_id,
-    _outline_node_payload,
-    execute_workspace_action,
+from ..services.workspace import execute_workspace_action
+from ..services.tool_category_state import (
+    activate_tool_categories,
+    create_tool_category_state,
+    read_tool_category_state,
+    remove_tool_category_state,
 )
 from ..services.workspace.run_log import (
     create_assistant_run,
@@ -82,385 +68,30 @@ from ..services.workspace.run_recovery import (
     resume_from_step,
     resume_run,
 )
-from ..services.operation_runtime import record_operation_signal
+from ..services.workspace.assistant_response import (
+    WorkspaceTurnTelemetry,
+    _assistant_conversation_to_dict,
+    _assistant_message_to_dict,
+    _workspace_outcome,
+    finalize_workspace_assistant_turn,
+)
+from ..services.workspace.generated_drafts import (
+    chapter_draft_result_data,
+    find_new_pending_chapter_draft,
+    pending_chapter_draft_ids,
+)
+from ..services.workspace.turn_control import (
+    AssistantTurnDirective,
+    apply_turn_directive,
+    is_terminal_tool_result,
+    terminal_reply as terminal_tool_reply,
+)
 from ..schemas.ai_writer import WorkspaceAssistantRequest, WorkspaceAssistantRunDetailResponse, WorkspaceAssistantRunListResponse
 
 router = APIRouter(tags=["ai-writer"])
 
-def _strip_json_fences(text: str) -> str:
-    value = (text or "").strip()
-    # Remove markdown code fences
-    for _ in range(2):
-        if value.startswith("```json"):
-            value = value[7:]
-        elif value.startswith("```"):
-            value = value[3:]
-        if value.endswith("```"):
-            value = value[:-3]
-    return value.strip()
-
-
-def _escape_json_string_values(text: str) -> str:
-    """Escape unescaped ASCII double-quotes inside JSON string values.
-
-    Scans the text tracking in-string / out-of-string state and escape mode.
-    When a double-quote appears inside a string and is NOT followed by a JSON
-    structural character (, } ] :), it is treated as an accidental unescaped
-    quote (e.g. from Chinese dialogue) and escaped as \\\".
-    """
-    result: list[str] = []
-    in_string = False
-    escape_next = False
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if not in_string:
-            result.append(ch)
-            if ch == '"':
-                in_string = True
-            i += 1
-        else:
-            if escape_next:
-                result.append(ch)
-                escape_next = False
-                i += 1
-            elif ch == '\\':
-                result.append(ch)
-                escape_next = True
-                i += 1
-            elif ch == '"':
-                # Potential string terminator — look ahead for structural char
-                ahead = i + 1
-                while ahead < len(text) and text[ahead].isspace():
-                    ahead += 1
-                if ahead >= len(text) or text[ahead] in ',}:]':
-                    # Real string terminator
-                    in_string = False
-                    result.append(ch)
-                else:
-                    # Unescaped quote inside string — escape it
-                    result.append('\\')
-                    result.append('"')
-                i += 1
-            else:
-                result.append(ch)
-                i += 1
-    return ''.join(result)
-
-
-def _parse_json_object(text: str) -> Optional[dict]:
-    cleaned = _strip_json_fences(text)
-
-    def _try_parse(candidate_text: str) -> Optional[dict]:
-        start = candidate_text.find("{")
-        if start < 0:
-            return None
-        for end_offset in range(len(candidate_text), start + 1, -1):
-            end = candidate_text.rfind("}", start, end_offset)
-            if end < 0:
-                continue
-            candidate = candidate_text[start:end + 1]
-            try:
-                parsed = json.loads(candidate, strict=False)
-                if isinstance(parsed, dict):
-                    return parsed
-            except (json.JSONDecodeError, ValueError):
-                continue
-        return None
-
-    parsed = _try_parse(cleaned)
-    if parsed is not None:
-        return parsed
-    # Escape unescaped quotes inside string values and retry
-    escaped = _escape_json_string_values(cleaned)
-    if escaped != cleaned:
-        return _try_parse(escaped)
-    return None
-
-
-WORKSPACE_JSON_REPAIR_SYSTEM_PROMPT = (
-    "你是JSON修复器，只修复语法，不改写正文，不增删工具动作。"
-    "输入是小说项目助手返回的近似JSON，可能因为章节正文里的引号、换行或尾随文本导致无法解析。"
-    "请把它修复为一个可被 json.loads 解析的合法JSON对象。"
-    "必须保留 reply、done、actions、needs_confirmation 字段；actions 内的工具名和参数必须尽量原样保留。"
-    "只输出JSON对象，不要Markdown，不要解释。"
-)
-
-
-async def _repair_workspace_json_output(raw_text: str, model: Optional[str]) -> Optional[dict]:
-    """Repair near-JSON workspace assistant output once before dropping actions."""
-    if not raw_text.strip():
-        return None
-    try:
-        result = await LLMGateway.chat_completion(
-            messages=[
-                {"role": "system", "content": WORKSPACE_JSON_REPAIR_SYSTEM_PROMPT},
-                {"role": "user", "content": raw_text[:120_000]},
-            ],
-            model=model,
-            temperature=0,
-            timeout=90,
-            retry=0,
-        )
-    except Exception:
-        return None
-    return _parse_json_object(result.get("content", ""))
-
-
-def _assistant_heuristic_plan(message: str) -> dict:
-    text = message.lower()
-    tools = {"read_recent_summaries", "read_outline", "read_worldbuilding", "read_characters", "read_relationships"}
-    if any(key in text for key in ["矛盾", "冲突", "合理", "检查", "详细", "正文", "bug", "不一致"]):
-        tools.add("read_chapter_detail")
-    if any(key in text for key in ["写", "生成", "新章节", "创建章节", "对话", "扮演", "行动", "出场"]):
-        tools.add("roleplay_characters")
-    should_create = bool(
-        any(key in text for key in ["创建章节", "新章节", "直接生成章节", "写一章", "写第", "帮我写第"])
-        or re.search(r"写\s*第?\s*\d+\s*章", text)
-        or re.search(r"第\s*\d+\s*章", text) and any(key in text for key in ["写", "生成", "创建"])
-    )
-    return {
-        "intent": "write" if should_create else "advise",
-        "tools": sorted(tools),
-        "character_names": [],
-        "needs_worldbuilding": any(key in text for key in ["设定", "世界观", "规则", "势力", "地图"]),
-        "should_create_chapter": should_create,
-        "chapter_title": _chapter_title_from_request(message) if should_create else "",
-        "reason": "启发式计划",
-    }
-
-
-def _chapter_title_from_request(message: str) -> str:
-    text = (message or "").strip()
-    match = re.search(r"第\s*([0-9一二两三四五六七八九十百千万零〇]+)\s*章", text)
-    if match:
-        return f"第{match.group(1)}章"
-    return "AI生成章节"
-
-
-def _normalize_assistant_plan(raw_plan: Optional[dict], message: str) -> dict:
-    fallback = _assistant_heuristic_plan(message)
-    if not raw_plan:
-        return fallback
-    allowed_tools = {
-        "read_recent_summaries",
-        "read_outline",
-        "read_worldbuilding",
-        "read_characters",
-        "read_relationships",
-        "read_chapter_detail",
-        "roleplay_characters",
-    }
-    tools = [tool for tool in raw_plan.get("tools") or [] if tool in allowed_tools]
-    for tool in fallback["tools"]:
-        if tool not in tools:
-            tools.append(tool)
-    names = [
-        str(name).strip()
-        for name in raw_plan.get("character_names") or []
-        if str(name).strip()
-    ][:6]
-    return {
-        "intent": str(raw_plan.get("intent") or fallback["intent"])[:50],
-        "tools": tools,
-        "character_names": names,
-        "needs_worldbuilding": bool(raw_plan.get("needs_worldbuilding", fallback["needs_worldbuilding"])),
-        "should_create_chapter": bool(raw_plan.get("should_create_chapter")) or bool(fallback["should_create_chapter"]),
-        "chapter_title": str(raw_plan.get("chapter_title") or fallback.get("chapter_title") or _chapter_title_from_request(message) or "")[:200],
-        "reason": str(raw_plan.get("reason") or fallback["reason"])[:500],
-    }
-
-
-def _resolve_assistant_characters(
-    db: Session,
-    project_id: str,
-    names: list[str],
-    outline_node_id: Optional[str],
-    limit: int = 4,
-) -> list[Any]:
-    return assistant_workspace(db).resolve_characters(
-        project_id,
-        names,
-        outline_node_id,
-        limit=limit,
-    )
-
-
-async def _assistant_character_roleplay(
-    db: Session,
-    project_id: str,
-    character: Any,
-    user_message: str,
-    outline_ctx: str,
-    summaries: str,
-    model: Optional[str],
-) -> dict:
-    project = get_project_or_404(db, project_id)
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                f"你是小说角色「{character.name}」的角色AI。\n"
-                "请根据角色档案、关系和当前剧情判断这个角色是否会主动行动或发言。"
-                "只输出JSON，不要输出解释性散文。\n"
-                "格式：{\"should_act\":true,\"action_type\":\"dialogue|action|inner|none\",\"content\":\"角色会说/做/想的内容\",\"rationale\":\"为什么符合人设\"}\n\n"
-                f"【角色档案】\n{_build_character_context(character)}\n\n"
-                f"【角色AI设定】\n{_build_character_ai_context(character)}\n\n"
-                f"【关系网】\n{_build_character_relationships(db, project_id, character.id)}\n\n"
-                f"【近期经历】\n{_build_character_timeline(db, character.id)}\n\n"
-                f"【作品文风约束】\n{build_style_context(project)}\n\n"
-                f"【当前大纲】\n{outline_ctx}\n\n"
-                f"【前文摘要】\n{summaries}"
-            ),
-        },
-        {"role": "user", "content": user_message},
-    ]
-    result = await LLMGateway.chat_completion(messages=messages, model=model, temperature=0.6, max_tokens=1200)
-    parsed = _parse_json_object(result.get("content", ""))
-    if not parsed:
-        parsed = {
-            "should_act": False,
-            "action_type": "none",
-            "content": "",
-            "rationale": result.get("content", "")[:500],
-        }
-    return {
-        "character_id": character.id,
-        "character_name": character.name,
-        "should_act": bool(parsed.get("should_act")),
-        "action_type": str(parsed.get("action_type") or "none")[:50],
-        "content": str(parsed.get("content") or "")[:4000],
-        "rationale": str(parsed.get("rationale") or "")[:1000],
-    }
-
-
-def _create_assistant_chapter(
-    db: Session,
-    project_id: str,
-    title: str,
-    content: str,
-    outline_node_id: Optional[str],
-    summary_text: str,
-    involved_character_names: list[str],
-    model: Optional[str],
-) -> Optional[Any]:
-    title = (title or "").strip()[:200]
-    content = (content or "").strip()
-    if not title or not content:
-        return None
-    outline_node = _get_outline_node_or_404(db, project_id, outline_node_id)
-    workspace = assistant_workspace(db)
-    chapter = workspace.create_chapter(
-        project_id=project_id,
-        outline_node_id=outline_node.id if outline_node else None,
-        title=title,
-        content=content,
-        word_count=_count_words(content),
-        current_version=1,
-    )
-    db.flush()
-    workspace.create_summary(
-        chapter_id=chapter.id,
-        summary_text=(summary_text or title)[:20000],
-        key_events=None,
-        token_count=len(summary_text or title),
-        ai_model=model,
-    )
-    names = {name.strip() for name in involved_character_names if name and name.strip()}
-    if names:
-        characters = workspace.characters_by_names(project_id, names)
-        for character in characters:
-            workspace.link_chapter_character(
-                chapter_id=chapter.id,
-                character_id=character.id,
-                appearance_type="AI助手识别",
-                description="由自动写作助手创建章节时关联",
-            )
-    return chapter
-
-
-def _chapter_brief(chapter: Any) -> dict:
-    return {
-        "id": chapter.id,
-        "title": chapter.title,
-        "outline_node_id": chapter.outline_node_id,
-        "word_count": chapter.word_count or 0,
-    }
-
-
-def _create_assistant_chapter_placeholder(
-    db: Session,
-    project_id: str,
-    title: str,
-    outline_node_id: Optional[str],
-) -> Any:
-    outline_node = _get_outline_node_or_404(db, project_id, outline_node_id)
-    clean_title = (title or "AI生成章节").strip()[:200] or "AI生成章节"
-    chapter = assistant_workspace(db).create_chapter(
-        project_id=project_id,
-        outline_node_id=outline_node.id if outline_node else None,
-        title=clean_title,
-        content="（AI正在生成正文，完成后会自动写入。）",
-        word_count=0,
-        current_version=1,
-    )
-    db.flush()
-    return chapter
-
-
-def _finalize_assistant_chapter(
-    db: Session,
-    chapter: Any,
-    title: str,
-    content: str,
-    summary_text: str,
-    involved_character_names: list[str],
-    model: Optional[str],
-) -> Any:
-    clean_title = (title or chapter.title or "AI生成章节").strip()[:200] or "AI生成章节"
-    clean_content = (content or "").strip()
-    chapter.title = clean_title
-    chapter.content = clean_content
-    chapter.word_count = _count_words(clean_content)
-    chapter.current_version = max(1, chapter.current_version or 1) + 1
-    chapter.updated_at = datetime.utcnow()
-    workspace = assistant_workspace(db)
-    workspace.create_snapshot(
-        chapter_id=chapter.id,
-        version_number=chapter.current_version,
-        content=clean_content,
-        word_count=chapter.word_count,
-        trigger_type="ai_insert",
-    )
-
-    if chapter.summary:
-        chapter.summary.summary_text = (summary_text or clean_title)[:20000]
-        chapter.summary.key_events = None
-        chapter.summary.token_count = len(summary_text or clean_title)
-        chapter.summary.ai_model = model
-        chapter.summary.updated_at = datetime.utcnow()
-    else:
-        workspace.create_summary(
-            chapter_id=chapter.id,
-            summary_text=(summary_text or clean_title)[:20000],
-            key_events=None,
-            token_count=len(summary_text or clean_title),
-            ai_model=model,
-        )
-
-    names = {name.strip() for name in involved_character_names if name and name.strip()}
-    if names:
-        workspace.clear_chapter_characters(chapter.id)
-        characters = workspace.characters_by_names(chapter.project_id, names)
-        for character in characters:
-            workspace.link_chapter_character(
-                chapter_id=chapter.id,
-                character_id=character.id,
-                appearance_type="AI助手识别",
-                description="由自动写作助手创建章节时关联",
-            )
-    return chapter
-
+_ASSISTANT_STREAM_TIMEOUT_SECONDS = 300
+_WORKSPACE_ASSISTANT_SCOPE = "project"
 
 def _assistant_history_text(history: list[dict], limit: int = 8) -> str:
     lines = []
@@ -478,183 +109,55 @@ def _assistant_history_text(history: list[dict], limit: int = 8) -> str:
     return "\n\n".join(lines) or "暂无对话历史。"
 
 
-def _compact_workspace_detail(value: object, limit: int = 180) -> str:
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
-    if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + "..."
+def _workspace_category_result(
+    arguments: dict[str, Any],
+    authorized_tool_names: set[str],
+) -> tuple[dict[str, Any], tuple[str, ...] | None]:
+    try:
+        categories = normalize_tool_categories(arguments.get("enabled_categories"))
+    except ValueError as exc:
+        return {
+            "tool": TOOL_CATEGORY_CONTROLLER,
+            "status": "error",
+            "detail": str(exc),
+            "data": None,
+        }, None
+    labels = [TOOL_CATEGORY_METADATA[category]["label"] for category in categories]
+    available = authorized_tool_names & set(tool_names_for_categories(categories))
+    detail = f"已准备{'、'.join(labels)}能力，共 {len(available)} 项可用工具" if labels else "已关闭全部业务工具"
+    return {
+        "tool": TOOL_CATEGORY_CONTROLLER,
+        "status": "ok",
+        "detail": detail,
+        "data": {
+            "enabled_categories": list(categories),
+            "labels": labels,
+            "available_tool_count": len(available),
+        },
+    }, categories
 
 
-def _workspace_result_summary(result: dict) -> str:
-    tool = str(result.get("tool") or "tool")
-    status = str(result.get("status") or "ok")
-    detail = _compact_workspace_detail(result.get("detail") or "")
-    prefix = f"{tool}（{status}）"
-    return f"{prefix}：{detail}" if detail else prefix
-
-
-def _workspace_action_summary(action: dict) -> str:
-    tool = str(action.get("tool") or "tool")
-    args = action.get("arguments") if isinstance(action.get("arguments"), dict) else {}
-    label = str(
-        args.get("title")
-        or args.get("name")
-        or args.get("chapter_title")
-        or args.get("field_name")
-        or args.get("id")
-        or ""
-    ).strip()
-    return f"{tool}：{_compact_workspace_detail(label, 80)}" if label else tool
-
-
-def _workspace_local_cli_bridge_prompt(*, allow_writes: bool) -> str:
-    permission = (
-        "本轮已获得一次性项目写入授权；可在最终轮次提出写入 actions。"
-        if allow_writes
-        else (
-            "本轮尚未获得项目写入授权；仍应提出完成请求所需的写入 actions，"
-            "司命会暂停并向用户申请一次性授权，绝不能声称已经保存。"
+def _workspace_category_instruction(
+    categories: tuple[str, ...],
+    *,
+    category_selected: bool,
+) -> str:
+    if not category_selected:
+        return (
+            "当前只开放 set_tool_categories，必须先调用它选择完成用户最新消息所需的类别；"
+            "在控制工具返回前不得直接回答、等待或声称工具不可用。调用后立即结束当前模型步骤。"
         )
+    if not categories:
+        return (
+            "本轮已经通过 set_tool_categories 明确关闭全部业务工具。"
+            "现在可以直接完成不需要业务工具的回复；如需业务能力，重新调用 set_tool_categories，"
+            "调用后立即结束当前模型步骤。"
+        )
+    labels = "、".join(TOOL_CATEGORY_METADATA[category]["label"] for category in categories)
+    return (
+        f"当前开放工具类别：{labels}。直接完成用户最新任务；需要更换能力时调用 set_tool_categories，"
+        "调用后立即结束当前模型步骤。"
     )
-    return f"""【本机 CLI 受控工具桥】
-当前 CLI 不通过原生 function calling 接收工具。不要因此声称本轮工具缺失，也不要要求用户改用命令行。
-你必须只输出一个 JSON 对象，禁止 Markdown 或额外文本：
-{{"reply":"给用户的简洁中文说明","done":true,"actions":[{{"tool":"工具名","arguments":{{}}}}],"needs_confirmation":false}}
-- 需要先读取资料时：done=false，actions 只放本轮需要的读取工具；司命会返回真实结果供下一轮继续。
-- 信息充分且需要写入时：done=true，actions 放最终写入工具；
-  工具名必须来自系统提示中的“本轮可用工具”。
-- 只需聊天回答时：done=true，actions=[]，把回复放入 reply。
-- 不得把工具调用写进 reply，也不得用“工具列表里没有 create_character”等未经核对的说法代替 actions。
-{permission}"""
-
-
-def _build_workspace_final_reply(
-    final_reply: str,
-    *,
-    all_actions: list[dict],
-    applied_actions: list[dict],
-    tool_logs: list[dict],
-    searched_context: list[dict],
-    needs_confirmation: bool = False,
-) -> str:
-    reply = str(final_reply or "").strip()
-    if reply:
-        return reply
-
-    if needs_confirmation:
-        return "本轮需要你确认后才能继续，但模型没有给出确认说明。请重试一次，或换用支持工具调用的模型。"
-
-    if applied_actions:
-        lines = [
-            f"本轮已执行 {len(applied_actions)} 个工具操作，但模型没有给出最终文字回复。",
-            "",
-            "执行结果：",
-        ]
-        lines.extend(f"- {_workspace_result_summary(action)}" for action in applied_actions[:5])
-        if len(applied_actions) > 5:
-            lines.append(f"- 另有 {len(applied_actions) - 5} 个结果已省略")
-        return "\n".join(lines)
-
-    if all_actions:
-        lines = [
-            f"模型规划了 {len(all_actions)} 个写入操作，但没有给出最终文字回复。",
-            "",
-            "计划操作：",
-        ]
-        lines.extend(f"- {_workspace_action_summary(action)}" for action in all_actions[:5])
-        if len(all_actions) > 5:
-            lines.append(f"- 另有 {len(all_actions) - 5} 个操作已省略")
-        return "\n".join(lines)
-
-    if tool_logs:
-        lines = [
-            "本轮已调用工具，但模型没有给出最终文字回复。",
-            "",
-            "工具结果：",
-        ]
-        lines.extend(f"- {_workspace_result_summary(log)}" for log in tool_logs[:5])
-        if len(tool_logs) > 5:
-            lines.append(f"- 另有 {len(tool_logs) - 5} 条工具日志已省略")
-        return "\n".join(lines)
-
-    if searched_context:
-        lines = [
-            "本轮已读取相关资料，但模型没有给出最终文字回复。",
-            "",
-            "已读取：",
-        ]
-        for item in searched_context[:5]:
-            tool = str(item.get("tool") or "search")
-            detail = _compact_workspace_detail(item.get("detail") or "")
-            data = item.get("data")
-            count = len(data) if isinstance(data, list) else 0
-            suffix = detail or (f"{count} 条结果" if count else "有结果")
-            lines.append(f"- {tool}：{suffix}")
-        if len(searched_context) > 5:
-            lines.append(f"- 另有 {len(searched_context) - 5} 条检索上下文已省略")
-        lines.append("")
-        lines.append("请重试一次；如果连续出现，建议在系统设置里测试当前模型/CLI 的流式输出和工具调用能力。")
-        return "\n".join(lines)
-
-    return "我没有收到模型的文字回复，也没有执行任何工具。请重试一次，或在系统设置里测试当前模型/CLI 是否支持项目助手的流式输出和工具调用。"
-
-
-def _workspace_outcome(
-    raw_reply: str,
-    *,
-    all_actions: list[dict],
-    applied_actions: list[dict],
-    tool_logs: list[dict],
-    searched_context: list[dict],
-    needs_confirmation: bool = False,
-    failed_logs: list[dict] | None = None,
-) -> str:
-    """Return a stable user-facing outcome for an assistant turn."""
-    if failed_logs:
-        return "partial_success" if applied_actions else "failed"
-    if needs_confirmation:
-        return "waiting_user"
-    if str(raw_reply or "").strip():
-        return "completed_with_reply"
-    if applied_actions or tool_logs or searched_context:
-        return "completed_with_tools"
-    if all_actions:
-        return "skipped_preflight"
-    return "empty_response"
-
-
-def _assistant_conversation_to_dict(conversation: Any, message_count: Optional[int] = None) -> dict:
-    return {
-        "id": conversation.id,
-        "project_id": conversation.project_id,
-        "title": conversation.title,
-        "scope": conversation.scope,
-        "current_chapter_id": conversation.current_chapter_id,
-        "current_outline_node_id": conversation.current_outline_node_id,
-        "model": conversation.model,
-        "message_count": message_count,
-        "created_at": utc_isoformat(conversation.created_at),
-        "updated_at": utc_isoformat(conversation.updated_at),
-    }
-
-
-def _assistant_message_to_dict(message: Any) -> dict:
-    payload = None
-    if message.payload_json:
-        try:
-            payload = json.loads(message.payload_json)
-        except Exception:
-            payload = None
-    return {
-        "id": message.id,
-        "conversation_id": message.conversation_id,
-        "role": message.role,
-        "content": message.content,
-        "payload": payload,
-        "status": message.status,
-        "created_at": utc_isoformat(message.created_at),
-        "updated_at": utc_isoformat(message.updated_at),
-    }
 
 
 def _get_assistant_conversation_or_404(
@@ -685,51 +188,6 @@ def _assistant_history_from_messages(
     return _assistant_history_text(history, limit=limit)
 
 
-def _previous_search_context_from_messages(
-    db: Session,
-    conversation_id: str,
-    before_message_id: Optional[str] = None,
-) -> str:
-    """Extract and merge persisted search results from ALL prior assistant messages in this conversation."""
-    messages = assistant_workspace(db).previous_assistant_messages(conversation_id)
-    # Merge by tool, deduplicate data entries by id, keep most recent
-    merged: dict[str, dict] = {}
-    seen_ids: dict[str, set] = {}  # tool -> set of seen entry ids
-    for message in messages:
-        if before_message_id and message.id == before_message_id:
-            continue
-        if not message.payload_json:
-            continue
-        try:
-            payload = json.loads(message.payload_json)
-        except Exception:
-            continue
-        ctx = payload.get("searched_context")
-        if not isinstance(ctx, list):
-            continue
-        for group in ctx:
-            if not isinstance(group, dict):
-                continue
-            tool = str(group.get("tool") or "?")
-            data = group.get("data")
-            if not isinstance(data, list):
-                continue
-            if tool not in merged:
-                merged[tool] = {"tool": tool, "detail": str(group.get("detail") or ""), "data": []}
-                seen_ids[tool] = set()
-            for entry in data:
-                if not isinstance(entry, dict):
-                    continue
-                eid = entry.get("id", "")
-                if eid and eid in seen_ids[tool]:
-                    continue
-                if eid:
-                    seen_ids[tool].add(eid)
-                merged[tool]["data"].append(entry)
-    all_search_results = list(merged.values())
-    return format_previous_search_context(all_search_results)
-
-
 def _assistant_title_from_message(message: str) -> str:
     title = " ".join((message or "").strip().split())
     if not title:
@@ -741,13 +199,19 @@ async def _execute_workspace_action(
     db: Session,
     project_id: str,
     action: dict,
-    assistant_mode: str = "quality",
     model: Optional[str] = None,
+    authorized_tool_names: set[str] | None = None,
 ) -> dict:
     """Execute a workspace tool action, with pre-flight forbidden-pattern check for chapter creation."""
-    action = inject_assistant_mode(action, assistant_mode)
     tool = str(action.get("tool") or "").strip()
     args = action.get("arguments") if isinstance(action.get("arguments"), dict) else {}
+    if authorized_tool_names is not None and tool not in authorized_tool_names:
+        return {
+            "tool": tool or "unknown",
+            "status": "blocked",
+            "detail": "该工具不在本轮服务端授权的能力集合中，未执行。",
+            "data": {},
+        }
     tool_def = registry.get(tool)
     accepts_model = (
         bool(tool_def and "model" in tool_def.input_schema)
@@ -758,101 +222,7 @@ async def _execute_workspace_action(
         args = {**args, "model": model}
         action = {**action, "arguments": args}
 
-    if tool == "create_chapter" and args.get("content") and not (args.get("draft_id") or args.get("content_ref")):
-        project = get_project_or_404(db, project_id)
-        violations = _detect_forbidden_sentence_violations(str(args.get("content")), project)
-        if violations:
-            try:
-                model = str(args.get("model") or "") or None
-                repaired, before, remaining = await _repair_forbidden_sentence_text(
-                    str(args.get("content")),
-                    project,
-                    model,
-                    None,
-                )
-                args = {**args, "content": repaired}
-                action = {**action, "arguments": args}
-            except Exception:
-                pass
-
     return await execute_workspace_action(db, project_id, action)
-
-
-def _is_affirmative_confirmation(text: str) -> bool:
-    normalized = str(text or "").strip().lower()
-    if not normalized:
-        return False
-    if any(phrase in normalized for phrase in ["不是", "不行", "不要", "不按", "不可以", "否", "换个方向", "改一下"]):
-        return False
-    return any(
-        phrase in normalized
-        for phrase in [
-            "是",
-            "可以",
-            "确认",
-            "同意",
-            "按这个",
-            "就这样",
-            "继续",
-            "没问题",
-            "照这个",
-            "就按",
-            "yes",
-            "ok",
-        ]
-    ) or normalized in {"好", "好的", "行"}
-
-
-def _user_requests_chapter_creation(text: str) -> bool:
-    normalized = str(text or "").strip().lower()
-    return any(
-        phrase in normalized
-        for phrase in ["写第", "写一章", "写新章", "新章节", "创建章节", "生成章节", "帮我写", "开始写", "续写第"]
-    )
-
-
-def _chapter_action_needs_outline_confirmation(
-    db: Session,
-    project_id: str,
-    actions: list[dict],
-    user_message: str,
-) -> bool:
-    confirmed = _is_affirmative_confirmation(user_message)
-    pending_outline_titles = set()
-    for action in actions:
-        if isinstance(action, dict) and action.get("tool") == "create_outline_node":
-            args = action.get("arguments") if isinstance(action.get("arguments"), dict) else {}
-            title = str(args.get("title") or "").strip()
-            if title:
-                pending_outline_titles.add(title)
-        elif isinstance(action, dict) and action.get("tool") == "create_outline_nodes":
-            args = action.get("arguments") if isinstance(action.get("arguments"), dict) else {}
-            nodes = args.get("nodes")
-            if isinstance(nodes, list):
-                for node in nodes:
-                    if not isinstance(node, dict):
-                        continue
-                    title = str(node.get("title") or "").strip()
-                    if title:
-                        pending_outline_titles.add(title)
-    if pending_outline_titles and _user_requests_chapter_creation(user_message) and not confirmed:
-        return True
-    for action in actions:
-        if not isinstance(action, dict) or action.get("tool") != "create_chapter":
-            continue
-        args = action.get("arguments") if isinstance(action.get("arguments"), dict) else {}
-        outline_ref = args.get("outline_node_id") or args.get("outline_node_title") or args.get("outline_title")
-        if _find_outline_by_title_or_id(db, project_id, outline_ref):
-            continue
-        if confirmed and str(outline_ref or "").strip() in pending_outline_titles:
-            continue
-        if confirmed and len(pending_outline_titles) == 1 and not str(outline_ref or "").strip():
-            args["outline_node_title"] = next(iter(pending_outline_titles))
-            continue
-        if not confirmed:
-            return True
-        return True
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -938,10 +308,10 @@ def _sse_event(payload) -> str:
 # ---------------------------------------------------------------------------
 
 @router.get("/projects/{project_id}/ai/assistant/conversations")
-async def list_assistant_conversations(project_id: str, scope: str = "writer", db: Session = Depends(get_db)):
+async def list_assistant_conversations(project_id: str, db: Session = Depends(get_db)):
     """List persisted assistant conversations for a project."""
     get_project_or_404(db, project_id)
-    conversations = assistant_workspace(db).conversations_with_counts(project_id, scope)
+    conversations = assistant_workspace(db).conversations_with_counts(project_id, _WORKSPACE_ASSISTANT_SCOPE)
     items = []
     for conversation, message_count in conversations:
         items.append(_assistant_conversation_to_dict(conversation, message_count))
@@ -1178,9 +548,9 @@ async def workspace_assistant_stream(
     # switching a task between iterations.
     payload.model = resolve_assistant_model(payload.model)
 
-    # Local CLI requests are routed by the selected CLI itself below.  Siming
-    # consumes that structured decision and never classifies the user's wording
-    # with a keyword/regular-expression gate at this entry point.
+    # The selected model receives the latest request, real project context and
+    # its authorized tools below. Siming does not pre-classify natural-language
+    # intent or choose a business target before the Agent acts.
     try:
         selected_provider = LLMGateway.provider_for_model(payload.model)
     except Exception:
@@ -1197,7 +567,7 @@ async def workspace_assistant_stream(
                 execution_conversation = workspace.create_conversation(
                     project_id=project_id,
                     title=_assistant_title_from_message(payload.message),
-                    scope=payload.scope,
+                    scope=_WORKSPACE_ASSISTANT_SCOPE,
                     canonical_conversation_id=payload.canonical_conversation_id,
                 )
                 commit_session(db)
@@ -1211,46 +581,24 @@ async def workspace_assistant_stream(
         tool_logs: list[dict] = []
         # Declared at function scope so GeneratorExit recovery can access them
         final_reply = ""
-        all_actions: list[dict] = []
         applied_actions: list[dict] = []
         searched_context: list[dict] = []
         final_model = ""
         final_usage = None
-        last_operation_report_at = 0.0
-
-        def report_model_activity(text: str, *, signal: str = "output", message: str = "模型正在生成回复") -> None:
-            nonlocal last_operation_report_at
-            if not assistant_run or not assistant_run.operation_id:
-                return
-            now = time.monotonic()
-            if now - last_operation_report_at < 2:
-                return
-            last_operation_report_at = now
-            record_operation_signal(
-                assistant_run.operation_id,
-                signal,
-                {"output_chars": len(text or "")},
-                message=message,
-            )
+        turn_telemetry = WorkspaceTurnTelemetry()
+        tool_category_state_file = ""
         try:
             # --- Phase 1: Setup ---
-            selected_node = _find_outline_by_title_or_id(db, project_id, payload.selected_outline_node_id)
-            selected_character = (
-                _find_character_by_name_or_id(db, project_id, payload.selected_character_id)
-                if payload.selected_character_id
-                else None
-            )
             if payload.conversation_id:
                 conversation = _get_assistant_conversation_or_404(db, project_id, payload.conversation_id)
-                conversation.scope = payload.scope
+                conversation.scope = _WORKSPACE_ASSISTANT_SCOPE
             else:
                 conversation = assistant_workspace(db).create_conversation(
                     project_id=project_id,
                     title=_assistant_title_from_message(payload.message),
-                    scope=payload.scope,
+                    scope=_WORKSPACE_ASSISTANT_SCOPE,
                 )
                 db.flush()
-            conversation.current_outline_node_id = selected_node.id if selected_node else None
             conversation.model = payload.model
             conversation.updated_at = datetime.utcnow()
 
@@ -1283,8 +631,7 @@ async def workspace_assistant_stream(
                 conversation_id=conversation.id,
                 user_message_id=user_msg_db.id,
                 assistant_message_id=assistant_msg_db.id,
-                scope=payload.scope,
-                assistant_mode=payload.assistant_mode,
+                scope=_WORKSPACE_ASSISTANT_SCOPE,
                 model=payload.model,
             )
 
@@ -1300,19 +647,17 @@ async def workspace_assistant_stream(
             project = get_project_or_404(db, project_id)
             project_folder = str(ensure_project_folder(db, project))
             commit_session(db)
+            pending_draft_ids_before = pending_chapter_draft_ids(db, project_id)
             local_cli_extra_body = LLMGateway.local_cli_extra_body(
                 payload.model,
                 cwd=project_folder,
             )
             local_cli_selected = is_local_cli_provider(selected_provider)
-            local_cli_permission_granted = (
-                local_cli_selected
-                and payload.local_cli_permission_grant == "project_agent_once"
-            )
             local_cli_mcp_enabled = (
-                selected_provider == "opencode_cli" and local_cli_permission_granted
+                local_cli_selected and supports_direct_mcp(selected_provider)
             )
-            local_cli_bridge_mode = local_cli_selected and not local_cli_mcp_enabled
+            if local_cli_mcp_enabled:
+                tool_category_state_file = create_tool_category_state()
             if local_cli_selected:
                 local_cli_read_permission_granted = (
                     selected_provider == "opencode_cli"
@@ -1322,48 +667,27 @@ async def workspace_assistant_stream(
                 local_cli_extra_body = dict(local_cli_extra_body)
                 local_cli_extra_body.update(
                     {
-                        "local_cli_permission_granted": local_cli_permission_granted,
+                        "local_cli_mcp_authorized": local_cli_mcp_enabled,
                         "local_cli_allow_mcp": local_cli_mcp_enabled,
                         "local_cli_read_permission_granted": local_cli_read_permission_granted,
                         "local_cli_read_paths": (
                             list(payload.local_cli_read_paths)
                             if local_cli_read_permission_granted else []
                         ),
-                        # OpenCode receives an inline one-process MCP config and
-                        # therefore never needs the real project directory.
-                        # Other CLIs use the validated JSON bridge in the same
-                        # isolated mode, even after one-turn write authorization.
                         "local_cli_isolated": True,
                         "local_cli_mcp_permission_pack": "project_management",
                         "local_cli_mcp_project_id": project_id,
+                        "local_cli_mcp_tool_category_state_file": tool_category_state_file,
+                        "local_cli_terminal_draft_project_id": (
+                            project_id if local_cli_mcp_enabled else ""
+                        ),
+                        "local_cli_terminal_draft_excluded_ids": sorted(pending_draft_ids_before),
                     }
                 )
             if assistant_run.operation_id:
                 local_cli_extra_body = dict(local_cli_extra_body or {})
                 local_cli_extra_body["operation_id"] = assistant_run.operation_id
-            style_context = build_style_context(project, concise=True)
-            selected_context: list[str] = [f"当前作品 project_id：{project_id}"]
-            creation_session = resolve_project_creation_session(
-                db,
-                project_id,
-                payload.creation_session_id,
-            )
-            creation_context = get_project_creation_context(
-                db,
-                project_id,
-                creation_session.id if creation_session else None,
-            )
-            if creation_session and creation_context:
-                selected_context.append(
-                    "当前作品关联的权威立项数据（不得把 confirmed 误报为待确认）：\n"
-                    f"{json.dumps(creation_context, ensure_ascii=False)}\n"
-                    "需要更多立项细节时，先调用 get_project_info；它会返回 creation_session_id、"
-                    "目标字数、目标章节和各工件状态，再按该 session_id 使用立项读取工具。"
-                )
-            if selected_node:
-                selected_context.append(f"当前选中大纲：{json.dumps(_outline_node_payload(selected_node), ensure_ascii=False)}")
-            if selected_character:
-                selected_context.append(f"当前选中角色：{json.dumps(_character_payload(selected_character), ensure_ascii=False)}")
+            explicit_context: list[str] = []
             if payload.selected_text and payload.selected_text.strip():
                 chapter_label = ""
                 if payload.selected_text_chapter_id:
@@ -1373,92 +697,55 @@ async def workspace_assistant_stream(
                     )
                     if chapter:
                         chapter_label = f"，来自章节「{chapter.title}」"
-                selected_context.append(f"用户选中了以下文本{chapter_label}：\n```\n{payload.selected_text.strip()}\n```")
+                explicit_context.append(f"用户明确选中了以下文本{chapter_label}：\n```\n{payload.selected_text.strip()}\n```")
 
             history_text = _assistant_history_from_messages(db, conversation.id, before_message_id=user_msg_db.id, limit=8)
             if history_text == "暂无对话历史。":
                 history_text = _assistant_history_text(payload.history)
 
-            previous_search_context = _previous_search_context_from_messages(db, conversation.id, before_message_id=user_msg_db.id)
+            authorized_tool_names = set(select_workspace_tool_names())
+            if local_cli_mcp_enabled:
+                authorized_tool_names = {
+                    tool.name for tool in registry.list_for_mcp(permission_pack="project_management")
+                }
+            active_categories: tuple[str, ...] = ()
+            category_selected = False
+            observed_category_version = 0
+            workspace_tool_names: list[str] = []
+            workspace_tool_name_set: set[str] = {TOOL_CATEGORY_CONTROLLER}
+            workspace_tool_schemas = [tool_category_controller_schema()]
 
-            # --- Two-phase memory recall ---
-            from ..services.workspace.tools.memory import normalize_category
-            _FIXED_CATS = ["user_preference", "writing_style", "workflow_preference", "preference"]
-            _RELATED_CATS = ["project_fact", "research_note", "fact", "search_result", "note"]
-
-            workspace = assistant_workspace(db)
-            fixed_memories = workspace.memories(project_id, _FIXED_CATS, limit=10)
-
-            related_memories: list = []
-            query_terms = re.findall(r"[一-鿿]{2,12}|[A-Za-z][A-Za-z0-9_-]{2,30}", payload.message or "")
-            if query_terms:
-                related_memories = workspace.related_memories(
-                    project_id,
-                    _RELATED_CATS,
-                    query_terms[:5],
-                    limit=10,
-                )
-
-            seen_ids = {m.id for m in fixed_memories}
-            all_mem = [
-                {"category": normalize_category(m.category), "key": m.key, "value": m.value, "importance": m.importance}
-                for m in fixed_memories
-            ] + [
-                {"category": normalize_category(m.category), "key": m.key, "value": m.value, "importance": m.importance}
-                for m in related_memories if m.id not in seen_ids
-            ]
-            memory_context = format_memory_context(all_mem)
-            workspace_tool_names = select_workspace_tool_names(
-                scope=payload.scope,
-                message=payload.message,
-                selected_text=bool(payload.selected_text and payload.selected_text.strip()),
-            )
-            workspace_tool_schemas = build_workspace_tool_schemas(workspace_tool_names)
-
-            system_prompt = build_system_prompt(
-                get_workspace_pack(payload.assistant_mode),
-                scope=payload.scope,
+            base_system_prompt = build_system_prompt(
+                get_workspace_pack(),
                 outline_batch_count=payload.outline_batch_count,
-                auto_apply=payload.auto_apply,
-                tool_names=workspace_tool_names,
             )
 
-            # --- Skill selection and injection ---
-            matched_skills = select_relevant_skills(db, project_id, payload.message, payload.scope)
-            skill_prompt_section, skill_info = build_skill_prompt_section(matched_skills)
-            if skill_prompt_section:
-                system_prompt = build_system_prompt(
-                    get_workspace_pack(payload.assistant_mode),
-                    skill_prompts=skill_prompt_section,
-                    scope=payload.scope,
-                    outline_batch_count=payload.outline_batch_count,
-                    auto_apply=payload.auto_apply,
-                    tool_names=workspace_tool_names,
+            if local_cli_mcp_enabled:
+                local_cli_contract = (
+                    "当前进程已连接仅限本轮、仅限当前作品的 Siming MCP 服务器 siming_turn。"
+                    "项目数据的读取和修改必须直接调用该服务器中的工具；"
+                    "不要输出工具 JSON，不要启动另一个 CLI，不要修改任何全局 MCP 配置。"
+                    "请依据用户最新消息和真实项目数据自行判断任务、选择目标与工具。"
+                    "若决定生成章节正文，必须先取得真实章级大纲 ID，再读取写作上下文并保存一份未入库草稿；"
+                    "草稿保存成功后立即结束，不得继续执行角色、关系、世界观或建档写入。"
                 )
-            if skill_info:
-                yield _sse_event({
-                    "type": "skills_matched",
-                    "skills": skill_info,
-                })
-            if local_cli_bridge_mode:
-                system_prompt = (
-                    f"{system_prompt}\n\n"
-                    f"{_workspace_local_cli_bridge_prompt(allow_writes=local_cli_permission_granted)}"
-                )
+                base_system_prompt = f"{base_system_prompt}\n\n{local_cli_contract}"
             initial_user = build_workspace_assistant_initial_user_message(
+                project_id=project_id,
                 project_title=project.title,
-                project_description=project.description,
-                style_context=style_context,
                 history_text=history_text,
-                selected_context=selected_context,
-                previous_search_context=previous_search_context,
-                memory_context=memory_context,
+                explicit_context=explicit_context,
                 outline_batch_count=payload.outline_batch_count,
-                auto_apply=payload.auto_apply,
                 user_message=payload.message,
             )
             messages: list[dict] = [
-                {"role": "system", "content": system_prompt},
+                {
+                    "role": "system",
+                    "content": (
+                        f"{base_system_prompt}\n\n"
+                        f"{_workspace_category_instruction(active_categories, category_selected=category_selected)}"
+                    ),
+                },
                 {"role": "user", "content": initial_user},
             ]
 
@@ -1466,43 +753,43 @@ async def workspace_assistant_stream(
             yield _sse_event({"type": "status", "message": "AI 助手开始分析和检索资料...", "tool": "agent_loop"})
 
             searched_queries: set[tuple] = set()
+            turn_terminal_result: dict[str, Any] | None = None
             try:
                 supports_function_calling = LLMGateway.supports_tool_calling(payload.model)
             except Exception:
                 supports_function_calling = True
+            if not supports_function_calling and not local_cli_mcp_enabled:
+                raise LLMError(
+                    "当前模型不支持原生工具调用，也没有可用的进程级 Siming MCP；"
+                    "无法执行项目 Agent 任务"
+                )
             use_function_calling = supports_function_calling
-            allow_plain_text_fallback = (
-                not supports_function_calling and not local_cli_bridge_mode
-            )
+
             if not supports_function_calling:
-                if local_cli_mcp_enabled:
-                    mode_message = (
-                        "OpenCode 已连接当前作品范围的临时 Siming MCP，"
-                        "可自行选择项目读写工具。"
-                    )
-                    mode_tool = "local_cli_mcp_mode"
-                elif local_cli_bridge_mode and local_cli_permission_granted:
-                    mode_message = (
-                        "本机 CLI 已启用受控工具桥；"
-                        "本轮可由司命校验并执行项目读写工具。"
-                    )
-                    mode_tool = "local_cli_bridge_mode"
-                elif local_cli_bridge_mode:
-                    mode_message = (
-                        "本机 CLI 已进入安全工具桥；"
-                        "读取可直接执行，写入会先请求一次性授权。"
-                    )
-                    mode_tool = "local_cli_bridge_mode"
-                else:
-                    mode_message = "当前模型不支持稳定工具调用，已切换为文本模式。"
-                    mode_tool = "local_cli_mode"
                 yield _sse_event({
                     "type": "status",
-                    "message": mode_message,
-                    "tool": mode_tool,
+                    "message": (
+                        "本机 CLI 已连接当前作品范围的临时 Siming MCP，"
+                        "可自行选择项目读写工具。"
+                    ),
+                    "tool": "local_cli_mcp_mode",
                 })
 
             for iteration in range(1, MAX_ITERATIONS + 1):
+                scoped_names = authorized_tool_names & set(tool_names_for_categories(active_categories))
+                workspace_tool_names = sorted(scoped_names)
+                workspace_tool_name_set = {TOOL_CATEGORY_CONTROLLER, *workspace_tool_names}
+                workspace_tool_schemas = [
+                    tool_category_controller_schema(),
+                    *build_workspace_tool_schemas(workspace_tool_names),
+                ]
+                messages[0] = {
+                    "role": "system",
+                    "content": (
+                        f"{base_system_prompt}\n\n"
+                        f"{_workspace_category_instruction(active_categories, category_selected=category_selected)}"
+                    ),
+                }
                 yield _sse_event({
                     "type": "iteration_start",
                     "iteration": iteration,
@@ -1518,28 +805,60 @@ async def workspace_assistant_stream(
                     fc_error = None
                     reasoning_buffer = ""
                     provider_state: list[dict] = []
+                    resume_notices: list[dict[str, Any]] = []
+
+                    def capture_stream_resume(info: dict[str, Any]) -> None:
+                        resume_notices.append(dict(info))
+
                     try:
                         stream_gen = LLMGateway.stream_chat_completion_with_tools(
                             messages=messages,
                             model=payload.model,
                             temperature=payload.temperature or 0.3,
                             max_tokens=payload.max_tokens,
-                            timeout=0,
+                            timeout=_ASSISTANT_STREAM_TIMEOUT_SECONDS,
                             retry=1,
+                            resume=8,
+                            on_resume=capture_stream_resume,
                             extra_body=local_cli_extra_body,
                             tools=workspace_tool_schemas,
-                            tool_choice="auto",
+                            tool_choice="required" if not category_selected else "auto",
                         )
                         async for chunk in stream_gen:
+                            while resume_notices:
+                                notice = resume_notices.pop(0)
+                                checkpoint_chars = max(0, int(notice.get("checkpoint_chars") or 0))
+                                resume_message = (
+                                    "模型连接中断，正在从已验证的文字检查点继续…"
+                                    if checkpoint_chars else "模型工具响应中断，正在重新获取完整工具调用…"
+                                )
+                                turn_telemetry.report_model_activity(assistant_run, resume_message, message=resume_message)
+                                yield _sse_event({
+                                    "type": "status",
+                                    "message": resume_message,
+                                    "tool": "stream_resume",
+                                })
                             if chunk["type"] == "content_delta":
                                 content_buffer.append(chunk["delta"])
-                                report_model_activity(chunk["delta"])
-                                yield _sse_event({"type": "thinking_delta", "delta": chunk["delta"]})
+                                turn_telemetry.report_model_activity(assistant_run, chunk["delta"])
+                                yield _sse_event({"type": "content_delta", "delta": chunk["delta"]})
                             elif chunk["type"] == "reasoning_delta":
                                 reasoning_buffer += chunk["delta"]
-                                report_model_activity(chunk["delta"], message="模型正在思考")
+                                turn_telemetry.report_model_activity(assistant_run, chunk["delta"], message="模型正在思考")
+                                visible_delta = turn_telemetry.record_reasoning_delta(chunk["delta"], iteration)
+                                if visible_delta:
+                                    yield _sse_event({
+                                        "type": "reasoning_delta",
+                                        "delta": visible_delta,
+                                        "iteration": iteration,
+                                    })
                             elif chunk["type"] == "tool_call_delta":
-                                report_model_activity(chunk.get("name") or chunk.get("arguments_delta") or "", signal="tool", message="模型正在准备工具调用")
+                                turn_telemetry.report_model_activity(
+                                    assistant_run,
+                                    chunk.get("name") or chunk.get("arguments_delta") or "",
+                                    signal="tool",
+                                    message="模型正在准备工具调用",
+                                )
                                 idx = chunk["index"]
                                 if idx not in tool_call_buffers:
                                     tool_call_buffers[idx] = {"id": chunk.get("id", ""), "name": "", "arguments": ""}
@@ -1558,9 +877,17 @@ async def workspace_assistant_stream(
                             elif chunk["type"] == "done":
                                 if not reasoning_buffer:
                                     reasoning_buffer = chunk.get("reasoning_content", "")
+                                    visible_delta = turn_telemetry.record_reasoning_delta(
+                                        reasoning_buffer,
+                                        iteration,
+                                    )
+                                    if visible_delta:
+                                        yield _sse_event({
+                                            "type": "reasoning_delta",
+                                            "delta": visible_delta,
+                                            "iteration": iteration,
+                                        })
                                 provider_state = chunk.get("provider_state") or []
-                    except CLIPermissionRequiredError:
-                        raise
                     except LLMError as e:
                         fc_error = e
                         if "API Key" in str(e) or "提供商" in str(e):
@@ -1569,44 +896,145 @@ async def workspace_assistant_stream(
                         fc_error = e
 
                     if fc_error is not None:
-                        use_function_calling = False
                         err_msg = str(fc_error)
                         err_type = type(fc_error).__name__
                         yield _sse_event({
                             "type": "status",
-                            "message": f"Function calling 失败（{err_type}: {err_msg}），回退到 JSON 模式。",
-                            "tool": "fallback_json",
+                            "message": f"原生工具调用失败（{err_type}: {err_msg}），本轮已停止。",
+                            "tool": "native_tool_protocol_error",
                         })
+                        raise fc_error
 
                 if not use_function_calling:
-                    # --- JSON fallback path ---
                     raw_buffer: list[str] = []
                     stream_error: Exception | None = None
+                    resume_notices: list[dict[str, Any]] = []
+
+                    def capture_text_stream_resume(info: dict[str, Any]) -> None:
+                        resume_notices.append(dict(info))
+
                     stream_gen = LLMGateway.stream_chat_completion(
                         messages=messages,
                         model=payload.model,
                         temperature=payload.temperature or 0.3,
                         max_tokens=payload.max_tokens,
-                        timeout=0,
-                        retry=1,
+                        timeout=_ASSISTANT_STREAM_TIMEOUT_SECONDS,
+                        # A direct-MCP CLI can commit writes before its buffered
+                        # final text is returned. Re-running that process after
+                        # a transport stop would cross the tool idempotency
+                        # boundary, so only pure model streams auto-resume.
+                        retry=0 if local_cli_mcp_enabled else 1,
+                        resume=0 if local_cli_mcp_enabled else 8,
+                        on_resume=capture_text_stream_resume,
                         extra_body=local_cli_extra_body,
                     )
                     try:
                         async for chunk in stream_gen:
+                            while resume_notices:
+                                resume_notices.pop(0)
+                                resume_message = "模型连接中断，正在从已验证的文字检查点继续…"
+                                turn_telemetry.report_model_activity(assistant_run, resume_message, message=resume_message)
+                                yield _sse_event({
+                                    "type": "status",
+                                    "message": resume_message,
+                                    "tool": "stream_resume",
+                                })
                             raw_buffer.append(chunk)
-                            report_model_activity(chunk)
-                            yield _sse_event({"type": "thinking_delta", "delta": chunk})
-                    except CLIPermissionRequiredError:
-                        raise
+                            turn_telemetry.report_model_activity(assistant_run, chunk)
+                            yield _sse_event({"type": "content_delta", "delta": chunk})
                     except Exception as stream_err:
                         stream_error = stream_err
                         yield _sse_event({"type": "status", "message": f"流式输出中断，尝试用已接收内容继续：{stream_err}", "tool": "stream_error"})
                     raw_content = "".join(raw_buffer)
+                    if local_cli_mcp_enabled and tool_category_state_file:
+                        category_state = read_tool_category_state(tool_category_state_file)
+                        next_version = int(category_state.get("version") or 0)
+                        if next_version > observed_category_version:
+                            observed_category_version = next_version
+                            requested = normalize_tool_categories(
+                                category_state.get("requested_categories") or [],
+                            )
+                            category_result, selected_categories = _workspace_category_result(
+                                {"enabled_categories": list(requested)},
+                                authorized_tool_names,
+                            )
+                            if selected_categories is not None:
+                                active_categories = selected_categories
+                                category_selected = True
+                                activate_tool_categories(tool_category_state_file)
+                            tool_logs.append({
+                                "tool": TOOL_CATEGORY_CONTROLLER,
+                                "status": category_result.get("status") or "ok",
+                                "detail": category_result.get("detail") or "",
+                            })
+                            yield _sse_event({
+                                "type": "tool_categories_changed",
+                                "tool": TOOL_CATEGORY_CONTROLLER,
+                                "result": category_result,
+                                "iteration": iteration,
+                            })
+                            yield _sse_event({
+                                "type": "iteration_end",
+                                "iteration": iteration,
+                                "message": "工具类别已切换，正在按新类别启动下一模型步骤",
+                            })
+                            continue
+                    if local_cli_mcp_enabled and not category_selected and stream_error is None:
+                        raise LLMError(
+                            "本机 CLI 没有调用临时 MCP 中唯一开放的 set_tool_categories，"
+                            "本轮已终止，未接受 CLI 返回的等待或完成文字"
+                        )
+                    if local_cli_mcp_enabled:
+                        # The CLI can commit the terminal draft before its
+                        # buffered final text reaches this process. Durable
+                        # draft evidence is authoritative even when transport
+                        # completion was lost.
+                        db.expire_all()
+                        generated_draft = find_new_pending_chapter_draft(
+                            db,
+                            project_id,
+                            pending_draft_ids_before,
+                        )
+                        if generated_draft is not None:
+                            turn_terminal_result = apply_turn_directive(
+                                {
+                                    "tool": "save_external_chapter_draft",
+                                    "status": "ok",
+                                    "detail": "本机 CLI 已生成章节草稿，尚未保存",
+                                    "data": chapter_draft_result_data(generated_draft),
+                                },
+                                AssistantTurnDirective.END_AFTER_DRAFT,
+                            )
+                            applied_actions.append(turn_terminal_result)
+                            tool_logs.append({
+                                "tool": "save_external_chapter_draft",
+                                "status": "ok",
+                                "detail": turn_terminal_result["detail"],
+                            })
+                            final_reply = terminal_tool_reply(turn_terminal_result)
+                            final_model = payload.model or ""
+                            final_usage = None
+                            yield _sse_event({
+                                "type": "write_result",
+                                "tool": "save_external_chapter_draft",
+                                "result": turn_terminal_result,
+                                "iteration": iteration,
+                            })
+                            yield _sse_event({
+                                "type": "iteration_end",
+                                "iteration": iteration,
+                                "message": "章节草稿已生成，已到达服务端回合终止边界",
+                            })
+                            break
                     if stream_error is not None:
                         detail = str(stream_error)
                         tool_logs.append({"tool": "stream_error", "status": "error", "detail": detail})
-                        final_reply = f"模型调用中断，未执行写入：{detail}"
-                        all_actions = []
+                        final_reply = (
+                            "本机 CLI 连接中断。为避免重复执行可能已经提交的 MCP 写入，"
+                            "系统没有自动重启该进程；已提交结果以当前项目数据为准，"
+                            "下次请求会从真实项目状态继续。"
+                            if local_cli_mcp_enabled else f"模型调用中断，未执行写入：{detail}"
+                        )
                         final_model = payload.model or ""
                         final_usage = None
                         yield _sse_event({
@@ -1615,194 +1043,23 @@ async def workspace_assistant_stream(
                             "message": "模型输出中断，本轮已停止执行",
                         })
                         break
-                    parsed = _parse_json_object(raw_content)
-                    if parsed is None and allow_plain_text_fallback:
-                        final_reply = raw_content.strip()
-                        all_actions = []
-                        final_model = payload.model or ""
-                        final_usage = None
-                        yield _sse_event({
-                            "type": "iteration_end",
-                            "iteration": iteration,
-                            "message": "本机 CLI 已返回普通文本回复",
-                        })
-                        break
-                    if parsed is None:
-                        yield _sse_event({
-                            "type": "status",
-                            "message": "模型返回的工具JSON格式不合法，正在自动修复",
-                            "tool": "json_repair",
-                        })
-                        repair_step = start_run_step(
-                            db,
-                            assistant_run,
-                            step_type="repair",
-                            tool="json_repair",
-                            iteration=iteration,
-                            request={"raw_length": len(raw_content), "raw_preview": raw_content[:1000]},
-                            detail="模型返回的工具JSON格式不合法，正在自动修复",
-                        )
-                        parsed = await _repair_workspace_json_output(raw_content, payload.model)
-                        if parsed is not None:
-                            tool_logs.append({"tool": "json_repair", "status": "ok", "detail": "已修复模型工具JSON"})
-                            finish_run_step(db, repair_step, status="ok", result={"keys": list(parsed.keys())}, detail="已修复模型工具JSON")
-                            yield _sse_event({"type": "tool", **tool_logs[-1]})
-                        else:
-                            tool_logs.append({"tool": "json_repair", "status": "error", "detail": "模型输出无法解析，未执行写入工具"})
-                            finish_run_step(db, repair_step, status="error", detail="模型输出无法解析，未执行写入工具", error="parse_failed")
-                            yield _sse_event({"type": "tool", **tool_logs[-1]})
-                    parsed = parsed or {
-                        "reply": "模型返回的工具格式不合法，已停止执行写入。请重试一次，或让助手先生成较短章节。",
-                        "done": True,
-                        "actions": [],
-                        "needs_confirmation": False,
-                    }
+                    final_reply = raw_content.strip()
                     final_model = payload.model or ""
                     final_usage = None
-
-                    is_done = bool(parsed.get("done", True))
-                    actions: list[dict] = parsed.get("actions") if isinstance(parsed.get("actions"), list) else []
-                    reply_part = str(parsed.get("reply") or "")
-
-                    if reply_part:
-                        yield _sse_event({"type": "thinking", "content": reply_part, "iteration": iteration})
-
-                    search_actions = [a for a in actions if isinstance(a, dict) and a.get("tool") in SEARCH_TOOL_NAMES]
-                    write_actions = [a for a in actions if isinstance(a, dict) and a.get("tool") in WRITE_TOOL_NAMES]
-
-                    if write_actions and local_cli_selected and not local_cli_permission_granted:
-                        requested_tools = ", ".join(
-                            sorted({str(action.get("tool") or "") for action in write_actions})
-                        )
-                        raise CLIPermissionRequiredError(
-                            f"项目写入工具需要一次性授权：{requested_tools or 'write'}"
-                        )
-
-                    if not is_done and write_actions:
-                        yield _sse_event({
-                            "type": "status",
-                            "message": f"跳过 {len(write_actions)} 个写入工具（非最终轮次）",
-                            "tool": "skip_write_actions",
-                        })
-                        write_actions = []
-
-                    yield _sse_event({
-                        "type": "tool",
-                        "tool": "planner",
-                        "status": "ok",
-                        "detail": f"第 {iteration} 轮：{'完成分析' if is_done else '需要更多信息'}，{len(search_actions)} 个搜索，{len(write_actions)} 个写入",
-                    })
-
-                    if is_done:
-                        all_actions = write_actions
-                        final_reply = reply_part
-                        yield _sse_event({
-                            "type": "iteration_end",
-                            "iteration": iteration,
-                            "message": "分析完成，准备执行最终操作",
-                        })
-                        break
-
-                    # Execute search actions (JSON path)
-                    if search_actions:
-                        search_results: list[dict] = []
-                        for action in search_actions[:8]:
-                            tool_name = str(action.get("tool") or "search")
-                            args = action.get("arguments") if isinstance(action.get("arguments"), dict) else {}
-
-                            dedup_key = (tool_name, json.dumps(args, ensure_ascii=False, sort_keys=True))
-                            if dedup_key in searched_queries:
-                                skipped_step = start_run_step(
-                                    db,
-                                    assistant_run,
-                                    step_type="search",
-                                    tool=tool_name,
-                                    iteration=iteration,
-                                    request=args,
-                                    detail="已查询过，见上文结果",
-                                )
-                                finish_run_step(db, skipped_step, status="skipped", result={"detail": "已查询过"})
-                                yield _sse_event({
-                                    "type": "search_result",
-                                    "tool": tool_name,
-                                    "result": {"tool": tool_name, "status": "skipped", "detail": "已查询过，见上文结果", "data": []},
-                                    "iteration": iteration,
-                                })
-                                continue
-                            searched_queries.add(dedup_key)
-
-                            step = start_run_step(
-                                db,
-                                assistant_run,
-                                step_type="search",
-                                tool=tool_name,
-                                iteration=iteration,
-                                request=args,
-                            )
-                            yield _sse_event({
-                                "type": "search_start",
-                                "tool": tool_name,
-                                "args": args,
-                                "iteration": iteration,
-                                "step_id": step.id if step else None,
-                            })
-                            try:
-                                action_result = await _execute_workspace_action(
-                                    db, project_id, action, assistant_mode=payload.assistant_mode, model=payload.model
-                                )
-                            except Exception as exc:
-                                action_result = {"tool": tool_name, "status": "error", "detail": str(exc), "data": []}
-                            finish_run_step(
-                                db,
-                                step,
-                                status=str(action_result.get("status") or "ok"),
-                                result=action_result,
-                                detail=str(action_result.get("detail") or ""),
-                                error=str(action_result.get("detail") or "") if action_result.get("status") == "error" else None,
-                            )
-                            search_results.append(action_result)
-                            tool_logs.append({
-                                "tool": action_result.get("tool") or tool_name,
-                                "status": action_result.get("status") or "ok",
-                                "detail": action_result.get("detail") or "",
-                            })
-                            yield _sse_event({
-                                "type": "search_result",
-                                "tool": tool_name,
-                                "result": action_result,
-                                "iteration": iteration,
-                                "step_id": step.id if step else None,
-                            })
-
-                        for action_result in search_results:
-                            compressed = _compress_search_result(action_result)
-                            if compressed:
-                                searched_context.append(compressed)
-
-                        messages.append({"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False)})
-                        messages.append({"role": "user", "content": format_tool_result_message(iteration, search_results)})
-
+                    completion_message = (
+                        "本机 CLI 已通过原生 MCP 完成本轮并返回文字结果"
+                        if local_cli_mcp_enabled
+                        else "模型执行器已完成本轮并返回文字结果"
+                    )
                     yield _sse_event({
                         "type": "iteration_end",
                         "iteration": iteration,
-                        "message": f"第 {iteration} 轮完成，{'获得 ' + str(len(search_actions)) + ' 条搜索结果' if search_actions else '未请求搜索'}",
+                        "message": completion_message,
                     })
-
-                    if iteration == MAX_ITERATIONS:
-                        yield _sse_event({
-                            "type": "status",
-                            "message": f"已达到 {MAX_ITERATIONS} 轮搜索上限，基于已有信息给出最终回复",
-                            "tool": "max_iterations",
-                        })
-                        all_actions = []
-                        final_reply = parsed.get("reply", "") or "已分析完毕。"
-                        break
-                    continue
+                    break
 
                 # --- Function calling: process accumulated tool calls ---
                 reply_text = "".join(content_buffer)
-                if reply_text:
-                    yield _sse_event({"type": "thinking", "content": reply_text, "iteration": iteration})
 
                 # Build tool_calls list from accumulated buffers
                 tool_calls: list[dict] = []
@@ -1823,58 +1080,53 @@ async def workspace_assistant_stream(
                         },
                     })
 
-                se_names = SEARCH_TOOL_NAMES
-                wr_names = WRITE_TOOL_NAMES
-                if local_cli_selected and not local_cli_permission_granted:
-                    requested_writes = [
-                        tc["function"]["name"]
-                        for tc in tool_calls
-                        if tc["function"]["name"] in wr_names
-                    ]
-                    if requested_writes:
-                        raise CLIPermissionRequiredError(
-                            "项目写入工具需要一次性授权："
-                            + ", ".join(sorted(set(requested_writes)))
+                category_calls = [
+                    call for call in tool_calls
+                    if call["function"]["name"] == TOOL_CATEGORY_CONTROLLER
+                ]
+                if category_calls:
+                    # A category replacement invalidates every other schema in
+                    # this model step, regardless of emitted call order.
+                    tool_calls = category_calls[:1]
+                else:
+                    if not category_selected and tool_calls:
+                        raise LLMError(
+                            "模型没有调用本步骤唯一开放的 set_tool_categories，"
+                            "本轮已终止，未执行模型虚构的其他工具调用"
                         )
+                    # A chapter draft is the sole business operation in its batch.
+                    draft_calls = [
+                        call
+                        for call in tool_calls
+                        if call["function"]["name"] in {"chapter_writer", "save_external_chapter_draft"}
+                    ]
+                    if draft_calls:
+                        tool_calls = draft_calls[:1]
 
+                wr_names = {
+                    name for name in workspace_tool_name_set
+                    if (definition := registry.get(name)) is not None
+                    and definition.tool_type == "write"
+                }
+                se_names = workspace_tool_name_set - wr_names - {TOOL_CATEGORY_CONTROLLER}
                 yield _sse_event({
                     "type": "tool",
-                    "tool": "planner",
+                    "tool": "tool_batch",
                     "status": "ok",
                     "detail": f"第 {iteration} 轮：{len(tool_calls)} 个工具调用（{len([t for t in tool_calls if t['function']['name'] in se_names])} 个搜索，{len([t for t in tool_calls if t['function']['name'] in wr_names])} 个写入）",
                 })
 
                 # Agent decides it's done — no tool calls, just text
                 if not tool_calls:
+                    if not category_selected:
+                        raise LLMError(
+                            "模型没有调用本步骤唯一开放的 set_tool_categories，"
+                            "本轮已终止，未接受模型伪造的等待或完成回复"
+                        )
                     if not reply_text.strip():
-                        use_function_calling = False
-                        allow_plain_text_fallback = True
-                        yield _sse_event({
-                            "type": "status",
-                            "message": "模型未返回正文或工具调用，正在降级为文本/JSON模式重试。",
-                            "tool": "empty_tool_stream_fallback",
-                        })
-                        yield _sse_event({
-                            "type": "iteration_end",
-                            "iteration": iteration,
-                            "message": "工具调用流为空，改用文本/JSON模式",
-                        })
-                        continue
-                    if iteration <= 2 and reply_text.strip():
-                        # Guard: agent stopped too early with a text reply
-                        _asst_msg: dict = {"role": "assistant", "content": reply_text}
-                        if reasoning_buffer:
-                            _asst_msg["reasoning_content"] = reasoning_buffer
-                        messages.append(_asst_msg)
-                        messages.append({"role": "user", "content": "信息还不足够，请继续搜索。先查相关章节正文和大纲上下文，不要急于给出最终回复。"})
-                        yield _sse_event({
-                            "type": "iteration_end",
-                            "iteration": iteration,
-                            "message": "信息不足，要求继续搜索",
-                        })
-                        continue
-                    # Agent is truly done
-                    final_reply = reply_text
+                        final_reply = "当前模型没有返回文字或工具调用，本轮未执行任何操作。"
+                    else:
+                        final_reply = reply_text
                     final_model = payload.model or ""
                     final_usage = None
                     yield _sse_event({
@@ -1886,6 +1138,8 @@ async def workspace_assistant_stream(
 
                 # Agent called tools — execute ALL of them (search and write alike)
                 all_results: list[dict] = []
+                native_stop_reason = ""
+                category_changed = False
                 for tc in tool_calls[:12]:
                     tool_name = tc["function"]["name"]
                     try:
@@ -1895,27 +1149,17 @@ async def workspace_assistant_stream(
 
                     dedup_key = (tool_name, json.dumps(tc_args, ensure_ascii=False, sort_keys=True))
                     is_write = tool_name in wr_names
-                    action_type = "write" if is_write else "search"
-                    if tool_name in se_names and dedup_key in searched_queries:
-                        skipped_step = start_run_step(
-                            db,
-                            assistant_run,
-                            step_type=action_type,
-                            tool=tool_name,
-                            iteration=iteration,
-                            request=tc_args,
-                            detail="已查询过，见上文结果",
-                        )
-                        finish_run_step(db, skipped_step, status="skipped", result={"detail": "已查询过"})
-                        yield _sse_event({
-                            "type": "search_result",
-                            "tool": tool_name,
-                            "result": {"tool": tool_name, "status": "skipped", "detail": "已查询过，见上文结果", "data": []},
-                            "iteration": iteration,
-                            "step_id": skipped_step.id if skipped_step else None,
-                        })
-                        all_results.append({"tool": tool_name, "status": "skipped", "detail": "已查询过", "data": []})
-                        continue
+                    action_type = (
+                        "control" if tool_name == TOOL_CATEGORY_CONTROLLER
+                        else "write" if is_write
+                        else "search"
+                    )
+
+                    if native_stop_reason:
+                        break
+                    if dedup_key in searched_queries:
+                        native_stop_reason = "duplicate_tool"
+                        break
                     searched_queries.add(dedup_key)
 
                     action = {"tool": tool_name, "arguments": tc_args}
@@ -1936,12 +1180,26 @@ async def workspace_assistant_stream(
                         "iteration": iteration,
                         "step_id": step.id if step else None,
                     })
-                    try:
-                        action_result = await _execute_workspace_action(
-                            db, project_id, action, assistant_mode=payload.assistant_mode, model=payload.model
+                    if tool_name == TOOL_CATEGORY_CONTROLLER:
+                        action_result, selected_categories = _workspace_category_result(
+                            tc_args,
+                            authorized_tool_names,
                         )
-                    except Exception as exc:
-                        action_result = {"tool": tool_name, "status": "error", "detail": str(exc), "data": []}
+                        if selected_categories is not None:
+                            active_categories = selected_categories
+                            category_selected = True
+                        category_changed = True
+                    else:
+                        try:
+                            action_result = await _execute_workspace_action(
+                                db,
+                                project_id,
+                                action,
+                                model=payload.model,
+                                authorized_tool_names=workspace_tool_name_set,
+                            )
+                        except Exception as exc:
+                            action_result = {"tool": tool_name, "status": "error", "detail": str(exc), "data": []}
                     finish_run_step(
                         db,
                         step,
@@ -1964,12 +1222,65 @@ async def workspace_assistant_stream(
                         "iteration": iteration,
                         "step_id": step.id if step else None,
                     })
+                    if category_changed:
+                        break
+                    if "cataloging" in tool_name:
+                        turn_terminal_result = action_result
+                        native_stop_reason = "cataloging_status"
+                        break
+                    elif is_terminal_tool_result(action_result):
+                        turn_terminal_result = action_result
+                        native_stop_reason = "terminal_tool"
+                        applied_actions.append(action_result)
+                        break
 
                 for action_result in all_results:
                     if action_result.get("tool") in se_names:
                         compressed = _compress_search_result(action_result)
                         if compressed:
                             searched_context.append(compressed)
+
+                if category_changed:
+                    assistant_tool_calls = [
+                        {"id": tc["id"], "type": "function", "function": tc["function"]}
+                        for tc in tool_calls
+                    ]
+                    category_message: dict[str, Any] = {
+                        "role": "assistant",
+                        "content": reply_text or None,
+                        "tool_calls": assistant_tool_calls,
+                    }
+                    if reasoning_buffer:
+                        category_message["reasoning_content"] = reasoning_buffer
+                    if provider_state:
+                        category_message["provider_state"] = provider_state
+                    messages.append(category_message)
+                    for tc, action_result in zip(tool_calls, all_results):
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": json.dumps(action_result, ensure_ascii=False),
+                        })
+                    yield _sse_event({
+                        "type": "iteration_end",
+                        "iteration": iteration,
+                        "message": "工具类别已切换，当前模型步骤结束",
+                    })
+                    continue
+
+                if native_stop_reason:
+                    if turn_terminal_result and is_terminal_tool_result(turn_terminal_result):
+                        final_reply = terminal_tool_reply(turn_terminal_result)
+                    elif turn_terminal_result:
+                        final_reply = str(turn_terminal_result.get("detail") or "已查询建档状态，本轮结束。")
+                    else:
+                        final_reply = "本轮没有获得新的查询结果，已停止重复推理。"
+                    yield _sse_event({
+                        "type": "iteration_end",
+                        "iteration": iteration,
+                        "message": "已到达服务端回合终止边界，不再调用模型",
+                    })
+                    break
 
                 # Feed results back as tool_result messages
                 assistant_tool_calls = [
@@ -2001,269 +1312,22 @@ async def workspace_assistant_stream(
                 # No continue here — loop naturally goes to next iteration
             else:
                 # Loop completed without break (shouldn't happen, but guard)
-                all_actions = []
                 final_reply = "已分析完毕。"
 
-            # --- Phase 4: Final write action execution ---
-            needs_conf = False
-            if all_actions and _chapter_action_needs_outline_confirmation(db, project_id, all_actions, payload.message):
-                all_actions = []
-                needs_conf = True
-                reply = final_reply.strip()
-                if "是否" not in reply and "确认" not in reply:
-                    final_reply = (
-                        f"{reply}\n\n" if reply else ""
-                    ) + f"我会先按接下来 {payload.outline_batch_count} 章给出大纲方向，请你确认是否按这个方向发展。"
-
-            if payload.auto_apply and all_actions:
-                created_outline_ids_by_title: dict[str, str] = {}
-                for action in all_actions[:12]:
-                    tool = str(action.get("tool") or "tool")
-                    args = action.get("arguments") if isinstance(action.get("arguments"), dict) else {}
-                    if tool in {"create_chapter", "update_chapter"}:
-                        outline_title = str(args.get("outline_node_title") or args.get("outline_title") or "").strip()
-                        if outline_title and outline_title in created_outline_ids_by_title:
-                            args["outline_node_id"] = created_outline_ids_by_title[outline_title]
-                            action["arguments"] = args
-                    idem_key = generate_idempotency_key(db, tool, project_id, args) if tool in ("create_chapter", "create_character", "create_outline_node", "create_outline_nodes", "create_worldbuilding_entry", "create_relationship") else None
-                    step = start_run_step(
-                        db,
-                        assistant_run,
-                        step_type="write",
-                        tool=tool,
-                        iteration=MAX_ITERATIONS + 1,
-                        request=args,
-                        detail="最终写入操作",
-                        idempotency_key=idem_key,
-                    )
-                    yield _sse_event({"type": "status", "message": f"正在执行工具：{tool}", "tool": tool, "step_id": step.id if step else None})
-                    try:
-                        action_result = await _execute_workspace_action(
-                            db, project_id, action, assistant_mode=payload.assistant_mode, model=payload.model
-                        )
-                    except Exception as exc:
-                        action_result = {"tool": tool, "status": "error", "detail": str(exc)}
-                    finish_run_step(
-                        db,
-                        step,
-                        status=str(action_result.get("status") or "ok"),
-                        result=action_result,
-                        detail=str(action_result.get("detail") or ""),
-                        error=str(action_result.get("detail") or "") if action_result.get("status") == "error" else None,
-                    )
-                    if tool == "create_outline_node" and action_result.get("status") == "ok":
-                        data = action_result.get("data") if isinstance(action_result.get("data"), dict) else {}
-                        title = str(data.get("title") or args.get("title") or "").strip()
-                        node_id = str(data.get("id") or "").strip()
-                        if title and node_id:
-                            created_outline_ids_by_title[title] = node_id
-                    elif tool == "create_outline_nodes" and action_result.get("status") == "ok":
-                        data = action_result.get("data") if isinstance(action_result.get("data"), dict) else {}
-                        nodes = data.get("nodes") if isinstance(data.get("nodes"), list) else []
-                        for node in nodes:
-                            if not isinstance(node, dict):
-                                continue
-                            title = str(node.get("title") or "").strip()
-                            node_id = str(node.get("id") or "").strip()
-                            if title and node_id:
-                                created_outline_ids_by_title[title] = node_id
-                    applied_actions.append(action_result)
-                    tool_logs.append({
-                        "tool": action_result.get("tool") or tool,
-                        "status": action_result.get("status") or "ok",
-                        "detail": action_result.get("detail") or "",
-                    })
-                    yield _sse_event({"type": "tool", **tool_logs[-1], "step_id": step.id if step else None})
-                commit_session(db)
-
-                # Auto-refresh search context so next turn sees fresh data
-                refresh_tools: dict[str, str] = {}
-                for ar in applied_actions:
-                    tool = str(ar.get("tool") or "")
-                    if ar.get("status") != "ok":
-                        continue
-                    if tool in ("create_outline_node", "create_outline_nodes", "update_outline_node", "delete_outline_node"):
-                        refresh_tools["search_outline_tree"] = "{}"
-                    elif tool in ("create_character", "update_character", "delete_character"):
-                        refresh_tools["list_characters"] = "{}"
-                    elif tool in ("create_worldbuilding_entry", "update_worldbuilding_entry", "delete_worldbuilding_entry"):
-                        refresh_tools["list_worldbuilding"] = "{}"
-                    elif tool in ("create_chapter", "update_chapter", "delete_chapter"):
-                        refresh_tools["list_chapters"] = "{}"
-                for rt, rt_args in refresh_tools.items():
-                    step = start_run_step(
-                        db,
-                        assistant_run,
-                        step_type="refresh",
-                        tool=rt,
-                        iteration=MAX_ITERATIONS + 2,
-                        request=json.loads(rt_args),
-                        detail="写入后刷新轻量上下文",
-                    )
-                    try:
-                        rt_result = await _execute_workspace_action(
-                            db, project_id,
-                            {"tool": rt, "arguments": json.loads(rt_args)},
-                            assistant_mode=payload.assistant_mode,
-                            model=payload.model,
-                        )
-                        finish_run_step(db, step, status=str(rt_result.get("status") or "ok"), result=rt_result, detail=str(rt_result.get("detail") or ""))
-                        compressed = _compress_search_result(rt_result)
-                        if compressed:
-                            searched_context.append(compressed)
-                    except Exception as exc:
-                        finish_run_step(db, step, status="error", detail="写入后刷新失败", error=str(exc))
-            elif all_actions:
-                log = {"tool": "auto_apply", "status": "skipped", "detail": "自动执行已关闭"}
-                tool_logs.append(log)
-                step = start_run_step(
-                    db,
-                    assistant_run,
-                    step_type="write",
-                    tool="auto_apply",
-                    iteration=MAX_ITERATIONS + 1,
-                    request={"actions": all_actions},
-                    detail=log["detail"],
-                )
-                finish_run_step(db, step, status="skipped", result=log, detail=log["detail"])
-                yield _sse_event({"type": "tool", **log, "step_id": step.id if step else None})
-
-            # --- Phase 5: Finalize ---
-            failed_logs = [
-                log for log in tool_logs
-                if str(log.get("status") or "").lower() == "error"
-            ]
-            final_reply_for_save = _build_workspace_final_reply(
-                final_reply,
-                all_actions=all_actions,
-                applied_actions=applied_actions,
-                tool_logs=tool_logs,
-                searched_context=searched_context,
-                needs_confirmation=needs_conf,
-            )
-            if failed_logs:
-                failed_text = "；".join(
-                    f"{log.get('tool')}: {log.get('detail') or '执行失败'}"
-                    for log in failed_logs[:3]
-                )
-                final_reply_for_save = (
-                    f"{final_reply_for_save}\n\n注意：本轮有工具执行失败，相关数据可能未保存：{failed_text}"
-                ).strip()
-            outcome = _workspace_outcome(
-                final_reply,
-                all_actions=all_actions,
-                applied_actions=applied_actions,
-                tool_logs=tool_logs,
-                searched_context=searched_context,
-                needs_confirmation=needs_conf,
-                failed_logs=failed_logs,
-            )
-            response_payload = {
-                "reply": final_reply_for_save,
-                "outcome": outcome,
-                "actions": all_actions,
-                "applied_actions": applied_actions,
-                "tool_logs": tool_logs,
-                "searched_context": searched_context,
-                "scope": payload.scope,
-                "model": final_model,
-                "usage": final_usage,
-            }
-            if assistant_run:
-                response_payload["run"] = run_payload(assistant_run)
-            assistant_msg_db.content = response_payload["reply"]
-            assistant_msg_db.payload_json = json.dumps(response_payload, ensure_ascii=False)
-            assistant_msg_db.status = "completed"
-            assistant_msg_db.updated_at = datetime.utcnow()
-            conversation.updated_at = datetime.utcnow()
-            commit_session(db)
-            mark_assistant_run(
+            # --- Phase 4: Finalize ---
+            response_payload = finalize_workspace_assistant_turn(
                 db,
-                assistant_run,
-                status="error" if outcome == "failed" else "completed",
-                phase="error" if outcome == "failed" else outcome,
-                final_reply=final_reply_for_save,
-                outcome=outcome,
+                assistant_run=assistant_run,
+                assistant_message=assistant_msg_db,
+                conversation=conversation,
+                final_reply=final_reply,
+                applied_actions=applied_actions,
+                tool_logs=tool_logs,
+                searched_context=searched_context,
+                final_model=final_model,
+                final_usage=final_usage,
+                reasoning_content="".join(turn_telemetry.reasoning_parts).strip(),
             )
-
-            # --- Auto-extract memories from conversation (fire-and-forget) ---
-            try:
-                should_auto_extract_memory = LLMGateway.supports_tool_calling(payload.model)
-            except Exception:
-                should_auto_extract_memory = True
-            if final_reply and payload.message and should_auto_extract_memory:
-                _pid, _umsg, _areply = project_id, payload.message, final_reply_for_save
-
-                async def _extract_and_save_memories():
-                    from ..database.session import SessionLocal as _SL
-                    from ..prompts.packs.memory_extraction import PACK as _MP
-                    from ..services.workspace.tools.memory import remember as _rem
-                    _db = _SL()
-                    try:
-                        _conv = f"用户：{_umsg}\n助手：{_areply}"
-                        _resp = await LLMGateway.chat_completion(
-                            messages=[{"role": "system", "content": _MP.build_system_prompt()},
-                                      {"role": "user", "content": _conv}],
-                            model=payload.model if request_provider is not None else None,
-                            temperature=0.2,
-                            max_tokens=2000,
-                            extra_body=LLMGateway.local_cli_extra_body(
-                                payload.model if request_provider is not None else None,
-                                cwd=project_folder,
-                            ),
-                        )
-                        _raw = _resp.get("content", "")
-                        try:
-                            _items = json.loads(_raw)
-                        except (json.JSONDecodeError, TypeError):
-                            _m = re.search(r"\[.*\]", _raw, re.DOTALL)
-                            _items = json.loads(_m.group()) if _m else []
-                        if not isinstance(_items, list):
-                            return
-                        saved = 0
-                        for item in _items:
-                            if saved >= 5:
-                                break
-                            _k = str(item.get("key") or "").strip()
-                            _v = str(item.get("value") or "").strip()
-                            _ev = str(item.get("evidence") or "").strip()
-                            _cat = str(item.get("category") or "").strip()
-                            _imp = int(item.get("importance") or 0)
-                            if not _k or not _v or not _ev or _imp < 7 or _ev not in _umsg:
-                                continue
-                            await _rem(_db, _pid, {
-                                "key": _k, "value": _v, "category": _cat,
-                                "importance": _imp, "source": "auto_extract",
-                            })
-                            saved += 1
-                    except NotFoundError:
-                        # No configured model: memory extraction is optional and should not
-                        # turn a successful assistant reply into noisy server logs.
-                        pass
-                    except Exception:
-                        import logging
-                        logging.getLogger(__name__).exception("memory auto-extract failed")
-                    finally:
-                        _db.close()
-
-                if request_provider is not None:
-                    # A phone-owned credential may not escape the request task
-                    # through a copied ContextVar in a fire-and-forget task.
-                    # Run the same memory extraction before completing the
-                    # stream, then release the ephemeral provider context.
-                    await _extract_and_save_memories()
-                else:
-                    asyncio.create_task(_extract_and_save_memories())
-
-            if assistant_run:
-                db.refresh(assistant_run)
-                response_payload["run"] = run_payload(assistant_run)
-                assistant_msg_db.payload_json = json.dumps(response_payload, ensure_ascii=False)
-                commit_session(db)
-            db.refresh(assistant_msg_db)
-            db.refresh(conversation)
-            response_payload["message"] = _assistant_message_to_dict(assistant_msg_db)
-            response_payload["conversation"] = _assistant_conversation_to_dict(conversation)
             yield _sse_event({"type": "complete", "data": response_payload})
             yield _sse_event("[DONE]")
         except (GeneratorExit, asyncio.CancelledError):
@@ -2287,56 +1351,14 @@ async def workspace_assistant_stream(
                 final_reply="任务已取消，本轮不会再写入章节。",
             )
             raise
-        except CLIPermissionRequiredError as exc:
-            permission_message = (
-                "本机 CLI 需要额外权限才能继续。本轮没有访问项目目录、调用 MCP "
-                "或执行写入；你可以在聊天窗口选择“仅本次允许并重试”。"
-            )
-            permission_payload = {
-                "tool_logs": tool_logs,
-                "outcome": "waiting_user",
-                "permission_required": {
-                    "kind": "local_cli_project_agent",
-                    "scope": "project_agent_once",
-                    "provider": selected_provider,
-                    "detail": str(exc),
-                },
-            }
-            if assistant_msg_db:
-                assistant_msg_db.content = permission_message
-                assistant_msg_db.status = "completed"
-                assistant_msg_db.payload_json = json.dumps(
-                    permission_payload,
-                    ensure_ascii=False,
-                )
-                commit_session(db)
-            mark_assistant_run(
-                db,
-                assistant_run,
-                status="completed",
-                phase="cli_permission_required",
-                final_reply=permission_message,
-                outcome="waiting_user",
-            )
-            if assistant_run:
-                db.refresh(assistant_run)
-            yield _sse_event(
-                {
-                    "type": "permission_required",
-                    "message": permission_message,
-                    "detail": str(exc),
-                    "permission_scope": "project_agent_once",
-                    "provider": selected_provider,
-                    "original_message": payload.message,
-                    "run": run_payload(assistant_run) if assistant_run else None,
-                }
-            )
-            yield _sse_event("[DONE]")
         except LLMError as exc:
             if assistant_msg_db:
                 assistant_msg_db.content = str(exc)
                 assistant_msg_db.status = "error"
-                assistant_msg_db.payload_json = json.dumps({"tool_logs": tool_logs}, ensure_ascii=False)
+                assistant_msg_db.payload_json = json.dumps({
+                    "tool_logs": tool_logs,
+                    "reasoning_content": "".join(turn_telemetry.reasoning_parts).strip(),
+                }, ensure_ascii=False)
                 commit_session(db)
             mark_assistant_run(db, assistant_run, status="error", phase="llm_error", error=str(exc))
             yield _sse_event({"type": "error", "message": str(exc)})
@@ -2345,90 +1367,19 @@ async def workspace_assistant_stream(
             if assistant_msg_db:
                 assistant_msg_db.content = f"服务器错误: {exc}"
                 assistant_msg_db.status = "error"
-                assistant_msg_db.payload_json = json.dumps({"tool_logs": tool_logs}, ensure_ascii=False)
+                assistant_msg_db.payload_json = json.dumps({
+                    "tool_logs": tool_logs,
+                    "reasoning_content": "".join(turn_telemetry.reasoning_parts).strip(),
+                }, ensure_ascii=False)
                 commit_session(db)
             mark_assistant_run(db, assistant_run, status="error", phase="server_error", error=str(exc))
             yield _sse_event({"type": "error", "message": f"服务器错误: {exc}"})
             yield _sse_event("[DONE]")
+        finally:
+            if tool_category_state_file:
+                remove_tool_category_state(tool_category_state_file)
 
     stream_factory = event_generator
-    if is_local_cli_provider(selected_provider):
-        async def cli_routed_event_generator(source_db: Session):
-            from ..services.agent.bridge import detect_and_stream_plan
-            from ..services.agent.local_cli_routing import classify_local_cli_workspace_request
-
-            yield _sse_event({
-                "type": "status",
-                "message": "正在由本机 CLI 判断任务执行线路...",
-                "tool": "local_cli_route",
-            })
-            try:
-                route = await classify_local_cli_workspace_request(
-                    model=payload.model or "",
-                    message=payload.message,
-                    selected_outline_node_id=payload.selected_outline_node_id,
-                )
-            except Exception as exc:
-                yield _sse_event({
-                    "type": "status",
-                    "message": f"本机 CLI 未返回有效线路，继续按普通项目协作执行：{exc}",
-                    "tool": "local_cli_route_fallback",
-                })
-                async for event in event_generator(source_db):
-                    yield event
-                return
-
-            route_name = str(route.get("route") or "general")
-            yield _sse_event({
-                "type": "status",
-                "message": f"本机 CLI 已选择执行线路：{route_name}",
-                "tool": "local_cli_route",
-            })
-            intent_override = None
-            if route_name in {"chapter_write", "chapter_rewrite"}:
-                intent_override = {
-                    "intent_type": "chapter",
-                    "mode": "quality" if payload.assistant_mode == "quality" else "fast",
-                    "outline_query": route.get("outline_query") or "",
-                    "requirements": payload.message,
-                    "chapter_number": route.get("chapter_number"),
-                    "rewrite": route_name == "chapter_rewrite",
-                }
-            elif route_name == "cataloging":
-                intent_override = {
-                    "intent_type": "project_init",
-                    "requirements": payload.message,
-                }
-
-            if intent_override is None:
-                async for event in event_generator(source_db):
-                    yield event
-                return
-
-            generator = await detect_and_stream_plan(
-                source_db,
-                project_id,
-                message=payload.message,
-                conversation_id=payload.conversation_id,
-                scope=payload.scope,
-                model=payload.model,
-                assistant_mode=payload.assistant_mode,
-                outline_batch_count=payload.outline_batch_count,
-                selected_outline_node_id=payload.selected_outline_node_id,
-                force_chapter_writing=route_name in {"chapter_write", "chapter_rewrite"},
-                intent_override=intent_override,
-            )
-            if generator is None:
-                yield _sse_event({
-                    "type": "error",
-                    "message": "本机 CLI 已选择执行线路，但司命未能建立对应计划，本轮没有写入。",
-                })
-                yield _sse_event("[DONE]")
-                return
-            async for event in generator:
-                yield event
-
-        stream_factory = cli_routed_event_generator
 
     if request_provider is not None:
         provider_stream_factory = stream_factory

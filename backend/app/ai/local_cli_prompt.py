@@ -3,14 +3,196 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from app.services.external_agent.mcp_server_spec import resolve_siming_mcp_server
 
-TRANSIENT_OPENCODE_MCP_NAME = "siming_turn"
-TRANSIENT_OPENCODE_MCP_TIMEOUT_MS = 12 * 60 * 60 * 1000
+TRANSIENT_MCP_NAME = "siming_turn"
+TRANSIENT_MCP_TIMEOUT_MS = 12 * 60 * 60 * 1000
+DIRECT_MCP_CLI_PROVIDERS = {
+    "claude_cli",
+    "codex_cli",
+    "opencode_cli",
+    "mimocode_cli",
+    "cursor_cli",
+    "kilocode_cli",
+    "qwen_code_cli",
+    "hermes_cli",
+    "openclaw_cli",
+    "dsh_cli",
+}
+
+
+def supports_direct_mcp(provider: str | None) -> bool:
+    return str(provider or "").strip().lower() in DIRECT_MCP_CLI_PROVIDERS
+
+
+def _write_json(path: Path, payload: Any) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
+
+def _mcp_server_config(server: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "command": server["command"],
+        "args": list(server.get("args") or []),
+    }
+    if server.get("cwd"):
+        result["cwd"] = server["cwd"]
+    return result
+
+
+def _without_mcp_disable_flags(env: dict[str, str]) -> dict[str, str]:
+    allowed = dict(env)
+    for name in (
+        "SIMING_DISABLE_MCP",
+        "MCP_DISABLE",
+        "NO_MCP",
+        "CLAUDE_CODE_DISABLE_MCP",
+        "CODEX_DISABLE_MCP",
+    ):
+        allowed.pop(name, None)
+    allowed["SIMING_LOCAL_CLI_MCP_SCOPE"] = "one_turn"
+    return allowed
+
+
+def _toml_string(value: object) -> str:
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def prepare_direct_mcp_launch(
+    adapter: Any,
+    launch: Any,
+    *,
+    cwd: str,
+    env: dict[str, str],
+    permission_pack: str,
+    project_id: str = "",
+    creation_session_id: str = "",
+    tool_category_state_file: str = "",
+) -> tuple[Any, dict[str, str]]:
+    """Inject exactly one authorized Siming MCP into a known Agent CLI."""
+    provider = adapter._provider
+    if not supports_direct_mcp(provider):
+        raise ValueError(f"{provider} does not support direct MCP injection")
+    server = resolve_siming_mcp_server(
+        permission_pack=permission_pack,
+        project_id=project_id,
+        creation_session_id=creation_session_id,
+        tool_category_state_file=tool_category_state_file,
+    )
+    server_config = _mcp_server_config(server)
+    args = list(launch.args)
+    env = _without_mcp_disable_flags(env)
+    root = Path(cwd)
+
+    if provider == "claude_cli":
+        config_path = _write_json(
+            root / ".siming-claude-mcp.json",
+            {"mcpServers": {TRANSIENT_MCP_NAME: server_config}},
+        )
+        adapter._insert_before_prompt(args, [
+            "--mcp-config", config_path,
+            "--strict-mcp-config",
+            "--tools", "Read",
+            "--allowedTools", "Read", f"mcp__{TRANSIENT_MCP_NAME}__*",
+            "--disable-slash-commands",
+        ])
+    elif provider == "codex_cli":
+        server_toml = (
+            "{" + TRANSIENT_MCP_NAME + "={"
+            f"command={_toml_string(server['command'])},"
+            "args=[" + ",".join(_toml_string(item) for item in server.get("args") or []) + "],"
+            f"cwd={_toml_string(server.get('cwd') or cwd)},"
+            'enabled=true,default_tools_approval_mode="approve",'
+            "startup_timeout_sec=30,tool_timeout_sec=600}}"
+        )
+        adapter._insert_before_prompt(args, [
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--sandbox", "read-only",
+            "-c", f"mcp_servers={server_toml}",
+        ])
+    elif provider == "qwen_code_cli":
+        config_path = _write_json(
+            root / ".siming-qwen-mcp.json",
+            {"mcpServers": {TRANSIENT_MCP_NAME: server_config}},
+        )
+        adapter._insert_before_prompt(args, [
+            "--bare",
+            "--mcp-config", config_path,
+            "--allowed-mcp-server-names", TRANSIENT_MCP_NAME,
+            "--allowed-tools", f"mcp__{TRANSIENT_MCP_NAME}__*",
+            "--approval-mode", "yolo",
+        ])
+    elif provider == "cursor_cli":
+        cursor_dir = root / ".cursor"
+        _write_json(cursor_dir / "mcp.json", {
+            "mcpServers": {TRANSIENT_MCP_NAME: {"type": "stdio", **server_config}},
+        })
+        env["CURSOR_CONFIG_DIR"] = str(cursor_dir)
+        adapter._insert_before_prompt(args, ["--approve-mcps", "--trust", "--force"])
+    elif provider == "hermes_cli":
+        local_app_data = Path(env.get("LOCALAPPDATA") or Path.home())
+        source_home = Path(env.get("HERMES_HOME") or local_app_data / "hermes")
+        transient_home = root / ".siming-hermes"
+        transient_home.mkdir(parents=True, exist_ok=True)
+        source_config = source_home / "config.yaml"
+        try:
+            config = yaml.safe_load(source_config.read_text(encoding="utf-8-sig")) if source_config.is_file() else {}
+        except (OSError, ValueError, TypeError, yaml.YAMLError):
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+        config["mcp_servers"] = {TRANSIENT_MCP_NAME: {**server_config, "enabled": True}}
+        (transient_home / "config.yaml").write_text(
+            yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        for filename in (".env", "auth.json"):
+            source = source_home / filename
+            if source.is_file():
+                shutil.copy2(source, transient_home / filename)
+        env["HERMES_HOME"] = str(transient_home)
+        env["HERMES_IGNORE_RULES"] = "1"
+        adapter._insert_before_prompt(args, ["--yolo"])
+    elif provider == "openclaw_cli":
+        source_path = Path(
+            env.get("OPENCLAW_CONFIG_PATH")
+            or Path.home() / ".openclaw" / "openclaw.json"
+        )
+        try:
+            config = json.loads(source_path.read_text(encoding="utf-8-sig")) if source_path.is_file() else {}
+        except (OSError, ValueError, TypeError):
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+        config["mcp"] = {"servers": {TRANSIENT_MCP_NAME: server_config}}
+        config_path = _write_json(root / ".siming-openclaw.json", config)
+        env["OPENCLAW_CONFIG_PATH"] = config_path
+    elif provider == "dsh_cli":
+        patch_path = _write_json(root / ".siming-dsh-mcp.json", [{
+            "insert": [{
+                "id": "siming-turn-mcp",
+                "name": "@deepseek-ai/dsh-mcp-client",
+                "config": {
+                    "serverName": TRANSIENT_MCP_NAME,
+                    "transport": "stdio",
+                    **server_config,
+                    "failOnStartupError": True,
+                    "reconnect": {"enabled": False},
+                },
+            }],
+        }])
+        adapter._insert_before_prompt(args, ["--patch", patch_path])
+
+    return type(launch)(args=args, stdin_text=launch.stdin_text), env
 
 
 def file_prompt_instruction(
@@ -68,6 +250,7 @@ def prepare_opencode_launch(
     mcp_permission_pack: str = "readonly_collaboration",
     mcp_project_id: str = "",
     mcp_creation_session_id: str = "",
+    mcp_tool_category_state_file: str = "",
 ) -> tuple[Any, str, dict[str, str]]:
     launch, prompt_file = adapter._opencode_family_launch(
         prompt=prompt,
@@ -79,51 +262,51 @@ def prepare_opencode_launch(
         direct_prompt_safe=direct_prompt_safe,
     )
     base_env = os.environ.copy()
+    if allow_mcp:
+        server = resolve_siming_mcp_server(
+            permission_pack=mcp_permission_pack,
+            project_id=mcp_project_id,
+            creation_session_id=mcp_creation_session_id,
+            tool_category_state_file=mcp_tool_category_state_file,
+        )
+        prefix = {
+            "opencode_cli": "OPENCODE",
+            "mimocode_cli": "MIMOCODE",
+            "kilocode_cli": "KILO",
+        }[adapter._provider]
+        config_root = str((Path(cwd) / f".siming-{prefix.lower()}-config").resolve())
+        Path(config_root).mkdir(parents=True, exist_ok=True)
+        base_env.update({
+            "XDG_CONFIG_HOME": config_root,
+            f"{prefix}_CONFIG_DIR": config_root,
+            f"{prefix}_DISABLE_PROJECT_CONFIG": "1",
+            f"{prefix}_PURE": "1",
+            "SIMING_LOCAL_CLI_MCP_SCOPE": "one_turn",
+            f"{prefix}_CONFIG_CONTENT": json.dumps({
+                "$schema": "https://opencode.ai/config.json",
+                "share": "disabled",
+                "mcp": {
+                    TRANSIENT_MCP_NAME: {
+                        "type": "local",
+                        "command": [server["command"], *server["args"]],
+                        "cwd": server.get("cwd") or cwd,
+                        "enabled": True,
+                        "timeout": TRANSIENT_MCP_TIMEOUT_MS,
+                    },
+                },
+                "permission": {
+                    "*": "deny",
+                    "read": "allow",
+                    "external_directory": "deny",
+                    f"{TRANSIENT_MCP_NAME}_*": "allow",
+                },
+            }, ensure_ascii=False),
+        })
+        if adapter._provider == "mimocode_cli":
+            base_env["MIMOCODE_DISABLE_CLAUDE_CODE_MCP"] = "1"
+            base_env["MIMOCODE_DISABLE_CLAUDE_IMPORT"] = "1"
+        return launch, prompt_file, base_env
     if adapter._provider == "opencode_cli":
-        if allow_mcp:
-            server = resolve_siming_mcp_server(
-                permission_pack=mcp_permission_pack,
-                project_id=mcp_project_id,
-                creation_session_id=mcp_creation_session_id,
-            )
-            config_root = str((Path(cwd) / ".siming-opencode-config").resolve())
-            Path(config_root).mkdir(parents=True, exist_ok=True)
-            base_env.update({
-                # OpenCode merges normal global/project configuration before
-                # OPENCODE_CONFIG_CONTENT. Redirect its config root as well so
-                # unrelated MCP servers never become ambient capabilities.
-                "XDG_CONFIG_HOME": config_root,
-                "OPENCODE_CONFIG_DIR": config_root,
-                "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
-                "OPENCODE_PURE": "1",
-                "SIMING_LOCAL_CLI_MCP_SCOPE": "one_turn",
-                "OPENCODE_CONFIG_CONTENT": json.dumps({
-                    "$schema": "https://opencode.ai/config.json",
-                    "share": "disabled",
-                    "mcp": {
-                        TRANSIENT_OPENCODE_MCP_NAME: {
-                            "type": "local",
-                            "command": [server["command"], *server["args"]],
-                            "cwd": server.get("cwd") or cwd,
-                            "enabled": True,
-                            "timeout": TRANSIENT_OPENCODE_MCP_TIMEOUT_MS,
-                        },
-                    },
-                    # The prompt file is inside the empty per-turn cwd. Reading
-                    # it is safe; external files, shell, editing, web, and every
-                    # non-Siming tool remain denied. The MCP prefix is explicit
-                    # so no blanket auto-approval is needed.
-                    "permission": {
-                        "*": "deny",
-                        "read": "allow",
-                        "external_directory": "deny",
-                        f"{TRANSIENT_OPENCODE_MCP_NAME}_*": "allow",
-                    },
-                }, ensure_ascii=False),
-            })
-            # Keep the empty working directory boundary, but do not apply the
-            # generic NO_MCP flags: this is the one explicitly authorized MCP.
-            return launch, prompt_file, base_env
         base_env = adapter._opencode_env(cwd)
     return launch, prompt_file, adapter._isolated_environment(base_env, isolated)
 

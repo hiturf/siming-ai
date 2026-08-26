@@ -41,7 +41,7 @@ def test_portable_writing_policy_keeps_pc_contract_and_budget() -> None:
     policy = portable_context_policy("writing")
     assert policy["contract"]["required_categories"] == ["target_outline", "style"]
     assert policy["model_defaults"] == {
-        "context_window_tokens": 16_384,
+        "context_window_tokens": 1_000_000,
         "safety_margin_tokens": 512,
         "minimum_output_reserve_tokens": 2_048,
         "output_ratio": 0.45,

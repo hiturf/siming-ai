@@ -17,17 +17,12 @@ class MCPNovelCreationToolsTest(unittest.TestCase):
         tools = list_mcp_tools(permission_pack="readonly_collaboration")
         names = {t.name for t in tools}
         self.assertIn("start_novel_creation_session", names)
-        self.assertIn("draft_novel_blueprint", names)
-        self.assertIn("review_novel_blueprint", names)
-        self.assertIn("get_novel_creation_session", names)
+        self.assertIn("get_creation_session", names)
 
-    def test_apply_in_project_management(self):
+    def test_creation_writes_in_project_management(self):
         tools = list_mcp_tools(permission_pack="project_management")
         names = {t.name for t in tools}
         expected = {
-            "apply_novel_blueprint",
-            "generate_novel_creation_stage",
-            "submit_novel_creation_stage",
             "patch_creation_session",
             "confirm_creation_artifact",
             "generate_creation_artifact",
@@ -40,6 +35,14 @@ class MCPNovelCreationToolsTest(unittest.TestCase):
             "finalize_creation_session",
         }
         self.assertTrue(expected.issubset(names))
+
+    def test_removed_creation_tools_are_not_exposed(self):
+        names = {t.name for t in list_mcp_tools(permission_pack="project_management")}
+        self.assertTrue({
+            "get_novel_creation_session",
+            "generate_novel_creation_stage",
+            "submit_novel_creation_stage",
+        }.isdisjoint(names))
 
     def test_canonical_creation_reads_are_available_to_readonly_collaboration(self):
         tools = list_mcp_tools(permission_pack="readonly_collaboration")
@@ -85,10 +88,15 @@ class MCPNovelCreationToolsTest(unittest.TestCase):
         self.assertEqual(properties["op"]["anyOf"][0]["enum"], ["add", "replace", "remove"])
         self.assertIn("JSON Pointer", properties["path"]["description"])
 
-    def test_apply_not_in_readonly(self):
+    def test_confirmation_schema_cannot_edit_and_confirm_in_one_call(self):
+        tools = list_mcp_tools(permission_pack="project_management")
+        confirm_tool = next(tool for tool in tools if tool.name == "confirm_creation_artifact")
+        self.assertNotIn("data", confirm_tool.input_schema.get("properties", {}))
+
+    def test_finalize_not_in_readonly(self):
         tools = list_mcp_tools(permission_pack="readonly_collaboration")
         names = {t.name for t in tools}
-        self.assertNotIn("apply_novel_blueprint", names)
+        self.assertNotIn("finalize_creation_session", names)
 
     def test_no_secret_tools_exposed(self):
         for pack in ["readonly_collaboration", "draft_generation", "project_writing", "project_management"]:

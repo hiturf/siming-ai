@@ -77,9 +77,10 @@ class GetMoshuUsageGuideTest(unittest.TestCase):
         self.assertIn("start_external_cataloging_job", text)
         self.assertIn("apply_pending_cataloging", text)
         self.assertIn("start_cataloging_job", text)
-        self.assertIn("phase='merged'", text)
+        self.assertIn("phase='facts'", text)
+        self.assertIn("phase='candidates'", text)
+        self.assertIn("save_external_cataloging_facts", text)
         self.assertIn("save_external_cataloging_candidates", text)
-        self.assertNotIn("phase='facts'", text)
 
     def test_quickstart_tells_external_agents_to_store_long_content(self):
         from app.services.workspace.tools.prompt_packs import get_moshu_usage_guide
@@ -100,7 +101,7 @@ class GetMoshuUsageGuideTest(unittest.TestCase):
         rules = get_api_free_mode_rules()
         self.assertIn("长内容处理规则", rules)
         self.assertIn("save_external_chapter_draft", rules)
-        self.assertIn("不要把整章正文", rules)
+        self.assertIn("不要在聊天回复里完整输出长正文", rules)
         self.assertIn("save_external_cataloging_candidates", rules)
         self.assertIn("基础写作任务不要调用", rules)
 
@@ -112,7 +113,8 @@ class GetMoshuUsageGuideTest(unittest.TestCase):
             for scenario in ("writing_no_api", "writing_internal"):
                 result = asyncio.run(get_moshu_usage_guide(db, "p1", {"scenario": scenario}))
                 text = json.dumps(result["data"]["guide"], ensure_ascii=False)
-                self.assertIn("独立", text)
+                self.assertIn("未入库草稿", text)
+                self.assertIn("立即结束", text)
                 self.assertNotIn("record_external_quality_review", text)
                 self.assertNotIn("角色对戏", text)
 
@@ -131,7 +133,7 @@ class GetPromptPackTest(unittest.TestCase):
         result = asyncio.run(get_prompt_pack(db, "p1", {"scope": "nonexistent"}))
         self.assertEqual(result["status"], "skipped")
 
-    def test_fast_chapter_writing_request_returns_fast_pack(self):
+    def test_chapter_writing_request_returns_the_quality_pack(self):
         from app.services.workspace.tools.prompt_packs import get_prompt_pack
 
         project = MagicMock()
@@ -143,11 +145,11 @@ class GetPromptPackTest(unittest.TestCase):
         project.short_sentences = False
 
         pack = MagicMock()
-        pack.pack_id = "chapter_writing_fast"
+        pack.pack_id = "chapter_writing_quality"
         pack.version = "1.0.0"
         pack.scope = "chapter_writing"
-        pack.title = "快速模式章节写作"
-        pack.summary = "少轮次直写"
+        pack.title = "质量模式章节写作"
+        pack.summary = "完整正文提示词"
         pack.workflow_json = []
         pack.quality_rubric_json = {"dimensions": []}
         pack.tool_playbook_json = {}
@@ -169,12 +171,12 @@ class GetPromptPackTest(unittest.TestCase):
         db = MagicMock()
         db.query.side_effect = query_side_effect
 
-        result = asyncio.run(get_prompt_pack(db, "p1", {"scope": "chapter_writing", "mode": "fast"}))
+        result = asyncio.run(get_prompt_pack(db, "p1", {"scope": "chapter_writing", "mode": "quality"}))
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["data"]["pack_id"], "chapter_writing_fast")
-        self.assertEqual(result["data"]["effective_pack_id"], "chapter_writing_fast")
-        self.assertIn("快速模式定位", result["data"]["system_prompt"])
-        self.assertIn("统一建档", result["data"]["system_prompt"])
+        self.assertEqual(result["data"]["pack_id"], "chapter_writing_quality")
+        self.assertEqual(result["data"]["effective_pack_id"], "chapter_writing_quality")
+        self.assertIn("未入库草稿", result["data"]["system_prompt"])
+        self.assertNotIn("快速模式", result["data"]["system_prompt"])
         self.assertEqual(result["data"]["forbidden_patterns"], [])
         self.assertIsNone(result["data"]["quality_rubric"])
         self.assertNotIn("去AI味硬规则", result["data"]["system_prompt"])

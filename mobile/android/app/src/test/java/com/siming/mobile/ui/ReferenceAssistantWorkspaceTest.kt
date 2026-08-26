@@ -37,10 +37,9 @@ class ReferenceAssistantWorkspaceTest {
     }
 
     @Test
-    fun `assistant quick actions map to canonical project scopes`() {
-        assertEquals(setOf("project", "outline", "characters", "worldbuilding"), assistantScopes.map { it.first }.toSet())
-        assertTrue(assistantQuickActions.any { it.label == "续写下一章" && it.scope == "project" })
-        assertTrue(assistantQuickActions.any { it.label == "检查世界观冲突" && it.scope == "worldbuilding" })
+    fun `assistant quick actions only provide user messages without app routing`() {
+        assertTrue(assistantQuickActions.any { it.label == "续写下一章" && "下一章" in it.prompt })
+        assertTrue(assistantQuickActions.any { it.label == "检查世界观冲突" && "世界观" in it.prompt })
     }
 
     private fun replica(entityType: String, entityId: String, payload: String) = ReplicaEntity(

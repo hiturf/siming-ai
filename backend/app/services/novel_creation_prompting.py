@@ -28,33 +28,33 @@ COMPACT_CONCEPT_SHAPE: dict[str, Any] = {
 
 CREATION_STAGE_TASK_RULES = (
     "只深化当前阶段的 baseline，顶层只返回 data 字段；"
-    "保留作者原文、锁定要求、已确认事实和专名，不提前生成下游阶段。"
-    "调整要求只作用于当前阶段；没有明确授权时不得改动其他内容。"
+    "未经本轮明确调整要求，保留作者原文、锁定要求、已确认事实和专名，不提前生成下游阶段。"
+    "明确调整只作用于当前阶段；没有明确授权时不得改动其他内容。"
     "如果 entity_target 存在，只生成或修改其中指定类型的对象，其他对象必须保持原样；"
     "新增数量必须根据作者本次调整要求判断，作者未给固定数字时按语义生成最合适的少量对象。"
 )
 
 CONCEPT_TASK_KINDS = {
     "author_led": "整理作者方案",
-    "explore": "生成一套可持续调整的创意方向",
+    "explore": "生成可持续调整的创意方向",
 }
 CONCEPT_TASK_RULES = {
     "author_led": (
-        "只生成恰好一张作者方案卡，不生成替代故事。作者原文、专名、因果、结局方向和锁定要求都是不可改写的事实；只补全空白。"
-        "如果提供了调整要求，只调整当前创意阶段，不影响其他阶段。"
+        "整理作者当前方案，不为凑数量制造替代故事。未经本轮明确调整，作者原文、专名、因果、结局方向和锁定要求只允许补全空白。"
+        "如果提供了调整要求，只按要求调整当前创意阶段，不影响其他阶段。"
     ),
     "explore": (
-        "只生成恰好一张轻量创意卡，不生成完整世界观、配角表、卷纲或章节细纲。方案必须遵守作者约束，并适合作者随后通过对话持续局部调整。"
+        "只生成本轮真正需要的轻量创意卡，不为凑数量生成相似方案，也不生成完整世界观、配角表、卷纲或章节细纲。方案必须遵守作者约束，并适合作者随后通过对话持续局部调整。"
         "如果提供了调整要求，只调整当前创意阶段，不影响其他阶段。"
     ),
 }
 CONCEPT_USER_INTROS = {
     "author_led": (
-        "请严格返回恰好1张作者方案卡，字段必须与下列 JSON 结构一致。"
+        "请返回本轮需要的作者方案卡，字段必须与下列 JSON 结构一致。"
         "方案必须忠实整理作者已经想好的内容，不得随机替换故事。\n"
     ),
     "explore": (
-        "请严格返回恰好1张创意卡，字段必须与下列 JSON 结构一致。"
+        "请返回本轮真正需要的创意卡，字段必须与下列 JSON 结构一致。"
         "创意卡应在数百字内可读完，并保留通过后续对话调整的空间。\n"
     ),
 }
@@ -82,7 +82,7 @@ def build_compact_concept_messages(
     author_led: bool,
     context: dict[str, Any],
 ) -> list[dict[str, str]]:
-    """Build the canonical single-card concept-generation messages."""
+    """Build the canonical concept-generation messages."""
     from app.modules.creation.interfaces.dependencies import render_creation_prompt
 
     system = render_creation_prompt(

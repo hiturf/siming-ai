@@ -16,18 +16,19 @@ class ExternalDraftToolsRegisteredTest(unittest.TestCase):
     def test_save_draft_registered(self):
         td = registry.get("save_external_chapter_draft")
         self.assertIsNotNone(td)
-        self.assertEqual(td.tool_type, "read")
+        self.assertEqual(td.tool_type, "write")
 
     def test_get_draft_registered(self):
         td = registry.get("get_external_chapter_draft")
         self.assertIsNotNone(td)
 
-    def test_in_readonly_pack(self):
+    def test_draft_write_requires_a_writing_capability_pack(self):
         from app.mcp.adapter import list_mcp_tools
-        tools = list_mcp_tools(permission_pack="readonly_collaboration")
-        names = {t.name for t in tools}
-        self.assertIn("save_external_chapter_draft", names)
-        self.assertIn("get_external_chapter_draft", names)
+        readonly = {t.name for t in list_mcp_tools(permission_pack="readonly_collaboration")}
+        drafting = {t.name for t in list_mcp_tools(permission_pack="chapter_drafting")}
+        self.assertNotIn("save_external_chapter_draft", readonly)
+        self.assertIn("get_external_chapter_draft", readonly)
+        self.assertIn("save_external_chapter_draft", drafting)
 
 
 class SaveExternalDraftTest(unittest.TestCase):
@@ -39,18 +40,75 @@ class SaveExternalDraftTest(unittest.TestCase):
         result = asyncio.run(save_external_chapter_draft(db, "p1", {}))
         self.assertEqual(result["status"], "skipped")
 
+    @patch("app.services.cataloging.launcher.find_cataloging_required_chapter", return_value=None)
+    @patch("app.services.cataloging.launcher.find_blocking_chapter_cataloging_job", return_value=None)
+    @patch("app.services.workspace.generated_drafts.find_pending_chapter_draft", return_value=None)
     @patch("app.services.workspace.generated_drafts.store_chapter_draft")
-    def test_saves_draft(self, mock_store):
+    def test_saves_draft_for_model_selected_outline(
+        self,
+        mock_store,
+        _mock_pending,
+        _mock_job,
+        _mock_required,
+    ):
         from app.services.workspace.tools.external_writing import save_external_chapter_draft
         mock_store.return_value = "draft-123"
         db = MagicMock()
+        outline = MagicMock(id="o1", title="Chapter 2", node_type="chapter")
+        outline_query = MagicMock()
+        outline_query.filter.return_value = outline_query
+        outline_query.first.return_value = outline
+        chapter_query = MagicMock()
+        chapter_query.filter.return_value = chapter_query
+        chapter_query.order_by.return_value = chapter_query
+        chapter_query.first.return_value = None
+        db.query.side_effect = [outline_query, chapter_query]
         result = asyncio.run(save_external_chapter_draft(db, "p1", {
             "content": "Test chapter content",
-            "title": "Chapter 1",
+            "title": "Caller must not control this title",
+            "outline_node_id": "o1",
+            "target_chapter_id": "wrong-existing-chapter",
         }))
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["data"]["draft_id"], "draft-123")
+        self.assertEqual(result["data"]["title"], "Chapter 2")
+        self.assertNotIn("target_chapter_id", result["data"])
         mock_store.assert_called_once()
+        self.assertNotIn("target_chapter_id", mock_store.call_args.kwargs)
+
+    @patch("app.services.cataloging.launcher.find_cataloging_required_chapter", return_value=None)
+    @patch("app.services.cataloging.launcher.find_blocking_chapter_cataloging_job", return_value=None)
+    @patch("app.services.workspace.generated_drafts.find_pending_chapter_draft", return_value=None)
+    @patch("app.services.workspace.generated_drafts.store_chapter_draft")
+    def test_refuses_outline_that_already_has_a_formal_chapter(
+        self,
+        mock_store,
+        _mock_pending,
+        _mock_job,
+        _mock_required,
+    ):
+        from app.services.workspace.tools.external_writing import save_external_chapter_draft
+
+        db = MagicMock()
+        outline = MagicMock(id="o1", title="Chapter 1", node_type="chapter")
+        outline_query = MagicMock()
+        outline_query.filter.return_value = outline_query
+        outline_query.first.return_value = outline
+        chapter = MagicMock(id="chapter-1")
+        chapter_query = MagicMock()
+        chapter_query.filter.return_value = chapter_query
+        chapter_query.order_by.return_value = chapter_query
+        chapter_query.first.return_value = chapter
+        db.query.side_effect = [outline_query, chapter_query]
+
+        result = asyncio.run(save_external_chapter_draft(db, "p1", {
+            "content": "Replacement prose must not be saved",
+            "outline_node_id": "o1",
+        }))
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["data"]["existing_chapter_id"], "chapter-1")
+        mock_store.assert_not_called()
 
 
 class GetExternalDraftTest(unittest.TestCase):

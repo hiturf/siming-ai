@@ -99,7 +99,7 @@
     "style_projection": "pc_prompt_contract_style_context"
   },
   "model_defaults": {
-    "context_window_tokens": 16384,
+    "context_window_tokens": 1000000,
     "minimum_output_reserve_tokens": 2048,
     "output_ratio": 0.45,
     "safety_margin_tokens": 512
@@ -134,7 +134,7 @@
     "required_over_budget_status": "needs_confirmation",
     "unknown_model_uses_defaults": true
   },
-  "source_sha256": "d0645d13f836ede14981a28b5b0d93c5a2890710c2404c9fe0d3304fcfd28b88",
+  "source_sha256": "9870aeb53af5da30458a11b879a31bce0aa9697af4a202907e0933a10a4991c8",
   "task_type": "writing",
   "token_estimation": {
     "cjk_ranges": [

@@ -1,4 +1,4 @@
-export type CreationAgentModelSource = 'conversation_override' | 'global_default' | 'task_setting' | 'task_setting_fallback' | 'unconfigured' | 'unknown'
+export type CreationAgentModelSource = 'conversation_override' | 'global_default' | 'task_setting' | 'unconfigured' | 'unknown'
 
 export interface CreationAgentRuntime {
   effective_model?: string
@@ -43,6 +43,12 @@ export const defaultCreationAgentRuntime = (
 export const extractCreationAgentErrorDetail = (error: unknown): Record<string, unknown> => {
   const detail = errorResponse(error)?.data?.detail
   if (detail && typeof detail === 'object' && !Array.isArray(detail)) return detail as Record<string, unknown>
+  if (error && typeof error === 'object' && 'detail' in error) {
+    const streamDetail = (error as { detail?: unknown }).detail
+    if (streamDetail && typeof streamDetail === 'object' && !Array.isArray(streamDetail)) {
+      return streamDetail as Record<string, unknown>
+    }
+  }
   return {}
 }
 

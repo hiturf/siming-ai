@@ -106,7 +106,7 @@ describe('NovelCreationWizardPage', () => {
     expect(screen.getByRole('button', { name: '免费开始' })).toBeInTheDocument()
   })
 
-  it('restores a single concept as a direct result without candidate-track actions', async () => {
+  it('opens the workbench without requiring a concept selection', async () => {
     const session = {
       id: 'session-1', status: 'reviewing', revision: 2, current_stage: 'concepts',
       draft: {
@@ -122,10 +122,8 @@ describe('NovelCreationWizardPage', () => {
       return Promise.reject(new Error(`unexpected GET ${url}`))
     })
     renderPage('/novel-creation?session=session-1')
-    expect(await screen.findByText('灰港遗忘症')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '确认当前方向' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /返回聊天继续调整/ })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /快速生成到最终审阅/ })).not.toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: '文风与世界观' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '确认当前方向' })).not.toBeInTheDocument()
   })
 
   it('reconnects to the active lightweight-concept run after a handoff', async () => {
@@ -177,53 +175,55 @@ describe('NovelCreationWizardPage', () => {
     expect(closeSource).toHaveBeenCalledTimes(1)
   })
 
-  it('confirms a concept without automatically starting the next stage', async () => {
-    const user = userEvent.setup()
-    const oldRun = {
-      id: 'run-old', session_id: 'session-1', stage: 'concepts', status: 'completed',
-      current_message: '旧创意任务已完成',
-    }
+  it('shows live model output progress without inventing a completion percentage', async () => {
     const session = {
-      id: 'session-1', status: 'reviewing', revision: 2, current_stage: 'concepts', runs: [oldRun],
+      id: 'session-live', status: 'drafting', revision: 1, current_stage: 'opening_outline',
+      runs: [{
+        id: 'run-live', session_id: 'session-live', stage: 'opening_outline', status: 'running',
+        operation_id: 'operation-live', model_source: 'deepseek:deepseek-v4-flash',
+        current_message: '正在生成前3章细纲',
+      }],
       draft: {
-        form: { brief: '记忆病毒', preset_id: 'suspense', genre: '悬疑推理', target_audience: '成年大众', platform: '暂不确定', target_words: 600000, target_chapters: 240, world_tone: '信息公平', story_structure: '三层谜团', pacing: '证据推进', writing_style: '精确克制', special_requirements: [], avoid: [] },
-        concepts: [{ id: 'concept-1', source_index: 0, title: '灰港遗忘症', logline: '女孩用遗忘换取感染者的记忆。', protagonist_seed: { name: '林七', identity: '医生', goal: '找母亲', lack: '害怕遗忘' }, world_hook: '记忆传播', core_conflict: '救人就会遗忘', story_engine: '读忆换线索', opening_hook: '陌生人说出她的童年', differentiators: [], risks: [], coverage: { score: 92, covered: [], missing: [] } }],
-        stages: {},
+        form: { brief: '长篇悬疑', preset_id: 'suspense', genre: '悬疑推理', target_audience: '成年大众', platform: '暂不确定', target_words: 600000, target_chapters: 240, world_tone: '信息公平', story_structure: '三层谜团', pacing: '证据推进', writing_style: '精确克制', special_requirements: [], avoid: [] },
+        concepts: [], stages: {},
       },
     }
-    const selected = { ...session, revision: 3, draft: { ...session.draft, selected_concept_id: 'concept-1' } }
-    const constraintsConfirmed = { ...selected, revision: 4 }
-    const conceptsConfirmed = { ...selected, revision: 5, current_stage: 'world_style' }
-    const eventSource = vi.fn().mockImplementation(function EventSourceStub() {
-      return { addEventListener: vi.fn(), close: vi.fn(), onerror: null, onopen: null }
-    })
-    vi.stubGlobal('EventSource', eventSource)
+    const listeners = new Map<string, (event: MessageEvent) => void>()
+    vi.stubGlobal('EventSource', vi.fn().mockImplementation(function EventSourceStub() {
+      return {
+        addEventListener: vi.fn((name: string, listener: (event: MessageEvent) => void) => listeners.set(name, listener)),
+        close: vi.fn(),
+        onerror: null,
+      }
+    }))
     mockGet.mockImplementation((url: string) => {
       if (url === '/novel-creation/presets') return Promise.resolve({ data: { data: presets } })
       if (url === '/novel-creation/sessions') return Promise.resolve({ data: { data: { sessions: [session] } } })
-      if (url === '/novel-creation/sessions/session-1') return Promise.resolve({ data: { data: session } })
+      if (url === '/novel-creation/sessions/session-live') return Promise.resolve({ data: { data: session } })
       return Promise.reject(new Error(`unexpected GET ${url}`))
     })
-    mockPatch.mockResolvedValue({ data: { data: selected } })
-    mockPost.mockImplementation((url: string) => {
-      if (url.endsWith('/stages/constraints/confirm')) return Promise.resolve({ data: { data: constraintsConfirmed } })
-      if (url.endsWith('/stages/concepts/confirm')) return Promise.resolve({ data: { data: conceptsConfirmed } })
-      if (url.endsWith('/runs')) return Promise.resolve({ data: { data: { run: {
-        id: 'run-new', session_id: 'session-1', stage: 'world_style', status: 'running',
-        operation_id: 'operation-new', current_message: '正在生成文风与世界观',
-      } } } })
-      return Promise.reject(new Error(`unexpected POST ${url}`))
-    })
 
-    renderPage('/novel-creation?session=session-1&run=run-old')
-    await user.click(await screen.findByRole('button', { name: '确认当前方向' }))
+    renderPage('/novel-creation?session=session-live&run=run-live')
+    await waitFor(() => expect(listeners.has('model_output')).toBe(true))
 
-    await waitFor(() => expect(mockPost).toHaveBeenCalledWith(
-      '/novel-creation/sessions/session-1/stages/concepts/confirm',
-      expect.objectContaining({ confirm: true }),
-    ))
-    expect(mockPost).not.toHaveBeenCalledWith('/novel-creation/sessions/session-1/runs', expect.anything())
-    expect(eventSource).not.toHaveBeenCalledWith('/api/v1/novel-creation/runs/run-new/stream')
+    act(() => listeners.get('model_output')?.(new MessageEvent('model_output', {
+      data: JSON.stringify({
+        event_type: 'model_output',
+        message: '模型正在生成并校验立项内容 · 已输出 12,345 字',
+        payload: {
+          kind: 'model_output',
+          output_chars: 12345,
+          output_preview: '第三章的结尾钩子正在形成',
+          max_output_tokens: 300000,
+          attempt: 1,
+        },
+      }),
+    })))
+
+    expect(await screen.findByText('模型正在生成并校验立项内容 · 已输出 12,345 字')).toBeInTheDocument()
+    expect(screen.getByText('已输出：12,345 字')).toBeInTheDocument()
+    expect(screen.getByText('第三章的结尾钩子正在形成')).toBeInTheDocument()
+    expect(screen.queryByText(/\d+%/)).not.toBeInTheDocument()
   })
 
   it('finalizes a run from REST when the SSE connection closes after completion', async () => {
@@ -401,83 +401,6 @@ describe('NovelCreationWizardPage', () => {
     })
   })
 
-  it('guides legacy errors to repair an upstream blocker before retrying', async () => {
-    const session = {
-      id: 'session-1', status: 'reviewing', revision: 8, current_stage: 'macro_outline',
-      runs: [{ id: 'run-opening', stage: 'opening_outline', status: 'failed' }],
-      last_error: {
-        failure_class: 'invalid_response',
-        message: '开篇细纲结构不完整',
-        next_action: '草稿已保留，请重试“前3章细纲”',
-        run_id: 'run-opening',
-      },
-      stage_flow: {
-        attention_stage: 'macro_outline', recommended_stage: 'macro_outline', pending_confirmations: [],
-        items: {
-          macro_outline: { stage: 'macro_outline', label: '全书主线与卷纲', status: 'stale', can_view: true, can_generate: true, can_confirm: false, blocked_by: [], actions: ['generate'] },
-          opening_outline: { stage: 'opening_outline', label: '前3章细纲', status: 'pending', can_view: false, can_generate: false, can_confirm: false, blocked_by: [{ stage: 'macro_outline', label: '全书主线与卷纲', reason: '需要重新生成' }], actions: [] },
-        },
-      },
-      draft: {
-        form: { brief: '记忆病毒', preset_id: 'suspense', genre: '悬疑推理', target_audience: '成年大众', platform: '暂不确定', target_words: 600000, target_chapters: 240, world_tone: '信息公平', story_structure: '三层谜团', pacing: '证据推进', writing_style: '精确克制', special_requirements: [], avoid: [] },
-        concepts: [],
-        stages: { macro_outline: { status: 'stale', data: null, stale_reason: '历史模型只返回了运行状态，请重新生成本阶段' } },
-      },
-    }
-    vi.stubGlobal('EventSource', vi.fn().mockImplementation(function EventSourceStub() {
-      return { addEventListener: vi.fn(), close: vi.fn(), onerror: null }
-    }))
-    mockGet.mockImplementation((url: string) => {
-      if (url === '/novel-creation/presets') return Promise.resolve({ data: { data: presets } })
-      if (url === '/novel-creation/sessions') return Promise.resolve({ data: { data: { sessions: [session] } } })
-      if (url === '/novel-creation/sessions/session-1') return Promise.resolve({ data: { data: session } })
-      return Promise.reject(new Error(`unexpected GET ${url}`))
-    })
-
-    const user = userEvent.setup()
-    renderPage('/novel-creation?session=session-1&stage=macro_outline')
-    await user.click(await screen.findByRole('button', { name: '先修复“全书主线与卷纲”' }))
-
-    expect(mockPost).not.toHaveBeenCalled()
-  })
-
-  it('does not bulk-generate later artifacts after confirming the single direction', async () => {
-    const session = {
-      id: 'session-1', status: 'reviewing', revision: 2, current_stage: 'world_style',
-      draft: {
-        form: { brief: '记忆病毒', preset_id: 'suspense', genre: '悬疑推理', target_audience: '成年大众', platform: '暂不确定', target_words: 600000, target_chapters: 240, world_tone: '信息公平', story_structure: '三层谜团', pacing: '证据推进', writing_style: '精确克制', special_requirements: [], avoid: [] },
-        concepts: [{ id: 'concept-1', source_index: 0, title: '灰港遗忘症', logline: '女孩用遗忘换取感染者的记忆。', protagonist_seed: { name: '林七', identity: '医生', goal: '找母亲', lack: '害怕遗忘' }, world_hook: '记忆传播', core_conflict: '救人就会遗忘', story_engine: '读忆换线索', opening_hook: '陌生人说出她的童年', differentiators: ['记忆感染'], risks: ['规则需稳定'], coverage: { score: 92, covered: [], missing: [] } }],
-        stages: {},
-      },
-    }
-    vi.stubGlobal('EventSource', vi.fn().mockImplementation(function EventSourceStub() {
-      return { addEventListener: vi.fn(), close: vi.fn(), onerror: null }
-    }))
-    mockGet.mockImplementation((url: string) => {
-      if (url === '/novel-creation/presets') return Promise.resolve({ data: { data: presets } })
-      if (url === '/novel-creation/sessions') return Promise.resolve({ data: { data: { sessions: [session] } } })
-      if (url === '/novel-creation/sessions/session-1') return Promise.resolve({ data: { data: session } })
-      return Promise.reject(new Error(`unexpected GET ${url}`))
-    })
-    mockPatch.mockResolvedValue({ data: { data: session } })
-    mockPost.mockImplementation((url: string) => {
-      if (url.endsWith('/runs')) return Promise.resolve({ data: { data: { run: { id: 'run-world', stage: 'world_style', status: 'running' } } } })
-      return Promise.resolve({ data: { data: session } })
-    })
-
-    const user = userEvent.setup()
-    renderPage('/novel-creation?session=session-1')
-    await user.click(await screen.findByRole('button', { name: '确认当前方向' }))
-
-    await waitFor(() => {
-      expect(mockPost).toHaveBeenCalledWith(
-        '/novel-creation/sessions/session-1/stages/concepts/confirm',
-        expect.objectContaining({ confirm: true }),
-      )
-    })
-    expect(mockPost).not.toHaveBeenCalledWith('/novel-creation/sessions/session-1/runs', expect.anything())
-  })
-
   it('keeps local form text and retries against the latest revision after a conflict', async () => {
     const initialSession = {
       id: 'session-1', status: 'drafting', revision: 2, current_stage: 'constraints',
@@ -581,8 +504,8 @@ describe('NovelCreationWizardPage', () => {
         recommended_stage: 'world_style',
         pending_confirmations: ['world_style'],
         items: {
-          world_style: { stage: 'world_style', label: '文风与世界观', status: 'generated', can_view: true, can_generate: true, can_confirm: true, blocked_by: [], actions: ['view', 'edit', 'regenerate', 'confirm'], next_stage: 'characters' },
-          characters: { stage: 'characters', label: '角色与关系', status: 'pending', can_view: true, can_generate: true, can_confirm: false, blocked_by: [], actions: ['view', 'generate'], next_stage: 'locations' },
+          world_style: { stage: 'world_style', label: '文风与世界观', status: 'generated', can_confirm: true, actions: ['view', 'edit', 'regenerate', 'confirm'], next_stage: 'characters' },
+          characters: { stage: 'characters', label: '角色与关系', status: 'pending', can_confirm: false, actions: ['view', 'generate'], next_stage: 'locations' },
         },
       },
       draft: {
@@ -607,7 +530,7 @@ describe('NovelCreationWizardPage', () => {
         items: {
           ...session.stage_flow.items,
           world_style: { ...session.stage_flow.items.world_style, status: 'confirmed', can_confirm: false },
-          characters: { ...session.stage_flow.items.characters, can_view: true, can_generate: true, blocked_by: [], actions: ['view', 'generate'] },
+          characters: { ...session.stage_flow.items.characters, actions: ['view', 'generate'] },
         },
       },
       draft: {

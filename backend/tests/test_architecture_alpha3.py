@@ -18,8 +18,8 @@ from app.modules.context.infrastructure import rebuild as context_rebuild
 from app.modules.context.infrastructure.rebuild import ContextRebuildRunner
 from app.modules.model_runtime.application.runtime import ModelRuntime
 from app.modules.model_runtime.domain.configuration import (
-    LocalTaskModelSetting,
     ModelProviderConfig,
+    TaskModelSetting,
 )
 from app.modules.operations.domain.failures import classify_failure
 from app.modules.operations.domain.state import default_outcome, project_lifecycle_status
@@ -32,30 +32,35 @@ class FakeModelConfigurations:
             default_model="writer-model",
             api_key="secret",
         )
-        self.task_model = LocalTaskModelSetting(
+        self.local_config = ModelProviderConfig(
+            provider="local_llama_cpp",
+            default_model="local-writer",
+            api_key="local",
+            provider_type="local_runtime",
+        )
+        self.task_model = TaskModelSetting(
             task_type="writing",
-            model_key="local-writer",
+            provider="local_llama_cpp",
+            model_name="local-writer",
             context_length=32768,
         )
-        self.failures: list[tuple[str, object]] = []
-
     def global_default(self) -> ModelProviderConfig | None:
         return self.global_config
 
     def ready_providers(self) -> tuple[ModelProviderConfig, ...]:
-        return (self.global_config,)
+        return (self.global_config, self.local_config)
 
     def provider(self, provider: str) -> ModelProviderConfig | None:
-        return self.global_config if provider == self.global_config.provider else None
+        return next(
+            (item for item in self.ready_providers() if item.provider == provider),
+            None,
+        )
 
-    def task_setting(self, task_type: str) -> LocalTaskModelSetting | None:
+    def task_setting(self, task_type: str) -> TaskModelSetting | None:
         return self.task_model if task_type == self.task_model.task_type else None
 
-    def record_failure(self, provider: str, error: BaseException | object) -> None:
-        self.failures.append((provider, error))
 
-
-def test_model_runtime_prefers_ready_global_unless_task_model_is_explicitly_requested():
+def test_model_runtime_prefers_task_default_and_applies_local_context():
     configurations = FakeModelConfigurations()
     runtime = ModelRuntime(configurations)
 
@@ -63,31 +68,24 @@ def test_model_runtime_prefers_ready_global_unless_task_model_is_explicitly_requ
         "app.modules.model_runtime.application.runtime.local_runtime_disabled",
         return_value=False,
     ):
-        default = runtime.select_for_task(task_type="writing")
         request_metadata = {"request": "chapter"}
         task_specific = runtime.select_for_task(
             task_type="writing",
-            prefer_task_model=True,
             extra_body=request_metadata,
         )
 
-    assert default.model == "openai:writer-model"
-    assert default.source == "global_default"
     assert task_specific.model == "local_llama_cpp:local-writer"
     assert task_specific.source == "task_setting"
     assert request_metadata["moshu_context_length"] == 32768
 
 
-def test_model_runtime_returns_provider_snapshots_and_delegates_failure_state():
+def test_model_runtime_returns_provider_snapshots_without_mutating_readiness():
     configurations = FakeModelConfigurations()
     runtime = ModelRuntime(configurations)
-    error = RuntimeError("quota reached")
 
     config = runtime.provider_config("openai")
-    runtime.record_failure("openai", error)
 
     assert config.default_model == "writer-model"
-    assert configurations.failures == [("openai", error)]
 
 
 def test_operation_state_and_failure_classification_are_shared_contracts():

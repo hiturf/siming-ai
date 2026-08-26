@@ -154,12 +154,12 @@ def _revision_preview_warnings(
 def _load_revision_context(
     db: Session,
     project_id: str,
-    chapter_id: str,
+    chapter_id: str | None,
     *,
     content: str,
     original_content: str | None,
     revision_round: int,
-) -> tuple[Project, Chapter, str, str, int]:
+) -> tuple[Project, Chapter | None, str, str, int]:
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise NotFoundError("作品不存在")
@@ -167,8 +167,8 @@ def _load_revision_context(
         db.query(Chapter)
         .filter(Chapter.id == chapter_id, Chapter.project_id == project_id)
         .first()
-    )
-    if not chapter:
+    ) if chapter_id else None
+    if chapter_id and not chapter:
         raise NotFoundError("章节不存在")
 
     source = str(content or "")
@@ -188,7 +188,7 @@ def _load_revision_context(
 
 def _build_revision_preview(
     *,
-    chapter: Chapter,
+    chapter: Chapter | None,
     original: str,
     source: str,
     rewritten: str,
@@ -227,7 +227,7 @@ def _build_revision_preview(
         else {}
     )
     return {
-        "chapter_id": chapter.id,
+        "chapter_id": chapter.id if chapter else None,
         "original": original,
         "input": source,
         "rewritten": rewritten,
@@ -255,7 +255,7 @@ def _build_revision_preview(
 async def preview_de_ai_revision(
     db: Session,
     project_id: str,
-    chapter_id: str,
+    chapter_id: str | None,
     *,
     content: str,
     original_content: str | None = None,

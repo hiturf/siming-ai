@@ -1,4 +1,5 @@
 """Launcher preference and verified application update endpoints."""
+
 from __future__ import annotations
 
 import os
@@ -12,6 +13,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..core.exceptions import ValidationError
 from ..core.response import ApiResponse
+from ..installer_updater import (
+    download_and_stage_update,
+    get_update_status,
+    schedule_staged_update_install,
+)
 from ..services.application_settings import (
     app_home,
     launcher_settings_payload,
@@ -19,11 +25,6 @@ from ..services.application_settings import (
     normalize_gateway_advertised_url,
     normalize_gateway_allowed_hosts,
     save_launcher_settings,
-)
-from ..installer_updater import (
-    download_and_stage_update,
-    get_update_status,
-    schedule_staged_update_install,
 )
 
 router = APIRouter(tags=["config"])
@@ -57,6 +58,12 @@ class LauncherSettingsUpdateRequest(BaseModel):
             return normalize_gateway_allowed_hosts(value)
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
+
+
+class ApplicationUpdateDownloadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["auto", "github", "gitee"] = "auto"
 
 
 def _exit_after_update_install() -> None:
@@ -99,15 +106,21 @@ def check_for_application_update():
 
 
 @router.post("/config/update/download")
-def download_application_update():
+def download_application_update(
+    payload: ApplicationUpdateDownloadRequest | None = None,
+):
     channel = launcher_settings_payload()["update_channel"]
     try:
-        data = download_and_stage_update(app_home(), channel)
+        data = download_and_stage_update(
+            app_home(),
+            channel,
+            payload.source if payload else "auto",
+        )
     except RuntimeError as exc:
         raise ValidationError(str(exc)) from exc
     return ApiResponse.success(
         data=data,
-        message="更新已下载并完成 SHA256 与签名校验",
+        message="更新已下载并完成 SHA256 校验",
     )
 
 
@@ -125,6 +138,7 @@ def install_application_update():
 
 
 __all__ = [
+    "ApplicationUpdateDownloadRequest",
     "LauncherSettingsUpdateRequest",
     "check_for_application_update",
     "download_application_update",

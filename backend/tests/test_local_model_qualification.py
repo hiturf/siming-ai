@@ -56,7 +56,7 @@ def test_qualification_reports_partial_models_as_limited():
                     '{"revealed_clue":{"chapter_number":73,"clue":"揭示"}}'
                 )
             }
-        return {"content": '{"tool":"create_chapter","arguments":{}}'}
+        return {"content": '{"tool":"create_character","arguments":{}}'}
 
     result = asyncio.run(
         qualify_local_model("partial-model", 8192, completion=complete)

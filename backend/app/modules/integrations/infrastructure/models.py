@@ -42,7 +42,7 @@ class Skill(Base):
     builtin_key = Column(String(50), nullable=True)  # e.g. "continue_writing"
     name = Column(String(100), nullable=False)
     description = Column(Text, nullable=True)
-    trigger_examples = Column(Text, nullable=True)  # JSON array of keyword strings
+    trigger_examples = Column(Text, nullable=True)  # JSON array of semantic usage examples
     system_prompt = Column(Text, nullable=False)
     recommended_tools = Column(Text, nullable=True)  # JSON array of tool names
     forbidden_tools = Column(Text, nullable=True)  # JSON array of tool names

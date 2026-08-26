@@ -1,6 +1,7 @@
 /* Message list rendering for the assistant chat. */
-import { Button, Empty, Space, Tag, Tooltip, Typography } from 'antd'
-import { DatabaseOutlined, DownOutlined } from '@ant-design/icons'
+import { useState } from 'react'
+import { Button, Dropdown, Empty, Space, Tag, Typography } from 'antd'
+import { DatabaseOutlined, DownOutlined, SaveOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import { ChapterVersionPanel } from '../ChapterVersionPanel'
 import { NarrativeLedgerPanel } from '../NarrativeLedgerPanel'
@@ -9,10 +10,10 @@ import { findStorageHealth, StorageRepairActions } from '../StorageRepairActions
 import { PersistentOutcome } from '../interaction'
 import type { OperationOutcome } from '../interaction'
 import { AssistantMessageTime } from './MessageTime'
+import { ReasoningDisclosure } from './ReasoningDisclosure'
 import type {
   WorkspaceAssistantMessage,
   WorkspaceMessageNavigationAction,
-  SkillMatch,
   WorkspaceToolLog,
 } from './types'
 import { SCOPE_LABEL } from './constants'
@@ -47,6 +48,57 @@ function chapterVersionActions(item: WorkspaceAssistantMessage): WorkspaceToolLo
   ].filter((action) => action.tool === 'list_chapter_versions' && action.data)
 }
 
+function chapterDraftActions(item: WorkspaceAssistantMessage): WorkspaceToolLog[] {
+  return (item.data?.applied_actions || []).filter((action) => (
+    ['chapter_writer', 'save_external_chapter_draft'].includes(String(action.tool || ''))
+    && action.status === 'ok'
+    && action.data?.draft_id
+    && action.data?.content
+  ))
+}
+
+function ChapterDraftSaveActions({
+  action,
+  activeDraftId,
+  activeDraftStatus,
+  onSave,
+}: {
+  action: WorkspaceToolLog
+  activeDraftId: string | null
+  activeDraftStatus: string | null
+  onSave: (action: WorkspaceToolLog, mode: 'save_only' | 'save_and_catalog') => Promise<void>
+}) {
+  const [savingMode, setSavingMode] = useState<'save_only' | 'save_and_catalog' | null>(null)
+  const draftId = String(action.data?.draft_id || '')
+  const saved = activeDraftId === draftId && activeDraftStatus === 'saved'
+  const save = async (mode: 'save_only' | 'save_and_catalog') => {
+    setSavingMode(mode)
+    try {
+      await onSave(action, mode)
+    } finally {
+      setSavingMode(null)
+    }
+  }
+  if (saved) return <Tag color="green">草稿已保存</Tag>
+  return (
+    <Dropdown.Button
+      type="primary"
+      size="small"
+      icon={<SaveOutlined />}
+      loading={savingMode === 'save_and_catalog'}
+      onClick={() => void save('save_and_catalog')}
+      menu={{
+        items: [{ key: 'save_only', label: '仅保存' }],
+        onClick: ({ key }) => {
+          if (key === 'save_only') void save('save_only')
+        },
+      }}
+    >
+      保存并建档
+    </Dropdown.Button>
+  )
+}
+
 const PERSISTENT_OUTCOMES = new Set([
   'partial_success',
   'empty_response',
@@ -69,7 +121,6 @@ function assistantOutcomeResult(item: WorkspaceAssistantMessage) {
 interface MessageListProps {
   messages: WorkspaceAssistantMessage[]
   generating: boolean
-  matchedSkills: SkillMatch[]
   showScrollBottom: boolean
   onScrollToBottom: () => void
   messagesRef: React.RefObject<HTMLDivElement>
@@ -77,12 +128,17 @@ interface MessageListProps {
   projectId: string
   onStorageRepaired?: () => void
   emptyDescription?: string
+  onSaveChapterDraft?: (
+    action: WorkspaceToolLog,
+    mode: 'save_only' | 'save_and_catalog',
+  ) => Promise<void>
+  activeDraftId?: string | null
+  activeDraftStatus?: string | null
 }
 
 export function MessageList({
   messages,
   generating,
-  matchedSkills,
   showScrollBottom,
   onScrollToBottom,
   messagesRef,
@@ -90,6 +146,9 @@ export function MessageList({
   projectId,
   onStorageRepaired,
   emptyDescription = '直接提出需求，AI会读取项目资料并决定是否调用工具。',
+  onSaveChapterDraft,
+  activeDraftId = null,
+  activeDraftStatus = null,
 }: MessageListProps) {
   return (
     <>
@@ -131,6 +190,12 @@ export function MessageList({
                 </Tag>
                 <AssistantMessageTime value={item.created_at} />
               </div>
+              {item.role === 'assistant' && (
+                <ReasoningDisclosure
+                  content={item.reasoning_content}
+                  streaming={generating && item.status === 'running'}
+                />
+              )}
               <Paragraph style={{ marginTop: 6, marginBottom: 6, whiteSpace: 'pre-wrap' }}>
                 {item.content}
               </Paragraph>
@@ -142,6 +207,16 @@ export function MessageList({
                   />
                 </div>
               )}
+              {item.role === 'assistant' && onSaveChapterDraft && chapterDraftActions(item).map((action, actionIndex) => (
+                <div className="workspace-assistant-message-action" key={`chapter-draft-${actionIndex}`}>
+                  <ChapterDraftSaveActions
+                    action={action}
+                    activeDraftId={activeDraftId}
+                    activeDraftStatus={activeDraftStatus}
+                    onSave={onSaveChapterDraft}
+                  />
+                </div>
+              ))}
               {item.role === 'assistant' && item.data?.outcome && PERSISTENT_OUTCOMES.has(item.data.outcome) && (
                 <PersistentOutcome
                   outcome={item.data.outcome as OperationOutcome}
@@ -210,24 +285,6 @@ export function MessageList({
           </div>
         )}
 
-        {/* Matched skills indicator */}
-        {matchedSkills.length > 0 && (
-          <div style={{ marginBottom: 8 }}>
-            <Text type="secondary" style={{ fontSize: 12 }}>已激活技能：</Text>
-            <Space size={[4, 4]} wrap>
-              {matchedSkills.map((s) => (
-                <Tooltip
-                  key={s.name}
-                  title={s.truncated ? `${s.description || ''}（提示词已截断）` : s.description}
-                >
-                  <Tag color={s.injected === false ? 'default' : 'blue'} style={{ fontSize: 11 }}>
-                    {s.name}{s.truncated ? ' ⚠' : ''}
-                  </Tag>
-                </Tooltip>
-              ))}
-            </Space>
-          </div>
-        )}
       </div>
     </>
   )

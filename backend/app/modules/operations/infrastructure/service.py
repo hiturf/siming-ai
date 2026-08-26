@@ -132,7 +132,7 @@ class SqlAlchemyOperationService(OperationServicePort):
                 if operation.status in TERMINAL_STATUSES:
                     yield "done", snapshot
                     return
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.2)
 
     async def action(self, operation_id: str, action: str) -> tuple[str, dict | None]:
         with SessionLocal() as db:

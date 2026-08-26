@@ -1,6 +1,7 @@
 """Pydantic schemas for AI writing engine endpoints."""
 from datetime import datetime
 from typing import Any, Literal, Optional
+
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -14,35 +15,20 @@ class MobileProviderEnvelope(BaseModel):
 
 
 class WorkspaceAssistantRequest(BaseModel):
-    """Conversational assistant for project planning modules."""
+    """Conversational assistant for a project workspace."""
 
-    scope: Literal["outline", "characters", "worldbuilding", "project"] = Field(..., description="Management scope")
     message: str = Field(..., min_length=1, max_length=1_000_000)
     conversation_id: Optional[str] = None
     canonical_conversation_id: Optional[str] = Field(
         None,
-        description="Canonical scoped conversation ID used to reuse the internal execution thread",
+        description="Canonical project conversation ID used to reuse the internal execution thread",
     )
-    creation_session_id: Optional[str] = Field(
-        None,
-        description="Creation data linked to this project and available to the assistant as structured context",
-    )
-    selected_outline_node_id: Optional[str] = None
-    selected_character_id: Optional[str] = None
     selected_text: Optional[str] = Field(None, description="User-selected text in the editor")
     selected_text_chapter_id: Optional[str] = Field(None, description="Chapter ID the selected text belongs to")
     model: Optional[str] = None
-    assistant_mode: Literal["quality", "fast"] = Field("fast", description="Workspace assistant controller mode")
     temperature: Optional[float] = Field(0.3, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(None, ge=1)
     outline_batch_count: int = Field(3, ge=1, le=12, description="Preferred number of consecutive outline chapters to plan")
-    auto_apply: bool = Field(True, description="Apply tool actions proposed by the model")
-    local_cli_permission_grant: Literal["chat_only", "project_agent_once"] = Field(
-        "chat_only",
-        description=(
-            "One-turn user grant for a local CLI to use the scoped Siming MCP tools"
-        ),
-    )
     local_cli_read_permission_grant: Literal["none", "read_once"] = Field(
         "none",
         description="One-turn consent to snapshot explicitly named local paths for OpenCode",
@@ -86,12 +72,11 @@ class WorkspaceAssistantRunResponse(BaseModel):
     conversation_id: Optional[str] = None
     canonical_conversation_id: Optional[str] = Field(
         None,
-        description="Canonical scoped conversation ID used to reuse the internal execution thread",
+        description="Canonical project conversation ID used to reuse the internal execution thread",
     )
     assistant_message_id: Optional[str] = None
     phase: Optional[str] = None
     scope: Optional[str] = None
-    assistant_mode: Optional[str] = None
     current_iteration: int = 0
     error: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -112,6 +97,8 @@ class WorkspaceAssistantRunStepResponse(BaseModel):
     retry_of_step_id: Optional[str] = None
     resolved_step_id: Optional[str] = None
     idempotency_key: Optional[str] = None
+    can_retry: bool = False
+    retry_block_reason: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     request: Any = None

@@ -18,8 +18,8 @@ from app.architecture.uow import commit_session
 
 from ...database.models import (
     LocalModel,
-    LocalModelTaskSetting,
     LocalRuntimeInstallation,
+    ModelTaskSetting,
     ModelAdapter,
 )
 from ...database.session import SessionLocal
@@ -112,7 +112,7 @@ class LocalRuntimeManager:
         model_key: str,
         *,
         context_length: int | None = None,
-        task_type: str = "chat",
+        task_type: str = "assistant",
         project_id: str | None = None,
         adapter_ids: list[str] | None = None,
     ) -> str:
@@ -424,8 +424,10 @@ class LocalRuntimeManager:
             else:
                 query = query.filter(ModelAdapter.project_id.is_(None))
             adapters = query.all()
-            task_setting = db.query(LocalModelTaskSetting).filter(
-                LocalModelTaskSetting.task_type == task_type
+            task_setting = db.query(ModelTaskSetting).filter(
+                ModelTaskSetting.task_type == task_type,
+                ModelTaskSetting.provider == "local_llama_cpp",
+                ModelTaskSetting.model_name == model_key,
             ).first()
             selected_ids = (
                 set(adapter_ids)

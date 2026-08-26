@@ -33,7 +33,7 @@ class InjectPublicPromptPackSectionTest(unittest.TestCase):
         db.query.return_value = query_mock
 
         original = "你是写作助手。"
-        result = inject_public_prompt_pack_section(original, db, "chapter_writing", "quality")
+        result = inject_public_prompt_pack_section(original, db, "chapter_writing")
 
         self.assertIn("质量模式章节写作", result)
         self.assertIn("1.0.0", result)
@@ -59,25 +59,6 @@ class InjectPublicPromptPackSectionTest(unittest.TestCase):
         original = "你是写作助手。"
         result = inject_public_prompt_pack_section(original, db, "chapter_writing")
         self.assertEqual(result, original)
-
-    def test_fast_mode_injects_fast_pack(self):
-        db = MagicMock()
-        pack = MagicMock()
-        pack.pack_id = "chapter_writing_fast"
-        pack.title = "快速模式"
-        pack.version = "1.0.0"
-        pack.summary = "少轮次直写"
-        pack.quality_rubric_json = None
-        pack.forbidden_patterns_json = ["仿佛"]
-
-        query_mock = MagicMock()
-        query_mock.filter.return_value = query_mock
-        query_mock.first.return_value = pack
-        db.query.return_value = query_mock
-
-        result = inject_public_prompt_pack_section("原始", db, "chapter_writing", "fast")
-        self.assertIn("快速模式", result)
-
 
 if __name__ == "__main__":
     unittest.main()

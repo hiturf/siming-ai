@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ...core.crypto import encrypt
-from ...database.models import APIConfig, LocalModel, LocalModelTaskSetting, LocalRuntimeInstallation, ModelDownloadTask, OperationRun
+from ...database.models import APIConfig, LocalModel, LocalRuntimeInstallation, ModelDownloadTask, ModelTaskSetting, OperationRun
 from ...database.session import SessionLocal
 from ..operation_runtime import ensure_operation, update_operation
 from .downloads import download_with_fallback
@@ -73,8 +73,10 @@ def ensure_catalog_rows() -> None:
             runtime.pid = None
             runtime.active_model_id = None
         recommended_context = detect_hardware().recommended_context
-        for setting in db.query(LocalModelTaskSetting).all():
-            model_context = context_by_model.get(setting.model_key)
+        for setting in db.query(ModelTaskSetting).filter(
+            ModelTaskSetting.provider == "local_llama_cpp"
+        ).all():
+            model_context = context_by_model.get(setting.model_name)
             if model_context and not setting.context_length:
                 # The catalog advertises capacity, not a safe launch default.
                 # Never silently expand a user's task context during startup.

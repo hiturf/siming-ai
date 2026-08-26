@@ -45,8 +45,8 @@ These tools mutate the database. They are denied until a confirmation-token mode
 
 | Pattern | Matching Tools |
 |---------|---------------|
-| `create_*` | `create_project`, `create_character`, `create_chapter`, `create_outline_node`, `create_worldbuilding_entry`, `create_relationship`, `create_scheduled_task`, `create_skill` |
-| `update_*` | `update_project_info`, `update_character`, `update_chapter`, `update_outline_node`, `update_worldbuilding_entry`, `update_relationship`, `update_scheduled_task`, `update_skill`, `update_cataloging_candidate` |
+| `create_*` | `create_project`, `create_character`, `create_outline_node`, `create_worldbuilding_entry`, `create_relationship`, `create_scheduled_task`, `create_skill` |
+| `update_*` | `update_project_info`, `update_character`, `update_outline_node`, `update_worldbuilding_entry`, `update_relationship`, `update_scheduled_task`, `update_skill`, `update_cataloging_candidate` |
 | `delete_*` | `delete_project`, `delete_character`, `delete_chapter`, `delete_outline_node`, `delete_worldbuilding_entry`, `delete_relationship`, `delete_scheduled_task`, `delete_skill` |
 | `merge_*` | `merge_duplicate_characters` |
 | `import_*` | `import_text_as_chapters`, `import_deconstruct_report` |
@@ -110,7 +110,7 @@ When write tools are enabled (Phase 4), each write invocation will require a con
 2. The server checks for a valid `confirmation_token` in the tool arguments.
 3. If missing or invalid, the server returns `PermissionDenied` with reason `confirmation_required`.
 4. If valid, the server executes the tool and invalidates the token (single-use).
-5. Tokens are scoped: a token issued for `create_chapter` cannot be used for `delete_project`.
+5. Tokens are scoped: a token issued for `create_character` cannot be used for `delete_project`.
 
 Token issuance mechanism is defined in the Phase 4 specification (MCP-0402). Until then, all write tools are unconditionally denied.
 

@@ -1,8 +1,6 @@
 """Conflict suggestion, character change detection, and worldbuilding conflict detection workspace tools."""
 from __future__ import annotations
 
-from app.architecture.uow import commit_session
-
 import json as _json
 import re as _re
 from datetime import datetime
@@ -13,11 +11,8 @@ from sqlalchemy.orm import Session
 from ....modules.model_runtime.application.execution import model_executor as LLMGateway
 from ....database.models import (
     Chapter,
-    ChapterCharacter,
     Character,
-    CharacterChangeLog,
     CharacterRelationship,
-    CharacterTimeline,
     Project,
     WorldbuildingEntry,
 )
@@ -128,12 +123,11 @@ async def detect_character_changes(
     project_id: str,
     args: dict[str, Any],
 ) -> dict:
-    """Detect character changes from chapter content.
+    """Detect character changes without mutating archive data.
 
-    Two modes:
-    - content+title: detect changes against current character states, return only (no DB writes).
-      Used before create_chapter so Agent can apply changes via update_character.
-    - chapter_id: detect and save change logs / timeline entries to DB.
+    Saved chapter content can be selected with ``chapter_id``, but all derived
+    character, relationship, timeline, and chapter-link writes belong solely to
+    the canonical cataloging pipeline.
     """
     chapter_title: str = ""
     chapter_text: str = ""
@@ -222,13 +216,6 @@ async def detect_character_changes(
         "personality": "personality",
     }
     allowed_fields = {"abilities", "personality", "background", "appearance"}
-    timeline_type_by_change = {
-        "skill": "skill_gain",
-        "experience": "key_decision",
-        "relationship": "relationship_change",
-        "personality": "emotional_turning_point",
-    }
-
     detected_changes: list[dict] = []
     if isinstance(changes, list):
         for change in changes:
@@ -256,48 +243,6 @@ async def detect_character_changes(
                 "new_value": new_val,
                 "confidence": confidence,
             })
-
-            # Persist logs only when chapter is already saved
-            if chapter_id:
-                log = CharacterChangeLog(
-                    character_id=char_id,
-                    chapter_id=chapter_id,
-                    change_type=change_type,
-                    field_name=field_name,
-                    old_value=old_val,
-                    new_value=new_val,
-                    confirmed=False,
-                )
-                db.add(log)
-                db.flush()
-
-                existing_chapter_char = (
-                    db.query(ChapterCharacter)
-                    .filter(
-                        ChapterCharacter.chapter_id == chapter_id,
-                        ChapterCharacter.character_id == char_id,
-                    )
-                    .first()
-                )
-                if not existing_chapter_char:
-                    db.add(ChapterCharacter(
-                        chapter_id=chapter_id,
-                        character_id=char_id,
-                        appearance_type="AI演化追踪",
-                        description=f"检测到{change_type}变化，可信度：{confidence}",
-                    ))
-
-                timeline_type = timeline_type_by_change.get(change_type, "key_decision")
-                db.add(CharacterTimeline(
-                    character_id=char_id,
-                    chapter_id=chapter_id,
-                    event_type=timeline_type,
-                    event_description=f"[{change_type}] {field_name}: {new_val or '见原文'}",
-                    emotional_state_change=new_val if change_type == "personality" else None,
-                ))
-
-    if chapter_id:
-        commit_session(db)
 
     return {
         "tool": "detect_character_changes",

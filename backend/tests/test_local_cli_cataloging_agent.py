@@ -36,6 +36,7 @@ from app.services.workspace.tools.cataloging import apply_pending_cataloging
 from app.services.workspace.tools.external_cataloging import (
     get_next_external_cataloging_chapter,
     save_external_cataloging_candidates,
+    save_external_cataloging_facts,
 )
 
 
@@ -67,7 +68,7 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
                 provider="opencode_cli",
                 provider_type="local_cli",
                 api_key_encrypted="",
-                default_model="opencode/deepseek-v4-flash-free",
+                default_model="opencode/big-pickle",
                 cli_command="opencode",
                 is_global_default=True,
             ))
@@ -90,87 +91,45 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
     async def _fake_cli_turn(self, *, job, run, agent_run_id, stage, **_kwargs):
         db = self.Session()
         try:
-            if stage == "merged":
+            if stage == "facts":
                 assigned = await get_next_external_cataloging_chapter(
                     db,
                     job.project_id,
                     {
                         "job_id": job.id,
-                        "phase": "merged",
+                        "phase": "facts",
                         "include_content": False,
                         "include_prompt_pack": False,
                         "include_context_indexes": False,
                     },
                 )
                 self.assertIsNone(assigned["data"]["content"])
-                await save_external_cataloging_candidates(
+                await save_external_cataloging_facts(
                     db,
                     job.project_id,
                     {
                         "job_id": job.id,
                         "chapter_id": run.chapter_id,
-                        "phase": "merged",
-                        "candidates": [
+                        "facts": [
                             {
-                                "type": "chapter_summary",
-                                "summary_text": "林舟推开旧门并看见另一个自己。",
-                                "coverage_manifest": {
-                                    "scene_count": 1,
-                                    "characters": ["林舟"],
-                                    "worldbuilding": [],
-                                    "relationships": [],
-                                    "character_profiles": ["林舟"],
+                                "fact_type": "chapter_overview",
+                                "evidence": "林舟推开旧门，看见门后站着另一个自己。",
+                                "payload": {
+                                    "summary": "林舟推开旧门并看见另一个自己。",
+                                    "key_events": ["推开旧门", "遇见另一个自己"],
                                 },
-                                "narrative_state": {
-                                    "events": [{"description": "林舟推开旧门。"}],
-                                    "timeline_events": [],
-                                    "foreshadowing_planted": [],
-                                    "foreshadowing_resolved": [],
-                                    "storyline_progress": [],
-                                    "new_storylines": [],
-                                    "reader_known_facts": [],
-                                    "character_known_facts": [],
-                                    "unresolved_actions": [],
-                                    "character_actions": [],
-                                    "relationship_changes": [],
+                            },
+                            {
+                                "fact_type": "character_fact",
+                                "evidence": "林舟推开旧门",
+                                "payload": {
+                                    "primary_name": "林舟",
+                                    "actions": ["推开旧门"],
                                 },
-                                "narrative_review": {"source": "provided", "findings": []},
-                            },
-                            {
-                                "type": "outline_create",
-                                "node_type": "chapter",
-                                "title": "第一章 开门",
-                                "summary": "林舟在旧门后遭遇异常自我。",
-                            },
-                            {
-                                "type": "character_create",
-                                "name": "林舟",
-                                "role_type": "protagonist",
-                                "personality": "谨慎而好奇。",
-                                "background": "推开旧门后看见另一个自己的旅人。",
-                            },
-                            {
-                                "type": "character_state_update",
-                                "name": "林舟",
-                                "appearance": "沿用本章描写",
-                                "age": "未明确",
-                                "current_location": "旧门前",
-                            },
-                            {
-                                "type": "chapter_link",
-                                "character_names": ["林舟"],
-                                "description": "本章出场",
                             },
                         ],
                     },
                 )
-                if job.execution_mode == "auto":
-                    await apply_pending_cataloging(
-                        db,
-                        job.project_id,
-                        {"job_id": job.id},
-                    )
-                    db.commit()
             elif stage == "candidates":
                 assigned = await get_next_external_cataloging_chapter(
                     db,
@@ -205,8 +164,8 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
                                 "narrative_review": {"source": "provided", "findings": []},
                             },
                             {
-                                "type": "outline",
-                                "action": "create",
+                                "type": "outline_create",
+                                "node_type": "chapter",
                                 "title": "第一章 开门",
                                 "summary": "林舟在旧门后遭遇异常自我。",
                             },
@@ -257,7 +216,7 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
                 db,
                 self.project_id,
                 mode,
-                "opencode_cli:opencode/deepseek-v4-flash-free",
+                "opencode_cli:opencode/big-pickle",
                 [self.chapter_id],
                 execution_backend="local_cli_agent",
             )
@@ -292,7 +251,7 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
                 db.query(CatalogingFact)
                 .filter(CatalogingFact.fact_type == "chapter_overview")
                 .count(),
-                0,
+                1,
             )
             self.assertGreater(db.query(CatalogingFact).count(), 0)
         finally:
@@ -341,9 +300,9 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
         )
         chapter = Chapter(id=self.chapter_id, title="第七章 寿宴发难")
         with tempfile.TemporaryDirectory() as directory:
-            task_file = __import__("pathlib").Path(directory) / "0007-merged.md"
+            task_file = __import__("pathlib").Path(directory) / "0007-candidates.md"
             task_file.write_text("第七章唯一任务", encoding="utf-8")
-            prompt = _task_prompt(task_file, job, run, chapter, "agent-run-7", "merged")
+            prompt = _task_prompt(task_file, job, run, chapter, "agent-run-7", "candidates")
             task_text = _task_text(
                 job=job,
                 run=run,
@@ -353,12 +312,12 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
                 project_folder=__import__("pathlib").Path(directory),
                 chapter=chapter,
                 chapter_file=task_file,
-                stage="merged",
+                stage="candidates",
             )
             launch = _build_cataloging_cli_launch(
                 config=config,
                 prompt=prompt,
-                model="opencode/deepseek-v4-flash-free",
+                model="opencode/big-pickle",
                 task_file=task_file,
                 project_folder=__import__("pathlib").Path(directory),
                 run=run,
@@ -406,45 +365,27 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
         db = self.Session()
         try:
             job = db.query(CatalogingJob).filter(CatalogingJob.id == job_id).first()
-            self.assertEqual(attempts, 2)
-            self.assertEqual(stages, ["merged", "merged"])
+            self.assertEqual(attempts, 3)
+            self.assertEqual(stages, ["facts", "facts", "candidates"])
             self.assertEqual(job.status, "completed", job.error)
             self.assertEqual(job.chapter_runs[0].status, "completed")
         finally:
             db.close()
 
-    def test_no_save_turn_uses_direct_jsonl_fallback_before_pausing_job(self):
+    def test_no_save_turn_pauses_without_a_non_mcp_fallback(self):
         job_id = self._create_job("auto")
         attempts = 0
-        fallback_calls = 0
 
         async def stalled_cli_turn(**_kwargs):
             nonlocal attempts
             attempts += 1
             return 0, "finished without MCP writes", ""
 
-        async def direct_fallback(db, *, job, run, stage, **_kwargs):
-            nonlocal fallback_calls
-            fallback_calls += 1
-            self.assertEqual(stage, "merged")
-            run.status = "completed"
-            job.status = "completed"
-            job.completed_chapters = 1
-            job.current_chapter_id = None
-            job.blocked_chapter_id = None
-            job.error = None
-            db.commit()
-            return True, ""
-
         with (
             patch("app.services.cataloging.local_cli_agent.SessionLocal", self.Session),
             patch(
                 "app.services.cataloging.local_cli_agent._run_cli_turn",
                 side_effect=stalled_cli_turn,
-            ),
-            patch(
-                "app.services.cataloging.local_cli_result._run_direct_jsonl_cataloging_fallback",
-                side_effect=direct_fallback,
             ),
         ):
             asyncio.run(_coordinate_cataloging(job_id, "opencode_cli"))
@@ -453,9 +394,9 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
         try:
             job = db.query(CatalogingJob).filter(CatalogingJob.id == job_id).first()
             self.assertEqual(attempts, _MAX_NO_SAVE_ATTEMPTS)
-            self.assertEqual(fallback_calls, 1)
-            self.assertEqual(job.status, "completed", job.error)
-            self.assertEqual(job.chapter_runs[0].status, "completed")
+            self.assertEqual(job.status, "paused_on_failure")
+            self.assertEqual(job.chapter_runs[0].status, "failed")
+            self.assertIn("MCP", job.error)
         finally:
             db.close()
 
@@ -500,7 +441,7 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
                         chapter=self.chapter,
                         config=config,
                         agent_run_id="agent-run-without-events",
-                        stage="merged",
+                        stage="facts",
                     ))
         finally:
             for name, value in old_env.items():
@@ -540,7 +481,7 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
                         chapter=self.chapter,
                         config=config,
                         agent_run_id="agent-run-quota",
-                        stage="merged",
+                        stage="facts",
                     ))
         finally:
             db.close()
@@ -557,13 +498,37 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
                 "SIMING_MANAGED_CATALOGING_JOB_ID": job_id,
                 "SIMING_MANAGED_CATALOGING_CHAPTER_ID": self.chapter_id,
                 "SIMING_MANAGED_CATALOGING_CHAPTER_RUN_ID": run.id,
-                "SIMING_MANAGED_CATALOGING_STAGE": "merged",
+                "SIMING_MANAGED_CATALOGING_STAGE": "facts",
             }
             with patch.dict(os.environ, env, clear=False):
                 assigned = asyncio.run(get_next_external_cataloging_chapter(
                     db,
                     self.project_id,
-                    {"job_id": job_id, "phase": "merged"},
+                    {"job_id": job_id, "phase": "facts"},
+                ))
+                self.assertEqual(assigned["status"], "ok")
+                facts_saved = asyncio.run(save_external_cataloging_facts(
+                    db,
+                    self.project_id,
+                    {
+                        "job_id": job_id,
+                        "chapter_id": self.chapter_id,
+                        "facts": [{
+                            "fact_type": "chapter_overview",
+                            "evidence": "林舟推开旧门，看见门后站着另一个自己。",
+                            "payload": {
+                                "summary": "林舟推开旧门并看见另一个自己。",
+                                "key_events": ["推开旧门", "遇见另一个自己"],
+                            },
+                        }],
+                    },
+                ))
+                self.assertEqual(facts_saved["status"], "ok")
+                os.environ["SIMING_MANAGED_CATALOGING_STAGE"] = "candidates"
+                assigned = asyncio.run(get_next_external_cataloging_chapter(
+                    db,
+                    self.project_id,
+                    {"job_id": job_id, "phase": "candidates"},
                 ))
                 self.assertEqual(assigned["status"], "ok")
                 partial = asyncio.run(save_external_cataloging_candidates(
@@ -572,7 +537,6 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
                     {
                         "job_id": job_id,
                         "chapter_id": self.chapter_id,
-                        "phase": "merged",
                         "candidates": [
                             {
                                 "type": "chapter_summary",
@@ -602,7 +566,7 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
                     "character_state_update for declared characters (0/1)",
                     partial["data"]["missing_required_items"],
                 )
-                self.assertEqual(partial["data"]["chapter_run_status"], "in_progress")
+                self.assertEqual(partial["data"]["chapter_run_status"], "facts_saved")
 
                 saved = asyncio.run(save_external_cataloging_candidates(
                     db,
@@ -610,7 +574,6 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
                     {
                         "job_id": job_id,
                         "chapter_id": self.chapter_id,
-                        "phase": "merged",
                         "candidates": [
                             {
                                 "type": "character_create",
@@ -684,7 +647,7 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
                         chapter=self.chapter,
                         config=config,
                         agent_run_id="agent-run-quota-retry",
-                        stage="merged",
+                        stage="facts",
                     ))
 
             self.assertLess(time.monotonic() - started, 3)

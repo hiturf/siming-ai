@@ -57,7 +57,7 @@ internal data class MobileContextPolicy(
                 sourceHash = root.stringValue("source_sha256"),
                 requiredCategories = contract.stringList("required_categories").toSet(),
                 optionalCategories = contract.stringList("optional_categories").toSet(),
-                contextWindowTokens = defaults.intValue("context_window_tokens", 16_384),
+                contextWindowTokens = defaults.intValue("context_window_tokens", 1_000_000),
                 safetyMarginTokens = defaults.intValue("safety_margin_tokens", 512),
                 minimumOutputReserveTokens = defaults.intValue("minimum_output_reserve_tokens", 2_048),
                 outputRatio = defaults.doubleValue("output_ratio", 0.45),
@@ -345,7 +345,7 @@ internal data class MobileContextManifest(
                 request = request,
                 requestFingerprint = root.stringValue("request_fingerprint"),
                 selectionFingerprint = root.stringValue("selection_fingerprint"),
-                contextWindowTokens = budget.intValue("context_window_tokens", 16_384),
+                contextWindowTokens = budget.intValue("context_window_tokens", 1_000_000),
                 inputBudgetTokens = budget.intValue("input_budget_tokens", 8_000),
                 outputReserveTokens = budget.intValue("output_reserve_tokens", 2_048),
                 safetyMarginTokens = budget.intValue("safety_margin_tokens", 512),
@@ -411,7 +411,7 @@ internal class MobileContextManifestEngine(
         if (missingRequired.isNotEmpty()) {
             warnings += "Required context is missing: ${missingRequired.joinToString(", ")}"
         }
-        warnings += "手机独立模式使用保守 16K 上下文与本地词法检索；未启用 PC FTS、向量检索或 pinned chunks。"
+        warnings += "手机独立模式使用与 PC 同源的模型容量预算和本地词法检索；未启用 PC FTS、向量检索或 pinned chunks。"
 
         val selectionFingerprint = mobileSha256(
             selected.joinToString("\u001e") { item ->
@@ -489,17 +489,18 @@ internal class MobileContextManifestEngine(
         candidates: MutableList<MobileContextManifestItem>,
         coverage: MutableMap<String, MobileContextCoverage>,
     ) {
-        val target = inputs.request.outlineNodeId.takeIf(String::isNotBlank)?.let { id ->
+        val requestedTarget = inputs.request.outlineNodeId.takeIf(String::isNotBlank)?.let { id ->
             inputs.rawRecords.firstOrNull { it.mobileRecordType() == "outline_node" && it.stringValue("id") == id }
                 ?: inputs.primaryRecords.firstOrNull {
                     it.mobileRecordType() == "outline_node" && it.stringValue("id") == id
                 }
         }
+        val target = requestedTarget?.takeIf { it.stringValue("node_type") == "chapter" }
         if (target == null) {
-            val reason = if (inputs.request.outlineNodeId.isBlank()) {
-                "Writing needs a target outline or section."
-            } else {
-                "The selected outline node no longer exists."
+            val reason = when {
+                inputs.request.outlineNodeId.isBlank() -> "Writing needs a chapter-level outline target."
+                requestedTarget == null -> "The requested outline node no longer exists."
+                else -> "The writing target must be a chapter node, not a volume or section."
             }
             coverage["target_outline"] = MobileContextCoverage(true, "missing", 0, reason)
             return

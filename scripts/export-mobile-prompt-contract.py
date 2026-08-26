@@ -17,17 +17,23 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
+from app.architecture.tool_categories import (  # noqa: E402
+    TOOL_CATEGORY_CONTROLLER,
+    tool_category_contract,
+    tool_category_controller_schema,
+)
 from app.modules.assistant.infrastructure.runtime import render_prompt  # noqa: E402
+from app.modules.creation.interfaces.agent_scope import (  # noqa: E402
+    CREATION_AGENT_REVISION_TOOL_NAMES,
+    CREATION_AGENT_WRITE_TOOL_NAMES,
+    CREATION_TURN_MAX_FAILED_WRITES,
+    CREATION_TURN_MAX_SUCCESSFUL_WRITES,
+)
 from app.prompts.character_writer_prompts import build_character_writer_messages  # noqa: E402
 from app.prompts.outline_writer_prompts import build_outline_writer_messages  # noqa: E402
 from app.prompts.style_prompts import build_style_context  # noqa: E402
 from app.prompts.worldbuilding_writer_prompts import build_worldbuilding_writer_messages  # noqa: E402
 from app.prompts.workspace_assistant import build_workspace_assistant_initial_user_message  # noqa: E402
-from app.prompts.writing_task_prompts import (  # noqa: E402
-    DEFAULT_WRITING_RULE,
-    GENRE_RULES,
-    TASK_RULES,
-)
 from app.services.agent.prompt_builder import compose_chapter_writer_messages  # noqa: E402
 from app.prompts.packs.chapter_quality import PACK as CHAPTER_QUALITY_PACK  # noqa: E402
 from app.services.workspace.registry import registry  # noqa: E402
@@ -59,8 +65,8 @@ from app.services.novel_creation_prompting import (  # noqa: E402
 )
 from app.services.novel_creation_agent import (  # noqa: E402
     CREATION_AGENT_TOOLS,
+    _domain_tool_schemas as creation_agent_domain_tool_schemas,
     _system_prompt as creation_agent_system_prompt,
-    _tool_schemas as creation_agent_tool_schemas,
 )
 from app.services.workspace.tools.novel_creation_v2 import _normalize_stage_data  # noqa: E402
 
@@ -80,8 +86,6 @@ MOBILE_TOOL_NAMES = [
     "character_writer",
     "outline_writer",
     "worldbuilding_writer",
-    "create_chapter",
-    "update_chapter",
     "create_outline_node",
     "create_outline_nodes",
     "update_outline_node",
@@ -91,15 +95,6 @@ MOBILE_TOOL_NAMES = [
     "update_worldbuilding_entry",
     "update_project_info",
 ]
-
-
-def _rule(rule):
-    return {
-        "key": rule.key,
-        "label": rule.label,
-        "keywords": list(rule.keywords),
-        "body": rule.body,
-    }
 
 
 def _style_template(*, short_sentences: bool, rhetoric: bool, custom: bool) -> str:
@@ -300,8 +295,8 @@ def _creation_normalization_fixture(baseline_fixture: dict) -> dict:
         },
         "characters": {
             "characters": {
-                "林舟": {"role": "主角，记忆修复师", "current_goal": "找到姐姐", "background": ""},
-                "沈岚": {"role_type": "导师，旧城守门人", "goal": "守住城门"},
+                "林舟": {"role_type": "protagonist", "current_goal": "找到姐姐", "background": "记忆修复师"},
+                "沈岚": {"role_type": "mentor", "goal": "守住城门", "background": "旧城守门人"},
             },
             "relationships": {
                 "r1": {"source": "林舟", "target": "沈岚", "relationship_type": "mentor"},
@@ -348,21 +343,14 @@ def build_contract() -> dict:
     tool_names = sorted(MOBILE_TOOL_NAMES)
     workspace_system = render_prompt(
         "assistant.workspace.quality",
-        scope_label="{{scope_label}}",
         outline_batch_count="{{outline_batch_count}}",
-        auto_apply="{{auto_apply}}",
-        tool_names=", ".join(tool_names),
     )
     initial_user = build_workspace_assistant_initial_user_message(
+        project_id="{{project_id}}",
         project_title="{{project_title}}",
-        project_description="{{project_description}}",
-        style_context="{{style_context}}",
         history_text="{{history_text}}",
-        selected_context=["{{selected_context}}"],
-        previous_search_context="{{previous_search_context}}",
-        memory_context="{{memory_context}}",
+        explicit_context=["{{explicit_context}}"],
         outline_batch_count=3,
-        auto_apply=True,
         user_message="{{user_message}}",
     )
     chapter_messages = compose_chapter_writer_messages(
@@ -373,28 +361,25 @@ def build_contract() -> dict:
         character_profiles="{{character_profiles}}",
         recent_summaries="{{recent_summaries}}",
         requirements="{{requirements}}",
-        writing_directives="{{writing_directives}}",
     )
     baseline_fixture = _creation_baseline_fixture()
     contract = {
-        "schema_version": 2,
+        "schema_version": 3,
         "source_versions": {
             "workspace": "assistant.workspace.quality@3.1.0",
-            "chapter_quality": "assistant.chapter.quality@3.0.0",
-            "chapter_fast": "assistant.chapter.fast@3.0.0",
+            "chapter_quality": "assistant.chapter.quality@3.1.0",
             "novel_creation": "creation.novel.stage@3.0.0",
         },
-        "tool_names": tool_names,
-        "tool_schemas": build_workspace_tool_schemas(tool_names),
+        "tool_names": sorted({*tool_names, TOOL_CATEGORY_CONTROLLER}),
+        "tool_schemas": [
+            tool_category_controller_schema(),
+            *build_workspace_tool_schemas(tool_names),
+        ],
+        "tool_categories": tool_category_contract(),
         "workspace_system_template": workspace_system,
         "workspace_initial_user_template": initial_user,
         "chapter": {
             "quality_system_template": chapter_messages[0]["content"],
-            "fast_system_template": render_prompt(
-                "assistant.chapter.fast",
-                writing_directives="{{writing_directives}}",
-                style_context="{{style_context}}",
-            ),
             "user_template": chapter_messages[1]["content"],
         },
         "style_templates": {
@@ -403,11 +388,6 @@ def build_contract() -> dict:
             for short in (False, True)
             for rhetoric in (False, True)
             for custom in (False, True)
-        },
-        "writing_rules": {
-            "genres": [_rule(rule) for rule in GENRE_RULES],
-            "tasks": [_rule(rule) for rule in TASK_RULES],
-            "default": _rule(DEFAULT_WRITING_RULE),
         },
         "writer_systems": _writer_systems(),
         "writer_user_templates": _writer_user_templates(),
@@ -418,8 +398,15 @@ def build_contract() -> dict:
         },
         "creation_agent": {
             "system_template": creation_agent_system_prompt("{{session_id}}"),
-            "tool_names": sorted(CREATION_AGENT_TOOLS),
-            "tool_schemas": creation_agent_tool_schemas(),
+            "tool_names": sorted({*CREATION_AGENT_TOOLS, TOOL_CATEGORY_CONTROLLER}),
+            "revision_tool_names": sorted(CREATION_AGENT_REVISION_TOOL_NAMES),
+            "write_tool_names": sorted(CREATION_AGENT_WRITE_TOOL_NAMES),
+            "max_successful_writes_per_turn": CREATION_TURN_MAX_SUCCESSFUL_WRITES,
+            "max_failed_writes_per_turn": CREATION_TURN_MAX_FAILED_WRITES,
+            "tool_schemas": [
+                tool_category_controller_schema(),
+                *creation_agent_domain_tool_schemas(),
+            ],
             "max_iterations": 6,
         },
         "creation": {

@@ -451,15 +451,15 @@ If a tool you expect is not available:
 
 ## No Siming API Mode
 
-Claude Code / Codex can write novels through Siming **without any model API configured inside Siming**. In this mode, Siming provides context, prompt packs, storage, and telemetry — the external model does all generation and review.
+Claude Code / Codex can write novels through Siming **without any model API configured inside Siming**. In this mode, Siming provides governed context, the quality writing prompt, and independent draft storage; the external model generates one draft.
 
 ### How It Works
 
-1. Siming stores your project data (outline, characters, worldbuilding)
-2. Claude Code / Codex fetches writing context and prompt packs from Siming
-3. The external model generates chapter text using its own capabilities
-4. The external model self-reviews using Siming's quality rubric
-5. The draft is saved to Siming and promoted to a chapter after confirmation
+1. The Agent reads real project entities and selects the chapter-level outline required by the user's latest message; the UI selection is not an implicit target.
+2. Siming prepares one persisted context manifest and the quality writing prompt.
+3. The external model generates exactly one independent unsaved draft.
+4. `save_external_chapter_draft` loads that draft into the editor and ends the model turn.
+5. The author separately chooses **Save and catalog** or **Save only**. De-AI and quality scoring read the current editor text.
 
 ### Writing a Chapter Without Siming API
 
@@ -468,45 +468,30 @@ Claude Code / Codex can write novels through Siming **without any model API conf
 prepare_external_writing_context({
   "project_id": "YOUR_PROJECT_ID",
   "outline_node_id": "NODE_ID",
-  "mode": "quality"
+  "requirements": "The user's latest writing request"
 })
 
 # 2. [Claude Code writes chapter using the context and prompt pack]
 
 # 3. Save the draft
 save_external_chapter_draft({
+  "project_id": "YOUR_PROJECT_ID",
   "content": "Generated chapter text...",
-  "title": "Chapter Title",
   "outline_node_id": "NODE_ID",
+  "context_manifest_id": "MANIFEST_ID",
   "source_agent": "claude-code"
 })
 
-# 4. Record quality review
-record_external_quality_review({
-  "draft_id": "DRAFT_ID",
-  "scores": {"opening_hook": 8, "plot_progression": 7, ...},
-  "pass": true,
-  "reviewer_model": "claude-sonnet-4-6"
-})
-
-# 5. Create the chapter
-create_chapter({
-  "title": "Chapter Title",
-  "draft_id": "DRAFT_ID",
-  "outline_node_id": "NODE_ID"
-})
-
-# 6. Follow the cataloging_job returned by create_chapter
-# If next_action is continue_external_cataloging, continue the merged loop.
-get_next_external_cataloging_chapter({"job_id": "JOB_ID", "phase": "merged"})
-save_external_cataloging_candidates({"job_id": "JOB_ID", "phase": "merged", "candidates": [...]})
-apply_pending_cataloging({"job_id": "JOB_ID"})
+# 4. Stop. Formal save and cataloging are author-controlled UI actions.
 ```
 
-### Creating a New Novel Without Siming API
+### Creating a New Novel Through the Shared Agent Contract
 
 ```
-# 1. Start creation session
+# 1. Open the creation-data category. This controller call ends the model step.
+set_tool_categories({"enabled_categories": ["creation_data"]})
+
+# 2. Start the canonical structured session
 start_novel_creation_session({
   "user_brief": "A xianxia novel about a female cultivator",
   "genre": "xianxia",
@@ -514,25 +499,16 @@ start_novel_creation_session({
   "platform": "qidian"
 })
 
-# 2. Draft blueprints (external agent fills the schema)
-draft_novel_blueprint({
-  "session_id": "SESSION_ID",
-  "execution_mode": "external_agent"
-})
-# [Claude Code generates blueprints using the provided schema]
+# 3. Read real session/artifact data and save the model's structured decisions
+get_creation_snapshot({"session_id": "SESSION_ID"})
+patch_creation_artifact({ ... })
+confirm_creation_artifact({ ... })
 
-# 3. Review blueprint
-review_novel_blueprint({
-  "session_id": "SESSION_ID",
-  "execution_mode": "external_agent",
-  "blueprint": { ... }
-})
+# 4. Open the creation-flow category. The replacement takes effect next step.
+set_tool_categories({"enabled_categories": ["creation_flow"]})
 
-# 4. Apply blueprint to create project
-apply_novel_blueprint({
-  "session_id": "SESSION_ID",
-  "mode": "auto"
-})
+# 5. Create the formal project only after the author explicitly asks for it
+finalize_creation_session({"session_id": "SESSION_ID"})
 ```
 
 ### Cataloging Without Siming API
@@ -633,10 +609,9 @@ current status, outline nodes, and worldbuilding entries, so it must follow
 | `get_external_chapter_draft` | Retrieve stored draft |
 | `record_external_quality_review` | Store quality review |
 | `start_novel_creation_session` | Start new novel creation |
-| `draft_novel_blueprint` | Generate blueprint schema |
-| `review_novel_blueprint` | Review blueprint |
-| `apply_novel_blueprint` | Create project from blueprint |
-| Canonical merged cataloging tools | Apply chapter summary, outline, character, worldbuilding and narrative-state candidates |
+| Canonical creation data tools | Read and patch the session's structured artifacts |
+| `finalize_creation_session` | Create a formal project from the structured session |
+| Canonical staged cataloging tools | Extract facts, resolve candidates, and apply chapter summary, outline, character, worldbuilding and narrative-state updates |
 | `search_chapters` | Search existing chapters |
 | `search_characters` | Search characters |
 | `search_worldbuilding` | Search worldbuilding |
@@ -706,8 +681,8 @@ If `chapter_writer` or other LLM tools fail with "no API key configured":
 3. Replace `chapter_writer` with:
    - `prepare_external_writing_context` to get context
    - External model generates text
-   - `save_external_chapter_draft` to store the draft
-   - `create_chapter` with `draft_id` to save
+   - `save_external_chapter_draft` to load one unsaved draft into the editor and end the turn
+   - The author then chooses **Save and catalog** or **Save only** in the UI
 
 ### SSE Not Connected
 

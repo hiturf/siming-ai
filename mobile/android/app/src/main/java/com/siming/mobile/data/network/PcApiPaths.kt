@@ -22,7 +22,7 @@ internal object PcApiPaths {
     const val NOVEL_CREATION_PRESETS = "$NOVEL_CREATION/presets"
     const val NOVEL_CREATION_SESSIONS = "$NOVEL_CREATION/sessions"
     const val NOVEL_CREATION_START = "$NOVEL_CREATION/start"
-    const val NOVEL_CREATION_APPLY = "$NOVEL_CREATION/apply"
+    const val NOVEL_CREATION_FINALIZE = "$NOVEL_CREATION/finalize"
     const val NOVEL_CREATION_AGENT_TURN = "$NOVEL_CREATION/agent-turn"
 
     fun project(projectId: String): String = "$PROJECTS/${segment(projectId)}"

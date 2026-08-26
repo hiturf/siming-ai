@@ -27,5 +27,5 @@ class PromptPack:
     default_temperature: float | None = None
     default_max_tokens: int | None = None
     context_budget: dict = field(default_factory=dict)
-    tool_policy: str = "none"  # "full" | "search_only" | "none" | "custom"
+    tool_policy: str = "none"  # "dynamic_selected" | "restricted" | "none" | "custom"
     build_system_prompt: Callable[..., str] = field(default=lambda: lambda **kw: "")

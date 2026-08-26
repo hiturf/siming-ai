@@ -224,7 +224,7 @@ export default function ContextGovernancePage({ projectId }: { projectId: string
     {
       title: '模型',
       key: 'model',
-      render: (_: unknown, item: ContextManifest) => <Text ellipsis={{ tooltip: item.model || '未知模型' }} style={{ maxWidth: 180 }}>{item.model || '未知模型 (16K 回退)'}</Text>,
+      render: (_: unknown, item: ContextManifest) => <Text ellipsis={{ tooltip: item.model || '未知模型' }} style={{ maxWidth: 180 }}>{item.model || '未知模型（1M 默认）'}</Text>,
     },
     {
       title: '操作',

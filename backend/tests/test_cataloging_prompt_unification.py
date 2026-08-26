@@ -10,6 +10,7 @@ from app.prompts.cataloging_source import (
     get_fact_extraction_rules,
     get_outline_granularity_rules,
 )
+from app.services.cataloging.orchestrator import _append_incremental_candidate_retry
 from app.services.cataloging.staged_prompts import (
     CATALOGING_RESOLUTION_SYSTEM_PROMPT,
     FACT_EXTRACTION_SYSTEM_PROMPT,
@@ -53,14 +54,32 @@ class CatalogingPromptUnificationTest(unittest.TestCase):
         self.assertIn("只输出 JSONL", shared_facts)
         self.assertIn("不要输出 Markdown", shared_facts)
 
-    def test_candidate_prompts_require_summary_and_outline_in_the_first_object(self):
+    def test_candidate_prompts_require_summary_and_outline_only_on_initial_generation(self):
         external = get_external_cataloging_system_prompt()
         internal = CATALOGING_RESOLUTION_SYSTEM_PROMPT
 
         for prompt in (external, internal):
-            self.assertIn("首个响应对象必须同时包含两个必填对象", prompt)
+            self.assertIn("首次生成回合的首个响应对象必须同时包含两个必填对象", prompt)
             self.assertIn('"chapter_outline"', prompt)
             self.assertIn("不能只返回其中一个", prompt)
+
+    def test_incremental_repair_prompt_does_not_request_a_full_candidate_replay(self):
+        for prompt in (
+            get_external_cataloging_system_prompt(),
+            CATALOGING_RESOLUTION_SYSTEM_PROMPT,
+        ):
+            self.assertEqual(prompt.count("【候选缺项自动修复】"), 1)
+            self.assertIn("增量修复回合", prompt)
+            self.assertIn("不要重发完整候选集", prompt)
+
+        retry_prompt = _append_incremental_candidate_retry(
+            "首次生成回合必须输出完整骨架。",
+            "缺少角色状态候选：张三",
+        )
+        self.assertIn("本节规则优先于上面的首次生成要求", retry_prompt)
+        self.assertIn("只输出错误信息明确指出的缺失候选", retry_prompt)
+        self.assertIn("不要重发完整候选集", retry_prompt)
+        self.assertNotIn("重新输出完整标准 JSONL", retry_prompt)
 
     def test_character_state_schema_tracks_appearance_and_age(self):
         external = get_external_cataloging_system_prompt()

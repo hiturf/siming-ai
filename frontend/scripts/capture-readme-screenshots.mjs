@@ -9,7 +9,7 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const frontendRoot = path.resolve(scriptDir, '..')
 const outputDir = path.resolve(frontendRoot, '..', 'docs', 'images', 'readme')
 const timestamp = '2026-07-16T08:30:00.000Z'
-const modelId = 'opencode_cli:opencode/deepseek-v4-flash-free'
+const modelId = 'opencode_cli:opencode/big-pickle'
 
 const project = {
   id: 'mistlight-project',
@@ -27,8 +27,8 @@ const project = {
 const model = {
   id: 'readme-opencode-model',
   provider: 'opencode_cli',
-  name: 'OpenCode DeepSeek V4 Flash',
-  default_model: 'opencode/deepseek-v4-flash-free',
+  name: 'OpenCode Big Pickle',
+  default_model: 'opencode/big-pickle',
   is_global_default: true,
   readiness_status: 'ready',
   readiness_message: '真实对话验证成功',
@@ -211,8 +211,8 @@ const operation = {
 }
 
 const gettingStartedEmpty = {
-  free_models: [{ id: 'opencode/deepseek-v4-flash-free', display_name: 'DeepSeek V4 Flash', recommended: true }],
-  recommended_model: 'opencode/deepseek-v4-flash-free',
+  free_models: [{ id: 'opencode/big-pickle', display_name: 'Big Pickle', recommended: true }],
+  recommended_model: 'opencode/big-pickle',
   platform_supported: true,
   configured: false,
   configured_model: null,
@@ -228,13 +228,13 @@ const gettingStartedEmpty = {
 const gettingStartedReady = {
   ...gettingStartedEmpty,
   configured: true,
-  configured_model: 'opencode/deepseek-v4-flash-free',
+  configured_model: 'opencode/big-pickle',
   is_global_default: true,
   needs_setup: false,
   has_detected_models: true,
   has_usable_models: true,
   recommended_action: '开始创作',
-  global_model: { provider: 'opencode_cli', model: 'opencode/deepseek-v4-flash-free' },
+  global_model: { provider: 'opencode_cli', model: 'opencode/big-pickle' },
 }
 
 const envelope = (data) => ({ code: 0, message: 'ok', data })
@@ -289,7 +289,7 @@ async function installApiMock(page, scene) {
     if (pathname === `/projects/${project.id}/chapters/chapter-23`) {
       return fulfill(route, chapterDetail)
     }
-    if (pathname === '/ai/system-assistant/conversations' && method === 'GET') {
+    if (pathname === '/ai/assistant/conversations' && method === 'GET') {
       return fulfill(route, { items: [], total: 0 })
     }
 

@@ -48,7 +48,6 @@ class ReadonlyAllowTest(unittest.TestCase):
             "detect_worldbuilding_conflicts", "detect_forbidden_patterns",
             "preview_writing_context", "preview_rag_context",
             "explain_context_selection", "evaluate_chapter",
-            "preview_skill_match",
         ]
         for name in analysis_tools:
             with self.subTest(name=name):
@@ -76,7 +75,7 @@ class WriteDenyTest(unittest.TestCase):
 
     def test_create_tools_denied(self):
         create_tools = [
-            "create_project", "create_character", "create_chapter",
+            "create_project", "create_character",
             "create_outline_node", "create_worldbuilding_entry",
             "create_relationship", "create_scheduled_task", "create_skill",
         ]
@@ -91,7 +90,7 @@ class WriteDenyTest(unittest.TestCase):
 
     def test_update_tools_denied(self):
         update_tools = [
-            "update_project_info", "update_character", "update_chapter",
+            "update_project_info", "update_character",
             "update_outline_node", "update_worldbuilding_entry",
             "update_relationship", "update_scheduled_task", "update_skill",
             "update_cataloging_candidate",

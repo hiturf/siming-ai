@@ -1,6 +1,7 @@
 """Scheduled task workspace tools."""
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from typing import Any
 
@@ -32,10 +33,24 @@ def _task_payload(task: ScheduledTask) -> dict:
 def _find_task(db: Session, project_id: str, args: dict[str, Any]) -> ScheduledTask | None:
     task_id = str(args.get("id") or args.get("task_id") or "").strip()
     if task_id:
-        return db.query(ScheduledTask).filter(ScheduledTask.id == task_id, ScheduledTask.project_id == project_id).first()
+        return (
+            db.query(ScheduledTask)
+            .filter(
+                ScheduledTask.id == task_id,
+                ScheduledTask.project_id == project_id,
+            )
+            .first()
+        )
     name = str(args.get("name") or "").strip()
     if name:
-        return db.query(ScheduledTask).filter(ScheduledTask.project_id == project_id, ScheduledTask.name == name).first()
+        return (
+            db.query(ScheduledTask)
+            .filter(
+                ScheduledTask.project_id == project_id,
+                ScheduledTask.name == name,
+            )
+            .first()
+        )
     return None
 
 
@@ -67,7 +82,11 @@ async def create_scheduled_task(db: Session, project_id: str, args: dict[str, An
     name = str(args.get("name") or "").strip()
     prompt = str(args.get("prompt") or "").strip()
     if not name or not prompt:
-        return {"tool": "create_scheduled_task", "status": "skipped", "detail": "任务名称或提示词为空"}
+        return {
+            "tool": "create_scheduled_task",
+            "status": "skipped",
+            "detail": "任务名称或提示词为空",
+        }
 
     from ..idempotency import check_idempotency, generate_idempotency_key
 
@@ -117,7 +136,11 @@ async def update_scheduled_task(db: Session, project_id: str, args: dict[str, An
     if "status" in args:
         status = str(args.get("status") or task.status)
         if status not in {"active", "paused"}:
-            return {"tool": "update_scheduled_task", "status": "skipped", "detail": "状态只能是 active 或 paused"}
+            return {
+                "tool": "update_scheduled_task",
+                "status": "skipped",
+                "detail": "状态只能是 active 或 paused",
+            }
         task.status = status
     task.next_run_at = _compute_next_run(task)
     task.updated_at = datetime.utcnow()
@@ -138,7 +161,12 @@ async def delete_scheduled_task(db: Session, project_id: str, args: dict[str, An
     task_id = task.id
     db.delete(task)
     db.flush()
-    return {"tool": "delete_scheduled_task", "status": "ok", "detail": f"已删除自动任务：{name}", "data": {"id": task_id}}
+    return {
+        "tool": "delete_scheduled_task",
+        "status": "ok",
+        "detail": f"已删除自动任务：{name}",
+        "data": {"id": task_id},
+    }
 
 
 async def run_scheduled_task_now(db: Session, project_id: str, args: dict[str, Any]) -> dict:
@@ -147,7 +175,7 @@ async def run_scheduled_task_now(db: Session, project_id: str, args: dict[str, A
         return {"tool": "run_scheduled_task_now", "status": "skipped", "detail": "未找到自动任务"}
     if task.id in get_active_tasks():
         return {"tool": "run_scheduled_task_now", "status": "skipped", "detail": "任务正在运行中"}
-    _execute_task(task.id)
+    await asyncio.to_thread(_execute_task, task.id)
     db.refresh(task)
     return {
         "tool": "run_scheduled_task_now",

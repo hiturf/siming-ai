@@ -4,7 +4,7 @@ import AxeBuilder from '@axe-core/playwright'
 const model = {
   id: 'opencode-ready',
   provider: 'opencode_cli',
-  default_model: 'opencode/deepseek-v4-flash-free',
+  default_model: 'opencode/big-pickle',
   is_global_default: true,
   readiness_status: 'ready',
   readiness_message: '真实对话已通过',
@@ -65,7 +65,7 @@ const operations = [
   {
     id: 'review-new', source_id: 'session-1', source_kind: 'novel_creation', project_id: 'p1', title: '新书立项 · 最终审阅',
     status: 'waiting_user', health_status: 'active', phase: 'final_review', current_message: '最终审阅已经保存，等待你的确认',
-    progress: { mode: 'indeterminate' }, model_source: 'opencode_cli:opencode/deepseek-v4-flash-free',
+    progress: { mode: 'indeterminate' }, model_source: 'opencode_cli:opencode/big-pickle',
     outcome: 'waiting_user', result_summary: '立项内容已经生成', result: { outcome: 'waiting_user', summary: '立项内容已经生成' },
     attention: { kind: 'confirmation', title: '最终内容等待确认', message: '请审阅后创建正式作品。', action_label: '前往审阅', action_url: '/novel-creation?session=session-1&stage=final_review' },
     resume_url: '/novel-creation?session=session-1', can_pause: false, can_cancel: true, can_retry: false,
@@ -174,7 +174,7 @@ const authorWorkbenchSession = {
   updated_at: '2026-07-27T09:55:00Z',
   runs: [{
     id: 'run-failed', session_id: 'author-workbench', stage: 'world_style', status: 'failed',
-    operation_id: 'operation-failed', model_source: 'opencode_cli:opencode/deepseek-v4-flash-free', attempt: 2,
+    operation_id: 'operation-failed', model_source: 'opencode_cli:opencode/big-pickle', attempt: 2,
     result_mode: 'repaired', current_message: '模型结构修复后仍缺少世界规则',
     warning: '原阶段草稿未被覆盖', next_action: '检查要求后重新生成文风与世界观',
   }],
@@ -186,12 +186,12 @@ const authorWorkbenchSession = {
   stage_flow: {
     attention_stage: 'world_style', recommended_stage: 'world_style', pending_confirmations: ['world_style'],
     items: {
-      world_style: { stage: 'world_style', label: '文风与世界观', status: 'generated', can_view: true, can_generate: true, can_confirm: true, blocked_by: [], actions: ['refine', 'confirm'], next_stage: 'characters' },
-      characters: { stage: 'characters', label: '角色与关系', status: 'pending', can_view: false, can_generate: false, can_confirm: false, blocked_by: [{ stage: 'world_style', label: '文风与世界观', reason: '等待确认' }], actions: [], next_stage: 'locations' },
-      locations: { stage: 'locations', label: '地点与势力', status: 'pending', can_view: false, can_generate: false, can_confirm: false, blocked_by: [{ stage: 'characters', label: '角色与关系', reason: '等待确认' }], actions: [], next_stage: 'macro_outline' },
-      macro_outline: { stage: 'macro_outline', label: '全书卷纲', status: 'pending', can_view: false, can_generate: false, can_confirm: false, blocked_by: [{ stage: 'locations', label: '地点与势力', reason: '等待确认' }], actions: [], next_stage: 'opening_outline' },
-      opening_outline: { stage: 'opening_outline', label: '前3章细纲', status: 'pending', can_view: false, can_generate: false, can_confirm: false, blocked_by: [{ stage: 'macro_outline', label: '全书卷纲', reason: '等待确认' }], actions: [], next_stage: 'final_review' },
-      final_review: { stage: 'final_review', label: '最终审阅', status: 'pending', can_view: false, can_generate: false, can_confirm: false, blocked_by: [{ stage: 'opening_outline', label: '前3章细纲', reason: '等待确认' }], actions: [] },
+      world_style: { stage: 'world_style', label: '文风与世界观', status: 'generated', can_confirm: true, actions: ['view', 'edit', 'regenerate', 'confirm'], next_stage: 'characters' },
+      characters: { stage: 'characters', label: '角色与关系', status: 'pending', can_confirm: false, actions: ['view', 'generate'], next_stage: 'locations' },
+      locations: { stage: 'locations', label: '地点与势力', status: 'pending', can_confirm: false, actions: ['view', 'generate'], next_stage: 'macro_outline' },
+      macro_outline: { stage: 'macro_outline', label: '全书卷纲', status: 'pending', can_confirm: false, actions: ['view', 'generate'], next_stage: 'opening_outline' },
+      opening_outline: { stage: 'opening_outline', label: '前3章细纲', status: 'pending', can_confirm: false, actions: ['view', 'generate'], next_stage: 'final_review' },
+      final_review: { stage: 'final_review', label: '最终审阅', status: 'pending', can_confirm: false, actions: ['view', 'generate'] },
     },
   },
   draft: {
@@ -228,7 +228,7 @@ const runningCreationSession = {
   updated_at: '2026-07-27T09:58:00Z',
   runs: [{
     id: 'run-running', session_id: 'running-creation', stage: 'concepts', status: 'running',
-    operation_id: 'operation-running', model_source: 'opencode_cli:opencode/deepseek-v4-flash-free', attempt: 1,
+    operation_id: 'operation-running', model_source: 'opencode_cli:opencode/big-pickle', attempt: 1,
     input_revision: 3, current_message: '正在忠实整理作者方案...',
   }],
   draft: {
@@ -305,7 +305,7 @@ async function mockUiApi(page: Page, assistantScenario: 'running' | 'recovery' =
     if (path === '/api/v1/novel-creation/sessions') return fulfill(route, { code: 0, data: { sessions: [] } })
     if (path === '/api/v1/projects') return fulfill(route, { code: 0, data: { items: [project], total: 1 } })
     if (
-      path === '/api/v1/ai/system-assistant/conversations'
+      path === '/api/v1/ai/assistant/conversations'
       && requestUrl.searchParams.get('scope_type') === 'project'
     ) return fulfill(route, { code: 0, data: {
       items: [{
@@ -314,7 +314,7 @@ async function mockUiApi(page: Page, assistantScenario: 'running' | 'recovery' =
       }],
       total: 1,
     } })
-    if (path === '/api/v1/ai/system-assistant/conversations') return fulfill(route, { code: 0, data: {
+    if (path === '/api/v1/ai/assistant/conversations') return fulfill(route, { code: 0, data: {
       items: [{
         id: assistantScenario === 'recovery' ? 'conversation-recovery' : 'conversation-running',
         title: assistantScenario === 'recovery' ? '角色冲突恢复' : '八卷仙侠悬疑立项',
@@ -323,7 +323,7 @@ async function mockUiApi(page: Page, assistantScenario: 'running' | 'recovery' =
       }],
       total: 1,
     } })
-    if (path === '/api/v1/ai/system-assistant/conversations/conversation-recovery') return fulfill(route, { code: 0, data: {
+    if (path === '/api/v1/ai/assistant/conversations/conversation-recovery') return fulfill(route, { code: 0, data: {
       conversation: {
         id: 'conversation-recovery', title: '角色冲突恢复', creation_session_id: 'recovery-creation',
         user_brief: '保留主角，只调整反派。', created_at: '2026-07-27T09:00:00Z', updated_at: '2026-07-27T10:00:00Z',
@@ -340,7 +340,7 @@ async function mockUiApi(page: Page, assistantScenario: 'running' | 'recovery' =
         },
       ],
     } })
-    if (path === '/api/v1/ai/system-assistant/conversations/conversation-running') return fulfill(route, { code: 0, data: {
+    if (path === '/api/v1/ai/assistant/conversations/conversation-running') return fulfill(route, { code: 0, data: {
       conversation: {
         id: 'conversation-running', title: '八卷仙侠悬疑立项', creation_session_id: 'running-creation',
         user_brief: '保留主角，扩写为八卷。', created_at: '2026-07-27T09:00:00Z', updated_at: '2026-07-27T10:00:00Z',
@@ -355,13 +355,13 @@ async function mockUiApi(page: Page, assistantScenario: 'running' | 'recovery' =
           status: 'running', message_type: 'operation', created_at: '2026-07-27T10:00:00Z',
           payload: { run: {
             id: 'run-running', session_id: 'running-creation', stage: 'macro_outline', status: 'running',
-            operation_id: 'operation-running', model_source: 'opencode_cli:opencode/deepseek-v4-flash-free',
+            operation_id: 'operation-running', model_source: 'opencode_cli:opencode/big-pickle',
             attempt: 1, current_message: '正在调整第 3—8 卷，并保留主角设定',
           } },
         },
       ],
     } })
-    if (path === '/api/v1/ai/system-assistant/conversations/conversation-project') return fulfill(route, { code: 0, data: {
+    if (path === '/api/v1/ai/assistant/conversations/conversation-project') return fulfill(route, { code: 0, data: {
       conversation: {
         id: 'conversation-project', title: '\u4e3b\u89d2\u52a8\u673a\u8c03\u6574', scope_type: 'project', scope_id: 'p1', project_id: 'p1',
         created_at: '2026-07-27T09:00:00Z', updated_at: '2026-07-27T10:00:00Z',
@@ -381,29 +381,29 @@ async function mockUiApi(page: Page, assistantScenario: 'running' | 'recovery' =
       session_id: 'running-creation',
       revision: 3,
       artifacts: [
-        { artifact: 'constraints', label: '作品定位', status: 'confirmed', source: 'author', revision: 3, locked_paths: ['/genre'], flow: { can_view: true, can_generate: false, can_confirm: false, blocked_by: [] } },
-        { artifact: 'concepts', label: '创意方案', status: 'confirmed', source: 'author', revision: 3, locked_paths: ['/protagonist'], flow: { can_view: true, can_generate: true, can_confirm: false, blocked_by: [] } },
-        { artifact: 'world_style', label: '文风与世界观', status: 'confirmed', source: 'model', revision: 3, locked_paths: [], flow: { can_view: true, can_generate: true, can_confirm: false, blocked_by: [] } },
-        { artifact: 'characters', label: '角色与关系', status: 'confirmed', source: 'author', revision: 3, locked_paths: ['/characters/0'], flow: { can_view: true, can_generate: true, can_confirm: false, blocked_by: [] } },
-        { artifact: 'locations', label: '地点与势力', status: 'confirmed', source: 'model', revision: 3, locked_paths: [], flow: { can_view: true, can_generate: true, can_confirm: false, blocked_by: [] } },
-        { artifact: 'macro_outline', label: '主线与卷纲', status: 'generated', source: 'assistant', revision: 3, locked_paths: [], running_operation: { id: 'run-running', stage: 'macro_outline', status: 'running', current_message: '正在调整第 3—8 卷' }, flow: { can_view: true, can_generate: true, can_confirm: true, blocked_by: [] } },
-        { artifact: 'opening_outline', label: '开篇细纲', status: 'stale', source: 'model', revision: 3, stale_reason: '上游阶段“主线与卷纲”已修改', locked_paths: [], checkpoint_count: 1, can_undo: true, flow: { can_view: true, can_generate: true, can_confirm: false, blocked_by: [], soft_dependencies: [{ stage: 'macro_outline', label: '主线与卷纲', reason: 'not_confirmed', message: '仍可生成' }] } },
-        { artifact: 'final_review', label: '完整性检查', status: 'pending', source: 'unknown', revision: 3, locked_paths: [], flow: { can_view: false, can_generate: false, can_confirm: false, blocked_by: [{ stage: 'opening_outline', label: '开篇细纲', reason: '等待确认' }] } },
+        { artifact: 'constraints', label: '作品定位', status: 'confirmed', source: 'author', revision: 3, locked_paths: ['/genre'], flow: { can_confirm: false } },
+        { artifact: 'concepts', label: '创意方案', status: 'confirmed', source: 'author', revision: 3, locked_paths: ['/protagonist'], flow: { can_confirm: false } },
+        { artifact: 'world_style', label: '文风与世界观', status: 'confirmed', source: 'model', revision: 3, locked_paths: [], flow: { can_confirm: false } },
+        { artifact: 'characters', label: '角色与关系', status: 'confirmed', source: 'author', revision: 3, locked_paths: ['/characters/0'], flow: { can_confirm: false } },
+        { artifact: 'locations', label: '地点与势力', status: 'confirmed', source: 'model', revision: 3, locked_paths: [], flow: { can_confirm: false } },
+        { artifact: 'macro_outline', label: '主线与卷纲', status: 'generated', source: 'assistant', revision: 3, locked_paths: [], running_operation: { id: 'run-running', stage: 'macro_outline', status: 'running', current_message: '正在调整第 3—8 卷' }, flow: { can_confirm: true } },
+        { artifact: 'opening_outline', label: '开篇细纲', status: 'stale', source: 'model', revision: 3, stale_reason: '上游阶段“主线与卷纲”已修改', locked_paths: [], checkpoint_count: 1, can_undo: true, flow: { can_confirm: false, soft_dependencies: [{ stage: 'macro_outline', label: '主线与卷纲', reason: 'not_confirmed', message: '仍可生成' }] } },
+        { artifact: 'final_review', label: '完整性检查', status: 'pending', source: 'unknown', revision: 3, locked_paths: [], flow: { can_confirm: false } },
       ],
     } })
     if (path === '/api/v1/novel-creation/sessions/recovery-creation/artifacts') return fulfill(route, { code: 0, data: {
       session_id: 'recovery-creation',
       revision: 9,
       artifacts: [
-        { artifact: 'constraints', label: '作品定位', status: 'confirmed', source: 'author', revision: 9, locked_paths: ['/genre'], flow: { can_view: true, can_generate: false, can_confirm: false, blocked_by: [] } },
-        { artifact: 'concepts', label: '创意方案', status: 'confirmed', source: 'author', revision: 9, locked_paths: ['/protagonist'], flow: { can_view: true, can_generate: true, can_confirm: false, blocked_by: [] } },
+        { artifact: 'constraints', label: '作品定位', status: 'confirmed', source: 'author', revision: 9, locked_paths: ['/genre'], flow: { can_confirm: false } },
+        { artifact: 'concepts', label: '创意方案', status: 'confirmed', source: 'author', revision: 9, locked_paths: ['/protagonist'], flow: { can_confirm: false } },
         {
           artifact: 'characters', label: '角色与关系', status: 'conflict', stored_status: 'confirmed', source: 'author', revision: 9,
           locked_paths: ['/characters/0'],
           conflict: { run_id: 'run-conflict', message: '任务基于版本 7，当前版本为 9', candidate_available: true, input_revision: 7, current_revision: 9 },
-          flow: { can_view: true, can_generate: true, can_confirm: false, blocked_by: [], soft_dependencies: [] },
+          flow: { can_confirm: false, soft_dependencies: [] },
         },
-        { artifact: 'macro_outline', label: '主线与卷纲', status: 'stale', source: 'model', revision: 9, stale_reason: '角色与关系已由作者修改', locked_paths: [], flow: { can_view: true, can_generate: true, can_confirm: false, blocked_by: [], soft_dependencies: [] } },
+        { artifact: 'macro_outline', label: '主线与卷纲', status: 'stale', source: 'model', revision: 9, stale_reason: '角色与关系已由作者修改', locked_paths: [], flow: { can_confirm: false, soft_dependencies: [] } },
       ],
     } })
     if (path === '/api/v1/novel-creation/sessions/recovery-creation/validate-consistency') return fulfill(route, {
@@ -741,7 +741,7 @@ for (const viewport of creationViewports) {
     await expect(page.getByText('0 个错误 · 1 个提醒')).toBeVisible()
     await expect(page.getByRole('heading', { name: '主线与卷纲' })).toBeVisible()
     await expect(page.getByText('正在调整第 3—8 卷，并保留主角设定')).toBeVisible()
-    await expect(page.getByText('模型：opencode_cli:opencode/deepseek-v4-flash-free')).toBeVisible()
+    await expect(page.getByText('模型：opencode_cli:opencode/big-pickle')).toBeVisible()
     await expect(page.getByRole('complementary', { name: '作品资料' })).toBeVisible()
     await expect(page.getByText('上游阶段“主线与卷纲”已修改')).toBeVisible()
     await expect(page.getByRole('button', { name: '撤销开篇细纲最近一次修改' })).toBeVisible()
@@ -862,7 +862,7 @@ for (const viewport of creationViewports) {
     await page.goto('/novel-creation?session=running-creation&run=run-running', { waitUntil: 'networkidle' })
 
     await expect(page.getByText('正在忠实整理作者方案...')).toBeVisible()
-    await expect(page.getByText('实际模型：opencode_cli:opencode/deepseek-v4-flash-free')).toBeVisible()
+    await expect(page.getByText('实际模型：opencode_cli:opencode/big-pickle')).toBeVisible()
     await expect(page.getByText('尝试次数：1')).toBeVisible()
     await expect(page.getByRole('button', { name: '新建立项' })).toBeDisabled()
     const cancelButton = page.getByRole('button', { name: '取消任务' })

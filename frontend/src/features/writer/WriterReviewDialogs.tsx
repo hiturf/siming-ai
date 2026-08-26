@@ -9,8 +9,10 @@ import {
   Tag,
   Typography,
 } from 'antd'
+import { useMemo } from 'react'
 
 import type { ModelSelectOption } from '../../hooks/useModelOptions'
+import { buildTextDiff, type TextDiffPart } from './textDiff'
 
 const { Paragraph, Text, Title } = Typography
 
@@ -104,12 +106,58 @@ function qualityScoreLevel(score: number) {
   return { label: '建议优先修订', color: 'warning' }
 }
 
+function DeAiDiffText({
+  parts,
+  side,
+}: {
+  parts: TextDiffPart[]
+  side: 'original' | 'candidate'
+}) {
+  return (
+    <pre
+      className="writer-de-ai-diff-text"
+      aria-label={side === 'original'
+        ? '原文差异，红色表示被删除或改写的内容'
+        : '候选稿差异，绿色表示新增或改写后的内容'}
+    >
+      {parts.map((part, index) => {
+        if (part.kind === 'equal') {
+          return <span key={`${part.kind}-${index}`}>{part.text}</span>
+        }
+        if (side === 'original' && part.kind === 'removed') {
+          return (
+            <del className="writer-de-ai-diff-removed" key={`${part.kind}-${index}`}>
+              {part.text}
+            </del>
+          )
+        }
+        if (side === 'candidate' && part.kind === 'added') {
+          return (
+            <ins className="writer-de-ai-diff-added" key={`${part.kind}-${index}`}>
+              {part.text}
+            </ins>
+          )
+        }
+        return null
+      })}
+    </pre>
+  )
+}
+
 export function WriterReviewDialogs({
   modelOptions,
   modelsLoading,
   quality,
   deAi,
 }: WriterReviewDialogsProps) {
+  const deAiDiff = useMemo(() => {
+    if (!deAi.preview) return null
+    return buildTextDiff(
+      deAi.target?.source ?? deAi.preview.original,
+      deAi.preview.rewritten,
+    )
+  }, [deAi.preview, deAi.target?.source])
+
   return (
     <>
       <Modal
@@ -289,12 +337,24 @@ export function WriterReviewDialogs({
             />
           </div>
         </div>
+        {deAi.preview && (
+          <div className="writer-de-ai-diff-legend" aria-label="差异颜色说明">
+            <span className="writer-de-ai-legend-removed">
+              <i aria-hidden="true" />红色：原文删改
+            </span>
+            <span className="writer-de-ai-legend-added">
+              <i aria-hidden="true" />绿色：候选稿新增
+            </span>
+          </div>
+        )}
         <div className={`writer-de-ai-compare${deAi.preview ? '' : ' writer-de-ai-compare-single'}`} aria-live="polite">
-          <section className="writer-de-ai-pane">
+          <section className={`writer-de-ai-pane${deAi.preview ? ' writer-de-ai-pane-original-diff' : ''}`}>
             <div className="writer-de-ai-pane-head"><Text strong>原文（未变更）</Text></div>
-            <pre>{deAi.target?.source || ''}</pre>
+            {deAiDiff
+              ? <DeAiDiffText parts={deAiDiff} side="original" />
+              : <pre>{deAi.target?.source || ''}</pre>}
           </section>
-          {deAi.preview && (
+          {deAi.preview && deAiDiff && (
             <section className="writer-de-ai-pane writer-de-ai-pane-candidate">
               <div className="writer-de-ai-pane-head">
                 <Text strong>
@@ -304,7 +364,7 @@ export function WriterReviewDialogs({
                   {deAi.preview.rewritten_word_count} 字 · {deAi.preview.model || deAi.preview.provider}
                 </Text>
               </div>
-              <pre>{deAi.preview.rewritten}</pre>
+              <DeAiDiffText parts={deAiDiff} side="candidate" />
             </section>
           )}
         </div>

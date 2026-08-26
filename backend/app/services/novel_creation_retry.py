@@ -24,7 +24,13 @@ def select_creation_retry_input(previous: Any, session: Any, *, use_latest: bool
         if previous.input_revision is not None
         else request.get("input_revision") or 0
     )
-    for key in ("input_snapshot", "input_snapshot_hash", "input_revision", "operation_id"):
+    for key in (
+        "input_snapshot",
+        "input_snapshot_hash",
+        "input_revision",
+        "operation_id",
+        "context_manifest_id",
+    ):
         request.pop(key, None)
     request["retry_of_run_id"] = previous.id
     request["retry_mode"] = "latest_draft" if use_latest else "original_input"

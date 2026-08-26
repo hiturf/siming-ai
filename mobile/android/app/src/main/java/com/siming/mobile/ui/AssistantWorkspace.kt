@@ -1,6 +1,5 @@
 package com.siming.mobile.ui
 
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,13 +15,14 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.CloudOff
 import androidx.compose.material.icons.outlined.Devices
 import androidx.compose.material.icons.outlined.Key
+import androidx.compose.material.icons.outlined.KeyboardArrowDown
+import androidx.compose.material.icons.outlined.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.PhoneAndroid
 import androidx.compose.material.icons.outlined.Save
 import androidx.compose.material.icons.outlined.StopCircle
@@ -54,25 +54,24 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.siming.mobile.data.AssistantModelRoute
+import kotlinx.coroutines.delay
 
 internal data class AssistantQuickAction(
     val label: String,
-    val scope: String,
     val prompt: String,
 )
 
 internal val assistantQuickActions = listOf(
-    AssistantQuickAction("续写下一章", "project", "用质量模式续写下一章。先读取与本章相关的角色、世界观和大纲信息，再开始写作；保持已有设定，不要自行改名或重写核心规则。"),
-    AssistantQuickAction("规划后 3 章", "outline", "基于当前主线和已完成正文，规划接下来 3 章细纲。每章给出推进目标、冲突、关键角色和章末钩子。"),
-    AssistantQuickAction("检查人物动机", "characters", "检查当前主要角色的目标、冲突和行为动机是否与最近正文一致；指出可能 OOC 的位置，并给出最小修改建议。"),
-    AssistantQuickAction("检查世界观冲突", "worldbuilding", "结合现有世界观设定和最近正文，检查规则冲突、时间线矛盾和新增但未建档的设定。"),
+    AssistantQuickAction("续写下一章", "用质量模式续写下一章。先读取与本章相关的角色、世界观和大纲信息，再开始写作；保持已有设定，不要自行改名或重写核心规则。"),
+    AssistantQuickAction("规划后 3 章", "基于当前主线和已完成正文，规划接下来 3 章细纲。每章给出推进目标、冲突、关键角色和章末钩子。"),
+    AssistantQuickAction("检查人物动机", "检查当前主要角色的目标、冲突和行为动机是否与最近正文一致；指出可能 OOC 的位置，并给出最小修改建议。"),
+    AssistantQuickAction("检查世界观冲突", "结合现有世界观设定和最近正文，检查规则冲突、时间线矛盾和新增但未建档的设定。"),
 )
 
 @Composable
 internal fun AssistantWorkspace(projectId: String, viewModel: MainViewModel) {
     var prompt by rememberSaveable { mutableStateOf("") }
     var submittedPrompt by rememberSaveable { mutableStateOf("") }
-    var scope by rememberSaveable { mutableStateOf("project") }
     val ui by viewModel.uiState
     val connection by viewModel.connection.collectAsStateWithLifecycle()
     val directApi = ui.directApi
@@ -91,7 +90,7 @@ internal fun AssistantWorkspace(projectId: String, viewModel: MainViewModel) {
     val gatewayMobile = connection != null && directApi != null && modelRoute == "mobile"
     val canUseAi = connection != null || directApi != null
 
-    LaunchedEffect(submittedPrompt, ui.assistantOutput, ui.assistantActivity, ui.assistantRunning) {
+    LaunchedEffect(submittedPrompt, ui.assistantOutput, ui.assistantReasoning, ui.assistantActivity, ui.assistantRunning) {
         if (submittedPrompt.isNotBlank() || ui.assistantOutput.isNotBlank() || ui.assistantRunning) {
             runCatching { listState.animateScrollToItem(maxOf(0, listState.layoutInfo.totalItemsCount - 1)) }
         }
@@ -151,7 +150,6 @@ internal fun AssistantWorkspace(projectId: String, viewModel: MainViewModel) {
                         assistantQuickActions.forEach { action ->
                             OutlinedButton(
                                 onClick = {
-                                    scope = action.scope
                                     prompt = action.prompt
                                 },
                                 modifier = Modifier.fillMaxWidth(),
@@ -172,6 +170,16 @@ internal fun AssistantWorkspace(projectId: String, viewModel: MainViewModel) {
                 item {
                     AssistantActivityBubble(
                         activity = ui.assistantActivity.ifBlank { "正在读取作品上下文并执行任务…" },
+                    )
+                }
+            }
+
+            if (ui.assistantReasoning.isNotBlank()) {
+                item {
+                    AssistantReasoningDisclosure(
+                        text = ui.assistantReasoning,
+                        streaming = ui.assistantRunning,
+                        runKey = submittedPrompt,
                     )
                 }
             }
@@ -197,21 +205,6 @@ internal fun AssistantWorkspace(projectId: String, viewModel: MainViewModel) {
                 modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 12.dp, vertical = 9.dp),
                 verticalArrangement = Arrangement.spacedBy(7.dp),
             ) {
-                Row(
-                    modifier = Modifier.horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    assistantScopes.forEach { (value, label) ->
-                        AssistChip(
-                            onClick = { scope = value },
-                            label = { Text(label) },
-                            colors = AssistChipDefaults.assistChipColors(
-                                containerColor = if (scope == value) MaterialTheme.colorScheme.primaryContainer else Color.White,
-                            ),
-                        )
-                    }
-                }
-
                 if (connection != null && directApi != null) {
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         AssistChip(
@@ -256,7 +249,6 @@ internal fun AssistantWorkspace(projectId: String, viewModel: MainViewModel) {
                                 prompt = ""
                                 viewModel.runAssistant(
                                     projectId,
-                                    scope,
                                     outgoing,
                                     if (modelRoute == "mobile") AssistantModelRoute.MobileKey else AssistantModelRoute.Pc,
                                 )
@@ -273,7 +265,6 @@ internal fun AssistantWorkspace(projectId: String, viewModel: MainViewModel) {
         }
     }
 }
-
 @Composable
 private fun UserBubble(text: String) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
@@ -316,10 +307,68 @@ private fun AssistantActivityBubble(activity: String) {
         )
     }
 }
+@Composable
+private fun AssistantReasoningDisclosure(
+    text: String,
+    streaming: Boolean,
+    runKey: String,
+) {
+    var expanded by rememberSaveable(runKey) { mutableStateOf(streaming) }
+    var visibleText by rememberSaveable(runKey) { mutableStateOf(if (streaming) "" else text) }
 
-internal val assistantScopes = listOf(
-    "project" to "全书",
-    "outline" to "大纲",
-    "characters" to "角色",
-    "worldbuilding" to "世界观",
-)
+    LaunchedEffect(text, streaming, runKey) {
+        if (!text.startsWith(visibleText)) {
+            visibleText = if (streaming) "" else text
+        }
+        while (visibleText.length < text.length) {
+            val codePoint = text.codePointAt(visibleText.length)
+            val nextIndex = visibleText.length + Character.charCount(codePoint)
+            visibleText = text.substring(0, nextIndex)
+            delay(12)
+        }
+    }
+
+    Card(
+        onClick = { expanded = !expanded },
+        colors = CardDefaults.cardColors(containerColor = SimingPaperWarm),
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth(0.92f),
+    ) {
+        Column(Modifier.padding(horizontal = 13.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Icon(Icons.Outlined.AutoAwesome, null, Modifier.size(16.dp), tint = SimingCinnabar)
+                    Text("模型思考摘要", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        if (streaming) "实时生成" else "已完成",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (streaming) SimingCinnabar else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Icon(
+                        if (expanded) Icons.Outlined.KeyboardArrowUp else Icons.Outlined.KeyboardArrowDown,
+                        if (expanded) "收起模型思考摘要" else "展开模型思考摘要",
+                        Modifier.size(18.dp),
+                    )
+                }
+            }
+            if (expanded) {
+                Text(
+                    "仅展示模型 API 实际返回的可见推理内容",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    visibleText + if (streaming || visibleText.length < text.length) "▍" else "",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}

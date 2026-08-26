@@ -26,14 +26,13 @@ def _conversation_data(
     return {
         "id": conversation.id,
         "title": conversation.title,
-        "scope": conversation.scope_type or "system",
-        "scope_type": conversation.scope_type or "system",
+        "scope": conversation.scope_type,
+        "scope_type": conversation.scope_type,
         "scope_id": conversation.scope_id,
         "project_id": conversation.project_id,
         "message_count": message_count,
         "creation_session_id": conversation.creation_session_id,
         "user_brief": conversation.user_brief,
-        "blueprints": conversation.blueprint_json or [],
         "created_at": utc_isoformat(conversation.created_at),
         "updated_at": utc_isoformat(conversation.updated_at),
     }
@@ -67,18 +66,18 @@ class SqlAlchemySystemConversationStore:
         )
         if not conversation:
             raise NotFoundError("系统助手对话不存在")
+        if conversation.scope_type not in {"creation", "project"}:
+            raise NotFoundError("对话不属于当前立项或作品上下文")
         return conversation
 
     @staticmethod
     def _normalize_scope(scope_type: str, scope_id: str | None) -> tuple[str, str | None]:
-        normalized = (scope_type or "system").strip().lower()
-        if normalized not in {"system", "creation", "project"}:
-            raise ValueError("scope_type must be system, creation, or project")
+        normalized = scope_type.strip().lower()
+        if normalized not in {"creation", "project"}:
+            raise ValueError("scope_type must be creation or project")
         identifier = (scope_id or "").strip() or None
-        if normalized != "system" and not identifier:
+        if not identifier:
             raise ValueError(f"{normalized} scope requires scope_id")
-        if normalized == "system":
-            identifier = None
         return normalized, identifier
 
     def _apply_scope(
@@ -94,7 +93,7 @@ class SqlAlchemySystemConversationStore:
                 conversation.project_id = None
             return
         scope_type, scope_id = self._normalize_scope(
-            str(payload.get("scope_type") or conversation.scope_type or "system"),
+            str(payload.get("scope_type") or conversation.scope_type),
             payload.get("scope_id"),
         )
         conversation.scope_type = scope_type
@@ -103,11 +102,13 @@ class SqlAlchemySystemConversationStore:
         conversation.creation_session_id = scope_id if scope_type == "creation" else None
 
     def list(self, *, scope_type: str | None = None, scope_id: str | None = None) -> dict[str, Any]:
-        query = self._session.query(SystemAssistantConversation)
+        query = self._session.query(SystemAssistantConversation).filter(
+            SystemAssistantConversation.scope_type.in_(("creation", "project")),
+        )
         if scope_type:
             normalized = scope_type.strip().lower()
-            if normalized not in {"system", "creation", "project"}:
-                raise ValueError("scope_type must be system, creation, or project")
+            if normalized not in {"creation", "project"}:
+                raise ValueError("scope_type must be creation or project")
             identifier = (scope_id or "").strip() or None
             query = query.filter(SystemAssistantConversation.scope_type == normalized)
             if identifier:
@@ -138,8 +139,8 @@ class SqlAlchemySystemConversationStore:
         self,
         title: str,
         *,
-        scope_type: str = "system",
-        scope_id: str | None = None,
+        scope_type: str,
+        scope_id: str,
     ) -> dict[str, Any]:
         normalized, identifier = self._normalize_scope(scope_type, scope_id)
         conversation = SystemAssistantConversation(
@@ -240,13 +241,19 @@ class SqlAlchemySystemConversationStore:
             message.operation_id = payload.get("operation_id") or None
         if payload.get("message_type") is not None:
             message.message_type = payload.get("message_type") or "text"
-        message.payload_json = payload.get("payload")
+        incoming_payload = payload.get("payload")
+        if isinstance(message.payload_json, dict) and isinstance(incoming_payload, dict):
+            # A long-running operation may update its presentation after the
+            # Creation Agent has already persisted the model/tool protocol.
+            # Merge opaque turn metadata so that status updates cannot erase
+            # the durable replay record.
+            message.payload_json = {**message.payload_json, **incoming_payload}
+        elif incoming_payload is not None or message.payload_json is None:
+            message.payload_json = incoming_payload
         if payload.get("creation_session_id") is not None:
             conversation.creation_session_id = payload.get("creation_session_id") or None
         if payload.get("user_brief") is not None:
             conversation.user_brief = payload.get("user_brief") or None
-        if payload.get("blueprints") is not None:
-            conversation.blueprint_json = payload["blueprints"]
         self._apply_scope(conversation, payload)
         self._session.flush()
         return {"conversation": _conversation_data(conversation), "message": _message_data(message)}
@@ -283,8 +290,6 @@ class SqlAlchemySystemConversationStore:
             conversation.creation_session_id = payload.get("creation_session_id") or None
         if payload.get("user_brief") is not None:
             conversation.user_brief = payload.get("user_brief") or None
-        if payload.get("blueprints") is not None:
-            conversation.blueprint_json = payload["blueprints"]
         self._apply_scope(conversation, payload)
 
         user_message = SystemAssistantMessage(
@@ -297,6 +302,9 @@ class SqlAlchemySystemConversationStore:
             conversation_id=conversation.id,
             role="assistant",
             content=payload.get("assistant_content") or "",
+            run_id=payload.get("run_id"),
+            operation_id=payload.get("operation_id"),
+            message_type=payload.get("message_type") or "text",
             status=payload.get("status") or "completed",
             payload_json=payload.get("payload"),
         )

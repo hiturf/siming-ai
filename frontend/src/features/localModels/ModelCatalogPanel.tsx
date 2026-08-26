@@ -8,7 +8,6 @@ import {
   Input,
   InputNumber,
   Modal,
-  Select,
   Space,
   Table,
   Tag,
@@ -141,7 +140,7 @@ export default function ModelCatalogPanel({ hardware, catalog, downloads, loadin
       await apiClient.post('/local-models/runtime/start', {
         model_key: model.model_key,
         context_length: contextForModel(model.model_key),
-        task_type: 'chat',
+        task_type: 'assistant',
       })
       message.success('本地模型已加载')
       await onRefresh()
@@ -202,22 +201,6 @@ export default function ModelCatalogPanel({ hardware, catalog, downloads, loadin
       hide()
       setQualifyingModel(null)
     }
-  }
-
-  const saveTaskModel = async (task: string, modelKey?: string | null, contextLength?: number) => {
-    if (!modelKey) {
-      await apiClient.delete(`/local-models/task-settings/${task}`)
-      message.success('任务模型已清除，将跟随全局默认模型')
-      await onRefresh()
-      return
-    }
-    await apiClient.put(`/local-models/task-settings/${task}`, {
-      model_key: modelKey,
-      context_length: contextLength || contextForModel(modelKey),
-      allow_api_fallback: false,
-    })
-    message.success('任务模型已保存')
-    await onRefresh()
   }
 
   const downloadCustomModel = async () => {
@@ -465,55 +448,6 @@ export default function ModelCatalogPanel({ hardware, catalog, downloads, loadin
           ]}
         />
       </Card>
-
-      <Card size="small" title="按任务选择本地模型">
-        <Space wrap size={16}>
-          {[
-            ['chat', '项目助手'],
-            ['cataloging', '作品建档'],
-            ['planning', '大纲与新书'],
-            ['writing', '章节写作'],
-            ['evaluation', '质量评估'],
-          ].map(([task, label]) => (
-            <div key={task} style={{ minWidth: 220 }}>
-              <Text type="secondary">{label}</Text>
-              <Select
-                allowClear
-                disabled={!usageEnabled}
-                style={{ width: '100%', marginTop: 4 }}
-                value={catalog?.task_settings?.[task]?.model_key}
-                placeholder="跟随全局默认/API/CLI"
-                options={(catalog?.items || [])
-                  .filter((item) => item.status === 'installed')
-                  .map((item) => ({ value: item.model_key, label: item.display_name }))}
-                onChange={(value) => saveTaskModel(task, value)}
-              />
-              <InputNumber
-                aria-label={`${label}上下文`}
-                min={1}
-                controls
-                disabled={!usageEnabled || !catalog?.task_settings?.[task]?.model_key}
-                value={catalog?.task_settings?.[task]?.context_length || undefined}
-                placeholder={`${Math.round(contextForModel(catalog?.task_settings?.[task]?.model_key) / 1024)}K 默认`}
-                addonAfter="tokens"
-                style={{ width: '100%', marginTop: 6 }}
-                onChange={(value) => saveTaskModel(
-                  task,
-                  catalog?.task_settings?.[task]?.model_key,
-                  Number(value) || contextForModel(catalog?.task_settings?.[task]?.model_key),
-                )}
-              />
-            </div>
-          ))}
-        </Space>
-      </Card>
-
-      <Alert
-        type="info"
-        showIcon
-        icon={<ExperimentOutlined />}
-        message="任务模型是本地运行时的显式覆盖；清空后会跟随系统全局默认模型/API/CLI，不会再自动抢占建档或新书生成。"
-      />
 
       <Modal
         open={Boolean(qualification)}

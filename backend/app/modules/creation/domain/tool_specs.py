@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from ....architecture.tool_spec import ToolSpec, project_typed_tool_spec
 
@@ -13,52 +13,9 @@ class CompatibleInput(BaseModel):
     model_config = ConfigDict(extra="allow", protected_namespaces=())
 
 
-_MODEL_REQUIRED_CREATION_TARGETS = frozenset({"concepts", "all"})
 _CREATION_MODEL_DESCRIPTION = (
-    "Required when stage or artifact is concepts or all; optional for other deterministic "
-    "targets. Pass a model identity already configured and tested in Siming. The model "
-    "used by the external MCP client is not inherited."
+    "Optional model identity. When omitted, creation uses the active default model."
 )
-
-
-def _model_requirement_schema(target_field: str) -> dict[str, Any]:
-    """Describe the same conditional model rule enforced by the stage runtime."""
-
-    return {
-        "allOf": [
-            {
-                "if": {
-                    "properties": {
-                        target_field: {
-                            "enum": sorted(_MODEL_REQUIRED_CREATION_TARGETS),
-                        },
-                    },
-                    "required": [target_field],
-                },
-                "then": {
-                    "properties": {
-                        "model": {"minLength": 1},
-                        "use_model": {"const": True},
-                    },
-                    "required": ["model"],
-                },
-            },
-        ],
-    }
-
-
-def _validate_creation_model(target: str, model: str, use_model: bool) -> None:
-    if target not in _MODEL_REQUIRED_CREATION_TARGETS:
-        return
-    if not use_model:
-        raise ValueError(
-            "use_model must be true when stage or artifact is concepts or all"
-        )
-    if not model.strip():
-        raise ValueError(
-            "model is required when stage or artifact is concepts or all; "
-            "the external MCP client's model is not inherited"
-        )
 
 
 class StartNovelCreationSessionInput(CompatibleInput):
@@ -69,31 +26,7 @@ class StartNovelCreationSessionInput(CompatibleInput):
     platform: str = ""
 
 
-class DraftNovelBlueprintInput(CompatibleInput):
-    session_id: str
-    execution_mode: Literal["template", "hybrid", "internal_llm", "external_agent"] = "template"
-    user_brief: str = ""
-    feedback: str = ""
-    revision_mode: Literal["initial", "refine", "regenerate"] = "initial"
-    enhance_with_llm: bool = False
-    skip_questions: bool = False
-    depth: Literal["concept", "full"] = "full"
-
-
-class ReviewNovelBlueprintInput(CompatibleInput):
-    session_id: str
-    execution_mode: Literal["hybrid", "internal_llm", "external_agent"] = "hybrid"
-    blueprint: dict[str, Any] = Field(default_factory=dict)
-
-
-class ApplyNovelBlueprintInput(CompatibleInput):
-    session_id: str
-    blueprint_index: int = 0
-    mode: Literal["manual", "auto"] = "manual"
-    blueprint: dict[str, Any] = Field(default_factory=dict)
-
-
-class GetNovelCreationSessionInput(CompatibleInput):
+class CreationSessionInput(CompatibleInput):
     session_id: str
 
 
@@ -143,7 +76,6 @@ class ListCreationArtifactsInput(CompatibleInput):
 class PatchCreationArtifactInput(CreationArtifactInput):
     expected_revision: int
     changes: list[CreationPatchOperation]
-    source: str = "assistant"
 
 
 class CreationArtifactLockInput(CreationArtifactInput):
@@ -169,12 +101,10 @@ class CreationEntityInput(CompatibleInput):
 class PatchCreationEntityInput(CreationEntityInput):
     expected_revision: int
     changes: list[CreationPatchOperation]
-    source: str = "assistant"
 
 
 class DeleteCreationEntityInput(CreationEntityInput):
     expected_revision: int
-    source: str = "assistant"
 
 
 class ListArtifactVersionsInput(CreationArtifactInput):
@@ -191,65 +121,13 @@ class RestoreArtifactVersionInput(CompatibleInput):
     expected_revision: int
 
 
-class GenerateNovelCreationStageInput(CompatibleInput):
-    model_config = ConfigDict(
-        extra="allow",
-        protected_namespaces=(),
-        json_schema_extra=_model_requirement_schema("stage"),
-    )
-
-    session_id: str
-    stage: str
-    model: str = Field(default="", description=_CREATION_MODEL_DESCRIPTION)
-    use_model: bool = Field(
-        default=True,
-        description="Must be true when stage is concepts or all.",
-    )
-    auto_confirm: bool = False
-    session_patch: dict[str, Any] = Field(default_factory=dict)
-    operation: str = "generate"
-    instruction: str = ""
-    expected_revision: int | None = None
-    entity_id: str = ""
-    entity_type: str = ""
-
-    @model_validator(mode="after")
-    def require_model_for_model_backed_target(self) -> GenerateNovelCreationStageInput:
-        _validate_creation_model(self.stage, self.model, self.use_model)
-        return self
-
-
-class SubmitNovelCreationStageInput(CompatibleInput):
-    session_id: str
-    stage: str
-    data: dict[str, Any]
-    confirm: bool = False
-    source: str = "external_agent"
-
-
 class ConfirmCreationArtifactInput(CreationArtifactInput):
     expected_revision: int
-    data: dict[str, Any] = Field(default_factory=dict)
-    source: Literal["author", "assistant", "external_agent"] = "assistant"
 
 
 class ModelBackedCreationArtifactInput(CreationArtifactInput):
-    model_config = ConfigDict(
-        extra="allow",
-        protected_namespaces=(),
-        json_schema_extra=_model_requirement_schema("artifact"),
-    )
-
     model: str = Field(default="", description=_CREATION_MODEL_DESCRIPTION)
-    use_model: bool = Field(
-        default=True,
-        description="Must be true when artifact is concepts or all.",
-    )
-
-    @model_validator(mode="after")
-    def require_model_for_model_backed_target(self) -> ModelBackedCreationArtifactInput:
-        _validate_creation_model(self.artifact, self.model, self.use_model)
-        return self
+    use_model: bool = True
 
 
 class GenerateCreationArtifactInput(ModelBackedCreationArtifactInput):
@@ -312,12 +190,8 @@ class ReadImportedFileInput(CompatibleInput):
 
 _INPUTS: dict[str, type[BaseModel]] = {
     "start_novel_creation_session": StartNovelCreationSessionInput,
-    "draft_novel_blueprint": DraftNovelBlueprintInput,
-    "review_novel_blueprint": ReviewNovelBlueprintInput,
-    "apply_novel_blueprint": ApplyNovelBlueprintInput,
-    "get_novel_creation_session": GetNovelCreationSessionInput,
-    "get_creation_session": GetNovelCreationSessionInput,
-    "get_creation_snapshot": GetNovelCreationSessionInput,
+    "get_creation_session": CreationSessionInput,
+    "get_creation_snapshot": CreationSessionInput,
     "get_creation_operation": GetCreationOperationInput,
     "patch_creation_session": PatchCreationSessionInput,
     "get_creation_artifact": CreationArtifactInput,
@@ -336,8 +210,6 @@ _INPUTS: dict[str, type[BaseModel]] = {
     "list_creation_artifact_versions": ListArtifactVersionsInput,
     "get_creation_artifact_diff": ArtifactVersionDiffInput,
     "restore_creation_artifact_version": RestoreArtifactVersionInput,
-    "generate_novel_creation_stage": GenerateNovelCreationStageInput,
-    "submit_novel_creation_stage": SubmitNovelCreationStageInput,
     "confirm_creation_artifact": ConfirmCreationArtifactInput,
     "generate_creation_artifact": GenerateCreationArtifactInput,
     "refine_creation_artifact": RefineCreationArtifactInput,
@@ -346,8 +218,8 @@ _INPUTS: dict[str, type[BaseModel]] = {
     "pause_creation_operation": CreationOperationInput,
     "resume_creation_operation": CreationOperationInput,
     "retry_creation_operation": CreationOperationInput,
-    "validate_creation_session": GetNovelCreationSessionInput,
-    "finalize_creation_session": GetNovelCreationSessionInput,
+    "validate_creation_session": CreationSessionInput,
+    "finalize_creation_session": CreationSessionInput,
     "import_creation_material": ImportCreationMaterialInput,
     "preview_creation_import": PreviewCreationImportInput,
     "apply_creation_import": ApplyCreationImportInput,

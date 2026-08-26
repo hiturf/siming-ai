@@ -1622,9 +1622,64 @@ private fun DirectApiSetupScreen(
     var protocol by rememberSaveable(existing?.baseUrl) {
         mutableStateOf(existing?.protocol ?: DirectApiConfig.PROTOCOL_AUTO)
     }
+    val taskModels = remember(existing?.baseUrl) {
+        mutableStateMapOf<String, String>().apply {
+            putAll(existing?.taskModels.orEmpty())
+        }
+    }
+    var taskModelPicker by rememberSaveable(existing?.baseUrl) { mutableStateOf<String?>(null) }
+    val modelChoices = (
+        listOf(model) +
+            ui.discoveredModels +
+            existing?.availableModels.orEmpty() +
+            taskModels.values
+        )
+        .map(String::trim)
+        .filter(String::isNotBlank)
+        .distinct()
 
     LaunchedEffect(ui.discoveredModels) {
         if (model.isBlank()) model = ui.discoveredModels.firstOrNull().orEmpty()
+    }
+
+    taskModelPicker?.let { taskType ->
+        AlertDialog(
+            onDismissRequest = { taskModelPicker = null },
+            title = { Text("选择${DirectApiConfig.taskModelLabels[taskType] ?: taskType}模型") },
+            text = {
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth().height(360.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    item {
+                        TextButton(
+                            onClick = {
+                                taskModels.remove(taskType)
+                                taskModelPicker = null
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("跟随 API 默认模型 · ${model.ifBlank { "尚未选择" }}")
+                        }
+                    }
+                    items(modelChoices, key = { it }) { candidate ->
+                        TextButton(
+                            onClick = {
+                                if (candidate == model) taskModels.remove(taskType)
+                                else taskModels[taskType] = candidate
+                                taskModelPicker = null
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(candidate, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { taskModelPicker = null }) { Text("取消") }
+            },
+        )
     }
 
     Scaffold(
@@ -1749,6 +1804,31 @@ private fun DirectApiSetupScreen(
                     )
                 }
             }
+            HorizontalDivider()
+            Text("按任务选择模型", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text(
+                "显式选择优先于任务默认；没有单独设置的任务会使用上面的 API 默认模型。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            DirectApiConfig.taskModelLabels.forEach { (taskType, label) ->
+                OutlinedButton(
+                    onClick = { taskModelPicker = taskType },
+                    enabled = modelChoices.isNotEmpty() && !ui.busy,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(Modifier.fillMaxWidth()) {
+                        Text(label, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            taskModels[taskType]?.let { "单独使用 · $it" }
+                                ?: "跟随默认 · ${model.ifBlank { "尚未选择" }}",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            }
             Button(
                 onClick = {
                     viewModel.configureDirectApi(
@@ -1757,6 +1837,8 @@ private fun DirectApiSetupScreen(
                         apiKey,
                         model,
                         protocol,
+                        modelChoices,
+                        taskModels.toMap(),
                         onConfigured,
                     )
                 },

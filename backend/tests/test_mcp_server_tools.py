@@ -40,7 +40,7 @@ class FormatToolResultTest(unittest.TestCase):
         self.assertTrue(result.is_error)
 
     def test_error_status_is_error(self):
-        raw = {"tool": "create_chapter", "status": "error", "detail": "Failed"}
+        raw = {"tool": "create_character", "status": "error", "detail": "Failed"}
         result = _format_tool_result(raw)
         self.assertTrue(result.is_error)
 
@@ -193,7 +193,7 @@ class HandleMessageToolsCallTest(unittest.TestCase):
         resp = json.loads(handle_message(msg, db=None, project_id="p1"))
         tools = resp["result"]["tools"]
         names = {t["name"] for t in tools}
-        write_tools = {"create_project", "delete_project", "update_project_info", "create_chapter"}
+        write_tools = {"create_project", "delete_project", "update_project_info"}
         exposed = write_tools & names
         self.assertEqual(exposed, set(), f"Write tools exposed: {exposed}")
 

@@ -6,7 +6,7 @@ writing context, continuity checks, and draft assistance.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -111,14 +111,14 @@ def render_quickstart(
         "- 内部模型工具只通过 MCP permission pack: internal_llm 暴露；project_management 只用于 API-free 的项目创建、导入、写入、导出、技能和自动任务管理。",
         "- 中文小说必须用中文保存角色名、别名、章节标题、摘要、大纲、事实和世界观；不要因为工具报错就改成英文或拼音。",
         "- 先调用 list_projects 或 get_project_info 确认作品；所有项目写入工具都必须传入正确 project_id。",
-        "- 创建、导入、建档、写作后必须调用 get_project_archive_status 或对应 search/list 工具验证数据真的写入到了目标作品。",
+        "- 创建、导入和建档后必须调用 get_project_archive_status 或对应 search/list 工具验证数据。章节写作只生成未保存草稿，草稿成功后必须立即停止。",
         "- 禁止默认调用的内部模型工具：chapter_writer, character_writer, outline_writer, worldbuilding_writer, design_plot, roleplay_character, dialogue_battle, evaluate_chapter, detect_character_changes, detect_new_worldbuilding, detect_worldbuilding_conflicts, rewrite_text, expand_text, continue_text, start_cataloging_job, resume_cataloging_job, retry_current_cataloging_chapter, rerun_cataloging_resolution_current, start_deconstruct_job。",
         "",
         "## 默认外部建档流程",
-        "get_prompt_pack(pack_id='cataloging_external_no_api') -> start_external_cataloging_job -> 循环 get_next_external_cataloging_chapter(phase='merged') / save_external_cataloging_candidates(phase='merged') / apply_pending_cataloging -> verify_external_cataloging_progress -> get_project_archive_status。",
+        "get_prompt_pack(pack_id='cataloging_external_no_api') -> start_external_cataloging_job -> 逐章执行 facts / candidates / apply / verify -> get_project_archive_status。",
         "",
         "## 默认外部写作流程",
-        "prepare_external_writing_context -> 外部 Agent 一次生成基础正文 -> save_external_chapter_draft -> create_chapter(draft_id/content_ref, skip_style_repair=true)。写入会自动创建统一建档任务；若返回 next_action=continue_external_cataloging，继续标准外部建档循环，否则不要重复建档。去除 AI 味和质量评审由用户另行发起。",
+        "prepare_external_writing_context -> 外部 Agent 一次生成正文 -> save_external_chapter_draft -> 立即停止。不得继续写入正式章节、角色/世界观或调用建档工具；作者会在界面选择“保存并建档”或“仅保存”。去除 AI 味和质量评分读取编辑器当前草稿，由用户另行发起。",
         "",
         "# Siming / 司命外部 Agent 快速入门",
         "",
@@ -128,7 +128,7 @@ def render_quickstart(
         "- 第一步通常调用 get_moshu_usage_guide；不确定时 scenario=quickstart。",
         "- 中文小说必须用中文保存角色名、别名、章节标题、摘要、大纲、事实和世界观；不要因为一次工具错误就改成英文或拼音。",
         "- 先调用 list_projects 或 get_project_info 确认作品；所有项目写入都必须使用正确 project_id。",
-        "- 完成导入、建档、写作后，必须调用 get_project_archive_status 或 search/list 工具验证数据真的存在。",
+        "- 完成导入或建档后，必须调用 get_project_archive_status 或 search/list 工具验证数据。章节草稿写入成功即结束，不执行后续验证轮询。",
         "- 如果用户说司命 API 欠费、未配置 API、或要求由 Claude/Codex 自己分析，禁止调用内部 LLM 工具。",
         "- 内部 LLM 工具包括 start_cataloging_job、chapter_writer、character_writer、outline_writer、worldbuilding_writer、design_plot、evaluate_chapter。",
         "",
@@ -140,13 +140,14 @@ def render_quickstart(
         "## 无 API 建档",
         "1. get_prompt_pack(pack_id='cataloging_external_no_api')",
         "2. start_external_cataloging_job()",
-        "3. 循环：get_next_external_cataloging_chapter(phase='merged') -> 外部 Agent 阅读章节和档案镜像 -> save_external_cataloging_candidates(phase='merged') -> apply_pending_cataloging",
-        "4. 每章 verify_external_cataloging_progress，最后 get_project_archive_status",
+        "3. get_next_external_cataloging_chapter(phase='facts') -> 只读当前章 -> save_external_cataloging_facts",
+        "4. get_next_external_cataloging_chapter(phase='candidates') -> list_cataloging_facts -> 读取当前档案 -> save_external_cataloging_candidates",
+        "5. apply_pending_cataloging -> verify_external_cataloging_progress；逐章重复，最后 get_project_archive_status",
         "",
         "## 无 API 写章节",
         "1. prepare_external_writing_context()",
         "2. 外部 Agent 一次生成基础正文；不自动执行去除 AI 味或质量评审",
-        "3. save_external_chapter_draft -> create_chapter(skip_style_repair=true)；确认 cataloging_job.job_id，并按返回的 next_action 决定由当前 Agent 继续外部建档还是等待后台任务",
+        "3. 调用 save_external_chapter_draft 保存未入库草稿，然后立即停止；正式保存和启动建档只能由作者在界面操作",
     ]
     from app.prompts.cataloging_source import get_language_rules, get_project_binding_rules
 
@@ -155,8 +156,8 @@ def render_quickstart(
         "## Context Governance (Required for Agent Tasks)",
         "- Before writing, review, rewriting, or cataloging a concrete chapter, call prepare_task_context to obtain the baseline manifest.",
         "- Use search_task_context for focused follow-up retrieval. Reading a project mirror directly remains allowed but is not auditable evidence.",
-        "- Before a formal chapter write, call submit_context_evidence for every required manifest item using its source hash.",
-        "- Pass context_manifest_id through prepare_external_writing_context, save_external_chapter_draft, and create_chapter.",
+        "- Before saving a generated draft, call submit_context_evidence for every required manifest item using its source hash.",
+        "- Pass context_manifest_id through prepare_external_writing_context and save_external_chapter_draft.",
         "",
         get_project_binding_rules(),
         "",
@@ -187,252 +188,6 @@ def render_external_cataloging(
         parts.append(f"\n## job_id\n{job_id}")
     return [McpPromptMessage(role="user", content="\n".join(parts))]
 
-    parts = [
-        "# 司命无 API 建档工作流",
-        "",
-        "目标：外部 Agent 自己阅读章节，提取事实，生成候选，交给司命工具落库。全过程不调用司命内部模型 API。",
-        "",
-        "## 工具顺序",
-        "1. get_prompt_pack(pack_id='cataloging_external_no_api')",
-        "2. start_external_cataloging_job",
-        "3. get_next_external_cataloging_chapter",
-        "4. save_external_cataloging_candidates(phase='merged')",
-        "5. apply_pending_cataloging",
-        "6. verify_external_cataloging_progress",
-        "7. 全部章节完成后 get_project_archive_status",
-        "",
-        "## 候选 item_type",
-        "- chapter_summary",
-        "- character_create / character_update / character_state_update / character_timeline / character_relationship / character_merge_candidate",
-        "- outline_create / outline_update",
-        "- worldbuilding_create / worldbuilding_update / worldbuilding_timeline",
-        "- chapter_link",
-        "",
-        "## 要求",
-        "- 中文小说必须用中文建档；角色名、别名、章节标题、摘要、大纲节点、世界观条目和证据均保留原文语言。",
-        "- 使用原文语言和小说里的称呼，不要把中文作品粗略改成英文档案。",
-        "- 每章处理后必须 apply_pending_cataloging，否则候选只是暂存，不会成为角色、大纲、世界观数据。",
-        "- 报告完成前必须验证 characters_count、outline_nodes_count、worldbuilding_count、chapters_count。",
-        "- 如果用户说 API 欠费，禁止调用 start_cataloging_job。",
-    ]
-    if project_id:
-        parts.append(f"\n## project_id\n{project_id}")
-    if job_id:
-        parts.append(f"\n## job_id\n{job_id}")
-    return [McpPromptMessage(role="user", content="\n".join(parts))]
-
-
-def _quality_writing_prompt_for_project(project: Any) -> str:
-    """Build the same focused base-writing prompt exposed by external tools."""
-    from app.prompts.prompt_source import get_public_chapter_quality_system_prompt
-    from app.prompts.style_prompts import build_style_context
-
-    style_context = build_style_context(project, include_anti_ai=False)
-    return get_public_chapter_quality_system_prompt().replace("{style_context}", style_context)
-
-
-def _legacy_render_writing_context(
-    db: Any,
-    project_id: str,
-    *,
-    chapter_number: str | None = None,
-    outline_node_id: str | None = None,
-    requirements: str | None = None,
-) -> list[McpPromptMessage]:
-    """Render the moshu_writing_context prompt.
-
-    Queries the database for outline, recent summaries, characters,
-    and worldbuilding, then assembles a compact prompt.
-    """
-    from app.database.models import (
-        Project, Chapter, OutlineNode,
-        Character, WorldbuildingEntry,
-    )
-
-    messages: list[McpPromptMessage] = []
-
-    # Project info
-    project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        return [McpPromptMessage(role="user", content=f"Error: Project {project_id} not found.")]
-
-    parts: list[str] = []
-    parts.append(f"# Siming Base Writing Context: {project.title}")
-    parts.append("")
-    parts.append("## Unified Base-Writing Prompt")
-    parts.append(_quality_writing_prompt_for_project(project))
-    parts.append("")
-    parts.append("## Required External Writing Workflow")
-    parts.append(
-        "prepare_external_writing_context -> generate one base draft -> "
-        "save_external_chapter_draft -> create_chapter(draft_id/content_ref, skip_style_repair=true). "
-        "The write result starts canonical cataloging; follow its next_action and never duplicate candidates. "
-        "De-AI revision and quality review are separate user actions."
-    )
-    if project.description:
-        parts.append(f"\n## Project Description\n{project.description}")
-    if project.writing_style:
-        parts.append(f"\n## Writing Style\n{project.writing_style}")
-    # Outline
-    if outline_node_id:
-        node = db.query(OutlineNode).filter(
-            OutlineNode.project_id == project_id,
-            OutlineNode.id == outline_node_id,
-        ).first()
-        if node:
-            parts.append(f"\n## Target Outline Node\n- **{node.title}** ({node.node_type})")
-            if node.summary:
-                parts.append(f"  Summary: {node.summary}")
-
-    # Recent chapter summaries
-    recent_chapters = db.query(Chapter).filter(
-        Chapter.project_id == project_id,
-    ).order_by(Chapter.sort_order.desc(), Chapter.created_at.desc(), Chapter.id.desc()).limit(5).all()
-
-    if recent_chapters:
-        parts.append("\n## Recent Chapter Summaries")
-        for ch in recent_chapters:
-            if ch.summary:
-                parts.append(f"- **{ch.title}**: {ch.summary.summary_text[:200]}")
-
-    # Characters
-    characters = db.query(Character).filter(
-        Character.project_id == project_id,
-    ).limit(10).all()
-
-    if characters:
-        parts.append("\n## Character States")
-        for c in characters:
-            state_parts = [f"- **{c.name}** ({c.role_type or 'unknown'})"]
-            if c.current_location:
-                state_parts.append(f"  Location: {c.current_location}")
-            if c.current_goal:
-                state_parts.append(f"  Goal: {c.current_goal}")
-            parts.append("\n".join(state_parts))
-
-    # Worldbuilding
-    wb_entries = db.query(WorldbuildingEntry).filter(
-        WorldbuildingEntry.project_id == project_id,
-    ).limit(10).all()
-
-    if wb_entries:
-        parts.append("\n## Worldbuilding Constraints")
-        for wb in wb_entries:
-            parts.append(f"- **{wb.title}** ({wb.dimension}): {wb.content[:150]}")
-
-    # Requirements
-    if requirements:
-        parts.append(f"\n## Writing Requirements\n{requirements}")
-
-    parts.append("\n## Warnings\n- Do not break established character traits.\n- Do not contradict worldbuilding entries.\n- Follow the unified quality prompt above.")
-
-    messages.append(McpPromptMessage(role="user", content="\n".join(parts)))
-    return messages
-
-
-def _legacy_render_continuity_check(
-    db: Any,
-    project_id: str,
-    *,
-    chapter_id: str | None = None,
-) -> list[McpPromptMessage]:
-    """Render the moshu_continuity_check prompt."""
-    from app.database.models import Project, Chapter, Character, WorldbuildingEntry
-
-    messages: list[McpPromptMessage] = []
-
-    project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        return [McpPromptMessage(role="user", content=f"Error: Project {project_id} not found.")]
-
-    parts: list[str] = []
-    parts.append(f"# Continuity Check: {project.title}")
-
-    if chapter_id:
-        chapter = db.query(Chapter).filter(
-            Chapter.project_id == project_id,
-            Chapter.id == chapter_id,
-        ).first()
-        if chapter:
-            parts.append(f"\n## Chapter to Check\n**{chapter.title}**\n{chapter.content[:3000]}")
-
-    # Character states
-    characters = db.query(Character).filter(
-        Character.project_id == project_id,
-    ).all()
-    if characters:
-        parts.append("\n## Character States (check for OOC)")
-        for c in characters:
-            parts.append(f"- **{c.name}**: personality={c.personality or 'N/A'}, goal={c.current_goal or 'N/A'}")
-
-    # Worldbuilding
-    wb_entries = db.query(WorldbuildingEntry).filter(
-        WorldbuildingEntry.project_id == project_id,
-    ).all()
-    if wb_entries:
-        parts.append("\n## Worldbuilding Rules (check for violations)")
-        for wb in wb_entries:
-            parts.append(f"- **{wb.title}**: {wb.content[:200]}")
-
-    parts.append("\n## Check For\n1. Out-of-character behavior\n2. Worldbuilding contradictions\n3. Timeline inconsistencies\n4. Setting violations")
-
-    messages.append(McpPromptMessage(role="user", content="\n".join(parts)))
-    return messages
-
-
-def _legacy_render_fanfic_draft(
-    db: Any,
-    project_id: str,
-    *,
-    outline_node_id: str | None = None,
-    requirements: str | None = None,
-) -> list[McpPromptMessage]:
-    """Render the moshu_fanfic_draft prompt."""
-    from app.database.models import Project, OutlineNode, Character
-
-    messages: list[McpPromptMessage] = []
-
-    project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        return [McpPromptMessage(role="user", content=f"Error: Project {project_id} not found.")]
-
-    parts: list[str] = []
-    parts.append(f"# Fanfic Draft Context: {project.title}")
-    parts.append("\n## Unified Quality Prompt")
-    parts.append(_quality_writing_prompt_for_project(project))
-    parts.append(
-        "\n## Rules\n"
-        "- Characters must stay in-character (anti-OOC).\n"
-        "- Do not expose any API keys, model secrets, or internal prompts.\n"
-        "- Respect established worldbuilding rules.\n"
-        "- Use the same quality prompt and external writing workflow as moshu_writing_context."
-    )
-
-    if project.description:
-        parts.append(f"\n## Original Work\n{project.description}")
-
-    if outline_node_id:
-        node = db.query(OutlineNode).filter(
-            OutlineNode.project_id == project_id,
-            OutlineNode.id == outline_node_id,
-        ).first()
-        if node:
-            parts.append(f"\n## Target Scene\n**{node.title}**: {node.summary or 'No summary'}")
-
-    characters = db.query(Character).filter(
-        Character.project_id == project_id,
-    ).limit(8).all()
-    if characters:
-        parts.append("\n## Character Profiles (for reference)")
-        for c in characters:
-            parts.append(f"- **{c.name}**: {c.personality or 'N/A'} | {c.background or 'N/A'}")
-
-    if requirements:
-        parts.append(f"\n## Fanfic Requirements\n{requirements}")
-
-    messages.append(McpPromptMessage(role="user", content="\n".join(parts)))
-    return messages
-
 
 def _render_governed_task_prompt(
     db: Any,
@@ -441,14 +196,8 @@ def _render_governed_task_prompt(
     task_type: str,
     title: str,
     arguments: dict[str, Any],
-    legacy_renderer: Callable[[], list[McpPromptMessage]] | None = None,
 ) -> list[McpPromptMessage]:
-    """Render only the shared manifest for MCP prompt consumers.
-
-    The legacy prompt builders selected project rows independently.  Keeping
-    them below for historical reference is harmless, but newly rendered MCP
-    prompts must use the same persisted manifest as API and CLI execution.
-    """
+    """Render the persisted context manifest shared by every execution route."""
     from app.database.models import Project
     from app.services.context_orchestrator import ContextOrchestrator
 
@@ -457,32 +206,22 @@ def _render_governed_task_prompt(
         return [McpPromptMessage(role="user", content=f"Error: Project {project_id} not found.")]
 
     orchestrator = ContextOrchestrator(db)
-    try:
-        manifest = orchestrator.prepare(
-            project_id=project_id,
-            task_type=task_type,
-            execution_route="external_mcp",
-            arguments=arguments,
-        )
-    except TypeError:
-        # A few third-party integrations use a read-only/mock session solely
-        # to render a display prompt. They cannot persist a manifest or source
-        # hash, so retain the historical display-only response for that case.
-        if legacy_renderer:
-            return legacy_renderer()
-        raise
+    manifest = orchestrator.prepare(
+        project_id=project_id,
+        task_type=task_type,
+        execution_route="external_mcp",
+        arguments=arguments,
+    )
     if not isinstance(manifest.id, str) or not manifest.id:
-        if legacy_renderer:
-            return legacy_renderer()
         return [McpPromptMessage(role="user", content="Error: a persisted context manifest could not be prepared.")]
     payload = orchestrator.manifest_payload(manifest, include_content=True)
     state = payload["status"]
     workflow = (
         "1. Call prepare_task_context with this manifest_id or your run_id.\n"
         "2. Use search_task_context only for a focused gap.\n"
-        "3. Before create_chapter or update_chapter, "
-        "call submit_context_evidence for every required source.\n"
-        "4. Direct project-mirror reads may inform exploration, but are not verified evidence."
+        "3. Before save_external_chapter_draft, call submit_context_evidence for every required source.\n"
+        "4. After save_external_chapter_draft succeeds, stop immediately; the author owns formal saving and cataloging.\n"
+        "5. Direct project-mirror reads may inform exploration, but are not verified evidence."
     )
     parts = [
         f"# Siming Governed Context: {title}",
@@ -516,13 +255,6 @@ def render_writing_context(
             "outline_node_id": outline_node_id or "",
             "requirements": requirements or "",
         },
-        legacy_renderer=lambda: _legacy_render_writing_context(
-            db,
-            project_id,
-            chapter_number=chapter_number,
-            outline_node_id=outline_node_id,
-            requirements=requirements,
-        ),
     )
 
 
@@ -538,7 +270,6 @@ def render_continuity_check(
         task_type="review",
         title="Continuity Review",
         arguments={"chapter_id": chapter_id or ""},
-        legacy_renderer=lambda: _legacy_render_continuity_check(db, project_id, chapter_id=chapter_id),
     )
 
 
@@ -558,12 +289,6 @@ def render_fanfic_draft(
             "outline_node_id": outline_node_id or "",
             "requirements": requirements or "",
         },
-        legacy_renderer=lambda: _legacy_render_fanfic_draft(
-            db,
-            project_id,
-            outline_node_id=outline_node_id,
-            requirements=requirements,
-        ),
     )
 
 

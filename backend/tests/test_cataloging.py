@@ -38,6 +38,7 @@ from app.services.cataloging.candidate_store import (
 )
 from app.services.cataloging.candidate_validation import inspect_candidate_coverage
 from app.services.cataloging.context import build_light_context
+from app.services.cataloging.constants import CATALOGING_STAGE_MAX_ATTEMPTS
 from app.services.context_builders import _build_world_context
 from app.services.cataloging.job_control import (
     cancel_job,
@@ -104,17 +105,9 @@ def complete_summary_payload(
 
 class CatalogingServiceTestCase(unittest.TestCase):
     def setUp(self):
-        self.old_cataloging_pipeline = os.environ.get("SIMING_CATALOGING_PIPELINE")
-        os.environ["SIMING_CATALOGING_PIPELINE"] = "staged"
         self.engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(bind=self.engine)
         self.Session = sessionmaker(bind=self.engine)
-
-    def tearDown(self):
-        if self.old_cataloging_pipeline is None:
-            os.environ.pop("SIMING_CATALOGING_PIPELINE", None)
-        else:
-            os.environ["SIMING_CATALOGING_PIPELINE"] = self.old_cataloging_pipeline
 
     def test_reconciles_completed_cataloging_job_into_task_center_projection(self):
         db = self.Session()
@@ -860,9 +853,9 @@ class CatalogingServiceTestCase(unittest.TestCase):
             }
             response = json.dumps(aggregate, ensure_ascii=False, indent=2)
             run.raw_output = (
-                f"=== MERGED CATALOGING ===\n{response}\n\n"
-                f"=== MERGED CATALOGING RETRY 2 ===\n{response}\n\n"
-                f"=== MERGED CATALOGING RETRY 3 ===\n{response}"
+                f"=== CANDIDATE RESOLUTION ===\n{response}\n\n"
+                f"=== CANDIDATE RESOLUTION RETRY 2 ===\n{response}\n\n"
+                f"=== CANDIDATE RESOLUTION RETRY 3 ===\n{response}"
             )
             run.status = "failed"
             db.flush()
@@ -1251,7 +1244,7 @@ class CatalogingServiceTestCase(unittest.TestCase):
         finally:
             db.close()
 
-    def test_character_candidate_reduces_descriptive_role_to_enum(self):
+    def test_character_candidate_preserves_structured_role_enum(self):
         db = self.Session()
         try:
             project = Project(title="Canonical Role Project")
@@ -1266,14 +1259,13 @@ class CatalogingServiceTestCase(unittest.TestCase):
             result = try_create_candidate(db, job, run, json.dumps({
                 "type": "character_create",
                 "name": "特昂糖",
-                "role_type": "主角，穿越者，陆家三岁孙女",
+                "role_type": "protagonist",
                 "background": "前世为研究员，现为陆家幼女",
             }, ensure_ascii=False), 0)
 
             payload = candidate_payload(result["candidate"])
             self.assertEqual(payload["role_type"], "protagonist")
-            self.assertNotIn("穿越者", payload["role_type"])
-            self.assertIn("穿越者、陆家三岁孙女", payload["background"])
+            self.assertEqual(payload["background"], "前世为研究员，现为陆家幼女")
         finally:
             db.close()
 
@@ -1686,368 +1678,7 @@ class CatalogingServiceTestCase(unittest.TestCase):
             cataloging_orchestrator.LLMGateway.stream_chat_completion = original_stream
             db.close()
 
-    def test_extract_run_merged_stage_generates_candidates_without_facts(self):
-        os.environ["SIMING_CATALOGING_PIPELINE"] = "merged"
-        db = self.Session()
-        original_stream = cataloging_orchestrator.LLMGateway.stream_chat_completion
-        calls = []
-
-        async def fake_stream(messages, **kwargs):
-            calls.append(messages)
-            body = "\n".join([
-                json.dumps({
-                    "type": "chapter_summary",
-                    "payload": complete_summary_payload(
-                        "The door opens.",
-                        key_events=["door opens"],
-                    ),
-                }, ensure_ascii=False),
-                json.dumps({
-                    "type": "outline_create",
-                    "payload": {"title": "Door", "node_type": "chapter", "summary": "The door opens."},
-                }, ensure_ascii=False),
-            ]) + "\n"
-            yield body
-
-        try:
-            project = Project(title="Merged Project")
-            db.add(project)
-            db.flush()
-            chapter = Chapter(project_id=project.id, title="Door", content="The door opens.")
-            db.add_all([
-                chapter,
-                Character(project_id=project.id, name="Lin"),
-                WorldbuildingEntry(project_id=project.id, title="Old Door", dimension="geography", content="A sealed door."),
-            ])
-            db.commit()
-            job = create_cataloging_job(db, project.id, "manual", "deepseek:test", [])
-            run = job.chapter_runs[0]
-            cataloging_orchestrator.LLMGateway.stream_chat_completion = fake_stream
-
-            async def collect():
-                return [event async for event in cataloging_orchestrator._extract_run(db, job, run)]
-
-            events = asyncio.run(collect())
-
-            self.assertEqual(len(calls), 1)
-            self.assertIn("single_stage_cataloging", calls[0][1]["content"])
-            self.assertEqual(db.query(CatalogingFact).count(), 0)
-            self.assertEqual(db.query(CatalogingCandidate).count(), 2)
-            self.assertTrue(any('"type":"chapter_extracted"' in event for event in events))
-            self.assertEqual(run.status, "awaiting_confirmation")
-        finally:
-            cataloging_orchestrator.LLMGateway.stream_chat_completion = original_stream
-            db.close()
-
-    def test_extract_run_projects_outline_from_summary_without_retry(self):
-        os.environ["SIMING_CATALOGING_PIPELINE"] = "merged"
-        db = self.Session()
-        original_stream = cataloging_orchestrator.LLMGateway.stream_chat_completion
-        prompts = []
-
-        async def fake_stream(messages, **kwargs):
-            prompts.append(messages[1]["content"])
-            yield json.dumps({
-                "type": "chapter_summary",
-                "payload": complete_summary_payload("Only a summary was returned."),
-            }, ensure_ascii=False) + "\n"
-
-        try:
-            project = Project(title="Coverage Gate Project")
-            db.add(project)
-            db.flush()
-            chapter = Chapter(project_id=project.id, title="第2章", content="人物在院中继续行动。")
-            db.add(chapter)
-            db.commit()
-            job = create_cataloging_job(db, project.id, "manual", "deepseek:test", [])
-            run = job.chapter_runs[0]
-            cataloging_orchestrator.LLMGateway.stream_chat_completion = fake_stream
-
-            async def collect():
-                return [event async for event in cataloging_orchestrator._extract_run(db, job, run)]
-
-            events = asyncio.run(collect())
-
-            self.assertEqual(len(prompts), 1)
-            candidates = db.query(CatalogingCandidate).filter(
-                CatalogingCandidate.chapter_run_id == run.id,
-            ).all()
-            outlines = [item for item in candidates if item.item_type == "outline_create"]
-            self.assertEqual(len(outlines), 1)
-            self.assertEqual(outlines[0].source_task, "deterministic_required_outline")
-            self.assertIn("Only a summary was returned.", outlines[0].raw_payload)
-            self.assertEqual(run.status, "awaiting_confirmation")
-            self.assertTrue(any('"type":"chapter_extracted"' in event for event in events))
-        finally:
-            cataloging_orchestrator.LLMGateway.stream_chat_completion = original_stream
-            db.close()
-
-    def test_review_only_coverage_warning_is_not_a_hard_run_error(self):
-        os.environ["SIMING_CATALOGING_PIPELINE"] = "merged"
-        db = self.Session()
-        original_stream = cataloging_orchestrator.LLMGateway.stream_chat_completion
-
-        async def fake_stream(messages, **kwargs):
-            yield json.dumps({
-                "chapter_summary": complete_summary_payload(
-                    "周氏在院中安顿家人。",
-                    characters=[],
-                ),
-                "chapter_outline": {
-                    "title": "第一章",
-                    "summary": "周氏在院中安顿家人。",
-                    "node_type": "chapter",
-                    "status": "completed",
-                },
-            }, ensure_ascii=False) + "\n"
-
-        try:
-            project = Project(title="Review Warning Project")
-            db.add(project)
-            db.flush()
-            chapter = Chapter(project_id=project.id, title="第一章", content="周氏在院中安顿家人。")
-            db.add_all([chapter, Character(project_id=project.id, name="周氏")])
-            db.commit()
-            job = create_cataloging_job(db, project.id, "auto", "deepseek:test", [])
-            run = job.chapter_runs[0]
-            cataloging_orchestrator.LLMGateway.stream_chat_completion = fake_stream
-
-            async def collect():
-                return [event async for event in cataloging_orchestrator._extract_run(db, job, run)]
-
-            asyncio.run(collect())
-
-            self.assertEqual(run.status, "awaiting_confirmation")
-            self.assertIsNone(run.error)
-            self.assertIn("原文角色", run.review_warning or "")
-        finally:
-            cataloging_orchestrator.LLMGateway.stream_chat_completion = original_stream
-            db.close()
-
-    def test_extract_run_accepts_required_summary_outline_skeleton(self):
-        os.environ["SIMING_CATALOGING_PIPELINE"] = "merged"
-        db = self.Session()
-        original_stream = cataloging_orchestrator.LLMGateway.stream_chat_completion
-        calls = []
-
-        async def fake_stream(messages, **kwargs):
-            calls.append(messages)
-            yield json.dumps({
-                "chapter_summary": complete_summary_payload(
-                    "The required skeleton was returned.",
-                    narrative_state={"events": ["The archive starts."]},
-                ),
-                "chapter_outline": {
-                    "title": "第2章",
-                    "summary": "The required skeleton was returned.",
-                    "node_type": "chapter",
-                    "status": "completed",
-                },
-            }, ensure_ascii=False) + "\n"
-
-        try:
-            project = Project(title="Required Skeleton Project")
-            db.add(project)
-            db.flush()
-            chapter = Chapter(project_id=project.id, title="第2章", content="The archive starts.")
-            db.add(chapter)
-            db.commit()
-            job = create_cataloging_job(db, project.id, "manual", "deepseek:test", [])
-            run = job.chapter_runs[0]
-            cataloging_orchestrator.LLMGateway.stream_chat_completion = fake_stream
-
-            async def collect():
-                return [event async for event in cataloging_orchestrator._extract_run(db, job, run)]
-
-            asyncio.run(collect())
-
-            candidates = db.query(CatalogingCandidate).filter(
-                CatalogingCandidate.chapter_run_id == run.id,
-            ).all()
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(len(candidates), 2)
-            self.assertEqual(
-                {candidate.item_type for candidate in candidates},
-                {"chapter_summary", "outline_create"},
-            )
-            outline = next(item for item in candidates if item.item_type == "outline_create")
-            self.assertNotEqual(outline.source_task, "deterministic_required_outline")
-            self.assertTrue(inspect_candidate_coverage(candidates).is_complete)
-            self.assertEqual(run.status, "awaiting_confirmation")
-        finally:
-            cataloging_orchestrator.LLMGateway.stream_chat_completion = original_stream
-            db.close()
-
-    def test_extract_run_recovers_pretty_summary_only_without_retry(self):
-        os.environ["SIMING_CATALOGING_PIPELINE"] = "merged"
-        db = self.Session()
-        original_stream = cataloging_orchestrator.LLMGateway.stream_chat_completion
-        calls = []
-
-        async def fake_stream(messages, **kwargs):
-            calls.append(messages)
-            body = json.dumps({
-                "type": "chapter_summary",
-                **complete_summary_payload("Pretty summary only."),
-            }, ensure_ascii=False, indent=2)
-            yield body[:41]
-            yield body[41:]
-
-        try:
-            project = Project(title="Pretty Summary Project")
-            db.add(project)
-            db.flush()
-            chapter = Chapter(project_id=project.id, title="第2章", content="人物继续行动。")
-            db.add(chapter)
-            db.commit()
-            job = create_cataloging_job(db, project.id, "manual", "deepseek:test", [])
-            run = job.chapter_runs[0]
-            cataloging_orchestrator.LLMGateway.stream_chat_completion = fake_stream
-
-            async def collect():
-                return [event async for event in cataloging_orchestrator._extract_run(db, job, run)]
-
-            asyncio.run(collect())
-
-            candidates = db.query(CatalogingCandidate).filter(
-                CatalogingCandidate.chapter_run_id == run.id,
-            ).all()
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(
-                {candidate.item_type for candidate in candidates},
-                {"chapter_summary", "outline_create"},
-            )
-            outline = next(item for item in candidates if item.item_type == "outline_create")
-            self.assertEqual(outline.source_task, "deterministic_required_outline")
-            self.assertTrue(inspect_candidate_coverage(candidates).is_complete)
-            self.assertEqual(run.status, "awaiting_confirmation")
-        finally:
-            cataloging_orchestrator.LLMGateway.stream_chat_completion = original_stream
-            db.close()
-
-    def test_extract_run_merged_recovers_pretty_json_array_without_retry(self):
-        os.environ["SIMING_CATALOGING_PIPELINE"] = "merged"
-        db = self.Session()
-        original_stream = cataloging_orchestrator.LLMGateway.stream_chat_completion
-        calls = []
-
-        async def fake_stream(messages, **kwargs):
-            calls.append(messages)
-            body = json.dumps([
-                {
-                    "type": "chapter_summary",
-                    **complete_summary_payload(
-                        "The sealed door opens.",
-                        narrative_state={"events": ["The door opens."]},
-                    ),
-                },
-                {
-                    "type": "outline_create",
-                    "node_type": "chapter",
-                    "title": "Door",
-                    "summary": "The sealed door opens.",
-                },
-            ], ensure_ascii=False, indent=2)
-            yield body[:53]
-            yield body[53:]
-
-        try:
-            project = Project(title="Pretty Array Project")
-            db.add(project)
-            db.flush()
-            chapter = Chapter(
-                project_id=project.id,
-                title="Door",
-                content="The sealed door opens.",
-            )
-            db.add(chapter)
-            db.commit()
-            job = create_cataloging_job(db, project.id, "manual", "deepseek:test", [])
-            run = job.chapter_runs[0]
-            cataloging_orchestrator.LLMGateway.stream_chat_completion = fake_stream
-
-            async def collect():
-                return [
-                    event
-                    async for event in cataloging_orchestrator._extract_run(db, job, run)
-                ]
-
-            events = asyncio.run(collect())
-
-            candidates = db.query(CatalogingCandidate).filter(
-                CatalogingCandidate.chapter_run_id == run.id,
-            ).all()
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(
-                {candidate.item_type for candidate in candidates},
-                {"chapter_summary", "outline_create"},
-            )
-            self.assertTrue(inspect_candidate_coverage(candidates).is_complete)
-            self.assertTrue(any('"type":"chapter_extracted"' in event for event in events))
-            self.assertEqual(run.status, "awaiting_confirmation")
-        finally:
-            cataloging_orchestrator.LLMGateway.stream_chat_completion = original_stream
-            db.close()
-
-    def test_extract_run_merged_recovers_complete_body_after_stream_disconnect(self):
-        os.environ["SIMING_CATALOGING_PIPELINE"] = "merged"
-        db = self.Session()
-        original_stream = cataloging_orchestrator.LLMGateway.stream_chat_completion
-        calls = []
-
-        async def fake_stream(messages, **kwargs):
-            calls.append(messages)
-            yield json.dumps({
-                "type": "chapter_summary",
-                **complete_summary_payload(
-                    "The relay activates.",
-                    narrative_state={"events": ["The relay activates."]},
-                ),
-                "outline_creates": [{
-                    "type": "outline_create",
-                    "node_type": "chapter",
-                    "title": "Relay",
-                    "summary": "The relay activates.",
-                }],
-            }, ensure_ascii=False, indent=2)
-            raise RuntimeError("peer closed after sending the complete body")
-
-        try:
-            project = Project(title="Interrupted Complete Response Project")
-            db.add(project)
-            db.flush()
-            chapter = Chapter(
-                project_id=project.id,
-                title="Relay",
-                content="The relay activates.",
-            )
-            db.add(chapter)
-            db.commit()
-            job = create_cataloging_job(db, project.id, "manual", "deepseek:test", [])
-            run = job.chapter_runs[0]
-            cataloging_orchestrator.LLMGateway.stream_chat_completion = fake_stream
-
-            async def collect():
-                return [
-                    event
-                    async for event in cataloging_orchestrator._extract_run(db, job, run)
-                ]
-
-            events = asyncio.run(collect())
-
-            candidates = db.query(CatalogingCandidate).filter(
-                CatalogingCandidate.chapter_run_id == run.id,
-            ).all()
-            self.assertEqual(len(calls), 1)
-            self.assertTrue(inspect_candidate_coverage(candidates).is_complete)
-            self.assertTrue(any('"type":"chapter_extracted"' in event for event in events))
-            self.assertEqual(run.status, "awaiting_confirmation")
-        finally:
-            cataloging_orchestrator.LLMGateway.stream_chat_completion = original_stream
-            db.close()
-
-    def test_extract_run_local_runtime_forces_staged_pipeline(self):
-        os.environ["SIMING_CATALOGING_PIPELINE"] = "merged"
+    def test_extract_run_local_runtime_uses_the_same_staged_pipeline(self):
         db = self.Session()
         original_stream = cataloging_orchestrator.LLMGateway.stream_chat_completion
         calls = []
@@ -2244,33 +1875,17 @@ class CatalogingServiceTestCase(unittest.TestCase):
         self.assertNotIn("镜像文件", messages[1]["content"])
         self.assertLess(len(messages[0]["content"]), 600)
 
-    def test_extract_run_local_runtime_falls_back_when_fact_stage_empty(self):
+    def test_extract_run_local_runtime_pauses_when_fact_stage_is_empty(self):
         db = self.Session()
         original_stream = cataloging_orchestrator.LLMGateway.stream_chat_completion
         calls = []
 
         async def fake_stream(messages, **kwargs):
             calls.append(messages[0]["content"])
-            if len(calls) <= 3:
-                yield "我无法抽取。"
-                return
-            body = "\n".join([
-                json.dumps({
-                    "type": "chapter_summary",
-                    "payload": complete_summary_payload(
-                        "fallback facts reached candidate stage",
-                        key_events=["ok"],
-                    ),
-                }, ensure_ascii=False),
-                json.dumps({
-                    "type": "outline_create",
-                    "payload": {"title": "第1章 开端", "node_type": "chapter", "summary": "fallback"},
-                }, ensure_ascii=False),
-            ]) + "\n"
-            yield body
+            yield "我无法抽取。"
 
         try:
-            project = Project(title="Local Runtime Fallback Project")
+            project = Project(title="Local Runtime Failure Project")
             db.add(project)
             db.flush()
             chapter = Chapter(project_id=project.id, title="第1章 开端", content="张三来到青云宗，发现灵石账目异常。")
@@ -2285,11 +1900,12 @@ class CatalogingServiceTestCase(unittest.TestCase):
 
             events = asyncio.run(collect())
 
-            self.assertEqual(len(calls), 4)
-            self.assertTrue(any('"type":"cataloging_warning"' in event and '"stage":"fact_extraction"' in event for event in events))
-            self.assertGreaterEqual(db.query(CatalogingFact).count(), 2)
-            self.assertEqual(db.query(CatalogingCandidate).count(), 2)
-            self.assertEqual(run.status, "awaiting_confirmation")
+            self.assertEqual(len(calls), CATALOGING_STAGE_MAX_ATTEMPTS)
+            self.assertTrue(any('"type":"cataloging_retry"' in event and '"stage":"fact_extraction"' in event for event in events))
+            self.assertEqual(db.query(CatalogingFact).count(), 0)
+            self.assertEqual(db.query(CatalogingCandidate).count(), 0)
+            self.assertEqual(run.status, "failed")
+            self.assertIn("模型未输出可用事实", run.error)
         finally:
             cataloging_orchestrator.LLMGateway.stream_chat_completion = original_stream
             db.close()
@@ -2435,7 +2051,7 @@ class CatalogingServiceTestCase(unittest.TestCase):
             run = job.chapter_runs[0]
             run.status = "failed"
             run.error = "候选覆盖不完整，缺少 chapter-level outline"
-            run.raw_output = "=== MERGED CATALOGING ===\n" + json.dumps({
+            run.raw_output = "=== CANDIDATE RESOLUTION ===\n" + json.dumps({
                 "type": "chapter_summary",
                 **complete_summary_payload(
                     "主角发现了旧档案。",
@@ -2476,7 +2092,7 @@ class CatalogingServiceTestCase(unittest.TestCase):
             job = create_cataloging_job(db, project.id, "manual", "deepseek:test", [])
             run = job.chapter_runs[0]
             run.status = "failed"
-            run.raw_output = "=== MERGED CATALOGING ===\n" + json.dumps({
+            run.raw_output = "=== CANDIDATE RESOLUTION ===\n" + json.dumps({
                 "type": "chapter_summary",
                 "summary_text": "只有摘要。",
             }, ensure_ascii=False)
@@ -2487,7 +2103,7 @@ class CatalogingServiceTestCase(unittest.TestCase):
             with self.assertRaises(ValidationError) as raised:
                 recover_current_cataloging_chapter(project.id, job.id, db)
 
-            self.assertNotIn("chapter-level outline", str(raised.exception))
+            self.assertIn("chapter-level outline", str(raised.exception))
             self.assertIn("coverage declaration", str(raised.exception))
             self.assertEqual(run.status, "failed")
             self.assertEqual(

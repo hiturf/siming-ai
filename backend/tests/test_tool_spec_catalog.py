@@ -1,4 +1,4 @@
-"""Typed workspace tool catalog compatibility tests."""
+"""Typed workspace tool catalog tests."""
 from __future__ import annotations
 
 import pytest
@@ -12,132 +12,66 @@ from app.services.workspace.registry import registry
 
 
 def _openai_parameters(name: str) -> dict:
-    schema = next(
-        item for item in registry.get_schemas() if item["function"]["name"] == name
-    )
+    schema = next(item for item in registry.get_schemas() if item["function"]["name"] == name)
     return schema["function"]["parameters"]
 
 
 def test_creation_tool_schema_has_one_typed_source():
-    spec = registry.get_spec("generate_novel_creation_stage")
+    spec = registry.get_spec("generate_creation_artifact")
     assert spec is not None
     assert spec.version == "3.0.0"
     assert _openai_parameters(spec.name) == spec.parameters_schema()
     assert spec.mcp_schema()["inputSchema"] == spec.parameters_schema()
-    assert spec.frontend_metadata()["version"] == spec.version
-    assert {"session_id", "stage"}.issubset(
+    assert {"session_id", "artifact", "expected_revision"}.issubset(
         set(spec.parameters_schema().get("required", []))
     )
 
 
-def test_creation_stage_mcp_contract_declares_conditional_model_requirement():
-    spec = registry.get_spec("generate_novel_creation_stage")
-    assert spec is not None
-
-    schema = spec.mcp_schema()["inputSchema"]
-    model_schema = schema["properties"]["model"]
-    assert "Required when stage or artifact is concepts or all" in model_schema["description"]
-    assert "external MCP client is not inherited" in model_schema["description"]
-    assert schema["allOf"] == [
-        {
-            "if": {
-                "properties": {"stage": {"enum": ["all", "concepts"]}},
-                "required": ["stage"],
-            },
-            "then": {
-                "properties": {
-                    "model": {"minLength": 1},
-                    "use_model": {"const": True},
-                },
-                "required": ["model"],
-            },
-        },
-    ]
-
-
-@pytest.mark.parametrize("stage", ["concepts", "all"])
-def test_creation_stage_contract_rejects_missing_model_when_runtime_requires_it(stage):
-    spec = registry.get_spec("generate_novel_creation_stage")
-    assert spec is not None
-
-    with pytest.raises(ValidationError, match="model is required"):
-        spec.validate_input({"session_id": "session-1", "stage": stage})
-
-    validated = spec.validate_input(
-        {"session_id": "session-1", "stage": stage, "model": "codex_cli:codex-cli"}
-    )
-    assert validated.model == "codex_cli:codex-cli"
-
-
-@pytest.mark.parametrize("stage", ["concepts", "all"])
-def test_creation_stage_contract_rejects_disabling_model_when_runtime_requires_it(stage):
-    spec = registry.get_spec("generate_novel_creation_stage")
-    assert spec is not None
-
-    with pytest.raises(ValidationError, match="use_model must be true"):
-        spec.validate_input(
-            {
-                "session_id": "session-1",
-                "stage": stage,
-                "model": "codex_cli:codex-cli",
-                "use_model": False,
-            }
-        )
-
-
-def test_creation_stage_contract_keeps_model_optional_for_deterministic_stages():
-    spec = registry.get_spec("generate_novel_creation_stage")
-    assert spec is not None
-
-    validated = spec.validate_input(
-        {"session_id": "session-1", "stage": "world_style", "use_model": False}
-    )
-    assert validated.model == ""
-
-
 @pytest.mark.parametrize(
-    ("tool_name", "artifact"),
+    ("tool_name", "extra"),
     [
-        ("generate_creation_artifact", "concepts"),
-        ("generate_creation_artifact", "all"),
-        ("refine_creation_artifact", "concepts"),
-        ("refine_creation_artifact", "all"),
-        ("regenerate_creation_artifact", "concepts"),
-        ("regenerate_creation_artifact", "all"),
+        ("generate_creation_artifact", {}),
+        ("refine_creation_artifact", {"instruction": "调整核心冲突"}),
+        ("regenerate_creation_artifact", {}),
     ],
 )
-def test_artifact_generation_contracts_apply_the_same_model_rule(tool_name, artifact):
+def test_artifact_generation_uses_default_model_without_a_model_gate(tool_name, extra):
     spec = registry.get_spec(tool_name)
     assert spec is not None
-    arguments = {
+    validated = spec.validate_input({
         "session_id": "session-1",
-        "artifact": artifact,
+        "artifact": "concepts",
         "expected_revision": 3,
+        **extra,
+    })
+    assert validated.model == ""
+
+    validated_without_model = spec.validate_input({
+        "session_id": "session-1",
+        "artifact": "concepts",
+        "expected_revision": 3,
+        "use_model": False,
+        **extra,
+    })
+    assert validated_without_model.use_model is False
+
+
+def test_removed_creation_tools_are_absent_from_every_catalog():
+    removed = {
+        "get_novel_creation_session",
+        "generate_novel_creation_stage",
+        "submit_novel_creation_stage",
     }
-    if tool_name == "refine_creation_artifact":
-        arguments["instruction"] = "调整核心冲突"
-
-    with pytest.raises(ValidationError, match="model is required"):
-        spec.validate_input(arguments)
-
-    arguments["model"] = "codex_cli:codex-cli"
-    assert spec.validate_input(arguments).model == "codex_cli:codex-cli"
+    assert all(registry.get(name) is None for name in removed)
+    assert removed.isdisjoint({item["function"]["name"] for item in registry.get_schemas()})
 
 
 def test_every_creation_session_tool_has_a_typed_input_contract():
     unrelated_generators = {
-        "design_plot",
-        "chapter_writer",
-        "character_writer",
-        "outline_writer",
-        "worldbuilding_writer",
-        "rewrite_text",
-        "expand_text",
-        "continue_text",
-        "roleplay_character",
-        "dialogue_battle",
+        "design_plot", "chapter_writer", "character_writer", "outline_writer",
+        "worldbuilding_writer", "rewrite_text", "expand_text", "continue_text",
+        "roleplay_character", "dialogue_battle",
     }
-
     for definition in CREATION_TOOL_DEFINITIONS:
         if definition.name in unrelated_generators:
             continue
@@ -150,16 +84,13 @@ def test_every_creation_session_tool_has_a_typed_input_contract():
 def test_creation_import_contract_rejects_unknown_strategy_and_artifact():
     spec = registry.get_spec("apply_creation_import")
     assert spec is not None
-
     with pytest.raises(ValidationError):
-        spec.validate_input(
-            {
-                "import_id": "import-1",
-                "selected_artifacts": ["unknown"],
-                "strategy": "replace_everything",
-                "expected_revision": 3,
-            }
-        )
+        spec.validate_input({
+            "import_id": "import-1",
+            "selected_artifacts": ["unknown"],
+            "strategy": "replace_everything",
+            "expected_revision": 3,
+        })
 
 
 def test_creation_operation_contract_requires_operation_id():
@@ -176,11 +107,3 @@ def test_unmigrated_tool_keeps_legacy_schema_projection():
     schema = spec.parameters_schema()
     assert schema["properties"] == tool.input_schema
     assert schema.get("required", []) == tool.required
-
-
-def test_frontend_catalog_comes_from_tool_specs():
-    metadata = {
-        item["name"]: item for item in registry.list_for_frontend()
-    }["inspect_story_granularity"]
-    assert metadata["version"] == "3.0.0"
-    assert metadata["writes_project_data"] is False

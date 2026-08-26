@@ -32,13 +32,28 @@ export interface SharedModelConfig {
   effective_deconstruct_input_char_limit?: number
   deconstruct_item_char_limit?: number | null
   effective_deconstruct_item_char_limit?: number
+  available_models?: Array<{
+    id: string
+    display_name?: string | null
+  }>
   created_at?: string
   updated_at?: string
+}
+
+export type ModelTaskType = 'assistant' | 'planning' | 'cataloging' | 'writing' | 'evaluation' | 'deconstruct'
+
+export interface SharedTaskModelSetting {
+  task_type: ModelTaskType
+  provider: string
+  model: string
+  context_length?: number | null
+  is_usable?: boolean
 }
 
 interface ModelConfigList {
   items: SharedModelConfig[]
   total?: number
+  task_models: Partial<Record<ModelTaskType, SharedTaskModelSetting>>
 }
 
 interface GlobalModelSelection {
@@ -55,6 +70,7 @@ async function fetchModelConfigs(): Promise<ModelConfigList> {
   return {
     items: response.data.data.items || [],
     total: response.data.data.total,
+    task_models: response.data.data.task_models || {},
   }
 }
 
@@ -109,4 +125,55 @@ export function useGlobalModelActions() {
   }, [queryClient])
 
   return { setGlobalModel }
+}
+
+export function useTaskModelActions() {
+  const queryClient = useQueryClient()
+
+  const setTaskModel = useCallback(async (
+    taskType: ModelTaskType,
+    provider: string,
+    model: string,
+    contextLength?: number | null,
+  ) => {
+    const response = await apiClient.put<ApiResponse<SharedTaskModelSetting>>(
+      `/config/task-models/${taskType}`,
+      {
+        provider,
+        model,
+        context_length: contextLength || null,
+      },
+    )
+    const saved = response.data?.data || {
+      task_type: taskType,
+      provider,
+      model,
+      context_length: contextLength || null,
+      is_usable: true,
+    }
+    queryClient.setQueryData<ModelConfigList>(modelConfigKeys.all, (current) => (
+      current
+        ? {
+            ...current,
+            task_models: { ...current.task_models, [taskType]: saved },
+          }
+        : current
+    ))
+    if (!queryClient.getQueryData(modelConfigKeys.all)) {
+      await queryClient.invalidateQueries({ queryKey: modelConfigKeys.all })
+    }
+    return saved
+  }, [queryClient])
+
+  const clearTaskModel = useCallback(async (taskType: ModelTaskType) => {
+    await apiClient.delete(`/config/task-models/${taskType}`)
+    queryClient.setQueryData<ModelConfigList>(modelConfigKeys.all, (current) => {
+      if (!current) return current
+      const taskModels = { ...current.task_models }
+      delete taskModels[taskType]
+      return { ...current, task_models: taskModels }
+    })
+  }, [queryClient])
+
+  return { setTaskModel, clearTaskModel }
 }

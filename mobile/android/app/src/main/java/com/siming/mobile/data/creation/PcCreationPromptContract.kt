@@ -71,7 +71,7 @@ internal class PcCreationPromptContract private constructor(
             put("form", draft.objectValue("form"))
             put("author_source", authorSource(draft))
             put("current_stage_data", conceptState["data"] ?: JsonNull)
-            put("interview_history", draft["agent_history"] ?: JsonArray(emptyList()))
+            put("interview_history", JsonArray(CreationAgentTurnRecords.displayMessages(session)))
             put("interview_reason", "")
             put("refinement_instruction", instruction)
             put("entity_target", JsonNull)
@@ -145,7 +145,7 @@ internal class PcCreationPromptContract private constructor(
 
     fun repairMessages(raw: String, error: String, stage: String): Pair<String, String> {
         val structure = if (stage == "concepts") {
-            "顶层 concepts 数组必须恰好包含 1 张卡，字段与示例完全一致"
+            "顶层 concepts 必须是非空数组，每张卡的字段与示例一致，不得为了满足数量而复制方案"
         } else {
             stageContract(stage)
         }

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from ..domain.configuration import LocalTaskModelSetting, ModelProviderConfig
+from ..domain.configuration import ModelProviderConfig, TaskModelSetting
 
 
 class ModelConfigurationPort(Protocol):
@@ -14,6 +14,4 @@ class ModelConfigurationPort(Protocol):
 
     def provider(self, provider: str) -> ModelProviderConfig | None: ...
 
-    def task_setting(self, task_type: str) -> LocalTaskModelSetting | None: ...
-
-    def record_failure(self, provider: str, error: BaseException | object) -> None: ...
+    def task_setting(self, task_type: str) -> TaskModelSetting | None: ...

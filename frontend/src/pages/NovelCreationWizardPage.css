@@ -596,6 +596,25 @@
   min-height: 26px;
 }
 
+.creation-run-stream-preview {
+  display: grid;
+  gap: 3px;
+  max-width: 100%;
+  padding: 8px 10px;
+  overflow: hidden;
+  border: 1px solid var(--ant-color-border-secondary);
+  border-radius: 6px;
+  background: var(--ant-color-fill-quaternary);
+}
+
+.creation-run-stream-preview .ant-typography:last-child {
+  overflow: hidden;
+  font-family: Consolas, "Cascadia Code", monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .creation-result-revision {
   margin-top: 16px;
 }

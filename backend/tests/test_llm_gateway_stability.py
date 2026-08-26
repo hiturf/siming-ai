@@ -126,6 +126,26 @@ class GatewayStabilityTestCase(unittest.TestCase):
 
         self.assertEqual(FakeAdapter.calls, 1)
 
+    def test_runtime_timeout_does_not_disable_a_verified_model(self):
+        FakeAdapter.error = LLMError("本机 CLI 请求超时（91秒）")
+
+        with self.assertRaisesRegex(LLMError, "91秒"):
+            asyncio.run(LLMGateway.chat_completion(
+                messages=[{"role": "user", "content": "hi"}],
+                model="gemini:gemini-2.5-flash",
+                retry=0,
+            ))
+
+        db = SessionLocal()
+        try:
+            config = db.query(APIConfig).filter(APIConfig.provider == "gemini").one()
+            self.assertEqual(config.readiness_status, "ready")
+            self.assertTrue(config.is_global_default)
+            self.assertEqual(config.readiness_json, '{"source":"test"}')
+            self.assertIsNone(config.last_tested_at)
+        finally:
+            db.close()
+
     def test_stream_retries_upstream_502_before_first_output(self):
         FakeAdapter.stream_errors = [
             LLMError("OpenAI API 错误: Error code: 502 - upstream request failed"),

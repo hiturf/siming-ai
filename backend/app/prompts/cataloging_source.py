@@ -73,10 +73,10 @@ def get_fact_extraction_rules() -> str:
 
 def get_cataloging_candidate_schema() -> str:
     return """【允许的候选 type 与 payload】
-首个响应对象必须同时包含两个必填对象：
+首次生成回合的首个响应对象必须同时包含两个必填对象：
 {"chapter_summary":{"summary_text":"...","coverage_manifest":{"scene_count":1,"characters":[],"worldbuilding":[],"relationships":[],"character_profiles":[]},"narrative_state":{"events":[],"timeline_events":[],"foreshadowing_planted":[],"foreshadowing_resolved":[],"storyline_progress":[],"new_storylines":[],"reader_known_facts":[],"character_known_facts":[],"unresolved_actions":[]},"narrative_review":{"source":"provided","outcome":"assessed"}},"chapter_outline":{"title":"当前章节原题","summary":"...","node_type":"chapter","status":"completed"}}
-系统会把这两个必填对象拆成 chapter_summary 与章级 outline_create。其他候选继续逐行输出；没有角色、新设定或关系时，coverage_manifest 对应项必须是 []，不得虚构补卡。
-除首个必填骨架对象外，每一行顶层都必须包含标准字段 type，例如 {"type":"worldbuilding_create", ...}。type 决定候选类别；不要把候选类别写进 node_type。
+系统会把这两个必填对象拆成 chapter_summary 与章级 outline_create。增量修复回合不重复这个骨架，只输出校验明确指出的缺失或失败候选；chapter_summary 或 chapter_outline 只有在明确缺失时才补。没有角色、新设定或关系时，coverage_manifest 对应项必须是 []，不得虚构补卡。
+除首次生成回合的首个必填骨架对象外，每一行顶层都必须包含标准字段 type，例如 {"type":"worldbuilding_create", ...}。type 决定候选类别；不要把候选类别写进 node_type。
 node_type 只用于 outline_create/outline_update 的层级，而且只能是 chapter、section 或 volume；世界观、角色等候选不得输出 node_type。
 - chapter_summary: {"summary_text":"...", "key_events":["..."], "characters":["..."], "worldbuilding":["..."], "coverage_manifest":{"scene_count":1,"characters":["..."],"worldbuilding":["..."],"relationships":[{"source_name":"...","target_name":"...","relationship_type":"..."}],"character_profiles":["本章新建或稳定档案发生变化的角色名"]}, "outline_hint":"...", "narrative_state":{"events":[...], "timeline_events":[...], "foreshadowing_planted":[...], "foreshadowing_resolved":[...], "storyline_progress":[...], "new_storylines":[...], "reader_known_facts":[...], "character_known_facts":[...], "unresolved_actions":[...]}, "narrative_review":{"source":"provided", "outcome":"assessed", "evidence":"本章叙事治理检查依据"}}
 - outline_create / outline_update: {"title":"...", "summary":"...", "actual_summary":"...", "planned_summary":"...", "node_type":"chapter|section|volume", "parent_title":"...", "status":"completed", "related_characters":["..."], "scene_number":1, "purpose":"...", "location":"...", "timeline":"...", "pov_character":"...", "characters":["..."], "entry_state":"...", "exit_state":"...", "emotional_residue":"...", "unresolved_actions":[...]}
@@ -93,7 +93,7 @@ node_type 只用于 outline_create/outline_update 的层级，而且只能是 ch
 def get_cataloging_candidate_rules() -> str:
     return """【候选写入规则】
 1. 每章必须至少生成 1 条 chapter_summary 和 1 条 chapter 级 outline_create。
-   第一行必须使用上述 chapter_summary + chapter_outline 必填响应对象；不能只返回其中一个，也不能先只返回摘要再提前结束。
+   首次生成回合的第一行必须使用上述 chapter_summary + chapter_outline 必填响应对象；不能只返回其中一个，也不能先只返回摘要再提前结束。增量修复回合只补校验明确指出的缺失或失败候选，不得重复已通过候选。
    chapter_summary 必须包含非空 summary_text，用一段话概括本章已经发生的主要事件；同时显式包含完整 narrative_state，没有发现时也要保留所有数组并填写 []，并提供 narrative_review，不能用“字段缺失”表示“没有问题”。
    foreshadowing_planted、storyline_progress、unresolved_actions 中每个治理条目的 evidence 必须填写当前章节中可逐字检索的 6-120 字原文摘录，禁止用概述替代；找不到原文摘录时不要生成该条目。foreshadowing_resolved 等解决项必须携带已有治理项的 resolves_item_id 或 resolves_dedupe_key；找不到稳定引用时只报告待复核，不得按标题猜测并关闭旧记录。
    coverage_manifest 必须显式包含 scene_count、characters、worldbuilding、relationships、character_profiles 五项；空项也写 []。relationships 列出本章明确出现、确认或改变且影响后续连续性的角色关系，character_profiles 列出本章需要新建或更新稳定档案的角色。
@@ -135,19 +135,30 @@ def get_cataloging_candidate_rules() -> str:
     不得用地点、功法、组织、事件充当关系端点，也不得靠 character_relationship 顺带创建空白角色卡。"""
 
 
+def get_incremental_cataloging_repair_rules() -> str:
+    return """【候选缺项自动修复】
+1. 当用户消息包含“上一轮校验未通过”时，这是增量修复回合，本节规则优先于首次生成规则。系统已经保留上一轮通过的候选；只输出错误信息明确指出的缺失候选，或解析失败、身份不一致、结构错误候选的修正版。
+2. 不要重发完整候选集，不得重复、删除、缩减或改写已有正确候选。chapter_summary 和 chapter_outline 只有在错误明确指出其缺失时才允许输出。
+3. 已有 coverage_manifest 是本章的累计验收合同。增量修复不得减少 scene_count，也不得删除其中已有角色、设定、关系或角色档案；需要修正清单时只能补充遗漏项。
+4. 错误若列出缺失场景编号，逐个输出对应 scene_number 的 section outline_create，并填写 purpose、location、timeline、pov_character、characters、entry_state、exit_state、emotional_residue、unresolved_actions；不要用重写摘要代替场景卡。
+5. 错误若列出缺失角色、设定、关系或章节关联，逐个输出相同稳定主名/标题/关系端点的对应候选。别名只放 aliases，不得在主名与别名之间切换。
+6. 输出完成后立即结束，不要附带解释。"""
+
+
 def get_candidate_resolution_rules() -> str:
     return "\n\n".join([
         """【候选生成统一规则】
 1. 你会收到当前章节事实 JSONL，以及系统按事实检索出的相关角色、世界观、大纲、关系和索引。
 2. 任务是把“新事实 + 相关旧资料”合并成可写入数据库的候选项，不要重新写读后感。
 3. 只输出 JSONL；每一行是一个完整 JSON 对象；不要输出 Markdown、解释、代码块或 JSON 数组。
-4. 第一行必须按【允许的候选 type 与 payload】一次性输出 chapter_summary + chapter_outline 必填骨架；其余候选单独成行。
-   除首个必填骨架外，禁止输出包含 character_state_updates、worldbuilding_entries、outline_creates、chapter_links 等列表的聚合对象。
-5. chapter_summary 必须输出 1 条，并包含非空 summary_text；不得只返回摘要后结束。
+4. 首次生成回合的第一行必须按【允许的候选 type 与 payload】一次性输出 chapter_summary + chapter_outline 必填骨架；其余候选单独成行。增量修复回合只输出校验明确指出的缺失或失败候选。
+   除首次生成回合的首个必填骨架外，禁止输出包含 character_state_updates、worldbuilding_entries、outline_creates、chapter_links 等列表的聚合对象。
+5. 首次生成回合必须输出 1 条 chapter_summary，并包含非空 summary_text；不得只返回摘要后结束。增量修复时，已通过的 chapter_summary 不得重复输出。
 6. 根据事实和相关卡片判断是创建、更新、关联还是提出角色合并候选。
 7. payload 要足够写库但不冗长；不要重复粘贴旧资料，不要输出无变化字段。""",
         get_outline_granularity_rules(),
         get_cataloging_candidate_rules(),
+        get_incremental_cataloging_repair_rules(),
     ])
 
 
@@ -156,22 +167,22 @@ def get_external_no_api_rules() -> str:
     return get_api_free_mode_rules() + """
 
 【编目专用补充规则】
-1. 默认使用融合无 API 工具链：start_external_cataloging_job -> get_next_external_cataloging_chapter(phase="merged") -> save_external_cataloging_candidates(phase="merged") -> apply_pending_cataloging -> verify_external_cataloging_progress。
-2. 外部 Agent 自己阅读章节正文和档案镜像，直接生成可写入候选；司命只负责保存、应用、验证。
-3. 准备 candidates 时保持 JSONL 颗粒度：一条候选对应一个对象；不要把整章合成一个大对象。
-4. 不要调用 save_external_cataloging_facts 或 list_cataloging_facts，除非工具明确提示当前章节是旧两阶段残留且需要继续 phase="candidates"。
+1. 使用与内部建档一致的质量工具链：facts -> candidates -> apply -> verify。
+2. facts 阶段只读当前章节正文并调用 save_external_cataloging_facts；不得读取旧档案或提前做创建、更新决策。
+3. candidates 阶段调用 list_cataloging_facts，再读取当前档案镜像，把事实解析成可写候选并调用 save_external_cataloging_candidates。
+4. 准备 candidates 时保持 JSONL 颗粒度：一条候选对应一个对象；不要把整章合成一个大对象。
 
 【顺序规则】
-- 融合建档必须按章节顺序串行：get_next_external_cataloging_chapter(phase="merged") → save_external_cataloging_candidates(phase="merged") → apply_pending_cataloging → verify_external_cataloging_progress。
+- 建档必须逐章串行：phase="facts" → save_external_cataloging_facts → phase="candidates" → list_cataloging_facts → save_external_cataloging_candidates → apply_pending_cataloging → verify_external_cataloging_progress。
 - 禁止并行处理后续章节；前一章创建/更新的角色、世界观和大纲会影响后一章应使用 create 还是 update。
 - 每章必须完成 apply_pending_cataloging 后才能处理下一章。
 - 候选只是暂存，不应用就不会出现在角色、大纲、世界观、章节摘要里。
 
 推荐工作流：
 1. 调用 start_external_cataloging_job 创建任务。
-2. 反复调用 get_next_external_cataloging_chapter(phase="merged")，按系统返回的最早未完成章节读取章节正文和档案镜像。
-3. 直接生成 chapter_summary、outline_create、character_create/update/state_update、worldbuilding_create/update、character_relationship、chapter_link 等候选，并调用 save_external_cataloging_candidates(phase="merged") 保存。
-4. apply_pending_cataloging 后立刻 verify_external_cataloging_progress。
+2. 调用 get_next_external_cataloging_chapter(phase="facts")，裸读返回的最早未完成章节，保存规范事实。
+3. 调用 get_next_external_cataloging_chapter(phase="candidates") 和 list_cataloging_facts，读取与事实有关的档案镜像，生成完整候选并保存。
+4. apply_pending_cataloging 后立刻 verify_external_cataloging_progress；验证完成后再处理下一章。
 5. 最终 verify_external_cataloging_progress + get_project_archive_status 验证。"""
 
 
@@ -182,6 +193,7 @@ def get_internal_cataloging_system_prompt() -> str:
         get_language_rules(),
         get_outline_granularity_rules(),
         get_cataloging_candidate_rules(),
+        get_incremental_cataloging_repair_rules(),
         get_time_tracking_rules(),
         get_naming_resolution_rules(),
         get_cataloging_candidate_schema(),
@@ -194,8 +206,10 @@ def get_external_cataloging_system_prompt() -> str:
         get_project_binding_rules(),
         get_language_rules(),
         get_external_no_api_rules(),
+        get_fact_extraction_rules(),
         get_outline_granularity_rules(),
         get_cataloging_candidate_rules(),
+        get_incremental_cataloging_repair_rules(),
         get_time_tracking_rules(),
         get_naming_resolution_rules(),
         get_cataloging_candidate_schema(),
@@ -278,9 +292,10 @@ def get_external_cataloging_workflow() -> list[dict[str, object]]:
     return [
         {"step": 1, "name": "select_project", "description": "导入或选择作品，记录 project_id"},
         {"step": 2, "name": "start_job", "description": "使用 project_id 创建外部无 API 建档任务"},
-        {"step": 3, "name": "generate_candidates_directly", "description": "【必须串行】逐章领取 phase='merged'：读取章节和档案镜像 → 直接生成候选 → save_external_cataloging_candidates", "parallel": False},
-        {"step": 4, "name": "apply_and_verify", "description": "apply_pending_cataloging → verify_external_cataloging_progress → 再处理下一章", "parallel": False},
-        {"step": 5, "name": "final_verify", "description": "verify_external_cataloging_progress + get_project_archive_status 验证作品档案计数"},
+        {"step": 3, "name": "extract_facts", "description": "领取 phase='facts'：只读当前章 → save_external_cataloging_facts", "parallel": False},
+        {"step": 4, "name": "resolve_candidates", "description": "领取 phase='candidates'：读取已保存事实与当前档案 → save_external_cataloging_candidates", "parallel": False},
+        {"step": 5, "name": "apply_and_verify", "description": "apply_pending_cataloging → verify_external_cataloging_progress → 再处理下一章", "parallel": False},
+        {"step": 6, "name": "final_verify", "description": "verify_external_cataloging_progress + get_project_archive_status 验证作品档案计数"},
     ]
 
 

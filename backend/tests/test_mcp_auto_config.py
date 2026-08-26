@@ -509,6 +509,44 @@ class McpAutoConfigTest(unittest.TestCase):
         self.assertEqual(existing.default_model, "xiaomi/mimo-v2.5-pro")
         db.commit.assert_called_once()
 
+    def test_retired_opencode_free_model_is_migrated_to_a_discovered_model(self):
+        existing = MagicMock()
+        existing.provider = "opencode_cli"
+        existing.default_model = "opencode/deepseek-v4-flash-free"
+        existing.cli_args = json.dumps(["run", "--pure", "{prompt}"])
+        db = MagicMock()
+        query = MagicMock()
+        query.filter.return_value = query
+        query.first.return_value = existing
+        db.query.return_value = query
+
+        def resolve(_command, fallbacks):
+            return "opencode.cmd" if "opencode.cmd" in fallbacks else None
+
+        with (
+            patch(
+                "app.services.external_agent.mcp_auto_config._resolve_command",
+                side_effect=resolve,
+            ),
+            patch(
+                "app.services.external_agent.mcp_auto_config.cursor_command",
+                return_value=None,
+            ),
+            patch(
+                "app.services.external_agent.mcp_auto_config.hermes_command",
+                return_value=None,
+            ),
+            patch(
+                "app.ai.local_cli_adapter.preferred_local_cli_model",
+                return_value="opencode/hy3-free",
+            ) as preferred,
+        ):
+            mcp_auto_config.ensure_detected_local_cli_model_configs(db, explicit_consent=True)
+
+        self.assertEqual(existing.default_model, "opencode/hy3-free")
+        preferred.assert_called_once_with("opencode_cli", "opencode.cmd")
+        db.commit.assert_called_once()
+
     def test_legacy_permission_defaults_are_migrated_once(self):
         settings = MagicMock()
         settings.trusted_local_enabled = True

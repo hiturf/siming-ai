@@ -36,19 +36,17 @@ class MCPPromptPackToolsTest(unittest.TestCase):
         tools = list_mcp_tools(permission_pack="readonly_collaboration")
         names = {t.name for t in tools}
         self.assertIn("start_novel_creation_session", names)
-        self.assertIn("draft_novel_blueprint", names)
-        self.assertIn("review_novel_blueprint", names)
+        self.assertIn("get_creation_session", names)
 
-    def test_apply_blueprint_not_in_readonly(self):
-        """apply_novel_blueprint is a write tool — should not be in readonly."""
+    def test_finalize_not_in_readonly(self):
         tools = list_mcp_tools(permission_pack="readonly_collaboration")
         names = {t.name for t in tools}
-        self.assertNotIn("apply_novel_blueprint", names)
+        self.assertNotIn("finalize_creation_session", names)
 
-    def test_apply_blueprint_in_project_management(self):
+    def test_finalize_in_project_management(self):
         tools = list_mcp_tools(permission_pack="project_management")
         names = {t.name for t in tools}
-        self.assertIn("apply_novel_blueprint", names)
+        self.assertIn("finalize_creation_session", names)
 
 
 if __name__ == "__main__":

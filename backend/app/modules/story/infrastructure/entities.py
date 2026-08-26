@@ -67,7 +67,6 @@ class Project(Base):
     cataloging_jobs = relationship(
         "CatalogingJob", back_populates="project", cascade="all, delete-orphan"
     )
-    agent_plans = relationship("AgentPlan", back_populates="project", cascade="all, delete-orphan")
     rag_documents = relationship("RagDocument", cascade="all, delete-orphan")
     rag_chunks = relationship("RagChunk", cascade="all, delete-orphan")
     skills = relationship("Skill", back_populates="project", cascade="all, delete-orphan")
@@ -369,6 +368,9 @@ class Chapter(Base):
     content_hash = Column(String(64), nullable=True)
     word_count = Column(Integer, default=0)
     current_version = Column(Integer, default=1)
+    # Narrative changes stay fenced from the next AI-written chapter until
+    # the exact saved version has completed the canonical cataloging pipeline.
+    cataloging_required = Column(Boolean, nullable=False, default=False)
     # Canonical reading order. This is intentionally independent from outline_node_id.
     sort_order = Column(Integer, nullable=False, default=1_000_000_000)
     quality_score = Column(Integer, nullable=True)

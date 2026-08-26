@@ -69,7 +69,7 @@ def _tool_decision_prompt() -> str:
 当前消息没有提供这两个数值。可用工具只有：
 - get_project_info({})：读取当前项目及关联立项约束
 - update_project_info({...})：修改项目
-- create_chapter({...})：创建正文
+- save_external_chapter_draft({...})：保存未入库章节草稿
 
 只输出 JSON，不要猜测数值：
 {"tool":"工具名","arguments":{},"reason":"一句话原因"}"""

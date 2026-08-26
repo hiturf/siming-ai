@@ -7,6 +7,8 @@ import re
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy.orm import Session
+
 from ....database.models import APIConfig
 from ...operations.interfaces.failures import classify_failure
 
@@ -148,7 +150,7 @@ def mark_model_ready(config: APIConfig, *, source: str, message: object | None =
     )
 
 
-def readiness_status_for_failure(message: object) -> tuple[str | None, str | None]:
+def readiness_status_for_verification_failure(message: object) -> tuple[str | None, str | None]:
     failure_class = classify_failure(sanitize_readiness_message(message, 2000))
     if failure_class == "auth":
         return READINESS_AUTH_REQUIRED, failure_class
@@ -159,8 +161,15 @@ def readiness_status_for_failure(message: object) -> tuple[str | None, str | Non
     return None, failure_class
 
 
-def mark_model_failure(config: APIConfig, error: BaseException | object, *, source: str) -> bool:
-    status, failure_class = readiness_status_for_failure(error)
+def mark_model_verification_failure(
+    config: APIConfig,
+    error: BaseException | object,
+    *,
+    source: str,
+) -> bool:
+    """Persist the result of an explicit user-requested connection test."""
+
+    status, failure_class = readiness_status_for_verification_failure(error)
     if not status:
         return False
     set_model_readiness(
@@ -175,7 +184,7 @@ def mark_model_failure(config: APIConfig, error: BaseException | object, *, sour
     return True
 
 
-def mark_model_unavailable(
+def mark_model_verification_unavailable(
     config: APIConfig, error: BaseException | object, *, source: str
 ) -> None:
     """Persist a definitive verification failure that has no narrower class."""
@@ -189,15 +198,48 @@ def mark_model_unavailable(
         failure_class=failure_class,
         tested=True,
     )
+
+
+def repair_runtime_readiness_demotions(db: Session) -> int:
+    """Undo readiness changes written by the deleted runtime-failure path.
+
+    Older builds persisted ordinary generation failures with ``source=gateway``
+    and also cleared the global default. Runtime failures are request results,
+    not connection verification results, so repair only those historical rows.
+    Explicit verification failures use another source and remain untouched.
+    """
+
+    repaired: list[APIConfig] = []
+    for config in db.query(APIConfig).all():
+        if readiness_status(config) == READINESS_READY:
+            continue
+        details = _details(config)
+        if details.get("source") != "gateway":
+            continue
+        details.update({
+            "source": "runtime_failure_repair",
+            "message": "已恢复：普通生成失败不再改变模型可用状态",
+        })
+        details.pop("failure_class", None)
+        config.readiness_status = READINESS_READY
+        config.readiness_json = json.dumps(
+            details,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        repaired.append(config)
+
+    has_default = db.query(APIConfig).filter(APIConfig.is_global_default.is_(True)).first()
+    if repaired and not has_default:
+        repaired.sort(
+            key=lambda item: (
+                item.last_tested_at or datetime.min,
+                item.created_at or datetime.min,
+                str(item.id or ""),
+            ),
+            reverse=True,
+        )
+        repaired[0].is_global_default = True
+
+    return len(repaired)
     config.is_global_default = False
-
-
-def record_gateway_failure(provider: str, error: BaseException | object) -> None:
-    """Compatibility entry point routed through the configured model runtime."""
-
-    from ..application.runtime import get_model_runtime
-
-    try:
-        get_model_runtime().record_failure(provider, error)
-    except Exception:
-        return

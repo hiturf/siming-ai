@@ -68,39 +68,7 @@ async def prepare_task_context(db: Session, project_id: str, args: dict[str, Any
         key in task_arguments and task_arguments.get(key) not in (None, "", [], {})
         for key in scoped_target_keys
     )
-    run_query = (
-        run_manifest.query_json
-        if run_manifest and isinstance(run_manifest.query_json, dict)
-        else {}
-    )
-    run_contract = run_query.get("arguments") if isinstance(run_query, dict) else None
-    run_contract = run_contract if isinstance(run_contract, dict) else {}
-    if run_contract.get("managed_chapter_write"):
-        if task_type != "writing":
-            return {
-                "tool": "prepare_task_context",
-                "status": "error",
-                "detail": "Managed chapter-writing runs cannot replace their context contract.",
-                "data": {"manifest_id": getattr(run_manifest, "id", None)},
-            }
-        if requested_manifest_id and requested_manifest_id != run_manifest.id:
-            return {
-                "tool": "prepare_task_context",
-                "status": "error",
-                "detail": "Managed chapter-writing runs must reuse their original context manifest.",
-                "data": {"manifest_id": run_manifest.id},
-            }
-        requested_outline = str(task_arguments.get("outline_node_id") or "").strip()
-        contracted_outline = str(run_contract.get("outline_node_id") or "").strip()
-        if requested_outline and requested_outline != contracted_outline:
-            return {
-                "tool": "prepare_task_context",
-                "status": "error",
-                "detail": "The requested outline does not match the managed chapter-writing target.",
-                "data": {"manifest_id": run_manifest.id},
-            }
-        manifest = run_manifest
-    elif manifest is None and run_manifest and not has_scoped_target:
+    if manifest is None and run_manifest and not has_scoped_target:
         if run_manifest.task_type == task_type:
             manifest = run_manifest
     if manifest is None:

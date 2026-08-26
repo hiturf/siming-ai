@@ -264,6 +264,47 @@ def test_heartbeat_preserves_quiet_health_and_real_activity_timestamp():
     assert operation.last_activity_at > previous_activity
 
 
+def test_stream_output_keeps_one_live_snapshot_without_growing_the_event_log():
+    _engine, _Session, db = _db()
+    operation = ensure_operation(
+        db,
+        source_kind="novel_creation",
+        source_id="live-output",
+        title="Live model output",
+    )
+    db.commit()
+    initial_event_count = len(operation.events)
+
+    record_operation_signal(
+        operation.id,
+        "stream_output",
+        {
+            "kind": "model_output",
+            "output_chars": 1200,
+            "output_preview": "first preview",
+        },
+        message="模型正在生成 · 已输出 1,200 字",
+        db=db,
+    )
+    record_operation_signal(
+        operation.id,
+        "stream_output",
+        {
+            "kind": "model_output",
+            "output_chars": 2400,
+            "output_preview": "latest preview",
+        },
+        message="模型正在生成 · 已输出 2,400 字",
+        db=db,
+    )
+
+    payload = serialize_operation(operation, include_events=True)
+    assert len(operation.events) == initial_event_count
+    assert payload["process_metrics"]["output_chars"] == 2400
+    assert payload["process_metrics"]["output_preview"] == "latest preview"
+    assert payload["last_output_at"] is not None
+
+
 def test_operation_actions_only_run_registered_handlers():
     calls: list[str] = []
     register_operation_actions("operation-1", pause=lambda: calls.append("pause"))
@@ -308,7 +349,7 @@ def test_external_agent_write_request_projects_waiting_attention_and_clears_it_a
     db.commit()
     run = create_agent_run(db, project.id, title="Agent write")
 
-    requested = request_write(db, run.id, "create_chapter", "创建第151章")
+    requested = request_write(db, run.id, "create_character", "创建角色林澈")
     db.expire_all()
     operation = db.query(OperationRun).filter(OperationRun.id == run.operation_id).one()
     waiting = serialize_operation(operation)

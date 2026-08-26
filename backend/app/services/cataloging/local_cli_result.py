@@ -2,15 +2,12 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
-
-from sqlalchemy.orm import Session
+from typing import Literal
 
 from app.ai.local_cli_adapter import CLIStalledError
 from app.architecture.uow import commit_session
 from app.database.models import AgentRun, AgentRunEvent, CatalogingChapterRun, CatalogingJob
 from app.database.session import SessionLocal
-from app.services.cataloging import orchestrator as cataloging_orchestrator
 from app.services.cataloging.job_control import refresh_job_progress
 from app.services.external_agent.run_service import add_event, update_run_status
 from app.services.operation_runtime import record_operation_signal
@@ -40,83 +37,13 @@ def agent_tool_event_count(
 
 
 def _turn_has_no_saved_progress(stage: str, status: str) -> bool:
-    if stage in {"full", "merged"}:
+    if stage == "facts":
         return status in {"pending", "in_progress", "extracting"}
     if stage == "candidates":
         return status == "facts_saved"
     if stage == "apply":
         return status == "awaiting_confirmation"
     return False
-
-
-async def _consume_cataloging_events(generator: Any) -> None:
-    async for _event in generator:
-        pass
-
-
-async def _run_direct_jsonl_cataloging_fallback(
-    db: Session,
-    *,
-    job: CatalogingJob,
-    run: CatalogingChapterRun,
-    agent_run_id: str,
-    stage: str,
-    stdout_tail: str = "",
-    stderr_tail: str = "",
-    failure_reason: str = "",
-) -> tuple[bool, str]:
-    add_event(
-        db,
-        agent_run_id,
-        "chapter_agent_fallback",
-        status="running",
-        message=failure_reason or "本机 CLI 未通过 MCP 保存，改用同一模型的直连 JSONL 建档兜底",
-        payload_json=json.dumps({
-            "job_id": job.id,
-            "chapter_id": run.chapter_id,
-            "chapter_run_id": run.id,
-            "stage": stage,
-            "stdout_tail": stdout_tail[-1500:],
-            "stderr_tail": stderr_tail[-1500:],
-        }, ensure_ascii=False),
-    )
-    commit_session(db)
-    try:
-        if stage in {"full", "merged", "candidates"}:
-            await _consume_cataloging_events(cataloging_orchestrator._extract_run(db, job, run))
-            db.refresh(job)
-            db.refresh(run)
-            if run.status == "failed":
-                return False, run.error or "直连 JSONL 建档未生成可用候选"
-            if job.execution_mode == "auto":
-                await _consume_cataloging_events(cataloging_orchestrator._apply_run(db, job, run))
-        elif stage == "apply":
-            await _consume_cataloging_events(cataloging_orchestrator._apply_run(db, job, run))
-        else:
-            return False, f"未知建档阶段：{stage}"
-        db.refresh(job)
-        db.refresh(run)
-        if run.status == "failed":
-            return False, run.error or "直连 JSONL 建档失败"
-        add_event(
-            db,
-            agent_run_id,
-            "chapter_agent_fallback_completed",
-            status="ok",
-            message="直连 JSONL 建档兜底已完成当前章节",
-            payload_json=json.dumps({
-                "job_id": job.id,
-                "chapter_id": run.chapter_id,
-                "chapter_run_id": run.id,
-                "stage": stage,
-                "chapter_status": run.status,
-            }, ensure_ascii=False),
-        )
-        commit_session(db)
-        return True, ""
-    except Exception as exc:
-        db.rollback()
-        return False, str(exc)
 
 
 def handle_cli_turn_exception(
@@ -131,7 +58,11 @@ def handle_cli_turn_exception(
     db = session_factory()
     try:
         job = db.query(CatalogingJob).filter(CatalogingJob.id == job_id).first()
-        run = db.query(CatalogingChapterRun).filter(CatalogingChapterRun.id == chapter_run_id).first()
+        run = (
+            db.query(CatalogingChapterRun)
+            .filter(CatalogingChapterRun.id == chapter_run_id)
+            .first()
+        )
         if not job or not run:
             return
         run.status = "failed"
@@ -189,7 +120,11 @@ async def handle_cli_turn_result(
     db = session_factory()
     try:
         job = db.query(CatalogingJob).filter(CatalogingJob.id == job_id).first()
-        run = db.query(CatalogingChapterRun).filter(CatalogingChapterRun.id == chapter_run_id).first()
+        run = (
+            db.query(CatalogingChapterRun)
+            .filter(CatalogingChapterRun.id == chapter_run_id)
+            .first()
+        )
         if not job or not run:
             return "return"
         add_event(
@@ -217,7 +152,7 @@ async def handle_cli_turn_result(
             attempt = no_save_attempts.get(run.id, 0) + 1
             no_save_attempts[run.id] = attempt
             if attempt < _MAX_NO_SAVE_ATTEMPTS:
-                if stage in {"full", "merged"}:
+                if stage == "facts":
                     run.status = "pending"
                 job.status = "running"
                 job.blocked_chapter_id = None
@@ -250,27 +185,12 @@ async def handle_cli_turn_result(
             run.status = "failed"
             run.error = stderr[-2000:] or stdout[-2000:] or f"CLI exit code {returncode}"
         elif _turn_has_no_saved_progress(stage, run.status):
-            reason = (
-                "MCP 已连接，但模型连续重试后仍未调用建档写入工具；改用同一模型的直连 JSONL 建档兜底"
-                if not tool_activity
-                else "模型调用了 Siming MCP，但连续重试后仍未完成本章保存；改用同一模型的直连 JSONL 建档兜底"
-            )
-            ok, fallback_error = await _run_direct_jsonl_cataloging_fallback(
-                db,
-                job=job,
-                run=run,
-                agent_run_id=agent_run_id,
-                stage=stage,
-                stdout_tail=stdout,
-                stderr_tail=stderr,
-                failure_reason=reason,
-            )
-            if ok:
-                no_save_attempts.pop(run.id, None)
-                commit_session(db)
-                return "continue"
             run.status = "failed"
-            run.error = f"本机 CLI 未通过 MCP 保存本章事实或候选；直连 JSONL 兜底也失败：{fallback_error}"
+            run.error = (
+                "MCP 已连接，但模型连续重试后仍未调用建档写入工具"
+                if not tool_activity
+                else "模型调用了 Siming MCP，但连续重试后仍未完成本章保存"
+            )
         if run.status == "failed":
             job.status = "paused_on_failure"
             job.blocked_chapter_id = run.chapter_id

@@ -61,7 +61,7 @@ Every event has a `sequence` number (monotonically increasing per run), an `even
 | `context_selected` | Agent reports which context it selected for reasoning | `sources`: array of {source_type, source_id, title, reason} |
 | `draft_chunk` | Agent streams a chunk of draft content | `content`: text chunk, `chunk_index`: sequence number |
 | `draft_ready` | Agent finished generating a complete draft | `content_type`: chapter/outline/character/worldbuilding, `summary`: brief description |
-| `write_requested` | Agent requests a confirmed write | `write_type`: create_chapter/update_chapter/..., `payload_summary`: what will be written |
+| `write_requested` | Agent requests a confirmed write | `write_type`: save_external_chapter_draft/patch_creation_artifact/..., `payload_summary`: what will be written |
 | `write_committed` | User confirmed and write was applied | `write_type`, `result_status`, `result_detail` |
 | `warning` | Non-fatal issue encountered | `detail`: warning description |
 | `error` | Fatal error occurred | `detail`: error description |

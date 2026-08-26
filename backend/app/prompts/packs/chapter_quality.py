@@ -5,23 +5,22 @@ from ...modules.assistant.infrastructure.runtime import render_prompt
 from . import PromptPack
 
 
-def _build_system(*, style_context: str, writing_directives: str = "") -> str:
+def _build_system(*, style_context: str) -> str:
     return render_prompt(
         "assistant.chapter.quality",
-        writing_directives=writing_directives.strip() or "遵守本轮项目上下文与作者要求。",
         style_context=style_context.strip() or "遵循项目既有文风。",
     )
 
 
 PACK = PromptPack(
     name="chapter_quality",
-    version="3.0.0",
+    version="3.1.0",
     pack_type="chapter",
     description="Quality chapter writer — full craft rules, dialogue, hooks, literary techniques",
     input_fields=[
         "style_context", "outline_context", "world_context",
         "character_profiles", "recent_summaries",
-        "plot_design", "roleplay_results", "requirements", "writing_directives",
+        "plot_design", "roleplay_results", "requirements",
     ],
     max_token_budget=12000,
     output_format="prose",

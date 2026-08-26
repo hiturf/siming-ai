@@ -12,7 +12,7 @@
     },
     "cataloging": {
       "baseline_chars": 6530,
-      "spec_id": "continuity.cataloging.merged"
+      "spec_id": "continuity.cataloging.candidates"
     },
     "novel_creation": {
       "baseline_chars": 359,

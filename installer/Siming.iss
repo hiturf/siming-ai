@@ -53,6 +53,11 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "installed.marker"; DestDir: "{app}"; DestName: ".siming-installed"; Flags: ignoreversion
 
+[InstallDelete]
+; PyInstaller's runtime is immutable application code. Recreate it on every
+; install so files removed by a newer release cannot survive an in-place update.
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon

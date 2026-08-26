@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const api = vi.hoisted(() => ({
@@ -24,6 +24,7 @@ vi.mock('../hooks/useModelOptions', () => ({
 }))
 
 import WriterPage from '../pages/WriterPage'
+import { AiPanelProvider } from '../contexts/AiPanelContext'
 import { storeNarrativeSourceLocator } from '../features/narrativeGovernance/sourceLocator'
 
 const source = '他站在门边，心中不由得涌起一阵复杂的情绪。值得注意的是，这一切都说明命运已经改变。'
@@ -78,6 +79,7 @@ describe('WriterPage manual writing actions', () => {
     vi.clearAllMocks()
     window.sessionStorage.clear()
     api.get.mockImplementation((url: string) => {
+      if (url.endsWith('/chapter-drafts/pending')) return Promise.resolve(response({ items: [], total: 0 }))
       if (url.endsWith('/outline')) return Promise.resolve(response({ items: [], flat: [], total: 0 }))
       if (url.endsWith('/chapters')) return Promise.resolve(response({ items: [chapter], total: 1 }))
       if (url.endsWith('/snapshots')) return Promise.resolve(response({ items: [], total: 0 }))
@@ -118,6 +120,7 @@ describe('WriterPage manual writing actions', () => {
       content: '第二章正文。',
     }
     api.get.mockImplementation((url: string) => {
+      if (url.endsWith('/chapter-drafts/pending')) return Promise.resolve(response({ items: [], total: 0 }))
       if (url.endsWith('/outline')) return Promise.resolve(response({ items: [], flat: [], total: 0 }))
       if (url.endsWith('/chapters')) return Promise.resolve(response({ items: [chapter, secondChapter], total: 2 }))
       if (url.endsWith('/snapshots')) return Promise.resolve(response({ items: [], total: 0 }))
@@ -149,6 +152,120 @@ describe('WriterPage manual writing actions', () => {
     expect(await screen.findByText('正文顺序已更新')).toBeInTheDocument()
   })
 
+  it('keeps even a legacy targeted draft separate and saves it as a new chapter', async () => {
+    const secondDraft = {
+      draft_id: 'draft-2',
+      project_id: 'project-1',
+      title: '第2章 夜雨',
+      outline_node_id: 'outline-2',
+      context_manifest_id: 'manifest-2',
+      target_chapter_id: 'chapter-1',
+      saved_chapter_id: null,
+      draft_status: 'pending' as const,
+      content: '夜雨落在山门外，第二章由此开始。',
+      word_count: 16,
+    }
+    api.get.mockImplementation((url: string) => {
+      if (url.endsWith('/chapter-drafts/pending')) return Promise.resolve(response(secondDraft))
+      if (url.endsWith('/outline')) return Promise.resolve(response({ items: [], flat: [], total: 0 }))
+      if (url.endsWith('/chapters')) return Promise.resolve(response({ items: [chapter], total: 1 }))
+      if (url.endsWith('/snapshots')) return Promise.resolve(response({ items: [], total: 0 }))
+      if (url.endsWith('/chapters/chapter-1')) return Promise.resolve(response(chapter))
+      throw new Error(`Unexpected GET ${url}`)
+    })
+    api.post.mockImplementation((url: string) => {
+      if (url.endsWith('/chapters')) {
+        return Promise.resolve(response({
+          ...chapter,
+          id: 'chapter-2',
+          title: secondDraft.title,
+          outline_node_id: secondDraft.outline_node_id,
+          content: secondDraft.content,
+          word_count: secondDraft.word_count,
+          cataloging_required: true,
+          cataloging_job: { started: true, status: 'running' },
+        }))
+      }
+      throw new Error(`Unexpected POST ${url}`)
+    })
+
+    render(
+      <AiPanelProvider>
+        <WriterPage projectId="project-1" />
+      </AiPanelProvider>,
+    )
+
+    expect(await screen.findByLabelText('当前草稿：第2章 夜雨')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '打开章节：第一章' })).toBeInTheDocument()
+    expect(await screen.findByText('第2章 夜雨 · 未保存')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(document.querySelector<HTMLTextAreaElement>('.writer-content-input textarea'))
+        .toHaveValue(secondDraft.content)
+    })
+    fireEvent.click(screen.getByRole('button', { name: '打开章节：第一章' }))
+    expect(await screen.findByText('请先保存当前 AI 章节草稿；保存前草稿是正文编辑器的唯一内容'))
+      .toBeInTheDocument()
+    expect(document.querySelector<HTMLTextAreaElement>('.writer-content-input textarea'))
+      .toHaveValue(secondDraft.content)
+    fireEvent.click(screen.getByRole('button', { name: '保存并建档' }))
+    await waitFor(() => expect(api.post).toHaveBeenCalledWith(
+      '/projects/project-1/chapters',
+      expect.objectContaining({ draft_id: 'draft-2', content: secondDraft.content }),
+    ))
+    expect(api.put).not.toHaveBeenCalled()
+  })
+
+  it('ignores a saved chapter detail response that arrives after the draft', async () => {
+    const lateDraft = {
+      draft_id: 'draft-late',
+      project_id: 'project-1',
+      title: '第二章 夜雨',
+      outline_node_id: 'outline-2',
+      context_manifest_id: 'manifest-2',
+      saved_chapter_id: null,
+      draft_status: 'pending' as const,
+      content: '第二章草稿必须一直占有编辑器。',
+      word_count: 15,
+    }
+    let resolvePendingDraft!: (value: ReturnType<typeof response<typeof lateDraft>>) => void
+    let resolveChapterDetail!: (value: ReturnType<typeof response<typeof chapter>>) => void
+    const pendingDraftRequest = new Promise<ReturnType<typeof response<typeof lateDraft>>>((resolve) => {
+      resolvePendingDraft = resolve
+    })
+    const chapterDetailRequest = new Promise<ReturnType<typeof response<typeof chapter>>>((resolve) => {
+      resolveChapterDetail = resolve
+    })
+    api.get.mockImplementation((url: string) => {
+      if (url.endsWith('/chapter-drafts/pending')) return pendingDraftRequest
+      if (url.endsWith('/outline')) return Promise.resolve(response({ items: [], flat: [], total: 0 }))
+      if (url.endsWith('/chapters')) return Promise.resolve(response({ items: [chapter], total: 1 }))
+      if (url.endsWith('/chapters/chapter-1')) return chapterDetailRequest
+      if (url.endsWith('/snapshots')) return Promise.resolve(response({ items: [], total: 0 }))
+      throw new Error(`Unexpected GET ${url}`)
+    })
+
+    render(
+      <AiPanelProvider>
+        <WriterPage projectId="project-1" />
+      </AiPanelProvider>,
+    )
+
+    await waitFor(() => expect(api.get).toHaveBeenCalledWith('/projects/project-1/chapters/chapter-1'))
+    await act(async () => { resolvePendingDraft(response(lateDraft)) })
+    await waitFor(() => {
+      expect(document.querySelector<HTMLTextAreaElement>('.writer-content-input textarea'))
+        .toHaveValue(lateDraft.content)
+    })
+    await act(async () => { resolveChapterDetail(response(chapter)) })
+
+    await waitFor(() => {
+      expect(document.querySelector<HTMLTextAreaElement>('.writer-content-input textarea'))
+        .toHaveValue(lateDraft.content)
+    })
+    expect(screen.getByLabelText('当前草稿：第二章 夜雨')).toBeInTheDocument()
+    expect(screen.queryByDisplayValue(source)).not.toBeInTheDocument()
+  })
+
   it('previews without writing, then saves an explicitly applied candidate as de_ai', async () => {
     render(<WriterPage projectId="project-1" />)
 
@@ -159,7 +276,11 @@ describe('WriterPage manual writing actions', () => {
     expect(await screen.findByText('这是一项独立修订，任何审核结果都不会自动覆盖正文')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '生成候选稿' }))
 
-    expect(await screen.findByText(candidate)).toBeInTheDocument()
+    const candidateDiff = await screen.findByLabelText('候选稿差异，绿色表示新增或改写后的内容')
+    expect(candidateDiff).toHaveTextContent(candidate)
+    expect(screen.getByLabelText('差异颜色说明')).toBeInTheDocument()
+    expect(document.querySelector('.writer-de-ai-diff-removed')).toBeInTheDocument()
+    expect(document.querySelector('.writer-de-ai-diff-added')).toBeInTheDocument()
     expect(api.post).toHaveBeenCalledWith(
       '/projects/project-1/chapters/chapter-1/de-ai-preview',
       { content: source, model: 'opencode_cli:test-model' },
@@ -173,10 +294,11 @@ describe('WriterPage manual writing actions', () => {
     })
     expect(api.put).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByRole('button', { name: /保存改动/ }))
+    fireEvent.click(screen.getByRole('button', { name: '保存并建档' }))
     await waitFor(() => expect(api.put).toHaveBeenCalled())
     expect(api.put.mock.calls[0][1]).toMatchObject({
       content: candidate,
+      cataloging_mode: 'save_and_catalog',
       trigger_type: 'de_ai',
     })
   })
@@ -217,7 +339,8 @@ describe('WriterPage manual writing actions', () => {
     fireEvent.click(reviseButton)
     fireEvent.click(screen.getByRole('button', { name: '生成候选稿' }))
 
-    expect(await screen.findByText(candidate)).toBeInTheDocument()
+    expect(await screen.findByLabelText('候选稿差异，绿色表示新增或改写后的内容'))
+      .toHaveTextContent(candidate)
     expect(screen.getByText('原文（未变更）')).toBeInTheDocument()
     expect(screen.getByText('候选稿（第 1 轮，未采用）')).toBeInTheDocument()
     expect(screen.getByText('候选稿有 1 项系统审核提醒，但仍完整保留供你查看')).toBeInTheDocument()
@@ -276,11 +399,15 @@ describe('WriterPage manual writing actions', () => {
     fireEvent.click(reviseButton)
     fireEvent.click(screen.getByRole('button', { name: '生成候选稿' }))
 
-    expect(await screen.findByText(candidate)).toBeInTheDocument()
+    expect(await screen.findByLabelText('候选稿差异，绿色表示新增或改写后的内容'))
+      .toHaveTextContent(candidate)
     const round2Button = screen.getByRole('button', { name: '继续处理候选稿（第 2/3 轮）' })
     await waitFor(() => expect(round2Button).toBeEnabled())
     fireEvent.click(round2Button)
-    expect(await screen.findByText(round2)).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByLabelText('候选稿差异，绿色表示新增或改写后的内容'))
+        .toHaveTextContent(round2)
+    })
     expect(api.post.mock.calls[1][1]).toEqual({
       content: candidate,
       original_content: source,
@@ -292,7 +419,10 @@ describe('WriterPage manual writing actions', () => {
     const round3Button = await screen.findByRole('button', { name: /继续处理候选稿.*第 3\/3 轮/ })
     await waitFor(() => expect(round3Button).toBeEnabled())
     fireEvent.click(round3Button)
-    expect(await screen.findByText(round3)).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByLabelText('候选稿差异，绿色表示新增或改写后的内容'))
+        .toHaveTextContent(round3)
+    })
     expect(api.post.mock.calls[2][1]).toEqual({
       content: round2,
       original_content: source,
@@ -334,6 +464,7 @@ describe('WriterPage manual writing actions', () => {
       content: '铸剑师终于说明血纹来自旧祭坛。',
     }
     api.get.mockImplementation((url: string) => {
+      if (url.endsWith('/chapter-drafts/pending')) return Promise.resolve(response({ items: [], total: 0 }))
       if (url.endsWith('/outline')) return Promise.resolve(response({ items: [], flat: [], total: 0 }))
       if (url.endsWith('/chapters')) return Promise.resolve(response({ items: [chapter, focusedChapter], total: 2 }))
       if (url.endsWith('/chapter-1/snapshots') || url.endsWith('/chapter-2/snapshots')) return Promise.resolve(response({ items: [], total: 0 }))

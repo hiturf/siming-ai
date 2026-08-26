@@ -16,8 +16,6 @@ class ToolCollection(Protocol):
 
 
 WRITE_PROJECT_DATA = {
-    "create_chapter",
-    "update_chapter",
     "delete_chapter",
     "restore_chapter_version",
     "create_character",
@@ -40,10 +38,9 @@ WRITE_PROJECT_DATA = {
     "set_cataloging_mode",
     "set_daily_word_goal",
     "repair_story_granularity",
-    "apply_novel_blueprint",
-    "submit_novel_creation_stage",
     "save_external_cataloging_facts",
     "save_external_cataloging_candidates",
+    "save_external_chapter_draft",
     "write_project_file",
     "sync_project_files",
     "apply_narrative_governance_candidates",

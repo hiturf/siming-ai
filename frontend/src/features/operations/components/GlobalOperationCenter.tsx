@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { createPortal } from 'react-dom'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { Badge, Button, Drawer, Empty, Flex, Popconfirm, Progress, Space, Spin, Tooltip, Typography, message } from 'antd'
+import { Badge, Button, Drawer, Empty, Flex, Popconfirm, Progress, Space, Spin, Tag, Tooltip, Typography, message } from 'antd'
 import { CheckOutlined, CloseCircleOutlined, ClockCircleOutlined, DeleteOutlined, PauseOutlined, PlayCircleOutlined, ReloadOutlined, UnorderedListOutlined } from '@ant-design/icons'
 import { PersistentOutcome } from '../../../components/interaction'
 import {
@@ -87,6 +87,19 @@ function hoursSince(value?: string | null) {
   return Math.max(0, Math.floor((Date.now() - timestamp) / 3_600_000))
 }
 
+interface ModelOutputMetrics {
+  kind: 'model_output'
+  output_chars?: number
+  output_preview?: string
+  max_output_tokens?: number
+  attempt?: number
+}
+
+function modelOutputMetrics(operation: OperationRun): ModelOutputMetrics | null {
+  const metrics = operation.process_metrics as ModelOutputMetrics | null | undefined
+  return metrics?.kind === 'model_output' ? metrics : null
+}
+
 function OperationItem({ operation, history, onAction, onDelete, onOpen, deletePending }: {
   operation: OperationRun
   history?: OperationRun[]
@@ -99,6 +112,7 @@ function OperationItem({ operation, history, onAction, onDelete, onOpen, deleteP
   const canDelete = TERMINAL_STATUSES.has(operation.status)
   const computing = COMPUTING_STATUSES.has(operation.status)
   const progress = operation.progress || { mode: 'indeterminate' }
+  const streamMetrics = modelOutputMetrics(operation)
   const interaction = toInteractionProjection(operation)
   const waitingHours = operation.status === 'waiting_user'
     ? hoursSince(operation.last_activity_at || operation.updated_at || operation.created_at)
@@ -114,6 +128,16 @@ function OperationItem({ operation, history, onAction, onDelete, onOpen, deleteP
           <Paragraph className="operation-center-message" ellipsis={{ rows: 2, expandable: true, symbol: '展开' }}>
             {operation.current_message || '正在等待新的运行信息'}
           </Paragraph>
+          {streamMetrics?.output_chars ? (
+            <div className="operation-center-stream-output" aria-live="polite">
+              <Space size={6} wrap>
+                <Tag color="cyan">已输出 {streamMetrics.output_chars.toLocaleString()} 字</Tag>
+                {streamMetrics.attempt ? <Tag>连续生成第 {streamMetrics.attempt} 段</Tag> : null}
+                {streamMetrics.max_output_tokens ? <Tag>预算 {streamMetrics.max_output_tokens.toLocaleString()} tokens</Tag> : null}
+              </Space>
+              {streamMetrics.output_preview ? <Text>{streamMetrics.output_preview}</Text> : null}
+            </div>
+          ) : null}
         </div>
         <Space size={4}>
           {operation.status !== 'waiting_user' && (operation.attention?.action_url || operation.resume_url) && (

@@ -192,8 +192,9 @@
 
 /* ─── Selection color ─── */
 ::selection {
-  background: var(--ant-color-primary-bg);
-  color: var(--ant-color-primary);
+  background-color: var(--ant-color-text, #20201f);
+  color: var(--ant-color-bg-container, #ffffff);
+  text-shadow: none;
 }
 
 /* ─── Focus ring refinement ─── */

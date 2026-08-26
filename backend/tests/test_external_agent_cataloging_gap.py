@@ -40,13 +40,11 @@ class ExternalCatalogingGapTest(unittest.TestCase):
         self.assertEqual(td.tool_type, "write")
         self.assertTrue(td.writes_project_data)
 
-    def test_external_agent_can_create_chapter(self):
-        """External agent should be able to create chapters."""
+    def test_external_agent_cannot_create_official_chapter(self):
         from app.services.workspace.registry import registry
         td = registry.get("create_chapter")
-        self.assertIsNotNone(td)
-        self.assertEqual(td.tool_type, "write")
-        self.assertTrue(td.writes_project_data)
+        self.assertIsNone(td)
+        self.assertIsNotNone(registry.get("save_external_chapter_draft"))
 
     def test_no_cataloging_verification_tool_exists(self):
         """Currently there is no tool to verify cataloging completeness.
@@ -94,11 +92,19 @@ class CatalogingToolPermissionsTest(unittest.TestCase):
         names = {t.name for t in tools}
         self.assertIn("create_worldbuilding_entry", names)
 
-    def test_create_chapter_in_project_writing(self):
+    def test_official_chapter_write_is_not_in_project_writing(self):
         from app.mcp.adapter import list_mcp_tools
         tools = list_mcp_tools(permission_pack="project_writing")
         names = {t.name for t in tools}
-        self.assertIn("create_chapter", names)
+        self.assertNotIn("create_chapter", names)
+        self.assertNotIn("update_chapter", names)
+
+    def test_chapter_drafting_pack_can_only_persist_unsaved_draft(self):
+        from app.mcp.adapter import list_mcp_tools
+        names = {t.name for t in list_mcp_tools(permission_pack="chapter_drafting")}
+        self.assertIn("save_external_chapter_draft", names)
+        self.assertNotIn("create_chapter", names)
+        self.assertNotIn("update_chapter", names)
 
     def test_cataloging_tools_not_in_readonly(self):
         """Create tools should not be in readonly pack."""

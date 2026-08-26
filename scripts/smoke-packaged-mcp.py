@@ -3,20 +3,34 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
+from contextlib import closing
 from pathlib import Path
+
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 
 REQUIRED_TOOLS = {
     "create_project",
     "start_novel_creation_session",
-    "submit_novel_creation_stage",
+    "patch_creation_artifact",
     "finalize_creation_session",
-    "create_chapter",
 }
 PATCH_MARKER = "MCP_STANDARD_JSON_PATCH_SMOKE"
+
+
+def _source_head_revision() -> str:
+    root = Path(__file__).resolve().parents[1]
+    config = Config()
+    config.set_main_option("script_location", str(root / "backend" / "alembic"))
+    revision = ScriptDirectory.from_config(config).get_current_head()
+    if not revision:
+        raise SystemExit("source Alembic graph has no head revision")
+    return revision
 
 
 def _run_mcp(
@@ -57,6 +71,7 @@ def main() -> int:
     if len(sys.argv) != 2:
         raise SystemExit("usage: smoke-packaged-mcp.py <Siming.exe>")
     executable = Path(sys.argv[1]).resolve()
+    expected_revision = _source_head_revision()
     requests = [
         {
             "jsonrpc": "2.0",
@@ -129,6 +144,28 @@ def main() -> int:
         session_id = str(creation_payload.get("data", {}).get("session_id") or "")
         if not session_id:
             raise SystemExit(f"packaged MCP did not create a novel session: {creation_payload}")
+
+        # Reproduce databases touched by the short-lived 300a19 build.  The
+        # migration was data-only and has been retired, so the packaged app
+        # must back up the database and normalize only this exact marker.
+        database_path = temp_path / "novel_agent.db"
+        with closing(sqlite3.connect(database_path)) as database:
+            current = database.execute(
+                "SELECT version_num FROM alembic_version"
+            ).fetchone()
+            if current != (expected_revision,):
+                raise SystemExit(f"packaged MCP initialized unexpected revision: {current}")
+            database.execute(
+                "UPDATE alembic_version SET version_num = ?",
+                ("300a19_runtime_readiness",),
+            )
+            database.execute(
+                "UPDATE siming_schema_metadata SET value = ? "
+                "WHERE key = 'alembic_revision'",
+                ("300a19_runtime_readiness",),
+            )
+            database.commit()
+
         patch_responses = _run_mcp(executable, env, [
             {
                 "jsonrpc": "2.0",
@@ -160,6 +197,32 @@ def main() -> int:
         ], cwd=foreign_agent_dir)
         patch_payload = _tool_payload(next((item for item in patch_responses if item.get("id") == 5), None))
         verify_payload = _tool_payload(next((item for item in patch_responses if item.get("id") == 6), None))
+        with closing(sqlite3.connect(database_path)) as database:
+            normalized_revision = database.execute(
+                "SELECT version_num FROM alembic_version"
+            ).fetchone()
+            metadata_revision = database.execute(
+                "SELECT value FROM siming_schema_metadata "
+                "WHERE key = 'alembic_revision'"
+            ).fetchone()
+        if normalized_revision != (expected_revision,):
+            raise SystemExit(
+                f"packaged MCP did not normalize retired revision: {normalized_revision}"
+            )
+        if metadata_revision != (expected_revision,):
+            raise SystemExit(
+                f"packaged MCP left stale schema metadata: {metadata_revision}"
+            )
+        retired_backups = list(
+            (temp_path / "backups").glob(
+                "novel_agent.pre-*-retired-revision.*.db"
+            )
+        )
+        if len(retired_backups) != 1:
+            raise SystemExit(
+                "packaged MCP did not create exactly one retired-revision backup: "
+                f"{retired_backups}"
+            )
     initialize = next((item for item in responses if item.get("id") == 1), None)
     catalog = next((item for item in responses if item.get("id") == 2), None)
     write_result = next((item for item in responses if item.get("id") == 3), None)
@@ -179,7 +242,7 @@ def main() -> int:
         raise SystemExit("packaged MCP standard JSON Patch was not persisted")
     print(
         f"Packaged MCP smoke test passed: {len(names)} tools; foreign dotenv isolation, "
-        "write, and JSON Patch paths OK"
+        "write, JSON Patch, and retired revision normalization paths OK"
     )
     return 0
 

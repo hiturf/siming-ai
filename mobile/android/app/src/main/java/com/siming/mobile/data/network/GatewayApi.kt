@@ -21,6 +21,8 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
@@ -502,12 +504,82 @@ suspend fun createProjectExport(
     suspend fun novelCreationAgentTurn(
         connection: GatewayConnection,
         payload: JsonObject,
-    ): JsonObject = request<ApiEnvelope<JsonObject>>(
-        connection.baseUrl,
-        PcApiPaths.NOVEL_CREATION_AGENT_TURN,
-        "POST",
-        json.encodeToString(payload),
-    ).data
+        onEvent: suspend (JsonObject) -> Unit = {},
+    ): JsonObject = withContext(Dispatchers.IO) {
+        val clientTurnId = (payload["client_turn_id"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+        require(clientTurnId.isNotBlank()) { "立项 SSE 请求缺少 client_turn_id" }
+        var afterSequence = (payload["after_sequence"] as? JsonPrimitive)?.longOrNull ?: 0L
+        var token = validAccessToken(connection.baseUrl)
+        var lastDisconnect: IOException? = null
+
+        repeat(3) reconnect@{
+            try {
+                var authenticatedRetry = false
+                while (true) {
+                    val reconnectPayload = JsonObject(payload.toMutableMap().apply {
+                        put("client_turn_id", JsonPrimitive(clientTurnId))
+                        put("after_sequence", JsonPrimitive(afterSequence))
+                    })
+                    val request = Request.Builder()
+                        .url(connection.baseUrl + PcApiPaths.NOVEL_CREATION_AGENT_TURN)
+                        .header("Authorization", "Bearer $token")
+                        .header("Accept", "text/event-stream")
+                        .post(json.encodeToString(reconnectPayload).toRequestBody(JSON_MEDIA_TYPE))
+                        .build()
+                    val response = client.newCall(request).execute()
+                    try {
+                        if (response.code == 401 && !authenticatedRetry) {
+                            token = refresh(connection.baseUrl, token)
+                            authenticatedRetry = true
+                            continue
+                        }
+                        if (!response.isSuccessful) throw errorFrom(response.code, response.body?.string())
+                        val source = response.body?.source() ?: throw IOException("立项助手响应为空")
+                        while (!source.exhausted()) {
+                            val line = source.readUtf8Line() ?: break
+                            if (!line.startsWith("data:")) continue
+                            val raw = line.removePrefix("data:").trim()
+                            if (raw.isEmpty() || raw == "[DONE]") continue
+                            val event = json.parseToJsonElement(raw) as? JsonObject ?: continue
+                            afterSequence = maxOf(
+                                afterSequence,
+                                (event["sequence"] as? JsonPrimitive)?.longOrNull ?: 0L,
+                            )
+                            onEvent(event)
+                            val type = (event["type"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+                            val message = (event["message"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+                            when (type) {
+                                "complete" -> return@withContext event["data"] as? JsonObject
+                                    ?: throw GatewayHttpException(502, "立项助手完成事件缺少结果")
+                                "error" -> throw GatewayHttpException(
+                                    422,
+                                    message.ifBlank { "立项助手处理失败" },
+                                )
+                                "cancelled" -> throw kotlinx.coroutines.CancellationException(
+                                    message.ifBlank { "本轮立项已取消" },
+                                )
+                            }
+                        }
+                        lastDisconnect = IOException("立项助手流提前结束")
+                        break
+                    } finally {
+                        response.close()
+                    }
+                }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: GatewayHttpException) {
+                throw error
+            } catch (error: IOException) {
+                lastDisconnect = error
+                return@reconnect
+            }
+        }
+        throw IOException(
+            "立项助手连接连续中断，后台任务可能仍在执行，请稍后重新进入",
+            lastDisconnect,
+        )
+    }
 
     suspend fun startNovelCreationRun(
         connection: GatewayConnection,
@@ -563,17 +635,16 @@ suspend fun createProjectExport(
         )
     }
 
-    suspend fun applyNovelCreation(
+    suspend fun finalizeNovelCreation(
         connection: GatewayConnection,
         sessionId: String,
     ): JsonObject = request<ApiEnvelope<JsonObject>>(
         connection.baseUrl,
-        PcApiPaths.NOVEL_CREATION_APPLY,
+        PcApiPaths.NOVEL_CREATION_FINALIZE,
         "POST",
         json.encodeToString(
             buildJsonObject {
                 put("session_id", sessionId)
-                put("mode", "auto")
             },
         ),
     ).data

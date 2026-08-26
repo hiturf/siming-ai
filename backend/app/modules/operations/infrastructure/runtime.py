@@ -300,7 +300,13 @@ def record_operation_signal(
         operation = session.query(OperationRun).filter(OperationRun.id == operation_id).first()
         if operation is None or operation.status not in ACTIVE_STATUSES:
             return
-        metrics = payload if signal in {"process", "quiet", "suspected_stall", "stalled"} else None
+        metrics = payload if signal in {
+            "process",
+            "stream_output",
+            "quiet",
+            "suspected_stall",
+            "stalled",
+        } else None
         health = (
             None
             if signal == "heartbeat"
@@ -317,6 +323,7 @@ def record_operation_signal(
                 "checkpoint",
                 "phase",
                 "model_fallback",
+                "stream_resume",
                 "error",
                 "suspected_stall",
                 "stalled",
@@ -342,11 +349,21 @@ def record_operation_signal(
             progress_mode=(payload or {}).get("progress_mode")
             if isinstance(payload, dict)
             else None,
-            output=signal == "output",
+            output=signal in {"output", "stream_output"},
             checkpoint=signal == "checkpoint",
             process_metrics=metrics,
             activity=signal
-            in {"output", "tool", "checkpoint", "phase", "model_fallback", "process", "error"},
+            in {
+                "output",
+                "stream_output",
+                "tool",
+                "checkpoint",
+                "phase",
+                "model_fallback",
+                "stream_resume",
+                "process",
+                "error",
+            },
         )
 
     _write_with_uow(_record, db)

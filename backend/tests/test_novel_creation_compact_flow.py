@@ -18,16 +18,16 @@ from app.modules.model_runtime.domain.configuration import ModelProviderConfig
 from app.schemas.ai_writer import MobileProviderEnvelope
 from app.services.novel_creation_contract import OPENING_OUTLINE_CHAPTER_COUNT
 from app.routers.novel_creation import (
-    NovelCreationApplyRequest,
+    NovelCreationFinalizeRequest,
     NovelCreationSessionPatchRequest,
     NovelCreationStageRunRequest,
-    apply_blueprint,
+    finalize_creation,
     start_creation_stage_run,
     update_creation_session,
 )
 from app.services.novel_creation_workspace import (
     STAGE_ORDER,
-    build_apply_blueprint,
+    build_project_materialization_payload,
     create_run as create_stage_run,
     derive_stage,
     initialize_session_draft,
@@ -36,11 +36,11 @@ from app.services.novel_creation_workspace import (
     save_stage,
     serialize_creation_artifact,
 )
-from app.services.workspace.tools.novel_creation import apply_novel_blueprint
+from app.services.workspace.tools.novel_creation import finalize_creation_session
 from app.services.workspace.tools.novel_creation_v2 import (
-    AuthorLockViolation,
-    _validate_author_requirements,
-    generate_novel_creation_stage,
+    _creation_output_token_limit,
+    _stream_model_text,
+    run_creation_artifact_generation,
 )
 from app.services.operation_runtime import input_snapshot_hash
 
@@ -103,7 +103,56 @@ def _concepts():
     ]
 
 
-def test_compact_concept_run_limits_output_and_keeps_legacy_blueprints_empty():
+def test_opening_outline_uses_the_governed_large_output_budget_without_a_6k_cap():
+    manifest = SimpleNamespace(output_reserve_tokens=300_000)
+
+    assert _creation_output_token_limit("deepseek:deepseek-v4-flash", manifest) == 300_000
+    assert _creation_output_token_limit("deepseek:deepseek-v4-flash", None) == 384_000
+
+
+def test_model_stream_publishes_a_reconnectable_live_output_snapshot():
+    def stream_chunks(**_kwargs):
+        async def generate():
+            yield '{"chapters":'
+            yield "[1,2,3]}"
+
+        return generate()
+
+    completion = MagicMock(side_effect=stream_chunks)
+    progress = MagicMock()
+    with (
+        patch(
+            "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
+            new=completion,
+        ),
+        patch(
+            "app.services.workspace.tools.novel_creation_v2.current_operation_id",
+            return_value="operation-live",
+        ),
+        patch(
+            "app.services.workspace.tools.novel_creation_v2.record_operation_signal",
+            new=progress,
+        ),
+    ):
+        text, attempt = asyncio.run(_stream_model_text(
+            messages=[{"role": "user", "content": "generate"}],
+            model="deepseek:deepseek-v4-flash",
+            temperature=0.2,
+            max_tokens=300_000,
+            extra_body=None,
+        ))
+
+    assert text == '{"chapters":[1,2,3]}'
+    assert attempt == 1
+    final = progress.call_args
+    assert final.args[:2] == ("operation-live", "stream_output")
+    assert final.args[2]["kind"] == "model_output"
+    assert final.args[2]["output_chars"] == len(text)
+    assert final.args[2]["output_preview"] == text
+    assert final.args[2]["max_output_tokens"] == 300_000
+
+
+def test_compact_concept_run_persists_only_current_concept_state():
     db = _db()
     session = _session(db)
     content = json.dumps({"concepts": _concepts()})
@@ -112,7 +161,7 @@ def test_compact_concept_run_limits_output_and_keeps_legacy_blueprints_empty():
         "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
         new=completion,
     ):
-        result = asyncio.run(generate_novel_creation_stage(db, "", {
+        result = asyncio.run(run_creation_artifact_generation(db, "", {
             "session_id": session.id,
             "stage": "concepts",
             "model": "openai:test",
@@ -121,8 +170,8 @@ def test_compact_concept_run_limits_output_and_keeps_legacy_blueprints_empty():
 
     assert result["status"] == "ok"
     assert completion.call_args.kwargs["max_tokens"] == 3200
-    assert completion.call_args.kwargs["retry"] == 0
-    assert session.blueprint_json is None
+    assert completion.call_args.kwargs["retry"] == 1
+    assert completion.call_args.kwargs["resume"] == 8
     assert len(session.draft_json["concepts"]) == 1
     assert len(session.draft_json["concept_seeds"]) == 1
     assert result["data"]["run"]["status"] == "waiting_user"
@@ -136,7 +185,7 @@ def test_compact_concepts_never_switch_models_on_quota_failure():
         "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
         new=completion,
     ):
-        result = asyncio.run(generate_novel_creation_stage(db, "", {
+        result = asyncio.run(run_creation_artifact_generation(db, "", {
             "session_id": session.id,
             "stage": "concepts",
             "model": "opencode_cli:opencode/first-free",
@@ -150,7 +199,7 @@ def test_compact_concepts_never_switch_models_on_quota_failure():
     assert not any(event["event_type"] == "model_fallback" for event in result["data"]["run"]["events"])
 
 
-def test_invalid_concepts_create_safe_draft_then_a_retry_can_succeed():
+def test_invalid_concepts_fail_without_writing_then_a_retry_can_succeed():
     db = _db()
     session = _session(db)
     invalid = json.dumps({"concepts": []})
@@ -158,24 +207,21 @@ def test_invalid_concepts_create_safe_draft_then_a_retry_can_succeed():
         "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
         new=_streaming_completion({"content": invalid}),
     ):
-        recovered = asyncio.run(generate_novel_creation_stage(db, "", {
+        recovered = asyncio.run(run_creation_artifact_generation(db, "", {
             "session_id": session.id,
             "stage": "concepts",
             "model": "openai:test",
             "use_model": True,
         }))
-    assert recovered["status"] == "ok"
-    assert recovered["data"]["run"]["status"] == "waiting_user"
-    assert recovered["data"]["run"]["result_mode"] == "deterministic_fallback"
-    assert session.draft_json["stages"]["concepts"]["source"] == "contract_fallback"
-    assert session.draft_json["stages"]["concepts"]["data"]["options"][0]["title"]
+    assert recovered["status"] == "error"
+    assert session.draft_json["concepts"] == []
 
     valid = json.dumps({"concepts": _concepts()})
     with patch(
         "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
         new=_streaming_completion({"content": valid}),
     ):
-        retried = asyncio.run(generate_novel_creation_stage(db, "", {
+        retried = asyncio.run(run_creation_artifact_generation(db, "", {
             "session_id": session.id,
             "stage": "concepts",
             "model": "openai:test",
@@ -207,7 +253,7 @@ def test_author_led_session_keeps_source_text_and_generates_one_author_plan():
         "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
         new=completion,
     ):
-        result = asyncio.run(generate_novel_creation_stage(db, "", {
+        result = asyncio.run(run_creation_artifact_generation(db, "", {
             "session_id": session.id,
             "stage": "concepts",
             "model": "openai:test",
@@ -222,20 +268,18 @@ def test_author_led_session_keeps_source_text_and_generates_one_author_plan():
     prompt = completion.call_args.kwargs["messages"][-1]["content"]
     assert "周遥必须是植物学实习生" in prompt
     assert "全书必须六卷" in prompt
+    assert completion.call_args.kwargs["extra_body"]["local_cli_retry_attempts"] == 1
 
 
-def test_partial_stream_retries_same_model_once_before_persisting():
+def test_stream_requests_bounded_same_model_resume_before_persisting():
     db = _db()
     session = _session(db)
-    completion = _streaming_completion(
-        RuntimeError("peer closed connection without sending complete message body (incomplete chunked read)"),
-        {"content": json.dumps({"concepts": _concepts()})},
-    )
+    completion = _streaming_completion({"content": json.dumps({"concepts": _concepts()})})
     with patch(
         "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
         new=completion,
     ):
-        result = asyncio.run(generate_novel_creation_stage(db, "", {
+        result = asyncio.run(run_creation_artifact_generation(db, "", {
             "session_id": session.id,
             "stage": "concepts",
             "model": "openai:test",
@@ -243,8 +287,10 @@ def test_partial_stream_retries_same_model_once_before_persisting():
         }))
 
     assert result["status"] == "ok"
-    assert completion.call_count == 2
-    assert result["data"]["run"]["attempt"] == 2
+    assert completion.call_count == 1
+    assert completion.call_args.kwargs["retry"] == 1
+    assert completion.call_args.kwargs["resume"] == 8
+    assert result["data"]["run"]["attempt"] == 1
     assert result["data"]["run"]["result_mode"] == "model"
 
 
@@ -257,7 +303,7 @@ def test_auth_and_configuration_failures_do_not_retry():
             "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
             new=completion,
         ):
-            result = asyncio.run(generate_novel_creation_stage(db, "", {
+            result = asyncio.run(run_creation_artifact_generation(db, "", {
                 "session_id": session.id,
                 "stage": "concepts",
                 "model": "openai:test",
@@ -287,7 +333,7 @@ def test_durable_cancellation_after_model_return_never_saves_stage_data():
         new=MagicMock(side_effect=cancel_before_return),
     ):
         with pytest.raises(asyncio.CancelledError):
-            asyncio.run(generate_novel_creation_stage(db, "", {
+            asyncio.run(run_creation_artifact_generation(db, "", {
                 "session_id": session.id,
                 "stage": "concepts",
                 "model": "openai:test",
@@ -298,7 +344,7 @@ def test_durable_cancellation_after_model_return_never_saves_stage_data():
     assert session.draft_json == original
 
 
-def test_refine_that_rewrites_author_locks_keeps_original_concepts():
+def test_refine_uses_the_models_structured_semantic_decision():
     db = _db()
     session = NovelCreationSession(mode="internal_llm", status="drafting", user_brief="周遥调查花色异常")
     db.add(session)
@@ -313,7 +359,6 @@ def test_refine_that_rewrites_author_locks_keeps_original_concepts():
     original["world_hook"] = "河谷镇依靠公共温室维持四季花展"
     save_compact_concepts(session, [original], source="author")
     db.commit()
-    before = deepcopy(session.draft_json["concepts"])
     rewritten = deepcopy(original)
     rewritten["protagonist_seed"].update({"name": "程野", "identity": "记者"})
     rewritten["world_hook"] = "一座普通城市"
@@ -326,7 +371,7 @@ def test_refine_that_rewrites_author_locks_keeps_original_concepts():
         "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
         new=completion,
     ):
-        result = asyncio.run(generate_novel_creation_stage(db, "", {
+        result = asyncio.run(run_creation_artifact_generation(db, "", {
             "session_id": session.id,
             "stage": "concepts",
             "model": "openai:test",
@@ -336,50 +381,8 @@ def test_refine_that_rewrites_author_locks_keeps_original_concepts():
         }))
 
     assert result["status"] == "ok"
-    assert result["data"]["run"]["result_mode"] == "deterministic_fallback"
-    assert session.draft_json["concepts"] == before
-
-
-def test_explicit_six_volume_lock_is_a_hard_result_contract():
-    draft = {
-        "creation_mode": "author_led",
-        "author_outline": "全书六卷，最终公开被调换的土壤试剂检测报告。",
-        "locked_requirements": ["全书必须六卷"],
-    }
-    invalid = {"volumes": [{"title": f"第{index}卷"} for index in range(1, 4)]}
-    with pytest.raises(AuthorLockViolation, match="6 卷"):
-        _validate_author_requirements("macro_outline", invalid, {}, draft)
-
-    valid = {"volumes": [{"title": f"第{index}卷"} for index in range(1, 7)]}
-    _validate_author_requirements("macro_outline", valid, {}, draft)
-
-
-def test_author_locks_cannot_be_hidden_in_unrelated_concept_fields():
-    draft = {
-        "creation_mode": "author_led",
-        "author_brief": "Zhou Yao is a botany intern investigating a greenhouse color anomaly.",
-        "locked_requirements": [
-            "\u5468\u9065\u5fc5\u987b\u662f\u690d\u7269\u5b66\u5b9e\u4e60\u751f",
-            "\u6838\u5fc3\u8bbe\u5b9a\uff1a\u6e29\u5ba4\u6309\u5b63\u8282\u8f6e\u6362\u82b1\u5349",
-        ],
-    }
-    rewritten = deepcopy(_concepts()[0])
-    rewritten["protagonist_seed"] = {
-        "name": "Cheng Ye",
-        "identity": "Reporter",
-        "goal": "Win a journalism prize",
-        "lack": "Acts too quickly",
-    }
-    rewritten["world_hook"] = "A conventional contemporary city."
-    rewritten["differentiators"] = list(draft["locked_requirements"])
-
-    with pytest.raises(AuthorLockViolation):
-        _validate_author_requirements(
-            "concepts",
-            {"options": [rewritten]},
-            {},
-            draft,
-        )
+    assert result["data"]["run"]["result_mode"] == "model"
+    assert session.draft_json["concepts"][0]["protagonist_seed"]["name"] == "程野"
 
 
 def test_invalid_json_is_repaired_once_and_refine_failure_keeps_current_concepts():
@@ -391,7 +394,7 @@ def test_invalid_json_is_repaired_once_and_refine_failure_keeps_current_concepts
         "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
         new=_streaming_completion({"content": invalid}, {"content": valid}),
     ):
-        repaired = asyncio.run(generate_novel_creation_stage(db, "", {
+        repaired = asyncio.run(run_creation_artifact_generation(db, "", {
             "session_id": session.id,
             "stage": "concepts",
             "model": "openai:test",
@@ -405,7 +408,7 @@ def test_invalid_json_is_repaired_once_and_refine_failure_keeps_current_concepts
         "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
         new=_streaming_completion({"content": invalid}, {"content": invalid}),
     ):
-        refined = asyncio.run(generate_novel_creation_stage(db, "", {
+        refined = asyncio.run(run_creation_artifact_generation(db, "", {
             "session_id": session.id,
             "stage": "concepts",
             "model": "openai:test",
@@ -413,8 +416,7 @@ def test_invalid_json_is_repaired_once_and_refine_failure_keeps_current_concepts
             "operation": "refine",
             "instruction": "保留人物，只加强开篇钩子",
         }))
-    assert refined["status"] == "ok"
-    assert refined["data"]["run"]["result_mode"] == "deterministic_fallback"
+    assert refined["status"] == "error"
     assert session.draft_json["concepts"] == before
 
 
@@ -451,7 +453,7 @@ def test_long_stage_save_uses_revision_cas_and_preserves_manual_edit():
         "app.services.workspace.tools.novel_creation_v2.LLMGateway.stream_chat_completion",
         new=MagicMock(side_effect=edit_then_stream),
     ):
-        result = asyncio.run(generate_novel_creation_stage(db, "", {
+        result = asyncio.run(run_creation_artifact_generation(db, "", {
             "session_id": session.id,
             "stage": "concepts",
             "model": "openai:test",
@@ -473,37 +475,6 @@ def test_long_stage_save_uses_revision_cas_and_preserves_manual_edit():
     assert artifact["status"] == "conflict"
     assert artifact["stored_status"] == "pending"
     assert artifact["conflict"]["candidate_available"] is True
-    assert operation.status == "failed"
-    assert operation.can_cancel is False
-    assert operation.can_retry is True
-
-
-def test_unusable_context_finishes_run_operation_and_stream_contract():
-    db = _db()
-    session = _session(db)
-    manifest = SimpleNamespace(id="context-stale", status="stale")
-
-    with patch(
-        "app.services.novel_creation_stage_execution.ContextOrchestrator.prepare",
-        return_value=manifest,
-    ), patch(
-        "app.services.novel_creation_stage_execution.ContextOrchestrator.validate",
-        return_value=(False, "The context must be rebuilt before generation."),
-    ):
-        result = asyncio.run(generate_novel_creation_stage(db, "", {
-            "session_id": session.id,
-            "stage": "concepts",
-            "model": "openai:test",
-            "use_model": True,
-        }))
-
-    run = db.query(NovelCreationStageRun).order_by(NovelCreationStageRun.created_at.desc()).first()
-    operation = db.get(OperationRun, run.operation_id)
-    assert result["status"] == "stale"
-    assert run.status == "failed"
-    assert run.failure_class == "stale"
-    assert run.completed_at is not None
-    assert any(event.event_type == "context_blocked" for event in run.events)
     assert operation.status == "failed"
     assert operation.can_cancel is False
     assert operation.can_retry is True
@@ -551,7 +522,7 @@ def test_stale_session_patch_returns_conflict_without_overwriting_author_text():
     assert session.draft_json["form"]["brief"] == original_brief
 
 
-def test_compact_seed_can_drive_stages_and_final_apply_blueprint():
+def test_compact_seed_can_drive_stages_and_project_materialization():
     db = _db()
     session = _session(db)
     save_compact_concepts(session, _concepts())
@@ -561,14 +532,14 @@ def test_compact_seed_can_drive_stages_and_final_apply_blueprint():
     for stage in STAGE_ORDER[2:]:
         save_stage(session, stage, derive_stage(session, stage), confirm=stage != "final_review")
 
-    blueprint = build_apply_blueprint(session)
-    assert blueprint["title"] == "Concept 1"
-    assert blueprint["protagonist"]["name"] == "Lead 1"
-    chapters = [item for item in blueprint["outline"] if item.get("node_type") == "chapter"]
+    project_payload = build_project_materialization_payload(session)
+    assert project_payload["title"] == "Concept 1"
+    assert project_payload["protagonist"]["name"] == "Lead 1"
+    chapters = [item for item in project_payload["outline"] if item.get("node_type") == "chapter"]
     assert len(chapters) == OPENING_OUTLINE_CHAPTER_COUNT
     with patch("app.services.workspace.tools.novel_creation._is_real_session", return_value=False):
-        applied = asyncio.run(apply_novel_blueprint(db, "", {"session_id": session.id, "mode": "auto"}))
-    assert applied["status"] == "ok"
+        finalized = asyncio.run(finalize_creation_session(db, "", {"session_id": session.id}))
+    assert finalized["status"] == "ok"
 
 
 def test_duplicate_running_concept_request_reuses_existing_run():
@@ -655,7 +626,7 @@ def test_android_creation_apply_immediately_enables_the_formal_project_for_sync(
     }
     with (
         patch(
-            "app.routers.novel_creation.apply_novel_blueprint",
+            "app.routers.novel_creation.finalize_creation_session",
             new=AsyncMock(return_value=tool_result),
         ),
         patch(
@@ -663,8 +634,8 @@ def test_android_creation_apply_immediately_enables_the_formal_project_for_sync(
         ) as gateway_service,
     ):
         response = asyncio.run(
-            apply_blueprint(
-                NovelCreationApplyRequest(session_id="creation-session"),
+            finalize_creation(
+                NovelCreationFinalizeRequest(session_id="creation-session"),
                 request,
                 MagicMock(),
             )

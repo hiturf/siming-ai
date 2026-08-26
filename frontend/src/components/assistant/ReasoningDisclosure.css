@@ -1,0 +1,135 @@
+.assistant-reasoning {
+  --reasoning-accent: #b86b2b;
+  --reasoning-accent-soft: color-mix(in srgb, var(--reasoning-accent) 11%, transparent);
+  background: color-mix(in srgb, var(--ant-color-bg-container) 94%, var(--reasoning-accent) 6%);
+  border: 1px solid color-mix(in srgb, var(--reasoning-accent) 24%, var(--ant-color-border-secondary));
+  border-radius: 8px;
+  margin: 8px 0 10px;
+  overflow: hidden;
+}
+
+.assistant-reasoning-trigger {
+  align-items: center;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--ant-color-text-secondary);
+  cursor: pointer;
+  display: flex;
+  font: inherit;
+  justify-content: space-between;
+  min-height: 38px;
+  padding: 8px 11px;
+  text-align: left;
+  width: 100%;
+}
+
+.assistant-reasoning-trigger:hover {
+  background: var(--reasoning-accent-soft);
+  color: var(--ant-color-text);
+}
+
+.assistant-reasoning-trigger:focus-visible {
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--reasoning-accent) 68%, transparent);
+  outline: none;
+}
+
+.assistant-reasoning-title,
+.assistant-reasoning-state {
+  align-items: center;
+  display: inline-flex;
+  gap: 6px;
+}
+
+.assistant-reasoning-title {
+  color: var(--ant-color-text);
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+
+.assistant-reasoning-title > .anticon {
+  color: var(--reasoning-accent);
+}
+
+.assistant-reasoning-state {
+  color: var(--ant-color-text-tertiary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.assistant-reasoning-streaming .assistant-reasoning-state {
+  color: var(--reasoning-accent);
+}
+
+.assistant-reasoning-chevron {
+  font-size: 9px;
+  transition: transform 180ms ease;
+}
+
+.assistant-reasoning-trigger[aria-expanded='true'] .assistant-reasoning-chevron {
+  transform: rotate(180deg);
+}
+
+.assistant-reasoning-region {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 180ms ease;
+}
+
+.assistant-reasoning-region-open {
+  grid-template-rows: 1fr;
+}
+
+.assistant-reasoning-region-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.assistant-reasoning-body {
+  border-top: 1px solid color-mix(in srgb, var(--reasoning-accent) 18%, var(--ant-color-border-secondary));
+  max-height: 300px;
+  overflow: auto;
+  padding: 10px 12px 12px;
+}
+
+.assistant-reasoning-note {
+  color: var(--ant-color-text-tertiary);
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  margin-bottom: 7px;
+}
+
+.assistant-reasoning-text {
+  color: var(--ant-color-text-secondary);
+  font-family: 'Noto Serif SC', 'Songti SC', serif;
+  font-size: 12px;
+  line-height: 1.75;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.assistant-reasoning-caret {
+  animation: assistant-reasoning-blink 0.8s steps(1, end) infinite;
+  background: var(--reasoning-accent);
+  display: inline-block;
+  height: 1.05em;
+  margin-left: 2px;
+  transform: translateY(0.12em);
+  width: 1px;
+}
+
+@keyframes assistant-reasoning-blink {
+  50% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .assistant-reasoning-chevron,
+  .assistant-reasoning-region {
+    transition: none;
+  }
+
+  .assistant-reasoning-caret {
+    animation: none;
+  }
+}

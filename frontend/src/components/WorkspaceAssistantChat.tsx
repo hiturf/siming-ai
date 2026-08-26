@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Alert, Button, Modal, Select, Space, Tag, Tooltip, Typography, message } from 'antd'
 import {
   DeleteOutlined,
@@ -8,7 +9,6 @@ import {
   SettingOutlined,
 } from '@ant-design/icons'
 import { apiClient } from '../api/client'
-import AgentPlanView, { type AgentPlanViewState, type AgentPlanStepView } from './AgentPlanView'
 import { AssistantMemoryModal } from './AssistantMemoryModal'
 import {
   type ApiResponse,
@@ -22,7 +22,6 @@ import {
   type WorkspacePersistedMessage,
   type WorkspaceRunLog,
   type WorkspaceToolLog,
-  type SkillMatch,
   type StepDetail,
   SCOPE_LABEL,
   assistantOutcomeToRunLog,
@@ -37,7 +36,8 @@ import {
 import { motionAwareScrollBehavior } from '../utils/motion'
 import { extractExplicitLocalPaths } from '../utils/localCliPathGrant'
 import { useOperations } from '../shared/operations/queries'
-import { projectAutoCatalogingMessages } from './assistant/catalogingNotifications'
+import { projectCatalogingMessages } from './assistant/catalogingNotifications'
+import { useAiPanelContext, type GeneratedChapterDraft } from '../contexts/AiPanelContext'
 import './WorkspaceAssistantChat.css'
 
 const { Text } = Typography
@@ -69,12 +69,6 @@ interface ActiveAssistantExecution {
   conversationId: string | null
   run: WorkspaceAssistantRun | null
   terminalHandled: boolean
-}
-
-interface CliPermissionRequest {
-  originalMessage: string
-  provider: string
-  detail: string
 }
 
 class AssistantRunRequestError extends Error {
@@ -129,26 +123,49 @@ async function fetchAssistantRunDetail(
   return payload.data
 }
 
+function generatedDraftFromAction(action: WorkspaceToolLog, projectId: string): GeneratedChapterDraft | null {
+  if (!['chapter_writer', 'save_external_chapter_draft'].includes(String(action.tool || ''))) return null
+  const data = action.data || {}
+  const draftId = String(data.draft_id || '')
+  const content = String(data.content || '')
+  if (!draftId || !content) return null
+  return {
+    draftId,
+    projectId: String(data.project_id || projectId),
+    title: String(data.title || ''),
+    outlineNodeId: data.outline_node_id ? String(data.outline_node_id) : null,
+    contextManifestId: data.context_manifest_id ? String(data.context_manifest_id) : null,
+    savedChapterId: data.saved_chapter_id ? String(data.saved_chapter_id) : null,
+    content,
+    wordCount: Number(data.word_count || 0),
+    status: String(data.draft_status || 'pending') as GeneratedChapterDraft['status'],
+  }
+}
+
 function WorkspaceAssistantChat({
   projectId,
-  scope,
-  selectedOutlineNodeId,
-  selectedCharacterId,
   selectedText,
   selectedTextChapterId,
   defaultModel,
   modelOptions = [],
   modelsLoading = false,
-  onGlobalModelChange,
+  onTaskModelChange,
   onManageModels,
   onApplied,
 }: WorkspaceAssistantChatProps) {
+  const navigate = useNavigate()
+  const {
+    generatedDraft,
+    openGeneratedDraft,
+    updateGeneratedDraft,
+    triggerRefresh,
+  } = useAiPanelContext()
   const [conversations, setConversations] = useState<WorkspaceAssistantConversation[]>([])
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null)
   const [messages, setMessages] = useState<WorkspaceAssistantMessage[]>([])
   // Query this project's cataloging operations directly.  A global "latest
   // 50" query could evict the relevant post-write task on busy installations.
-  const { data: operations = [] } = useOperations(100, {
+  const { data: operations = [], refetch: refetchCatalogingOperations } = useOperations(100, {
     projectId,
     sourceKind: 'cataloging',
   })
@@ -161,15 +178,12 @@ function WorkspaceAssistantChat({
   const [showAllRunLogs, setShowAllRunLogs] = useState(false)
   const [showSelectionTag, setShowSelectionTag] = useState(true)
   const [retryingStepId, setRetryingStepId] = useState<string | null>(null)
-  const [currentPlan, setCurrentPlan] = useState<AgentPlanViewState | null>(null)
-  const [retryingPlanKey, setRetryingPlanKey] = useState<string | null>(null)
   const [detailStep, setDetailStep] = useState<StepDetail | null>(null)
   useEffect(() => {
     setShowSelectionTag(true)
   }, [selectedText])
   const messagesRef = useRef<HTMLDivElement | null>(null)
   const [showScrollBottom, setShowScrollBottom] = useState(false)
-  const [matchedSkills, setMatchedSkills] = useState<SkillMatch[]>([])
   const abortRef = useRef<AbortController | null>(null)
   const cancelRequestedRef = useRef(false)
   const cancelInFlightRef = useRef<Promise<boolean> | null>(null)
@@ -186,14 +200,12 @@ function WorkspaceAssistantChat({
   const [canceling, setCanceling] = useState(false)
   const [cancelPending, setCancelPending] = useState(false)
   const [runtimeAnnouncement, setRuntimeAnnouncement] = useState('')
-  const [nextCliGrant, setNextCliGrant] = useState(false)
-  const [cliPermissionRequest, setCliPermissionRequest] = useState<CliPermissionRequest | null>(null)
 
   const selectedProvider = String(defaultModel || '').split(':', 1)[0]
   const isLocalCliModel = selectedProvider.endsWith('_cli')
   const isOpenCodeCliModel = selectedProvider === 'opencode_cli'
   const catalogingMessages = useMemo(
-    () => projectAutoCatalogingMessages(operations, projectId),
+    () => projectCatalogingMessages(operations, projectId),
     [operations, projectId],
   )
   const displayedMessages = useMemo(
@@ -206,11 +218,6 @@ function WorkspaceAssistantChat({
     ],
     [messages, catalogingMessages],
   )
-
-  useEffect(() => {
-    setNextCliGrant(false)
-    setCliPermissionRequest(null)
-  }, [defaultModel])
 
   useEffect(() => {
     mountedRef.current = true
@@ -226,20 +233,81 @@ function WorkspaceAssistantChat({
     }
   }, [])
 
-  const changeGlobalModel = async (nextModel: string) => {
-    if (!onGlobalModelChange || nextModel === defaultModel) return
+  const changeTaskModel = async (nextModel?: string) => {
+    if (!onTaskModelChange || nextModel === defaultModel) return
     setModelChanging(true)
     try {
-      await onGlobalModelChange(nextModel)
+      await onTaskModelChange(nextModel)
       message.success(generating
-        ? '已设为全局默认；当前任务继续使用启动时的模型，下个任务生效'
-        : '已设为全局默认，对所有项目生效')
+        ? '项目助手默认模型已保存；当前任务仍使用启动时的模型，下个任务生效'
+        : nextModel ? '项目助手默认模型已保存' : '项目助手将跟随全局默认模型')
     } catch (err: any) {
-      message.error(err.message || '切换全局模型失败，仍保留原模型')
+      message.error(err.message || '切换项目助手模型失败，仍保留原模型')
     } finally {
       setModelChanging(false)
     }
   }
+
+  const saveChapterDraft = useCallback(async (
+    action: WorkspaceToolLog,
+    mode: 'save_only' | 'save_and_catalog',
+  ) => {
+    const actionDraft = generatedDraftFromAction(action, projectId)
+    const draft = generatedDraft?.draftId === actionDraft?.draftId
+      ? generatedDraft
+      : actionDraft
+    if (!draft) {
+      message.error('找不到可保存的章节草稿，请重新生成')
+      return
+    }
+    if (draft.status !== 'pending') {
+      message.info('这份草稿已经保存')
+      return
+    }
+    const payload = {
+      title: draft.title.trim() || '未命名章节',
+      outline_node_id: draft.outlineNodeId,
+      content: draft.content,
+      context_manifest_id: draft.contextManifestId,
+      draft_id: draft.draftId,
+      cataloging_mode: mode,
+      trigger_type: 'ai_insert',
+    }
+    const response = await apiClient.post<ApiResponse<Record<string, any>>>(
+      `/projects/${projectId}/chapters`,
+      payload,
+    )
+    const chapterId = String(response.data.data.id || response.data.data.chapter_id || '')
+    const savedDraft = {
+      ...draft,
+      savedChapterId: chapterId || null,
+      status: 'saved' as const,
+    }
+    if (generatedDraft?.draftId === draft.draftId) updateGeneratedDraft(savedDraft)
+    else openGeneratedDraft(savedDraft)
+    triggerRefresh()
+    await Promise.resolve(onApplied?.())
+    navigate(`/project/${encodeURIComponent(projectId)}`)
+    if (mode === 'save_and_catalog') {
+      if (response.data.data.cataloging_job?.started) {
+        await refetchCatalogingOperations()
+        message.success('章节已保存，建档已经开始；可从聊天中的按钮查看进度')
+      } else {
+        message.error(response.data.data.cataloging_job?.error || '章节已保存，但建档启动失败；请在正文页重试')
+      }
+    } else {
+      message.success('章节已仅保存；完成建档前 AI 不会继续下一章')
+    }
+  }, [
+    generatedDraft,
+    navigate,
+    onApplied,
+    openGeneratedDraft,
+    projectId,
+    refetchCatalogingOperations,
+    triggerRefresh,
+    updateGeneratedDraft,
+  ])
 
   const handleMessagesScroll = useCallback(() => {
     const el = messagesRef.current
@@ -270,7 +338,7 @@ function WorkspaceAssistantChat({
     return () => window.cancelAnimationFrame(frame)
   }, [latestCatalogingNoticeKey, showScrollBottom])
 
-  const conversationScope = 'project'
+  const agentRuntimeTool = 'project_agent'
   const scopeLabel = SCOPE_LABEL
 
   const addRunLog = (log: Omit<WorkspaceRunLog, 'key'>) => {
@@ -358,7 +426,6 @@ function WorkspaceAssistantChat({
     try {
       const res = await apiClient.get<ApiResponse<{ items: WorkspaceAssistantConversation[]; total: number }>>(
         `/projects/${projectId}/ai/assistant/conversations`,
-        { scope: conversationScope },
       )
       const items = res.data.data.items || []
       setConversations(items)
@@ -437,7 +504,6 @@ function WorkspaceAssistantChat({
     setInput('')
     setRunLogs([])
     setCurrentRun(null)
-    setCurrentPlan(null)
     setShowAllRunLogs(false)
   }
 
@@ -487,10 +553,9 @@ function WorkspaceAssistantChat({
         execution.run = cancelledRun
         execution.terminalHandled = true
         setCurrentRun(cancelledRun)
-        setCurrentPlan(null)
         setGenerating(false)
         const cancelledMessage = '已停止后续执行；取消前已完成的内容会保留。'
-        addRunLog({ tool: scope, status: 'cancelled', message: cancelledMessage })
+        addRunLog({ tool: agentRuntimeTool, status: 'cancelled', message: cancelledMessage })
         updateAssistantById(execution.assistantMessageId, (item) => ({
           ...item,
           content: item.content && item.content !== '正在分析需求...'
@@ -526,7 +591,7 @@ function WorkspaceAssistantChat({
         } else {
           const failureMessage = error?.message || '取消任务失败，请在任务中心重试'
           message.error(failureMessage)
-          addRunLog({ tool: scope, status: 'error', message: failureMessage })
+          addRunLog({ tool: agentRuntimeTool, status: 'error', message: failureMessage })
         }
         cancelRequestedRef.current = false
         return false
@@ -553,7 +618,7 @@ function WorkspaceAssistantChat({
       void cancelAssistantRun(execution.run, execution)
       return
     }
-    addRunLog({ tool: scope, status: 'running', message: '正在取得任务编号，随后立即取消' })
+    addRunLog({ tool: agentRuntimeTool, status: 'running', message: '正在取得任务编号，随后立即取消' })
     message.info('任务正在建立，取得任务编号后会立即取消')
   }
 
@@ -681,179 +746,6 @@ function WorkspaceAssistantChat({
     }
   }
 
-  const retryPlanStep = async (stepKey: string) => {
-    if (!currentPlan) return
-    setRetryingPlanKey(stepKey)
-    try {
-      const res = await apiClient.post<ApiResponse<Record<string, unknown>>>(
-        `/projects/${projectId}/ai/agent/plans/${currentPlan.plan_id}/steps/${stepKey}/retry`,
-      )
-      const data = res.data.data
-      setCurrentPlan((prev) => {
-        if (!prev) return null
-        return {
-          ...prev,
-          steps: prev.steps.map((s) =>
-            s.step_key === stepKey
-              ? {
-                  ...s,
-                  status: (data.status as AgentPlanStepView['status']) || 'ok',
-                  detail: data.detail as string | undefined,
-                  error: data.error as string | undefined,
-                  attempt_no: (data.attempt_no as number) || 1,
-                }
-              : s
-          ),
-        }
-      })
-      addRunLog({
-        tool: (data.tool as string) || stepKey,
-        status: (data.status as string) || 'ok',
-        message: `重试: ${data.detail || (data.status === 'error' ? '失败' : '成功')}`,
-      })
-      if (data.status === 'error') {
-        message.error((data.detail as string) || `步骤「${stepKey}」重试失败`)
-      } else {
-        message.success(`步骤「${stepKey}」重试成功`)
-      }
-    } catch (err: any) {
-      message.error(err?.response?.data?.detail || err.message || '重试失败')
-    } finally {
-      setRetryingPlanKey(null)
-    }
-  }
-
-  const handlePlanSseFrame = (frame: string) => {
-    const data = frame
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith('data:'))
-      .map((line) => line.replace(/^data:\s?/, ''))
-      .join('\n')
-    if (!data || data === '[DONE]') return
-    const event = JSON.parse(data)
-    if (event.type === 'step_start') {
-      const ev = event as { step_key: string; tool: string }
-      setCurrentPlan((prev) => {
-        if (!prev) return null
-        return {
-          ...prev,
-          steps: prev.steps.map((s) =>
-            s.step_key === ev.step_key ? { ...s, status: 'running' as const } : s
-          ),
-        }
-      })
-    } else if (event.type === 'step_result') {
-      const ev = event as {
-        step_key: string
-        tool: string
-        status: string
-        detail?: string
-        error?: string
-        data?: Record<string, unknown>
-      }
-      setCurrentPlan((prev) => {
-        if (!prev) return null
-        return {
-          ...prev,
-          steps: prev.steps.map((s) =>
-            s.step_key === ev.step_key
-              ? { ...s, status: (ev.status as AgentPlanStepView['status']) || 'ok', detail: ev.detail, error: ev.error }
-              : s
-          ),
-        }
-      })
-      addRunLog({ tool: ev.tool, status: ev.status, message: ev.detail || ev.tool })
-      appendToolLog({ tool: ev.tool, status: ev.status, detail: ev.detail, data: ev.data })
-    } else if (event.type === 'step_skip') {
-      const ev = event as { step_key: string }
-      setCurrentPlan((prev) => {
-        if (!prev) return null
-        return {
-          ...prev,
-          steps: prev.steps.map((s) =>
-            s.step_key === ev.step_key ? { ...s, status: 'skipped' as const } : s
-          ),
-        }
-      })
-    } else if (event.type === 'step_blocked') {
-      const ev = event as { step_key: string; detail?: string }
-      setCurrentPlan((prev) => {
-        if (!prev) return null
-        return {
-          ...prev,
-          steps: prev.steps.map((s) =>
-            s.step_key === ev.step_key ? { ...s, status: 'blocked' as const, detail: ev.detail } : s
-          ),
-        }
-      })
-    } else if (event.type === 'plan_end') {
-      const ev = event as { status: string; error?: string }
-      setCurrentPlan((prev) => prev ? { ...prev, status: (ev.status as AgentPlanViewState['status']) || 'completed' } : null)
-      addRunLog({
-        tool: 'plan',
-        status: ev.status === 'completed' ? 'ok' : 'error',
-        message: ev.status === 'completed' ? '计划执行完成' : (ev.error || '计划执行失败'),
-      })
-    }
-  }
-
-  const streamPlanRequest = async (url: string) => {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    })
-    if (!res.ok || !res.body) {
-      const errText = await res.text().catch(() => '')
-      throw new Error(errText || `HTTP ${res.status}`)
-    }
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const frames = buffer.split(/\r?\n\r?\n/)
-      buffer = frames.pop() || ''
-      for (const frame of frames) {
-        if (frame.trim()) handlePlanSseFrame(frame)
-      }
-    }
-    buffer += decoder.decode()
-    if (buffer.trim()) handlePlanSseFrame(buffer)
-  }
-
-  const resumeFromPlanStep = async (stepKey: string) => {
-    if (!currentPlan) return
-    setRetryingPlanKey(stepKey)
-    try {
-      await streamPlanRequest(
-        `/api/v1/projects/${projectId}/ai/agent/plans/${currentPlan.plan_id}/steps/${stepKey}/resume-from/stream`,
-      )
-      message.success('从该步骤继续执行完成')
-    } catch (err: any) {
-      message.error(err.message || '继续执行失败')
-    } finally {
-      setRetryingPlanKey(null)
-    }
-  }
-
-  const retryAllPlanSteps = async () => {
-    if (!currentPlan) return
-    setRetryingPlanKey('__all__')
-    try {
-      await streamPlanRequest(
-        `/api/v1/projects/${projectId}/ai/agent/plans/${currentPlan.plan_id}/resume/stream`,
-      )
-      message.success('重试完成')
-    } catch (err: any) {
-      message.error(err.message || '重试失败')
-    } finally {
-      setRetryingPlanKey(null)
-    }
-  }
-
   const showStepDetail = async (stepId: string) => {
     if (!currentRun) return
     try {
@@ -904,11 +796,8 @@ function WorkspaceAssistantChat({
         : run.status === 'interrupted'
           ? '后台任务已中断，可安全重试'
           : `后台任务${RUN_STATUS_LABELS[run.status]}`
-      addRunLog({ tool: scope, status: ok ? 'ok' : run.status, message: terminalMessage })
+      addRunLog({ tool: agentRuntimeTool, status: ok ? 'ok' : run.status, message: terminalMessage })
       setRuntimeAnnouncement(terminalMessage)
-      setCurrentPlan((previous) => previous
-        ? { ...previous, status: ok ? 'completed' : 'error' }
-        : null)
       await fetchConversations()
       if (ok) await Promise.resolve(onApplied?.())
     }
@@ -923,7 +812,7 @@ function WorkspaceAssistantChat({
     if (!isCurrentExecution(execution)) return false
     if (!initialRun) {
       const missingRunMessage = '连接在任务编号返回前中断，无法自动恢复。请在任务中心查看执行结果。'
-      addRunLog({ tool: scope, status: 'error', message: missingRunMessage })
+      addRunLog({ tool: agentRuntimeTool, status: 'error', message: missingRunMessage })
       setRuntimeAnnouncement(missingRunMessage)
       updateAssistantById(execution.assistantMessageId, (item) => ({
         ...item,
@@ -937,7 +826,7 @@ function WorkspaceAssistantChat({
 
     if (announce) {
       const reconnectingMessage = '连接中断，任务仍在后台执行。正在恢复状态…'
-      addRunLog({ tool: scope, status: 'running', message: reconnectingMessage })
+      addRunLog({ tool: agentRuntimeTool, status: 'running', message: reconnectingMessage })
       setRuntimeAnnouncement(reconnectingMessage)
       updateAssistantById(execution.assistantMessageId, (item) => ({
         ...item,
@@ -963,7 +852,7 @@ function WorkspaceAssistantChat({
           const recoveryMessage = fatal
             ? `${error instanceof Error ? error.message : '恢复任务状态失败'}。请在任务中心查看结果。`
             : '多次恢复连接失败，已停止本页轮询。后台任务不受影响，请在任务中心查看。'
-          addRunLog({ tool: scope, status: 'error', message: recoveryMessage })
+          addRunLog({ tool: agentRuntimeTool, status: 'error', message: recoveryMessage })
           setRuntimeAnnouncement(recoveryMessage)
           updateAssistantById(execution.assistantMessageId, (item) => ({
             ...item,
@@ -1035,7 +924,6 @@ function WorkspaceAssistantChat({
 
   const sendMessage = async (options?: {
     text?: string
-    grantProjectAgentOnce?: boolean
     readPaths?: string[]
   }) => {
     if (generating || historyLoading) {
@@ -1076,18 +964,11 @@ function WorkspaceAssistantChat({
     }
     const grantedReadPaths = isOpenCodeCliModel ? proposedReadPaths : []
 
-    const grantProjectAgentOnce = isLocalCliModel && Boolean(
-      options?.grantProjectAgentOnce || nextCliGrant,
-    )
-    setNextCliGrant(false)
-    setCliPermissionRequest(null)
     setGenerating(true)
     cancelRequestedRef.current = false
-    setRunLogs([{ key: `${Date.now()}-start`, tool: scope, status: 'running', message: '正在提交给AI助手' }])
+    setRunLogs([{ key: `${Date.now()}-start`, tool: agentRuntimeTool, status: 'running', message: '正在提交给AI助手' }])
     setCurrentRun(null)
-    setCurrentPlan(null)
     setShowAllRunLogs(false)
-    setMatchedSkills([])
     const controller = new AbortController()
     const token = ++executionSequenceRef.current
     const execution: ActiveAssistantExecution = {
@@ -1109,7 +990,7 @@ function WorkspaceAssistantChat({
         role: 'assistant',
         content: '正在分析需求...',
         status: 'running',
-        data: createEmptyWorkspaceResponse([{ tool: scope, status: 'running', detail: 'AI 正在搜索和分析...' }]),
+        data: createEmptyWorkspaceResponse([{ tool: agentRuntimeTool, status: 'running', detail: 'AI 正在搜索和分析...' }]),
       },
     ])
     if (options?.text === undefined) setInput('')
@@ -1123,22 +1004,14 @@ function WorkspaceAssistantChat({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          scope: conversationScope,
           outline_batch_count: 3,
           message: userText,
           conversation_id: activeConversationId || undefined,
-          selected_outline_node_id: selectedOutlineNodeId || undefined,
-          selected_character_id: selectedCharacterId || undefined,
           selected_text: selectedText || undefined,
           selected_text_chapter_id: selectedTextChapterId || undefined,
           model: defaultModel || undefined,
-          assistant_mode: 'fast',
           temperature: 0.3,
           max_tokens: undefined,
-          auto_apply: true,
-          local_cli_permission_grant: grantProjectAgentOnce
-            ? 'project_agent_once'
-            : 'chat_only',
           local_cli_read_permission_grant: grantedReadPaths.length > 0 ? 'read_once' : 'none',
           local_cli_read_paths: grantedReadPaths,
           history,
@@ -1199,15 +1072,13 @@ function WorkspaceAssistantChat({
           }
         } else if (event.type === 'status') {
           const detail = event.message || '正在执行'
-          const log = { tool: event.tool || scope, status: 'running', detail, stepId: event.step_id }
+          const log = { tool: event.tool || agentRuntimeTool, status: 'running', detail, stepId: event.step_id }
           addRunLog({ tool: log.tool, status: log.status, message: detail, stepId: event.step_id })
           appendToolLog(log, `正在执行：${detail}`, execution.assistantMessageId)
         } else if (event.type === 'tool') {
           const detail = event.detail || event.message || event.tool
           const log = { tool: event.tool || 'tool', status: event.status || 'ok', detail, stepId: event.step_id }
-          if (log.tool !== 'planner') {
-            addRunLog({ tool: log.tool, status: log.status, message: `${log.tool}: ${detail}`, stepId: event.step_id })
-          }
+          addRunLog({ tool: log.tool, status: log.status, message: `${log.tool}: ${detail}`, stepId: event.step_id })
           appendToolLog(log, undefined, execution.assistantMessageId)
         } else if (event.type === 'iteration_start') {
           // silently track iteration progress
@@ -1223,92 +1094,7 @@ function WorkspaceAssistantChat({
           const status = ev.result?.status || 'ok'
           addRunLog({ tool: ev.tool, status, message: detail, stepId: ev.step_id })
           appendToolLog({ tool: ev.tool, status, detail, stepId: ev.step_id }, undefined, execution.assistantMessageId)
-        } else if (event.type === 'plan_created') {
-          const ev = event as { plan_id: string; plan_name: string; steps: Array<{ step_key: string; tool: string; status: string; label?: string }> }
-          setCurrentPlan({
-            plan_id: ev.plan_id,
-            plan_name: ev.plan_name,
-            status: 'running',
-            steps: ev.steps.map((s) => ({
-              step_key: s.step_key,
-              tool: s.tool,
-              status: (s.status as AgentPlanStepView['status']) || 'pending',
-              label: s.label,
-            })),
-          })
-          addRunLog({ tool: 'plan', status: 'running', message: `计划「${ev.plan_name}」已创建，${ev.steps.length} 个步骤` })
-        } else if (event.type === 'plan_start') {
-          setCurrentPlan((prev) => prev ? { ...prev, status: 'running' } : null)
-        } else if (event.type === 'step_start') {
-          const ev = event as { step_key: string; tool: string; attempt_no?: number }
-          setCurrentPlan((prev) => {
-            if (!prev) return null
-            return {
-              ...prev,
-              steps: prev.steps.map((s) =>
-                s.step_key === ev.step_key
-                  ? { ...s, status: 'running' as const, attempt_no: ev.attempt_no }
-                  : s
-              ),
-            }
-          })
-          addRunLog({ tool: ev.tool, status: 'running', message: `执行: ${ev.tool}` })
-        } else if (event.type === 'step_result') {
-          const ev = event as { step_key: string; tool: string; status: string; detail?: string; error?: string; data?: Record<string, unknown> }
-          setCurrentPlan((prev) => {
-            if (!prev) return null
-            return {
-              ...prev,
-              steps: prev.steps.map((s) =>
-                s.step_key === ev.step_key
-                  ? { ...s, status: (ev.status as AgentPlanStepView['status']) || 'ok', detail: ev.detail, error: ev.error }
-                  : s
-              ),
-            }
-          })
-          addRunLog({ tool: ev.tool, status: ev.status, message: ev.detail || (ev.status === 'ok' ? '完成' : '失败') })
-          appendToolLog({ tool: ev.tool, status: ev.status, detail: ev.detail, data: ev.data }, undefined, execution.assistantMessageId)
-        } else if (event.type === 'step_skip') {
-          const ev = event as { step_key: string; tool: string; status: string }
-          setCurrentPlan((prev) => {
-            if (!prev) return null
-            return {
-              ...prev,
-              steps: prev.steps.map((s) =>
-                s.step_key === ev.step_key ? { ...s, status: 'skipped' as const } : s
-              ),
-            }
-          })
-        } else if (event.type === 'step_blocked') {
-          const ev = event as { step_key: string; tool: string; detail?: string }
-          setCurrentPlan((prev) => {
-            if (!prev) return null
-            return {
-              ...prev,
-              steps: prev.steps.map((s) =>
-                s.step_key === ev.step_key
-                  ? { ...s, status: 'blocked' as const, detail: ev.detail }
-                  : s
-              ),
-            }
-          })
-        } else if (event.type === 'plan_end') {
-          const ev = event as { plan_id: string; status: string; error?: string }
-          setCurrentPlan((prev) => {
-            if (!prev) return null
-            return { ...prev, status: (ev.status as AgentPlanViewState['status']) || 'completed' }
-          })
-          addRunLog({
-            tool: 'plan',
-            status: ev.status === 'completed' ? 'ok' : 'error',
-            message: ev.status === 'completed' ? '计划执行完成' : (ev.error || '计划执行失败'),
-          })
-        } else if (event.type === 'no_plan') {
-          // No plan detected, fell back to old flow — handled by subsequent events
-        } else if (event.type === 'skills_matched') {
-          const ev = event as { skills: Array<{ name: string; description?: string; truncated?: boolean; warnings?: string[]; recommended_tools?: string[]; injected?: boolean }> }
-          setMatchedSkills(ev.skills || [])
-        } else if (event.type === 'thinking_delta') {
+        } else if (event.type === 'content_delta') {
           const ev = event as { delta: string }
           updateAssistantById(execution.assistantMessageId, (item) => ({
               ...item,
@@ -1316,12 +1102,23 @@ function WorkspaceAssistantChat({
                 ? ev.delta
                 : item.content + ev.delta,
             }))
-        } else if (event.type === 'thinking') {
-          const ev = event as { content: string; iteration: number }
-          updateAssistantById(execution.assistantMessageId, (item) => ({ ...item, content: ev.content }))
+        } else if (event.type === 'reasoning_delta') {
+          const ev = event as { delta: string }
+          updateAssistantById(execution.assistantMessageId, (item) => ({
+            ...item,
+            reasoning_content: `${item.reasoning_content || ''}${ev.delta || ''}`,
+          }))
         } else if (event.type === 'complete') {
           const payload = event.data as WorkspaceAssistantResponse
           const reply = payload.reply?.trim() || EMPTY_ASSISTANT_REPLY
+          const draftAction = [...(payload.applied_actions || [])]
+            .reverse()
+            .find((action) => generatedDraftFromAction(action, projectId) !== null)
+          const nextDraft = draftAction ? generatedDraftFromAction(draftAction, projectId) : null
+          if (nextDraft?.status === 'pending') {
+            openGeneratedDraft(nextDraft)
+            navigate(`/project/${encodeURIComponent(projectId)}`)
+          }
           completed = true
           execution.terminalHandled = true
           if (payload.run) {
@@ -1335,41 +1132,17 @@ function WorkspaceAssistantChat({
               conversation_id: payload.message?.conversation_id || item.conversation_id,
               role: 'assistant',
               content: reply,
+              reasoning_content: payload.reasoning_content || item.reasoning_content,
               status: payload.message?.status || 'completed',
               created_at: payload.message?.created_at || item.created_at,
               updated_at: payload.message?.updated_at || item.updated_at,
               data: payload,
             }))
           if (payload.message?.id) execution.assistantMessageId = payload.message.id
-          addRunLog(assistantOutcomeToRunLog(payload, scope))
+          addRunLog(assistantOutcomeToRunLog(payload, agentRuntimeTool))
           setRuntimeAnnouncement('任务已完成')
           void fetchConversations()
           Promise.resolve(onApplied?.()).catch(() => undefined)
-        } else if (event.type === 'permission_required') {
-          completed = true
-          execution.terminalHandled = true
-          const permissionMessage = event.message || '本机 CLI 需要你的授权才能继续。'
-          setCliPermissionRequest({
-            originalMessage: event.original_message || userText,
-            provider: event.provider || selectedProvider,
-            detail: event.detail || '',
-          })
-          if (event.run) {
-            execution.run = event.run as WorkspaceAssistantRun
-            setCurrentRun(event.run as WorkspaceAssistantRun)
-          }
-          updateAssistantById(execution.assistantMessageId, (item) => ({
-            ...item,
-            content: permissionMessage,
-            status: 'completed',
-          }))
-          addRunLog({
-            tool: 'cli_permission',
-            status: 'waiting_user',
-            message: '本轮未授权，等待你决定是否仅本次允许并重试',
-          })
-          setRuntimeAnnouncement('本机 CLI 正在等待你的授权决定')
-          void fetchConversations()
         } else if (event.type === 'error') {
           throw new Error(event.message || 'AI助手执行失败')
         }
@@ -1397,7 +1170,7 @@ function WorkspaceAssistantChat({
         } else {
           const failureMessage = err.message || 'AI助手执行失败'
           message.error(failureMessage)
-          addRunLog({ tool: scope, status: 'error', message: failureMessage })
+          addRunLog({ tool: agentRuntimeTool, status: 'error', message: failureMessage })
           setRuntimeAnnouncement(failureMessage)
           updateAssistantById(execution.assistantMessageId, (item) => ({ ...item, content: failureMessage, status: 'error' }))
         }
@@ -1417,7 +1190,7 @@ function WorkspaceAssistantChat({
   const modelUnavailable = !modelsLoading && modelOptions.length === 0
 
   return (
-    <section className="workspace-assistant-chat" data-testid={`${scope}-ai-chat`}>
+    <section className="workspace-assistant-chat" data-testid="project-ai-chat">
       <div className="workspace-assistant-sr-status" role="status" aria-live="polite" aria-atomic="true">
         {runtimeAnnouncement}
       </div>
@@ -1444,22 +1217,23 @@ function WorkspaceAssistantChat({
           </Space>
         </div>
         <div className="workspace-assistant-model-row">
-          <Tooltip title="这是所有项目共用的默认模型。切换不会改变已经启动的任务。">
+          <Tooltip title="这是项目助手任务的默认模型。清空后跟随全局默认；切换不会改变已经启动的任务。">
             <span className="workspace-assistant-model-label">
-              全局模型 <InfoCircleOutlined aria-hidden="true" />
+              助手模型 <InfoCircleOutlined aria-hidden="true" />
             </span>
           </Tooltip>
           <Select
-            aria-label="全局模型"
+            aria-label="项目助手模型"
             className="workspace-assistant-model-select"
             size="small"
+            allowClear
             value={defaultModel}
             options={modelOptions}
             loading={modelsLoading || modelChanging}
             disabled={modelOptions.length === 0 || modelChanging}
             placeholder={modelsLoading ? '正在读取可用模型' : '暂无可用模型'}
             popupMatchSelectWidth={false}
-            onChange={(value) => { void changeGlobalModel(value) }}
+            onChange={(value) => { void changeTaskModel(value) }}
           />
           <Tooltip title={modelOptions.length === 0 ? '前往设置并完成模型真实对话测试' : '管理模型配置'}>
             <Button
@@ -1487,98 +1261,12 @@ function WorkspaceAssistantChat({
       {isLocalCliModel && !modelUnavailable && (
         <Alert
           className="workspace-assistant-cli-permission"
-          type={nextCliGrant ? 'warning' : 'info'}
+          type="info"
           showIcon
-          message={nextCliGrant ? '下一条消息已获得单次 CLI 代理权限' : '本机 CLI 已内化到此聊天'}
-          description={nextCliGrant
-            ? (isOpenCodeCliModel
-              ? '下一条消息可使用仅限当前作品的临时 Siming MCP；发送后授权自动失效。'
-              : '发送后授权自动失效；不会修改该 CLI 的全局配置。')
-            : (isOpenCodeCliModel
-              ? '默认是隔离对话；单次授权后仅连接当前作品范围的临时 MCP。消息中出现本地路径时会另行确认，只提供临时只读快照。'
-              : '默认是隔离对话，不读取项目目录、不调用 MCP、不自动批准 CLI 权限。需要代理操作时，由你单次授权。')}
-          action={nextCliGrant ? (
-            <Button size="small" onClick={() => setNextCliGrant(false)}>取消授权</Button>
-          ) : (
-            <Button
-              size="small"
-              onClick={() => {
-                Modal.confirm({
-                  title: '仅授权下一条消息？',
-                  okText: '仅授权下一条',
-                  cancelText: '保持安全对话',
-                  content: (
-                    <div className="workspace-assistant-cli-grant-copy">
-                      {isOpenCodeCliModel ? (
-                        <>
-                          <p>OpenCode 会在隔离临时目录中启动，并直接连接只包含当前作品工具的临时 Siming MCP。</p>
-                          <p>不会向 OpenCode 暴露作品目录、Shell 或其他程序的 MCP，也不会启用全局 MCP 配置。</p>
-                        </>
-                      ) : (
-                        <>
-                          <p>该 CLI 将以当前作品目录为工作目录，并可使用已配置的 Siming MCP。</p>
-                          <p>部分 CLI 会用自动批准模式完成命令或工具调用；其系统权限仍由 CLI 自身决定。请只对你信任的任务授权。</p>
-                        </>
-                      )}
-                      <p>授权只持续这一条消息，且不会扫描或修改 CLI 的全局配置。</p>
-                    </div>
-                  ),
-                  onOk: () => setNextCliGrant(true),
-                })
-              }}
-            >
-              授权下一条代理操作
-            </Button>
-          )}
-        />
-      )}
-
-      {cliPermissionRequest && (
-        <Alert
-          className="workspace-assistant-cli-permission"
-          type="warning"
-          showIcon
-          message="CLI 请求额外权限，本轮已安全停止"
-          description={cliPermissionRequest.detail || '尚未读取项目或调用 MCP。你可以仅授权这一次并重试原请求。'}
-          action={(
-            <Space size={4}>
-              <Button size="small" onClick={() => setCliPermissionRequest(null)}>不允许</Button>
-              <Button
-                size="small"
-                type="primary"
-                onClick={() => {
-                  const request = cliPermissionRequest
-                  Modal.confirm({
-                    title: '仅本次允许并重试？',
-                    okText: '允许并重试',
-                    cancelText: '取消',
-                    content: (
-                      <div className="workspace-assistant-cli-grant-copy">
-                        {isOpenCodeCliModel ? (
-                          <>
-                            <p>OpenCode 将在隔离临时目录中重新执行原请求，并仅连接当前作品范围的临时 Siming MCP。</p>
-                            <p>不会开放项目目录或其他 MCP；授权会在本次请求结束后自动失效。</p>
-                          </>
-                        ) : (
-                          <>
-                            <p>CLI 将重新执行原请求，并可访问当前作品目录、使用已配置的 Siming MCP。</p>
-                            <p>部分 CLI 会用自动批准模式执行命令；授权会在本次请求结束后自动失效。</p>
-                          </>
-                        )}
-                        <p>司命不会因此修改该 CLI 的全局配置。</p>
-                      </div>
-                    ),
-                    onOk: () => void sendMessage({
-                      text: request.originalMessage,
-                      grantProjectAgentOnce: true,
-                    }),
-                  })
-                }}
-              >
-                仅本次允许并重试
-              </Button>
-            </Space>
-          )}
+          message="本机 CLI 已连接本轮临时 Siming MCP"
+          description={isOpenCodeCliModel
+            ? '只开放当前作品范围的工具；本地路径仍需另行确认并只提供临时只读快照。'
+            : '只开放当前作品范围的工具，启动参数已预先批准本轮 MCP；不会修改 CLI 的全局配置。'}
         />
       )}
 
@@ -1612,19 +1300,7 @@ function WorkspaceAssistantChat({
         )}
       </div>
 
-      {currentPlan && (
-        <div style={{ padding: '0 12px' }}>
-          <AgentPlanView
-            plan={currentPlan}
-            onRetryStep={retryPlanStep}
-            onResumeFromStep={resumeFromPlanStep}
-            onRetryAll={retryAllPlanSteps}
-            retryingKey={retryingPlanKey}
-          />
-        </div>
-      )}
-
-      {runLogs.length > 0 && !currentPlan && (
+      {runLogs.length > 0 && (
         <div className="workspace-assistant-run-log">
           <div className="workspace-assistant-run-log-header">
             <Space size={6}>
@@ -1676,7 +1352,10 @@ function WorkspaceAssistantChat({
               </Tag>
               {log.tool && <Text code>{log.tool}</Text>}
               <Text>{log.message}</Text>
-              {log.status === 'error' && !log.resolvedStepId && log.stepId && currentRun && (
+              {log.status === 'error' && !log.resolvedStepId && log.canRetry === false && log.retryBlockReason && (
+                <Text type="secondary">{log.retryBlockReason}</Text>
+              )}
+              {log.status === 'error' && !log.resolvedStepId && log.canRetry !== false && log.stepId && currentRun && (
                 <Space size={4}>
                   <Button
                     type="link"
@@ -1712,12 +1391,14 @@ function WorkspaceAssistantChat({
       <MessageList
         messages={displayedMessages}
         generating={generating}
-        matchedSkills={matchedSkills}
         showScrollBottom={showScrollBottom}
         onScrollToBottom={scrollToBottom}
         messagesRef={messagesRef}
         onScroll={handleMessagesScroll}
         projectId={projectId}
+        onSaveChapterDraft={saveChapterDraft}
+        activeDraftId={generatedDraft?.draftId || null}
+        activeDraftStatus={generatedDraft?.status || null}
         emptyDescription={modelUnavailable ? '模型准备好后，从这里开始第一次对话。' : undefined}
         onStorageRepaired={() => {
           onApplied?.()

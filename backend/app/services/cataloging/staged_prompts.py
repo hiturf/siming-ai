@@ -1,7 +1,6 @@
 """Prompt templates for staged project cataloging."""
 from __future__ import annotations
 
-from app.modules.assistant.infrastructure.runtime import render_prompt
 from app.prompts.cataloging_source import (
     get_candidate_resolution_rules,
     get_cataloging_candidate_schema,
@@ -25,9 +24,6 @@ CATALOGING_RESOLUTION_SYSTEM_PROMPT = "\n\n".join([
     get_cataloging_candidate_schema(),
 ])
 
-CATALOGING_MERGED_SYSTEM_PROMPT = render_prompt("continuity.cataloging.merged")
-
-
 def build_fact_extraction_prompt(chapter_title: str, chapter_content: str) -> str:
     return f"""当前章节标题：
 {chapter_title}
@@ -48,32 +44,4 @@ def build_resolution_prompt(facts_jsonl: str, context_json: str, chapter_title: 
 相关旧资料与索引：
 {context_json}
 
-请基于“事实 + 相关旧资料”输出最终候选 JSONL。第一行必须用必填骨架对象同时给出 chapter_summary 和 chapter_outline，不得只返回摘要后结束。旧资料是紧凑上下文，只有命中内容才展开；不要因为索引里出现名称就强行更新。"""
-def build_merged_cataloging_prompt(
-    *,
-    chapter_title: str,
-    chapter_content: str,
-    context_json: str,
-    chapter_file: str = "",
-    project_folder: str = "",
-    use_file_references: bool = False,
-) -> str:
-    if use_file_references:
-        return f"""当前章节标题：{chapter_title}
-
-当前章节 UTF-8 文件：{chapter_file}
-项目镜像目录：{project_folder}
-
-请直接读取章节文件，并读取项目镜像中的 characters/、worldbuilding/、outline/、summaries/ 等已有档案文件。不要要求系统把正文或档案重新粘贴进提示词。
-
-请按系统规则直接输出候选 JSONL：第一行必须同时包含 chapter_summary 和 chapter_outline，不得只返回摘要后结束；随后输出 character_create/update/state_update、character_relationship、worldbuilding_create/update/timeline、chapter_link 等。
-禁止输出 fact JSONL。"""
-    return f"""当前章节标题：{chapter_title}
-
-当前章节正文：
-{chapter_content}
-
-已有角色、世界观、大纲和近期摘要上下文：
-{context_json}
-
-请按系统规则直接输出候选 JSONL。第一行必须同时包含 chapter_summary 和 chapter_outline，不得只返回摘要后结束。禁止输出 fact JSONL。"""
+请基于“事实 + 相关旧资料”输出最终候选 JSONL。首次生成时，第一行必须用必填骨架对象同时给出 chapter_summary 和 chapter_outline，不得只返回摘要后结束；增量修复时只补校验明确指出的缺失或失败候选。旧资料是紧凑上下文，只有命中内容才展开；不要因为索引里出现名称就强行更新。"""

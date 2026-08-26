@@ -1,9 +1,8 @@
 {
-  "legacy_page_api_imports": 22,
-  "legacy_page_use_effect_calls": 49,
+  "legacy_page_api_imports": 19,
+  "legacy_page_use_effect_calls": 44,
   "oversized_pages": {
-    "SettingsPage.tsx": 1486,
-    "NovelCreationWizardPage.tsx": 1351,
+    "NovelCreationWizardPage.tsx": 1031,
     "DeconstructPage.tsx": 1271
   }
 }

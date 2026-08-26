@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClientProvider } from '@tanstack/react-query'
 import { createSimingQueryClient } from '../shared/query/client'
@@ -55,6 +55,86 @@ describe('GettingStartedPanel', () => {
     expect(screen.getByText(/逐个真实测试/)).toBeInTheDocument()
     expect(api.post).toHaveBeenCalledWith('/config/getting-started/opencode/activate', { preferred_model: null })
     expect(screen.queryByText(/先安装 Node.js/)).not.toBeInTheDocument()
+  })
+
+  it('asks before adding a newly installed managed OpenCode to the current-user PATH', async () => {
+    const pathIntegration = {
+      supported: true,
+      managed_install: true,
+      configured: false,
+      directory: String.raw`C:\Users\writer\AppData\Local\Siming\managed-cli\opencode\bin`,
+      scope: 'user',
+      requires_new_terminal: true,
+    }
+    api.get.mockResolvedValue({ data: { data: {
+      ...baseStatus,
+      activation_job: {
+        id: 'job-installed',
+        status: 'running',
+        phase: 'discovering_models',
+        percent: 88,
+        message: '已找到当前可免费使用的模型',
+        command: `${pathIntegration.directory}\\opencode.exe`,
+        free_models: [],
+        path_integration: pathIntegration,
+      },
+    } } })
+    api.put.mockResolvedValue({ data: { data: {
+      ...pathIntegration,
+      configured: true,
+      changed: true,
+    } } })
+
+    renderPanel()
+
+    expect((await screen.findAllByText('OpenCode 已安装，要加入 PATH 吗？')).length).toBeGreaterThan(0)
+    expect(screen.getByText(/只修改当前 Windows 用户，不需要管理员权限/)).toBeInTheDocument()
+    expect(screen.getByText(/不添加也不影响司命继续使用 OpenCode/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '添加到 PATH' }))
+
+    await waitFor(() => expect(api.put).toHaveBeenCalledWith(
+      '/config/getting-started/opencode/path',
+      { enabled: true },
+    ))
+    expect(await screen.findByText(/请打开一个新终端后运行 opencode/)).toBeInTheDocument()
+  })
+
+  it('keeps a later PATH action on the ready screen when the install prompt was skipped', async () => {
+    const pathIntegration = {
+      supported: true,
+      managed_install: true,
+      configured: false,
+      directory: String.raw`C:\Users\writer\AppData\Local\Siming\managed-cli\opencode\bin`,
+      scope: 'user',
+      requires_new_terminal: true,
+    }
+    api.get.mockResolvedValue({ data: { data: {
+      ...baseStatus,
+      needs_setup: false,
+      configured: true,
+      is_global_default: true,
+      has_usable_models: true,
+      global_model: { provider: 'opencode_cli', model: 'opencode/free-model' },
+      opencode_mcp_configured: true,
+      path_integration: pathIntegration,
+    } } })
+    api.put.mockResolvedValue({ data: { data: {
+      ...pathIntegration,
+      configured: true,
+      changed: true,
+    } } })
+
+    renderPanel()
+
+    const noticeTitle = await screen.findByText('需要在终端直接启动 OpenCode？')
+    const notice = noticeTitle.closest('.ant-alert')
+    expect(notice).not.toBeNull()
+    fireEvent.click(within(notice as HTMLElement).getByRole('button', { name: '添加到 PATH' }))
+
+    await waitFor(() => expect(api.put).toHaveBeenCalledWith(
+      '/config/getting-started/opencode/path',
+      { enabled: true },
+    ))
   })
 
   it('offers MCP setup for ready OpenCode and shows the first-idea prompt after verification', async () => {

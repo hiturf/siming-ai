@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any
 from urllib import error as urllib_error
+from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 from .core.legacy_env import compatible_env_enabled, get_compatible_env
@@ -103,19 +104,22 @@ def _github_token() -> str | None:
     )
 
 
-def _request_headers() -> dict[str, str]:
+def _request_headers(url: str = "") -> dict[str, str]:
     headers = {
-        "Accept": "application/vnd.github+json",
         "User-Agent": USER_AGENT,
     }
-    token = _github_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    hostname = (urllib_parse.urlparse(url).hostname or "").lower()
+    if hostname == "api.github.com":
+        headers["Accept"] = "application/vnd.github+json"
+    if hostname in {"api.github.com", "github.com"}:
+        token = _github_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
     return headers
 
 
 def _request(url: str, timeout: float = 8.0) -> bytes:
-    request = urllib_request.Request(url, headers=_request_headers())
+    request = urllib_request.Request(url, headers=_request_headers(url))
     with urllib_request.urlopen(request, timeout=timeout) as response:
         return response.read()
 
@@ -269,7 +273,7 @@ def _expected_sha256(manifest: dict[str, Any]) -> str:
 
 
 def _download_to_file(url: str, target: Path, timeout: float = 120) -> None:
-    request = urllib_request.Request(url, headers=_request_headers())
+    request = urllib_request.Request(url, headers=_request_headers(url))
     with urllib_request.urlopen(request, timeout=timeout) as response, target.open("wb") as file:
         while True:
             chunk = response.read(1024 * 1024)

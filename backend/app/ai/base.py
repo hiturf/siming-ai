@@ -19,6 +19,10 @@ class BaseAdapter(ABC):
         self.cli_command = cli_command
         self.cli_args = cli_args
         self.api_protocol = api_protocol
+        # Text streams keep their public ``str``-only contract. Adapters expose
+        # terminal metadata here so the gateway can resume a token-limit stop
+        # without leaking control frames to callers.
+        self.last_stream_finish_reason: str | None = None
 
     @abstractmethod
     async def chat_completion(

@@ -346,6 +346,36 @@ def test_responses_stream_maps_text_tool_calls_and_done_metadata():
     assert done["provider_state"][0]["encrypted_content"] == "encrypted-state"
 
 
+def test_responses_stream_preserves_incomplete_terminal_state_for_gateway_resume():
+    async def stream_events():
+        yield SimpleNamespace(type="response.output_text.delta", delta="partial")
+        yield SimpleNamespace(
+            type="response.incomplete",
+            response=SimpleNamespace(status="incomplete", usage=None, output=[]),
+        )
+
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=stream_events())
+
+    async def collect():
+        adapter = OpenAIAdapter(
+            api_key="secret",
+            base_url="https://proxy.example/codex",
+            api_protocol="responses",
+        )
+        return [chunk async for chunk in adapter.stream_chat_completion_with_tools(
+            messages=[{"role": "user", "content": "work"}],
+            model="gpt-test",
+        )]
+
+    with patch("app.ai.openai_adapter.AsyncOpenAI", return_value=client):
+        chunks = asyncio.run(collect())
+
+    assert chunks[0] == {"type": "content_delta", "delta": "partial"}
+    assert chunks[-1]["type"] == "done"
+    assert chunks[-1]["finish_reason"] == "incomplete"
+
+
 def test_chat_streams_ignore_empty_choice_chunks_and_keep_usage():
     usage = SimpleNamespace(prompt_tokens=3, completion_tokens=2, total_tokens=5)
 

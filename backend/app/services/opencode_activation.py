@@ -15,9 +15,9 @@ from app.ai.local_cli_adapter import (
 )
 from app.architecture.uow import commit_session
 from app.services.model_readiness import (
-    mark_model_failure,
     mark_model_ready,
-    mark_model_unavailable,
+    mark_model_verification_failure,
+    mark_model_verification_unavailable,
 )
 
 
@@ -79,9 +79,17 @@ def save_readiness_failure(message: str, *, unavailable_fallback: bool = False) 
         with SessionLocal() as db:
             config = db.query(APIConfig).filter(APIConfig.provider == "opencode_cli").first()
             if config:
-                changed = mark_model_failure(config, message, source="opencode_activation")
+                changed = mark_model_verification_failure(
+                    config,
+                    message,
+                    source="opencode_activation",
+                )
                 if not changed and unavailable_fallback:
-                    mark_model_unavailable(config, message, source="opencode_activation")
+                    mark_model_verification_unavailable(
+                        config,
+                        message,
+                        source="opencode_activation",
+                    )
                     changed = True
                 if changed:
                     commit_session(db)

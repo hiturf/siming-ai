@@ -2,7 +2,6 @@
 from .constants import (
     CHAPTER_CHUNK_THRESHOLD,
     CHAPTER_SUB_CHUNK_SIZE,
-    CHEAP_MODEL_BY_PROVIDER,
     CHUNK_SIZE,
     DEFAULT_MAP_CONCURRENCY,
     FINAL_OUTPUT_ARRAY_MAX_ITEMS,
@@ -55,9 +54,6 @@ from .map_reduce import (
 )
 from .model_selection import (
     analysis_mode_from_payload,
-    cheapest_model_for,
-    configured_model_for_provider,
-    default_configured_model,
     limits_info_for,
     map_concurrency_from_payload,
     map_output_limit_for,
@@ -126,7 +122,6 @@ __all__ = [
     "REDUCE_BRIEF_MIN_CHARS_PER_CHUNK",
     "REDUCE_BRIEF_MAX_CHARS_PER_CHUNK",
     "FINAL_OUTPUT_ARRAY_MAX_ITEMS",
-    "CHEAP_MODEL_BY_PROVIDER",
     "REDUCE_INPUT_PROFILES",
     "REDUCE_SECTION_SOURCE_FIELDS",
     "WORLD_DIMENSIONS",
@@ -134,10 +129,7 @@ __all__ = [
     "module_options_from_payload",
     "map_concurrency_from_payload",
     "analysis_mode_from_payload",
-    "configured_model_for_provider",
     "provider_from_model",
-    "cheapest_model_for",
-    "default_configured_model",
     "models_from_payload",
     "model_limits_for",
     "model_output_limit_for",

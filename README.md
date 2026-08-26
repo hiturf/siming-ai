@@ -48,15 +48,15 @@ Siming is a free and open-source, local-first AI workspace for planning, writing
 
 ### 2. 点击“准备 AI 并开始构思”
 
-没有任何模型配置时，司命会为 Windows 自动下载、校验并测试 OpenCode，整个过程都在图形界面里完成。测试通过后才会把模型标记为可用。
+没有任何模型配置时，司命会为 Windows 自动下载、校验并测试 OpenCode，整个过程都在图形界面里完成。OpenCode 安装完成后，司命会询问是否将其目录添加到当前用户 PATH；这是可选操作，不需要管理员权限，添加后可在新打开的终端中直接运行 `opencode`。测试通过后才会把模型标记为可用。
 
-免费方案当前使用 OpenCode 提供的免费开源模型 DeepSeek V4 Flash，运行时会显示完整模型 ID：
+司命会读取 OpenCode CLI 当前公布的模型列表，优先选择仍然可用的免费模型。当前内置回退推荐为 Big Pickle，运行时会显示完整模型 ID：
 
 ```text
-opencode_cli:opencode/deepseek-v4-flash-free
+opencode_cli:opencode/big-pickle
 ```
 
-免费模型、额度与数据政策由对应服务提供方决定，可能随时调整。若实际模型发生切换，司命会在运行记录中明确显示；更多高质量模型仍需前往相应模型官网自行订阅。
+免费模型、额度与数据政策由对应服务提供方决定，可能随时调整。若内置推荐不在本机 CLI 的实时列表中，司命会改选当前可用的免费模型，并在运行记录中明确显示实际模型；更多高质量模型仍需前往相应模型官网自行订阅。
 
 ### 3. 说一句故事想法
 
@@ -109,7 +109,7 @@ docker compose -f compose.gateway.yml up -d
 
 ## 模型与隐私
 
-司命可以使用 OpenAI、Anthropic Claude、DeepSeek、Google Gemini、通义千问、OpenAI 兼容中转站，也可以调用 Claude Code、Codex、OpenCode 等本机 CLI。仅“检测到命令”不等于可用；只有完成真实对话测试的模型才会进入新书、助手和写作流程。
+司命可以使用 OpenAI、Anthropic Claude、DeepSeek、Google Gemini、通义千问、OpenAI 兼容中转站，也可以调用 Claude Code、Codex、OpenCode、DeepSeek Harness（DSH）等本机 CLI。仅“检测到命令”不等于可用；只有完成真实对话测试的模型才会进入新书、助手和写作流程。
 
 - 作品数据库、文件镜像、快照和任务记录保存在你选择的本机目录。
 - 司命不会自主把整个作品库上传到项目服务器。
@@ -120,7 +120,7 @@ docker compose -f compose.gateway.yml up -d
 
 ## 下载与信任
 
-Windows 正式下载资产现在以 `Siming-Setup.exe` 为主，`Siming.exe` 仅保留为历史单文件客户端的兼容升级桥。应用内安装包更新要求 SHA-256 与发布校验值一致，并通过可信 Windows Authenticode 签名校验；未签名发布只能供用户主动下载和手动安装，安全更新器不会静默放宽这一要求。
+Windows 正式下载资产只有 `Siming-Setup.exe` 及其 `Siming-Setup.sha256`。应用内更新会同时查询 GitHub 官方 Releases 与 Gitee 同步镜像；发现同一版本后由用户明确选择本次下载源，并始终要求 SHA-256 与发布校验值一致。项目尚未配置 Windows 代码签名证书，因此当前阶段暂不强制 Authenticode 校验；取得证书后会恢复签名与时间戳验证。
 
 为减少供应链风险：
 
@@ -128,7 +128,7 @@ Windows 正式下载资产现在以 `Siming-Setup.exe` 为主，`Siming.exe` 仅
 2. 下载同一版本的 `Siming-Setup.sha256`，用 `certutil -hashfile Siming-Setup.exe SHA256` 计算文件哈希并与其对照。
 3. 不要使用网盘、聊天群或第三方网站二次分发的安装包或 EXE。
 
-Windows Release 同时保留 `Siming-Setup.exe`、`Siming-Setup.sha256`、`Siming.exe`、`update.json`、`sha256.txt`；Android 提供 `Siming.apk` 与 `Siming-apk-sha256.txt`。旧单 EXE 用户收到兼容更新后，会由新更新器引导迁移到可选择安装目录的安装版；安装完成后的后续更新则使用已验证安装包覆盖原安装目录。
+Windows Release 提供 `Siming-Setup.exe` 与 `Siming-Setup.sha256`；Android 提供 `Siming.apk` 与 `Siming-apk-sha256.txt`。旧单 EXE 用户可以直接运行当前安装包迁移，原有数据目录不会被删除。
 
 ## 外部 Agent 与提示词投稿
 
@@ -174,7 +174,7 @@ cd mobile\android
 .\gradlew.bat testDebugUnitTest lintDebug assembleDebug
 ```
 
-本地桌面完整打包使用 `.\build-installer.bat`；只构建历史兼容单 EXE 可使用 `.\build-exe.bat`。签名 APK 使用 `.\scripts\build-android-release.ps1`（签名凭据只通过环境变量提供）。提交代码、文档、可复现问题或者通过 GUI 生成的提示词投稿都很欢迎。
+本地桌面完整打包使用 `.\build-installer.bat`；`.\build-exe.bat` 只用于开发排障，不是发布入口。签名 APK 使用 `.\scripts\build-android-release.ps1`（签名凭据只通过环境变量提供）。提交代码、文档、可复现问题或者通过 GUI 生成的提示词投稿都很欢迎。
 
 ## 路线图与许可证
 

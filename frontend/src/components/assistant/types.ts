@@ -1,8 +1,5 @@
 /* Shared types for the assistant chat system. */
 
-export type WorkspaceAssistantScope = 'outline' | 'characters' | 'worldbuilding' | 'project'
-export type WorkspaceAssistantMode = 'fast' | 'quality'
-
 export interface ApiResponse<T> {
   code: number
   message: string
@@ -46,6 +43,7 @@ export interface WorkspaceAssistantConversation {
 
 export interface WorkspaceAssistantResponse {
   reply: string
+  reasoning_content?: string
   outcome?: WorkspaceAssistantOutcome
   actions?: WorkspaceAction[]
   applied_actions?: WorkspaceToolLog[]
@@ -68,6 +66,7 @@ export interface WorkspaceAssistantMessage {
   conversation_id?: string
   role: 'user' | 'assistant'
   content: string
+  reasoning_content?: string
   status?: string
   created_at?: string
   updated_at?: string
@@ -95,6 +94,8 @@ export interface WorkspaceRunLog {
   attemptNo?: number
   retryOfStepId?: string | null
   resolvedStepId?: string | null
+  canRetry?: boolean
+  retryBlockReason?: string | null
 }
 
 export type WorkspaceAssistantRunStatus =
@@ -127,6 +128,8 @@ export interface WorkspaceAssistantRunStep {
   status?: string | null
   detail?: string | null
   error?: string | null
+  can_retry?: boolean
+  retry_block_reason?: string | null
 }
 
 export interface WorkspaceAssistantRunDetail {
@@ -142,26 +145,14 @@ export interface WorkspaceAssistantModelOption {
 
 export interface WorkspaceAssistantChatProps {
   projectId: string
-  scope: WorkspaceAssistantScope
-  selectedOutlineNodeId?: string | null
-  selectedCharacterId?: string | null
   selectedText?: string
   selectedTextChapterId?: string | null
   defaultModel?: string
   modelOptions?: WorkspaceAssistantModelOption[]
   modelsLoading?: boolean
-  onGlobalModelChange?: (model: string) => Promise<unknown>
+  onTaskModelChange?: (model?: string) => Promise<unknown>
   onManageModels?: () => void
   onApplied?: () => void | Promise<void>
-}
-
-export interface SkillMatch {
-  name: string
-  description?: string
-  truncated?: boolean
-  warnings?: string[]
-  recommended_tools?: string[]
-  injected?: boolean
 }
 
 export interface StepDetail {

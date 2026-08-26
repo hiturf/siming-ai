@@ -14,8 +14,8 @@ class ContinuityPromptService:
     def __init__(self, renderer: PromptRenderer) -> None:
         self._renderer = renderer
 
-    def render_merged_cataloging(self) -> str:
-        return self._renderer.render("continuity.cataloging.merged")
+    def render_cataloging_candidates(self) -> str:
+        return self._renderer.render("continuity.cataloging.candidates")
 
     def render_external_cataloging(self) -> str:
         return self._renderer.render("continuity.cataloging.external")

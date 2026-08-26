@@ -1,13 +1,13 @@
 """End-to-end test for external writing without Siming API.
 
-Proves external agents can write a chapter without any Siming model API.
-Monkeypatches all LLM gateway calls to fail.
+Proves external agents can prepare context and produce one terminal unsaved draft
+without any Siming model API.
 """
 import asyncio
 import sys
 import os
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -15,147 +15,78 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 class ExternalWritingNoApiE2ETest(unittest.TestCase):
     """Verify the complete external writing flow without LLM API."""
 
-    def test_full_no_api_workflow(self):
-        """Test the complete workflow with mocked DB."""
+    def test_full_no_api_workflow_stops_at_unsaved_draft(self):
+        """The external writing turn prepares context, stores one draft, and stops."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from app.database.models import Base, CatalogingJob, Chapter, OutlineNode, Project
         from app.services.workspace.tools.external_writing import (
             prepare_external_writing_context,
             save_external_chapter_draft,
-            record_external_quality_review,
         )
-
-        # Mock project
-        project = MagicMock()
-        project.id = "p1"
-        project.title = "Test Novel"
-        project.writing_style = "natural"
-        project.forbidden_sentence_patterns = "仿佛\n不由得"
-        project.narrative_perspective = "third_person"
-
-        # Mock character
-        char = MagicMock()
-        char.id = "c1"
-        char.name = "Hero"
-        char.role_type = "protagonist"
-        char.personality = "Brave"
-        char.current_location = "Castle"
-        char.current_goal = "Save world"
-        char.life_status = "alive"
-
-        # Mock worldbuilding
-        wb = MagicMock()
-        wb.id = "w1"
-        wb.title = "Magic System"
-        wb.dimension = "power_system"
-        wb.content = "Magic requires mana"
-
-        # Mock prompt pack
-        pack = MagicMock()
-        pack.pack_id = "chapter_writing_quality"
-        pack.version = "1.0.0"
-        pack.title = "Quality Writing"
-        pack.system_prompt = "Write well..."
-        pack.workflow_json = [{"step": 1}]
-        pack.quality_rubric_json = {"dimensions": [{"name": "opening_hook", "max_score": 10}]}
-        pack.forbidden_patterns_json = ["仿佛"]
-
-        def query_side_effect(model):
-            q = MagicMock()
-            q.filter.return_value = q
-            q.order_by.return_value = q
-            q.limit.return_value = q
-            model_name = model.__name__ if hasattr(model, '__name__') else str(model)
-            if "Project" in model_name:
-                q.first.return_value = project
-            elif "PublicPromptPack" in model_name:
-                q.first.return_value = pack
-            elif "Character" in model_name and "Relationship" not in model_name:
-                q.all.return_value = [char]
-            elif "WorldbuildingEntry" in model_name:
-                q.all.return_value = [wb]
-            elif "Chapter" in model_name:
-                q.all.return_value = []
-            elif "CharacterRelationship" in model_name:
-                q.all.return_value = []
-            elif "OutlineNode" in model_name:
-                q.first.return_value = None
-            else:
-                q.first.return_value = None
-                q.all.return_value = []
-            return q
-
-        db = MagicMock()
-        db.query.side_effect = query_side_effect
-
-        # Step 1: Prepare context (no LLM call)
-        ctx_result = asyncio.run(prepare_external_writing_context(db, "p1", {"mode": "quality"}))
-        self.assertEqual(ctx_result["status"], "ok")
-        self.assertIn("prompt_pack", ctx_result["data"])
-        self.assertIn("characters", ctx_result["data"])
-        self.assertIn("worldbuilding", ctx_result["data"])
-
-        # Step 2: Save draft (no LLM call)
-        with patch("app.services.workspace.generated_drafts.store_chapter_draft", return_value="draft-e2e"):
-            draft_result = asyncio.run(save_external_chapter_draft(db, "p1", {
-                "content": "The rain fell on the battlefield. Hero drew his sword.",
-                "title": "Chapter 1: The Battle",
-                "source_agent": "claude-code",
-            }))
-        self.assertEqual(draft_result["status"], "ok")
-        self.assertEqual(draft_result["data"]["draft_id"], "draft-e2e")
-
-        # Step 3: Record quality review (no LLM call)
-        review_result = asyncio.run(record_external_quality_review(db, "p1", {
-            "draft_id": "draft-e2e",
-            "scores": {"opening_hook": 8, "plot_progression": 7},
-            "issues": [],
-            "pass": True,
-            "reviewer_model": "claude-sonnet-4-6",
-        }))
-        self.assertEqual(review_result["status"], "ok")
-        self.assertIn("PASS", review_result["detail"])
-
-        # Step 4: Create the same durable cataloging job used by the cataloging
-        # page without selecting or calling an internal model.
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        from app.database.models import Base, Chapter, CatalogingChapterRun, OutlineNode, Project
-        from app.services.cataloging.launcher import create_and_queue_cataloging_job
 
         engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
         Base.metadata.create_all(engine)
-        Session = sessionmaker(bind=engine)
-        real_db = Session()
-        real_db.add_all([
-            Project(id="p1", title="Test Novel"),
-            OutlineNode(id="o1", project_id="p1", title="第1章 战场", node_type="chapter", summary="Hero上战场。"),
-            Chapter(
-                id="ch-e2e",
-                project_id="p1",
-                outline_node_id="o1",
-                title="第1章 战场",
-                content="The rain fell on the battlefield. Hero drew his sword.",
-            ),
-        ])
-        real_db.commit()
+        db = sessionmaker(bind=engine)()
         try:
-            job, launch = create_and_queue_cataloging_job(
-                real_db,
-                "p1",
-                ["ch-e2e"],
-                backend_override="external_agent",
-                trigger_source="chapter_write",
-                run_now=True,
+            project = Project(
+                id="p1",
+                title="Test Novel",
+                writing_style="natural",
+                narrative_perspective="third_person",
             )
-            self.assertEqual(job.execution_backend, "external_agent")
-            self.assertIsNone(job.model)
-            self.assertFalse(launch["worker_queued"])
-            self.assertEqual(launch["next_action"], "continue_external_cataloging")
-            chapter_run = real_db.query(CatalogingChapterRun).filter(
-                CatalogingChapterRun.job_id == job.id,
-            ).one()
-            self.assertEqual(chapter_run.chapter_id, "ch-e2e")
+            outline = OutlineNode(
+                id="o1",
+                project_id=project.id,
+                title="Chapter 1: The Battle",
+                node_type="chapter",
+                summary="Hero enters the battlefield.",
+            )
+            db.add_all([project, outline])
+            db.commit()
+
+            context_result = asyncio.run(
+                prepare_external_writing_context(
+                    db,
+                    project.id,
+                    {"outline_node_id": outline.id},
+                )
+            )
+            self.assertEqual(context_result["status"], "ok")
+            manifest_id = context_result["data"]["context_manifest_id"]
+            self.assertTrue(manifest_id)
+            self.assertIn("Governed Task Context", context_result["data"]["writing_context"])
+
+            with patch(
+                "app.services.workspace.generated_drafts.store_chapter_draft",
+                return_value="draft-e2e",
+            ):
+                draft_result = asyncio.run(
+                    save_external_chapter_draft(
+                        db,
+                        project.id,
+                        {
+                            "content": "The rain fell on the battlefield. Hero drew his sword.",
+                            "outline_node_id": outline.id,
+                            "context_manifest_id": manifest_id,
+                            "source_agent": "claude-code",
+                            "_context_execution_route": "external_mcp",
+                        },
+                    )
+                )
+
+            self.assertEqual(draft_result["status"], "ok")
+            self.assertEqual(draft_result["data"]["draft_id"], "draft-e2e")
+            self.assertTrue(draft_result["turn_terminal"])
+            self.assertEqual(
+                draft_result["data"]["next_actions"],
+                ["save_and_catalog", "save_only"],
+            )
+            self.assertEqual(db.query(Chapter).count(), 0)
+            self.assertEqual(db.query(CatalogingJob).count(), 0)
         finally:
-            real_db.close()
+            db.close()
             Base.metadata.drop_all(engine)
             engine.dispose()
 

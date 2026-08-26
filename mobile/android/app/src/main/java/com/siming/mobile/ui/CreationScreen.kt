@@ -128,6 +128,8 @@ internal fun CreationScreen(
             stages = stages,
             running = ui.creationRunning,
             activity = ui.creationActivity,
+            replyDelta = ui.creationReplyDelta,
+            progressEvents = ui.creationProgressEvents,
             onBack = viewModel::closeCreation,
             onOpenDossier = { showDossier = true },
             onSend = { message -> viewModel.sendCreationMessage(active.string("id"), message) },

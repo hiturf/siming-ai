@@ -1,7 +1,6 @@
 """Author-owned constraints and stage-output validation for V3 creation."""
 from __future__ import annotations
 
-import re
 from copy import deepcopy
 from typing import Any
 
@@ -9,13 +8,6 @@ from app.services.novel_creation_contract import (
     LEGACY_OPENING_OUTLINE_CHAPTER_COUNT,
     OPENING_OUTLINE_CHAPTER_COUNT,
 )
-from app.services.novel_creation_values import requested_volume_count as _requested_volume_count
-
-
-class AuthorLockViolation(ValueError):
-    """The model removed or rewrote an author-owned immutable requirement."""
-
-
 _WORLD_STYLE_TEXT_FIELDS = ("writing_style", "world_tone", "story_structure", "pacing")
 _AUTHOR_FIELD_LABELS = {
     "writing_style": "正文风格",
@@ -154,10 +146,7 @@ def _validate_stage(stage: str, data: dict[str, Any]) -> None:
         raise ValueError("模型只返回了运行状态，没有返回可用的阶段正文")
     if stage == "concepts":
         options = data.get("options")
-        expected_count = len(options) if isinstance(options, list) else 0
-        if expected_count not in {1, 3}:
-            raise ValueError("创意方向必须包含一张作者方案或三张探索方案")
-        _validate_compact_concepts(options, expected_count=expected_count)
+        _validate_compact_concepts(options)
     if stage == "world_style":
         invalid = [
             _AUTHOR_FIELD_LABELS[field]
@@ -264,12 +253,9 @@ def _validate_opening_outline(data: dict[str, Any]) -> None:
 
 def _validate_compact_concepts(
     concepts: Any,
-    *,
-    expected_count: int = 1,
 ) -> list[dict[str, Any]]:
-    if not isinstance(concepts, list) or len(concepts) != expected_count:
-        label = "作者方案" if expected_count == 1 else "轻量创意卡"
-        raise ValueError(f"模型必须一次返回恰好{expected_count}张{label}")
+    if not isinstance(concepts, list) or not concepts:
+        raise ValueError("创意方向没有可用的方案卡")
     required = ("title", "logline", "world_hook", "core_conflict", "opening_hook")
     cards: list[dict[str, Any]] = []
     titles: set[str] = set()
@@ -303,219 +289,3 @@ def _author_context(draft: dict[str, Any]) -> dict[str, Any]:
             _text(item) for item in (draft.get("locked_requirements") or []) if _text(item)
         ],
     }
-
-
-def _lock_text(value: Any) -> str:
-    return re.sub(
-        r"[\s，。；：、,.!?！？;:‘’“”\"'（）()《》〈〉【】\[\]]+",
-        "",
-        _author_text(value),
-    ).casefold()
-
-
-def _locked_anchors(requirement: str) -> list[str]:
-    requirement = _text(requirement)
-    if not requirement:
-        return []
-    anchors: list[str] = []
-    anchors.extend(re.findall(r"[“\"「『]([^”\"」』]{2,40})[”\"」』]", requirement))
-    if "：" in requirement or ":" in requirement:
-        tail = re.split(r"[：:]", requirement, maxsplit=1)[-1]
-        if 2 <= len(_text(tail)) <= 80:
-            anchors.append(_text(tail))
-    match = re.search(r"^(.{2,20}?)(?:必须|不得|不可|不能)", requirement)
-    if match:
-        subject = _text(match.group(1)).strip("，。；：: ")
-        if subject not in {"全书", "故事", "作品", "设定", "核心设定", "结局", "主角", "角色"}:
-            anchors.append(subject)
-    match = re.search(
-        r"(?:必须(?:保留|叫|名为|是|为|包含|采用)?|不得(?:删除|改写|修改|更名)?|"
-        r"不可(?:删除|改写|修改|更名)?|不能(?:删除|改写|修改|更名)?|保留)\s*(.{2,80})$",
-        requirement,
-    )
-    if match:
-        value = re.sub(
-            r"(?:不得|不可|不能)?(?:删除|改写|修改|更名|改变)$",
-            "",
-            match.group(1),
-        ).strip("，。；：: ")
-        if value and not re.fullmatch(r"[0-9０-９零〇一二两三四五六七八九十百]+卷", value):
-            anchors.append(value)
-    unique: list[str] = []
-    for anchor in anchors:
-        normalized = _lock_text(anchor)
-        if len(normalized) >= 2 and normalized not in {_lock_text(item) for item in unique}:
-            unique.append(_text(anchor))
-    return unique
-
-
-def _semantic_region(value: Any, fields: tuple[str, ...]) -> str:
-    if not isinstance(value, dict):
-        return ""
-    return _lock_text({field: value.get(field) for field in fields if field in value})
-
-
-def _stage_semantic_regions(stage: str, data: dict[str, Any]) -> list[str]:
-    """Return only author-facing semantic fields, grouped by their entity."""
-    regions: list[str] = []
-    if stage == "concepts":
-        options = data.get("options") if isinstance(data.get("options"), list) else []
-        for option in options:
-            if not isinstance(option, dict):
-                continue
-            protagonist = option.get("protagonist_seed")
-            regions.append(_semantic_region(
-                protagonist,
-                ("name", "identity", "goal", "lack", "background", "motivation"),
-            ))
-            regions.append(_semantic_region(
-                option,
-                (
-                    "title", "logline", "world_hook", "core_conflict",
-                    "story_engine", "opening_hook",
-                ),
-            ))
-    elif stage == "characters":
-        for character in data.get("characters") or []:
-            regions.append(_semantic_region(
-                character,
-                (
-                    "name", "identity", "role_type", "goal", "current_goal",
-                    "background", "personality", "description", "profile",
-                ),
-            ))
-        for relationship in data.get("relationships") or []:
-            regions.append(_semantic_region(
-                relationship,
-                (
-                    "source", "target", "source_name", "target_name",
-                    "relationship_type", "relation_type", "description",
-                ),
-            ))
-    elif stage == "world_style":
-        regions.append(_semantic_region(
-            data,
-            (
-                "writing_style", "world_tone", "story_structure", "pacing",
-                "style_rules", "forbidden_patterns",
-            ),
-        ))
-        for entry in data.get("worldbuilding") or []:
-            regions.append(_semantic_region(
-                entry,
-                ("title", "dimension", "content", "description", "rules", "summary"),
-            ))
-    elif stage == "locations":
-        for entry in data.get("entries") or []:
-            regions.append(_semantic_region(
-                entry,
-                ("title", "dimension", "content", "description", "rules", "summary"),
-            ))
-        for relationship in data.get("relations") or []:
-            regions.append(_semantic_region(
-                relationship,
-                ("source_title", "target_title", "relation_type", "description"),
-            ))
-    elif stage == "macro_outline":
-        regions.append(_semantic_region(
-            data,
-            ("story_overview", "core_conflict", "ending_direction", "stage_plan"),
-        ))
-        for volume in data.get("volumes") or []:
-            regions.append(_semantic_region(
-                volume,
-                ("title", "summary", "core_conflict", "ending", "goal"),
-            ))
-    elif stage == "opening_outline":
-        for chapter in data.get("chapters") or []:
-            regions.append(_semantic_region(
-                chapter,
-                ("title", "summary", "goal", "hook", "chapter_number", "description"),
-            ))
-        for section in data.get("sections") or []:
-            regions.append(_semantic_region(
-                section,
-                ("title", "summary", "description", "metadata"),
-            ))
-    elif stage == "final_review":
-        regions.append(_semantic_region(data, ("blocking", "warnings", "counts")))
-    return [region for region in regions if region]
-
-
-def _validate_author_requirements(
-    stage: str,
-    data: dict[str, Any],
-    baseline: dict[str, Any],
-    draft: dict[str, Any],
-) -> None:
-    author = _author_context(draft)
-    requirements = author["locked_requirements"]
-    requested_volumes = _requested_volume_count(draft)
-    if stage == "macro_outline" and requested_volumes:
-        volumes = data.get("volumes") if isinstance(data.get("volumes"), list) else []
-        if len(volumes) != requested_volumes:
-            raise AuthorLockViolation(
-                f"作者锁定要求为 {requested_volumes} 卷，模型返回 {len(volumes)} 卷"
-            )
-    if not requirements:
-        return
-    output_regions = _stage_semantic_regions(stage, data)
-    baseline_text = "".join(_stage_semantic_regions(stage, baseline))
-    stage_keywords = {
-        "characters": ("主角", "角色", "姓名", "名字", "身份"),
-        "world_style": ("世界", "设定", "规则", "基调"),
-        "locations": ("地点", "城市", "势力", "组织"),
-        "macro_outline": ("主线", "核心", "冲突", "结局", "卷"),
-        "opening_outline": ("开篇", "前三章", "前3章", "前十五章", "前15章"),
-    }
-    missing: list[str] = []
-    for requirement in requirements:
-        relevant = stage == "concepts" or any(
-            keyword in requirement for keyword in stage_keywords.get(stage, ())
-        )
-        anchors = _locked_anchors(requirement)
-        tokens = [_lock_text(anchor) for anchor in anchors if _lock_text(anchor)]
-        for token in tokens:
-            if token in baseline_text:
-                relevant = True
-        if not relevant or not tokens:
-            continue
-        if not any(all(token in region for token in tokens) for region in output_regions):
-            absent = [
-                anchor
-                for anchor, token in zip(anchors, tokens)
-                if not any(token in region for region in output_regions)
-            ]
-            missing.extend(absent or [requirement])
-    if missing:
-        raise AuthorLockViolation(
-            "模型结果删除或改写了作者锁定内容：" + "、".join(dict.fromkeys(missing))
-        )
-
-
-def _safe_compact_concepts(draft: dict[str, Any]) -> list[dict[str, Any]]:
-    author = _author_context(draft)
-    form = draft.get("form") if isinstance(draft.get("form"), dict) else {}
-    brief = author["author_brief"] or _text(form.get("brief")) or "待补充故事方案"
-    locked_source = "；".join([brief, *author["locked_requirements"]])
-    protagonist_match = re.search(r"(?:^|[，。；])\s*([^，。；]{2,20}?)(?:必须是|必须为|是)", locked_source)
-    protagonist_name = _text(protagonist_match.group(1)) if protagonist_match else "待确认主角"
-    title_seed = brief.split("。", 1)[0].split("，", 1)[0][:20] or "作者方案"
-    base = {
-        "title": title_seed,
-        "subtitle": "依据作者原始设定整理，可继续编辑",
-        "logline": brief[:120],
-        "protagonist_seed": {
-            "name": protagonist_name,
-            "identity": locked_source[:500],
-            "goal": "落实作者方案中的首要目标",
-            "lack": "待作者确认",
-        },
-        "world_hook": locked_source[:500],
-        "core_conflict": locked_source[:500],
-        "story_engine": "遵循作者大纲持续推进",
-        "opening_hook": "从作者指定的起点切入",
-        "differentiators": author["locked_requirements"] or ["保留作者原始设定"],
-        "risks": ["这是模型格式异常后的安全草稿，请在继续前检查"],
-    }
-    return [base]

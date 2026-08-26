@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Col, Row, message } from 'antd'
 import { apiClient } from '../api/client'
-import { useAutoResumeCataloging } from '../features/cataloging/useAutoResumeCataloging'
 import { useModelOptions } from '../hooks/useModelOptions'
 import CatalogingCandidatesPanel from './CatalogingCandidatesPanel'
 import CatalogingHeader from './CatalogingHeader'
@@ -35,7 +34,7 @@ const candidateRunId = (job: CatalogingJob | null, runs: CatalogingRun[]) => {
 
 function CatalogingPage({ projectId }: CatalogingPageProps) {
   const [mode, setMode] = useState<CatalogingMode>('auto')
-  const { modelOptions, defaultModel, loading: modelsLoading } = useModelOptions()
+  const { modelOptions, defaultModel, loading: modelsLoading } = useModelOptions('cataloging')
   const [model, setModel] = useState<string | undefined>()
   const selectedModel = model || defaultModel || undefined
   const [chapters, setChapters] = useState<ChapterItem[]>([])
@@ -406,13 +405,6 @@ function CatalogingPage({ projectId }: CatalogingPageProps) {
   const updateCandidateDraft = (candidateId: string, value: string) => {
     setCandidateDrafts((current) => ({ ...current, [candidateId]: value }))
   }
-
-  useAutoResumeCataloging({
-    job,
-    streaming,
-    onLog: appendLog,
-    onResume: streamJob,
-  })
 
   useEffect(() => {
     fetchChapters().catch((err) => message.error(err.message || '获取章节失败'))

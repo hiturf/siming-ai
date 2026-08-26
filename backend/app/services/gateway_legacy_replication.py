@@ -50,10 +50,7 @@ from app.modules.story.infrastructure.entities import (
 )
 from app.services.chapter_ordering import next_chapter_sort_order
 from app.services.chapter_service import chapter_to_detail, create_snapshot
-from app.services.character_role_types import (
-    append_character_role_description,
-    normalize_character_role_type,
-)
+from app.services.character_role_types import normalize_character_role_type
 from app.services.character_service import (
     character_to_dict,
     create_character_version,
@@ -700,10 +697,6 @@ def _prepare_character_mutation_values(
         values["role_type"] = normalize_character_role_type(None)
     if "role_type" in values:
         raw_role_type = values["role_type"]
-        values["background"] = append_character_role_description(
-            values.get("background", row.background if row is not None else None),
-            raw_role_type,
-        )
         values["role_type"] = normalize_character_role_type(
             raw_role_type,
             default=(row.role_type or "other") if row is not None else "other",

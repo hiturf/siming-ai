@@ -7,10 +7,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.services.agent.prompt_builder import build_system_prompt, inject_public_prompt_pack_section
-from app.prompts.prompt_source import (
-    get_public_chapter_fast_system_prompt,
-    get_public_chapter_quality_system_prompt,
-)
+from app.prompts.prompt_source import get_public_chapter_quality_system_prompt
 
 
 class BuildSystemPromptWithPublicPackTest(unittest.TestCase):
@@ -35,7 +32,7 @@ class BuildSystemPromptWithPublicPackTest(unittest.TestCase):
         query_mock.first.return_value = mock_pack
         db.query.return_value = query_mock
 
-        result = build_system_prompt(pack, db=db, public_pack_scope="chapter_writing", public_pack_mode="quality")
+        result = build_system_prompt(pack, db=db, public_pack_scope="chapter_writing")
         self.assertIn("质量模式", result)
         self.assertIn("1.0.0", result)
 
@@ -44,7 +41,7 @@ class BuildSystemPromptWithPublicPackTest(unittest.TestCase):
         pack.build_system_prompt.return_value = "你是写作助手。"
         # Mock build_tool_policy_section to return empty
         with patch("app.services.agent.prompt_builder.build_tool_policy_section", return_value=""):
-            result = build_system_prompt(pack, scope="chapter_writing", mode="quality")
+            result = build_system_prompt(pack, scope="chapter_writing")
         self.assertEqual(result, "你是写作助手。")
 
 
@@ -68,7 +65,7 @@ class InjectPublicPromptPackSectionTest(unittest.TestCase):
         query_mock.first.return_value = mock_pack
         db.query.return_value = query_mock
 
-        result = inject_public_prompt_pack_section("原始提示词", db, "chapter_writing", "quality")
+        result = inject_public_prompt_pack_section("原始提示词", db, "chapter_writing")
         self.assertIn("质量模式章节写作", result)
         self.assertIn("1.0.0", result)
         self.assertNotIn("opening_hook", result)
@@ -86,17 +83,13 @@ class InjectPublicPromptPackSectionTest(unittest.TestCase):
 
 
 class PublicChapterPromptUnificationTest(unittest.TestCase):
-    """Public/external chapter prompts share contracts while modes stay distinct."""
-
-    def test_fast_public_prompt_is_distinct_direct_writing_prompt(self):
+    def test_public_prompt_uses_the_single_unsaved_draft_contract(self):
         quality = get_public_chapter_quality_system_prompt()
-        fast = get_public_chapter_fast_system_prompt()
-
-        self.assertNotEqual(fast, quality)
-        self.assertLess(len(fast), len(quality))
-        self.assertIn("快速模式定位", fast)
-        self.assertIn("API-free 模式", fast)
-        self.assertIn("统一建档", fast)
+        self.assertIn("API-free 模式", quality)
+        self.assertIn("未入库草稿", quality)
+        self.assertIn("立即结束", quality)
+        self.assertNotIn("快速模式", quality)
+        self.assertNotIn("create_chapter", quality)
 
 
 if __name__ == "__main__":

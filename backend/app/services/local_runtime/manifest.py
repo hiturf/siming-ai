@@ -47,18 +47,18 @@ MODEL_CATALOG = [
         ],
     },
     {
-        "model_key": "qwen3.5-27b-q4",
-        "display_name": "Qwen3.5 27B UD-Q4_K_XL",
-        "family": "qwen3.5",
+        "model_key": "qwen3.8-27b-q4",
+        "display_name": "Qwen3.8 27B UD-Q4_K_XL",
+        "family": "qwen3.8",
         "parameter_size": "27B",
         "quantization": "UD-Q4_K_XL",
         "context_length": 262144,
-        "file_name": "Qwen3.5-27B-UD-Q4_K_XL.gguf",
+        "file_name": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
         "license_name": "Apache-2.0",
         "min_ram_gb": 32,
         "recommended_vram_gb": 24,
         "sources": [
-            "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-UD-Q4_K_XL.gguf",
+            "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-UD-Q4_K_XL.gguf",
         ],
     },
 ]

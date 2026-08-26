@@ -27,7 +27,7 @@ from app.modules.creation.infrastructure.models import (
 from app.modules.model_runtime.application.execution import model_executor as LLMGateway
 from app.modules.operations.infrastructure.models import OperationRun
 from app.services.content_store import content_root
-from app.services.character_role_types import append_character_role_description, normalize_character_role_type
+from app.services.character_role_types import normalize_character_role_type
 from app.services.novel_creation_authoring import _validate_stage
 from app.services.novel_creation_contract import OPENING_OUTLINE_CHAPTER_COUNT
 from app.services.novel_creation_workspace import save_stage, serialize_creation_artifact
@@ -393,7 +393,7 @@ def create_material_import(
     tool_mode = "deterministic_import"
     if model:
         try:
-            selection = LLMGateway.select_model_for_task(task_type="novel_creation", model_override=model)
+            selection = LLMGateway.select_model_for_task(task_type="planning", model_override=model)
             effective = selection.model or model
             provider, model_name = LLMGateway.model_identity(effective, {"moshu_task_type": "planning"})
             model_source = f"{provider}:{model_name}"
@@ -588,10 +588,6 @@ def _artifact_payload(artifact: str, candidates: dict[str, Any], import_run: Nov
             item = _clean_row(row)
             item["name"] = _text(item.get("name") or item.get("title"))
             raw_role_type = item.get("role_type")
-            item["background"] = append_character_role_description(
-                item.get("background"),
-                raw_role_type,
-            )
             item["role_type"] = normalize_character_role_type(
                 raw_role_type,
                 default="protagonist" if index == 0 else "supporting",

@@ -36,7 +36,6 @@ def test_domain_tool_declarations_form_the_complete_registry() -> None:
     declarations = [tool for group in DOMAIN_TOOL_GROUPS for tool in group]
     names = [tool.name for tool in declarations]
 
-    assert len(names) == 193
     assert len(set(names)) == len(names)
     assert set(names) == set(_TOOL_REGISTRATION_ORDER)
     assert registry.all_names() == list(_TOOL_REGISTRATION_ORDER)

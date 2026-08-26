@@ -26,8 +26,8 @@ PROVIDER_CAPABILITIES: dict[str, ProviderCapabilities] = {
     # Gemini OpenAI-compatible endpoint can reject tool_choice when the selected
     # model is in thinking mode. Leaving tools present still lets it call tools.
     "gemini": ProviderCapabilities(supports_tool_choice=False),
-    # Local agent CLIs are text executors in Siming's provider layer. Tool use
-    # must be orchestrated by Siming itself, not encoded as OpenAI tool calls.
+    # Agent CLIs do not emit OpenAI tool-call envelopes. Authorized workflows
+    # attach Siming as a native MCP server inside the CLI process instead.
     "claude_cli": ProviderCapabilities(supports_tools=False, supports_tool_choice=False, supports_streaming_tools=False),
     "codex_cli": ProviderCapabilities(supports_tools=False, supports_tool_choice=False, supports_streaming_tools=False),
     "opencode_cli": ProviderCapabilities(supports_tools=False, supports_tool_choice=False, supports_streaming_tools=False),
@@ -37,11 +37,13 @@ PROVIDER_CAPABILITIES: dict[str, ProviderCapabilities] = {
     "qwen_code_cli": ProviderCapabilities(supports_tools=False, supports_tool_choice=False, supports_streaming_tools=False),
     "hermes_cli": ProviderCapabilities(supports_tools=False, supports_tool_choice=False, supports_streaming_tools=False),
     "openclaw_cli": ProviderCapabilities(supports_tools=False, supports_tool_choice=False, supports_streaming_tools=False),
+    "dsh_cli": ProviderCapabilities(supports_tools=False, supports_tool_choice=False, supports_streaming_tools=False),
     "custom_cli": ProviderCapabilities(supports_tools=False, supports_tool_choice=False, supports_streaming_tools=False),
-    # llama.cpp's OpenAI-compatible surface is used as a local text runtime here.
-    # Its tool-call behavior varies by model/template and can return empty tool
-    # streams for small local models, so Siming should orchestrate tools itself.
-    "local_llama_cpp": ProviderCapabilities(supports_tools=False, supports_tool_choice=False, supports_streaming_tools=False),
+    # The managed llama.cpp server exposes OpenAI-compatible tool calls.  Do not
+    # infer a model's capability from the fact that it runs locally: pass the
+    # caller's tools through and let the selected model/template answer.  Agent
+    # callers retain their existing error/empty-stream fallback paths.
+    "local_llama_cpp": ProviderCapabilities(),
 }
 
 

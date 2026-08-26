@@ -32,8 +32,8 @@ export const PERMISSION_PACKS: PermissionPack[] = [
   {
     name: 'project_writing',
     label: '项目写入',
-    description: '允许外部 Agent 写入章节、角色、大纲、世界观、外部草稿和外部建档候选。不会调用司命内部模型。',
-    tools: ['create_chapter', 'update_chapter', 'restore_chapter_version', 'create_character', 'update_character', 'create_outline_node', 'update_outline_node', 'create_worldbuilding_entry', 'update_worldbuilding_entry', 'save_external_chapter_draft', 'repair_story_granularity'],
+    description: '允许外部 Agent 保存未入库章节草稿，并写入角色、大纲、世界观和外部建档候选。正式章节只能由作者在正文页保存。',
+    tools: ['save_external_chapter_draft', 'restore_chapter_version', 'create_character', 'update_character', 'create_outline_node', 'update_outline_node', 'create_worldbuilding_entry', 'update_worldbuilding_entry', 'repair_story_granularity'],
     riskLevel: 'medium',
     dependsOn: ['readonly_collaboration'],
   },

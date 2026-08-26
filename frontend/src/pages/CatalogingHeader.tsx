@@ -48,7 +48,7 @@ function CatalogingHeader({
           style={{ width: 260 }}
           value={model}
           loading={modelsLoading}
-          placeholder="跟随全局默认模型"
+          placeholder="跟随作品建档任务默认模型"
           options={modelOptions}
           onChange={(value) => onModelChange(value)}
         />

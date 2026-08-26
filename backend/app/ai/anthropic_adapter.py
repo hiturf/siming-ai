@@ -1,10 +1,16 @@
 """Anthropic Claude adapter using the official anthropic SDK."""
 from typing import AsyncGenerator, Optional
 
-from anthropic import AsyncAnthropic, APIError, APITimeoutError, APIConnectionError, AuthenticationError
+from anthropic import (
+    APIConnectionError,
+    APIError,
+    APITimeoutError,
+    AsyncAnthropic,
+    AuthenticationError,
+)
 
-from .base import BaseAdapter
 from ..core.exceptions import LLMError
+from .base import BaseAdapter
 
 
 def _convert_tools_to_anthropic(tools: list[dict]) -> list[dict]:
@@ -195,6 +201,7 @@ class AnthropicAdapter(BaseAdapter):
         """Text-only streaming — no tool calls surfaced."""
         client = self._get_client()
         system, anthropic_messages = _convert_messages_for_anthropic(messages)
+        self.last_stream_finish_reason = None
         try:
             kwargs = {
                 "model": model,
@@ -209,6 +216,10 @@ class AnthropicAdapter(BaseAdapter):
                 async for text in stream.text_stream:
                     if text:
                         yield text
+                final_message = await stream.get_final_message()
+                self.last_stream_finish_reason = str(
+                    getattr(final_message, "stop_reason", None) or "stop"
+                )
         except AuthenticationError as e:
             raise LLMError(f"Anthropic API Key 无效: {e}")
         except APITimeoutError as e:

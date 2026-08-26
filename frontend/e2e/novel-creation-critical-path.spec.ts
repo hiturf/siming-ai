@@ -122,6 +122,36 @@ async function fulfill(route: Route, data: unknown, status = 200) {
   })
 }
 
+async function fulfillAgentTurn(route: Route, data: Record<string, unknown>) {
+  const request = route.request().postDataJSON() as { client_turn_id?: string }
+  const result = (data.data as Record<string, unknown> | undefined) ?? data
+  const clientTurnId = request.client_turn_id || 'e2e-client-turn'
+  const events = [
+    { client_turn_id: clientTurnId, sequence: 1, type: 'turn_started', message: '已接收请求，正在准备立项上下文…', data: {} },
+    { client_turn_id: clientTurnId, sequence: 2, type: 'reply_delta', message: '', data: { delta: result.reply || '' } },
+    { client_turn_id: clientTurnId, sequence: 3, type: 'complete', message: '本轮立项处理完成', data: result },
+  ]
+  await route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+  })
+}
+
+async function fulfillAgentError(route: Route, message: string, data: Record<string, unknown>) {
+  const request = route.request().postDataJSON() as { client_turn_id?: string }
+  const clientTurnId = request.client_turn_id || 'e2e-client-turn'
+  const events = [
+    { client_turn_id: clientTurnId, sequence: 1, type: 'turn_started', message: '已接收请求，正在准备立项上下文…', data: {} },
+    { client_turn_id: clientTurnId, sequence: 2, type: 'error', message, data },
+  ]
+  await route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+  })
+}
+
 async function mockApi(page: Page, options: {
   models?: unknown[]
   sessions?: unknown[]
@@ -245,9 +275,12 @@ async function mockApi(page: Page, options: {
       agentTurnCalls += 1
       if (options.onAgentTurn) return options.onAgentTurn(route, agentTurnCalls)
       if (options.onInterview) return options.onInterview(route, agentTurnCalls)
-      return fulfill(route, {
-        code: 0,
-        data: { reply: '已记录你的创作要求。', run: null, tool_results: [] },
+      return fulfillAgentTurn(route, {
+        reply: '已记录你的创作要求。',
+        run: null,
+        tool_results: [],
+        message_status: 'completed',
+        turn_persisted: true,
       })
     }
     if (path.startsWith('/api/v1/novel-creation/sessions/') && path.endsWith('/interview/next')) {
@@ -281,14 +314,14 @@ async function mockApi(page: Page, options: {
       if (options.onStageRun) return options.onStageRun(route)
       return fulfill(route, { code: 0, data: { run: { id: 'run-1', status: 'running', current_message: '\u6b63\u5728\u751f\u6210\u4e09\u5957\u8f7b\u91cf\u521b\u610f' } } })
     }
-    if (path === '/api/v1/novel-creation/apply' && method === 'POST') {
+    if (path === '/api/v1/novel-creation/finalize' && method === 'POST') {
       if (options.onApply) return options.onApply(route)
       return fulfill(route, { code: 0, data: { project_id: 'project-1', warnings: [] } })
     }
-    if (path === '/api/v1/ai/system-assistant/conversations' && method === 'GET') {
+    if (path === '/api/v1/ai/assistant/conversations' && method === 'GET') {
       return fulfill(route, { code: 0, data: { items: [], total: 0 } })
     }
-    if (path === '/api/v1/ai/system-assistant/conversations' && method === 'POST') {
+    if (path === '/api/v1/ai/assistant/conversations' && method === 'POST') {
       return fulfill(route, { code: 0, data: { conversation: { id: 'conversation-1', title: '\u65b0\u4e66' } } })
     }
     if (path.endsWith('/turns/start') && method === 'POST') {
@@ -312,7 +345,7 @@ async function mockApi(page: Page, options: {
         },
       } })
     }
-    if (path.includes('/ai/system-assistant/conversations/') && path.endsWith('/turns') && method === 'POST') {
+    if (path.includes('/ai/assistant/conversations/') && path.endsWith('/turns') && method === 'POST') {
       return fulfill(route, { code: 0, data: { conversation: { id: 'conversation-1', title: '\u65b0\u4e66' } } })
     }
     if (path.startsWith('/api/v1/projects/project-1')) {
@@ -368,24 +401,25 @@ test('keeps mobile navigation named and touch-sized at 390px', async ({ page }) 
 
 test('shows quota exhaustion as an error with the CLI runtime diagnostics', async ({ page }) => {
   await mockApi(page, {
-    onInterview: async (route) => fulfill(route, {
-      detail: {
-        message: 'Free usage exceeded, retrying in 9h',
+    onAgentTurn: async (route) => fulfillAgentError(
+      route,
+      '模型额度已耗尽或请求受限',
+      {
         failure_class: 'quota_or_rate_limit',
         next_action: '\u5207\u6362\u6709\u989d\u5ea6\u7684\u6a21\u578b\u540e\u91cd\u8bd5\u3002',
         runtime: {
           effective_model: 'opencode_cli:free-model', provider: 'opencode_cli', model_source: 'global_default',
-          tool_mode: 'local_cli_text_json', timeout_seconds: 0, quota_status: 'exhausted_or_limited',
+          tool_mode: 'creation_agent_tools', timeout_seconds: 0, quota_status: 'exhausted_or_limited',
         },
       },
-    }, 422),
+    ),
   })
   await page.goto('/gui', { waitUntil: 'domcontentloaded' })
   await page.getByLabel(zh.message).fill('\u6211\u60f3\u521b\u5efa\u4e00\u672c\u65b0\u7684\u5c0f\u8bf4')
   await page.getByRole('button', { name: new RegExp(zh.send) }).click()
 
   const failure = page.locator('[data-message-status="error"]')
-  await expect(failure).toContainText('Free usage exceeded')
+  await expect(failure).toContainText('模型额度已耗尽或请求受限')
   await page.getByLabel(zh.runtimeToggle).click()
   await expect(page.getByLabel(zh.runtime)).toContainText('\u989d\u5ea6\u5df2\u8017\u5c3d\u6216\u9650\u6d41')
   await expect(page.getByLabel(zh.runtime)).toContainText('opencode_cli:free-model')
@@ -563,8 +597,8 @@ test('keeps a generated-stage deep link adjustable through the unified assistant
       legacy_current_stage: 'characters',
       pending_confirmations: ['world_style'],
       items: {
-        world_style: { stage: 'world_style', label: '\u6587\u98ce\u4e0e\u4e16\u754c\u89c2', status: 'generated', can_view: true, can_generate: true, can_confirm: true, blocked_by: [], actions: ['view', 'edit', 'regenerate', 'confirm'], next_stage: 'characters' },
-        characters: { stage: 'characters', label: '\u89d2\u8272\u4e0e\u5173\u7cfb', status: 'pending', can_view: false, can_generate: false, can_confirm: false, blocked_by: [{ stage: 'world_style', label: '\u6587\u98ce\u4e0e\u4e16\u754c\u89c2', reason: 'not_confirmed' }], actions: [], next_stage: 'locations' },
+        world_style: { stage: 'world_style', label: '\u6587\u98ce\u4e0e\u4e16\u754c\u89c2', status: 'generated', can_confirm: true, actions: ['view', 'edit', 'regenerate', 'confirm'], next_stage: 'characters' },
+        characters: { stage: 'characters', label: '\u89d2\u8272\u4e0e\u5173\u7cfb', status: 'pending', can_confirm: false, actions: ['view', 'generate'], next_stage: 'locations' },
       },
     },
     draft: {
@@ -588,7 +622,7 @@ test('keeps a generated-stage deep link adjustable through the unified assistant
       items: {
         ...session.stage_flow.items,
         world_style: { ...session.stage_flow.items.world_style, status: 'confirmed', can_confirm: false },
-        characters: { ...session.stage_flow.items.characters, can_view: true, can_generate: true, blocked_by: [], actions: ['view', 'generate'] },
+        characters: { ...session.stage_flow.items.characters, actions: ['view', 'generate'] },
       },
     },
     draft: {
@@ -605,9 +639,12 @@ test('keeps a generated-stage deep link adjustable through the unified assistant
     sessions: [session],
     onAgentTurn: async (route) => {
       actionBody = route.request().postDataJSON()
-      return fulfill(route, {
-        code: 0,
-        data: { reply: '已按要求保留世界观事实并调整文风。', run: null, tool_results: [] },
+      return fulfillAgentTurn(route, {
+        reply: '已按要求保留世界观事实并调整文风。',
+        run: null,
+        tool_results: [],
+        message_status: 'completed',
+        turn_persisted: true,
       })
     },
     onConfirmAndGenerate: async (route, stage) => {
@@ -627,9 +664,6 @@ test('keeps a generated-stage deep link adjustable through the unified assistant
   const requestText = '保留世界观事实，只把文风调整得更冷峻。'
   await page.getByLabel(zh.message).fill(requestText)
   await page.getByRole('button', { name: new RegExp(zh.send) }).click()
-  const writePermission = page.getByRole('dialog', { name: '允许本机 CLI 仅修改本轮立项数据？' })
-  await writePermission.getByRole('button', { name: '允许本轮修改' }).click()
-  await expect(writePermission).toBeHidden()
   await expect(page.getByText('已按要求保留世界观事实并调整文风。')).toBeVisible()
   expect(actionBody).toMatchObject({ session_id: 'session-1', message: requestText })
   await expectNoSeriousAccessibilityViolations(page)

@@ -21,7 +21,7 @@ def _session(tmp_path):
     return engine, sessionmaker(bind=engine, expire_on_commit=False)
 
 
-def test_offline_character_role_uses_same_normalization_and_identity_preservation_as_pc(tmp_path):
+def test_offline_character_role_uses_same_structured_enum_as_pc(tmp_path):
     engine, Session = _session(tmp_path)
     try:
         with Session() as db:
@@ -40,7 +40,7 @@ def test_offline_character_role_uses_same_normalization_and_identity_preservatio
                     "id": "character-role-mobile",
                     "project_id": project.id,
                     "name": "陆糖",
-                    "role_type": "主角，穿越者，陆家三岁孙女",
+                    "role_type": "protagonist",
                     "background": "华清实验室天才少女转生。",
                     "abilities": [],
                     "aliases": [],
@@ -53,8 +53,7 @@ def test_offline_character_role_uses_same_normalization_and_identity_preservatio
             character = db.get(Character, "character-role-mobile")
             assert character is not None
             assert character.role_type == "protagonist"
-            assert "华清实验室天才少女转生。" in (character.background or "")
-            assert "身份补充：穿越者、陆家三岁孙女" in (character.background or "")
+            assert character.background == "华清实验室天才少女转生。"
 
             snapshot = domain_snapshot_for_entity(
                 db,
@@ -65,7 +64,6 @@ def test_offline_character_role_uses_same_normalization_and_identity_preservatio
             assert snapshot is not None
             assert snapshot["role_type"] == "protagonist"
             assert snapshot["background"] == character.background
-            assert "身份补充：穿越者、陆家三岁孙女" in (snapshot["background"] or "")
     finally:
         engine.dispose()
 

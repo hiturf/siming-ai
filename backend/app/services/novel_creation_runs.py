@@ -5,7 +5,7 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from app.database.models import (
     NovelCreationSession,
@@ -319,61 +319,6 @@ def fail_run(
         operation.can_retry = True
 
 
-def block_run_for_context(
-    db: Session,
-    run: NovelCreationStageRun,
-    *,
-    context_status: str,
-    message: str,
-) -> None:
-    """Finish a run that requires context repair without leaving SSE hanging."""
-    next_action = "检查上下文提示并重新执行当前阶段，已保存草稿不会丢失。"
-    run.status = "failed"
-    run.failure_class = context_status or "needs_confirmation"
-    run.current_message = message[:1000]
-    run.next_action = next_action
-    run.completed_at = datetime.utcnow()
-    add_run_event(
-        db,
-        run,
-        "context_blocked",
-        "warning",
-        message,
-        {
-            "context_status": context_status,
-            "next_action": next_action,
-            "retryable": True,
-        },
-    )
-    _complete_claim(db, run, error=message, status="failed")
-    if not run.operation_id:
-        return
-    operation = db.query(OperationRun).filter(OperationRun.id == run.operation_id).first()
-    if not operation:
-        return
-    update_operation(
-        db,
-        operation,
-        status="failed",
-        health_status="active",
-        message=message,
-        failure_class=context_status or "needs_confirmation",
-        next_action=next_action,
-        checkpoint=True,
-        attention={
-            "kind": "context",
-            "title": "上下文需要处理",
-            "message": message,
-            "action_label": "检查后重试",
-            "action_url": f"/novel-creation?session={run.session_id}&run={run.id}",
-            "blocking": True,
-        },
-        outcome="blocked",
-    )
-    operation.can_cancel = False
-    operation.can_retry = True
-
-
 def serialize_run(run: NovelCreationStageRun, include_events: bool = True) -> dict[str, Any]:
     result = deepcopy(run.result_json) if isinstance(run.result_json, dict) else None
     data = {
@@ -402,6 +347,19 @@ def serialize_run(run: NovelCreationStageRun, include_events: bool = True) -> di
         "updated_at": run.updated_at.isoformat() if run.updated_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
     }
+    session = object_session(run)
+    operation = (
+        session.get(OperationRun, run.operation_id)
+        if session and run.operation_id
+        else None
+    )
+    stream_progress = (
+        deepcopy(operation.process_metrics_json)
+        if operation and isinstance(operation.process_metrics_json, dict)
+        else None
+    )
+    if stream_progress and stream_progress.get("kind") == "model_output":
+        data["stream_progress"] = stream_progress
     card_presentation = (result or {}).get("card_presentation")
     normalized_status = "waiting_user" if run.status == "waiting_author" else run.status
     if (
@@ -422,6 +380,71 @@ def serialize_run(run: NovelCreationStageRun, include_events: bool = True) -> di
             for event in run.events
         ]
     return data
+
+
+def interrupt_novel_creation_run(
+    db: Session,
+    run: NovelCreationStageRun,
+    *,
+    message: str = "立项模型连接已中断，本阶段未完成",
+    next_action: str = "检查已保存草稿后重新生成本阶段",
+) -> bool:
+    """Finish an abandoned producer and its operation as one durable state."""
+
+    if run.status not in {"queued", "running"}:
+        return False
+    invalidate_run_card_presentation(run)
+    now = datetime.utcnow()
+    run.status = "interrupted"
+    run.failure_class = "interrupted"
+    run.current_message = message
+    run.next_action = next_action
+    run.completed_at = now
+    run.updated_at = now
+    payload = {
+        "failure_class": "interrupted",
+        "next_action": next_action,
+        "retryable": True,
+    }
+    sequence = max([int(event.sequence or 0) for event in run.events] or [0]) + 1
+    db.add(NovelCreationStageEvent(
+        run_id=run.id,
+        sequence=sequence,
+        event_type="interrupted",
+        status="interrupted",
+        message=message,
+        payload_json=deepcopy(payload),
+        created_at=now,
+    ))
+    _complete_claim(db, run, error=message, status="interrupted")
+
+    operation = db.get(OperationRun, run.operation_id) if run.operation_id else None
+    if operation:
+        update_operation(
+            db,
+            operation,
+            status="interrupted",
+            health_status="disconnected",
+            message=message,
+            event_type="interrupted",
+            payload=payload,
+            failure_class="interrupted",
+            next_action=next_action,
+            attention={
+                "kind": "recovery",
+                "title": "立项生成已中断",
+                "message": next_action,
+                "blocking": True,
+            },
+            result={
+                "summary": message,
+                "completed": [],
+                "incomplete": [next_action],
+            },
+            outcome="interrupted",
+        )
+        operation.can_retry = True
+    return True
 
 
 def mark_interrupted_novel_creation_runs(db: Session) -> int:

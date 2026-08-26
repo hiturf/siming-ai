@@ -58,10 +58,7 @@ export interface StageFlowItem {
   stage: string
   label: string
   status: StageState['status']
-  can_view: boolean
-  can_generate: boolean
   can_confirm: boolean
-  blocked_by: Array<{ stage: string; label: string; reason: string }>
   actions: string[]
   next_stage?: string | null
 }
@@ -138,12 +135,19 @@ export interface StageRun {
   input_snapshot_hash?: string
   model_source?: string
   attempt?: number
-  result_mode?: 'model' | 'repaired' | 'deterministic_fallback'
+  result_mode?: 'model' | 'repaired'
   warning?: string
   diagnostic_count?: number
+  stream_progress?: {
+    kind: 'model_output'
+    output_chars: number
+    output_preview?: string
+    max_output_tokens?: number
+    attempt?: number
+  }
   result?: {
     attempt?: number
-    result_mode?: 'model' | 'repaired' | 'deterministic_fallback'
+    result_mode?: 'model' | 'repaired'
     warning?: string
   }
   created_at?: string
@@ -169,7 +173,6 @@ export function runAttempt(run: StageRun) {
 export function runResultModeLabel(run: StageRun) {
   const mode = run.result_mode || run.result?.result_mode
   if (mode === 'repaired') return '同模型结构修复'
-  if (mode === 'deterministic_fallback') return '可编辑安全草稿'
   if (mode === 'model') return '模型直接生成'
   return '未记录'
 }

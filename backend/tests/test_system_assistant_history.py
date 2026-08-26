@@ -63,7 +63,7 @@ def test_system_turn_accepts_large_creation_text_with_an_explicit_safety_limit()
         (SystemTurnFinish, {"scope_type": "project"}),
     ],
 )
-def test_non_system_scope_requires_an_identifier(payload_type, payload):
+def test_every_conversation_scope_requires_an_identifier(payload_type, payload):
     with pytest.raises(ValidationError):
         payload_type(**payload)
 
@@ -103,8 +103,12 @@ def test_concurrent_conversation_writes_do_not_deadlock_the_async_server(tmp_pat
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             return await asyncio.gather(*(
                 client.post(
-                    "/api/v1/ai/system-assistant/conversations",
-                    json={"title": f"并发会话 {index}"},
+                    "/api/v1/ai/assistant/conversations",
+                    json={
+                        "title": f"并发会话 {index}",
+                        "scope_type": "creation",
+                        "scope_id": f"creation-{index}",
+                    },
                 )
                 for index in range(12)
             ))
@@ -115,34 +119,32 @@ def test_concurrent_conversation_writes_do_not_deadlock_the_async_server(tmp_pat
         assert SqlAlchemySystemConversationStore(db).list()["total"] == 12
 
 
-def test_system_conversation_persists_messages_and_blueprint_state():
+def test_system_conversation_persists_messages_and_creation_scope():
     db = _db_session()
     conversations = SqlAlchemySystemConversationStore(db)
     created = asyncio.run(create_system_conversation(
-        SystemConversationCreate(title="克苏鲁新书"),
+        SystemConversationCreate(
+            title="克苏鲁新书",
+            scope_type="creation",
+            scope_id="session-1",
+        ),
         conversations,
     ))
     conversation_id = created.data["conversation"]["id"]
 
-    blueprints = [{
-        "title": "规则怪谈：别替旧神签收",
-        "protagonist": {"name": "林雾白"},
-    }]
     asyncio.run(append_system_turn(
         conversation_id,
         SystemTurnCreate(
             user_content="帮我创建一本克苏鲁规则怪谈",
-            assistant_content="已生成三个方案",
+            assistant_content="已保存本轮立项资料",
             creation_session_id="session-1",
             user_brief="克苏鲁+规则怪谈",
-            blueprints=blueprints,
         ),
         conversations,
     ))
 
     detail = asyncio.run(get_system_conversation(conversation_id, conversations))
     assert detail.data["conversation"]["creation_session_id"] == "session-1"
-    assert detail.data["conversation"]["blueprints"] == blueprints
     assert [item["role"] for item in detail.data["messages"]] == ["user", "assistant"]
     assert detail.data["conversation"]["created_at"].endswith("+00:00")
     assert all(item["created_at"].endswith("+00:00") for item in detail.data["messages"])
@@ -154,7 +156,10 @@ def test_system_conversation_persists_messages_and_blueprint_state():
 def test_system_turn_persists_running_placeholder_before_completion():
     db = _db_session()
     conversations = SqlAlchemySystemConversationStore(db)
-    created = asyncio.run(create_system_conversation(SystemConversationCreate(title=""), conversations))
+    created = asyncio.run(create_system_conversation(
+        SystemConversationCreate(title="", scope_type="creation", scope_id="session-1"),
+        conversations,
+    ))
     conversation_id = created.data["conversation"]["id"]
 
     started = asyncio.run(start_system_turn(
@@ -177,10 +182,46 @@ def test_system_turn_persists_running_placeholder_before_completion():
     assert [message["status"] for message in detail.data["messages"]] == ["completed", "completed"]
 
 
+def test_finishing_an_operation_preserves_creation_agent_protocol_payload():
+    db = _db_session()
+    conversations = SqlAlchemySystemConversationStore(db)
+    created = conversations.create(
+        "立项工具回合",
+        scope_type="creation",
+        scope_id="session-1",
+    )
+    conversation_id = created["conversation"]["id"]
+    started = conversations.start_turn(conversation_id, {
+        "user_content": "补充世界观",
+        "creation_session_id": "session-1",
+        "scope_type": "creation",
+        "scope_id": "session-1",
+    })
+    assistant_id = started["messages"][1]["id"]
+    trace = {"schema": "creation_agent_turn.v1", "replayable": True}
+
+    conversations.finish_turn(conversation_id, assistant_id, {
+        "assistant_content": "后台任务已开始",
+        "status": "running",
+        "payload": {"creation_agent_turn": trace, "run": {"status": "running"}},
+    })
+    finished = conversations.finish_turn(conversation_id, assistant_id, {
+        "assistant_content": "后台任务已完成",
+        "status": "completed",
+        "payload": {"run": {"status": "completed"}},
+    })
+
+    assert finished["message"]["payload"]["creation_agent_turn"] == trace
+    assert finished["message"]["payload"]["run"]["status"] == "completed"
+
+
 def test_running_system_message_is_interrupted_after_restart():
     db = _db_session()
     conversations = SqlAlchemySystemConversationStore(db)
-    created = asyncio.run(create_system_conversation(SystemConversationCreate(title=""), conversations))
+    created = asyncio.run(create_system_conversation(
+        SystemConversationCreate(title="", scope_type="creation", scope_id="session-1"),
+        conversations,
+    ))
     conversation_id = created.data["conversation"]["id"]
 
     started = asyncio.run(start_system_turn(
@@ -213,16 +254,18 @@ def test_conversation_scope_can_follow_creation_and_project_contexts():
     assert created.data["conversation"]["scope_type"] == "creation"
     assert created.data["conversation"]["scope_id"] == "creation-1"
 
-    # The project FK is deliberately omitted here because this unit database has
-    # no matching project. The store-level transition is covered using system scope.
     changed = asyncio.run(set_system_conversation_scope(
         conversation_id,
-        SystemConversationScopePatch(scope_type="system"),
+        SystemConversationScopePatch(scope_type="project", scope_id="project-1"),
         conversations,
     ))
-    assert changed.data["conversation"]["scope_type"] == "system"
-    assert changed.data["conversation"]["scope_id"] is None
+    assert changed.data["conversation"]["scope_type"] == "project"
+    assert changed.data["conversation"]["scope_id"] == "project-1"
     assert changed.data["conversation"]["creation_session_id"] is None
-    assert changed.data["conversation"]["project_id"] is None
-    listing = asyncio.run(list_system_conversations(conversations, scope_type="system"))
+    assert changed.data["conversation"]["project_id"] == "project-1"
+    listing = asyncio.run(list_system_conversations(
+        conversations,
+        scope_type="project",
+        scope_id="project-1",
+    ))
     assert [item["id"] for item in listing.data["items"]] == [conversation_id]

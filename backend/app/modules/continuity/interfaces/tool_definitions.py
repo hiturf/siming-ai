@@ -295,7 +295,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="detect_character_changes",
-        description="检测章节中追踪角色的变化（技能/经历/关系/性格）。三种模式：1) 传draft_id/content_ref检测chapter_writer草稿；2) 传content+title检测未保存正文；3) 传chapter_id检测已保存章节（自动保存变化日志和时间线）。",
+        description="只读检测章节中追踪角色的变化（技能/经历/关系/性格）。可传draft_id/content_ref、content+title或chapter_id；不会写入角色、变化日志、时间线或章节关联，正式正文的衍生数据统一由作者启动的建档任务处理。",
         input_schema={
             "content": {
                 "type": "string",
@@ -309,7 +309,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             "title": {"type": "string", "description": "章节标题（与content配合使用）"},
             "chapter_id": {
                 "type": "string",
-                "description": "已保存的章节ID（检测已保存章节时使用，会自动写入变化日志）",
+                "description": "已保存的章节ID（只读取正文进行分析，不写入任何数据）",
             },
         },
         tool_type="analysis",
@@ -378,10 +378,9 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="prepare_external_writing_context",
-        description="Build a complete writing context package for external agents. API-free: does not call LLM. Returns prompt pack, outline, characters, worldbuilding, summaries, quality rubric, and forbidden patterns.",
+        description="Build a complete writing context package for a model-selected chapter outline. API-free: does not call LLM. The outline_node_id must be a chapter node in the current project.",
         input_schema={
             "outline_node_id": {"type": "string", "description": "Target outline node ID"},
-            "mode": {"type": "string", "description": "Writing mode: quality|fast"},
             "include_prompt_pack": {
                 "type": "boolean",
                 "description": "Include public prompt pack (default true)",
@@ -398,16 +397,16 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             "pinned_chunk_ids": {"type": "array", "items": {"type": "string"}},
             "pinned_source_ids": {"type": "array", "items": {"type": "string"}},
         },
+        required=["outline_node_id"],
         tool_type="read",
         estimated_cost="free",
         handler_name="prepare_external_writing_context",
     ),
     ToolDef(
         name="save_external_chapter_draft",
-        description="Save an externally generated chapter draft. API-free. Returns draft_id/content_ref for use with create_chapter.",
+        description="Save one independent, not-yet-official new-chapter draft for a model-selected outline and end the model turn. The outline must not already have a formal chapter; this tool never creates rewrite drafts or overwrites saved prose.",
         input_schema={
             "content": {"type": "string", "description": "Chapter content to save"},
-            "title": {"type": "string", "description": "Chapter title"},
             "outline_node_id": {"type": "string", "description": "Linked outline node ID"},
             "context_manifest_id": {
                 "type": "string",
@@ -417,13 +416,9 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
                 "type": "string",
                 "description": "Source agent name (e.g. claude-code)",
             },
-            "quality_review_json": {
-                "type": "string",
-                "description": "Optional quality review JSON",
-            },
         },
-        required=["content"],
-        tool_type="read",
+        required=["content", "outline_node_id"],
+        tool_type="write",
         estimated_cost="free",
         handler_name="save_external_chapter_draft",
     ),
@@ -637,7 +632,8 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             "job_id": {"type": "string", "description": "Cataloging job ID"},
             "phase": {
                 "type": "string",
-                "description": "facts, candidates, or merged. merged is the experimental single-stage flow that directly saves candidates in chapter_order.",
+                "enum": ["facts", "candidates"],
+                "description": "facts extracts the current chapter; candidates resolves its saved facts against the current archive.",
             },
             "include_content": {
                 "type": "boolean",
@@ -686,10 +682,6 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         input_schema={
             "job_id": {"type": "string", "description": "Cataloging job ID"},
             "chapter_id": {"type": "string", "description": "Chapter ID"},
-            "phase": {
-                "type": "string",
-                "description": "Optional. Use merged for the experimental single-stage flow.",
-            },
             "candidates": {
                 "type": "array",
                 "items": {"type": "object"},

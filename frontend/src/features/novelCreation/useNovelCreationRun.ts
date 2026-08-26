@@ -151,8 +151,33 @@ export function useNovelCreationRun({
     const handleEvent = (event: MessageEvent) => {
       if (!current()) return
       try {
-        const payload = JSON.parse(event.data) as { message?: string; event_type?: string; payload?: { stage?: string } }
+        const payload = JSON.parse(event.data) as {
+          message?: string
+          event_type?: string
+          payload?: {
+            stage?: string
+            kind?: 'model_output'
+            output_chars?: number
+            output_preview?: string
+            max_output_tokens?: number
+            attempt?: number
+          }
+        }
         if (payload.message) setRunMessage(payload.message)
+        if (payload.event_type === 'model_output' && payload.payload?.kind === 'model_output') {
+          setActiveRun((previous) => previous && previous.id === runId
+            ? {
+                ...previous,
+                stream_progress: {
+                  kind: 'model_output',
+                  output_chars: Number(payload.payload?.output_chars || 0),
+                  output_preview: payload.payload?.output_preview,
+                  max_output_tokens: payload.payload?.max_output_tokens,
+                  attempt: payload.payload?.attempt,
+                },
+              }
+            : previous)
+        }
         const stageIndex = payload.payload?.stage ? CORE_STAGES.indexOf(payload.payload.stage) : -1
         if (stageIndex >= 0) {
           const completed = payload.event_type === 'stage_completed'
@@ -165,7 +190,7 @@ export function useNovelCreationRun({
         // Keep the last readable status.
       }
     }
-    for (const eventName of ['started', 'stage_progress', 'stage_repaired', 'stage_completed', 'completed', 'failed']) {
+    for (const eventName of ['started', 'model_output', 'stage_progress', 'stage_repaired', 'stage_completed', 'completed', 'failed']) {
       source.addEventListener(eventName, handleEvent as EventListener)
     }
     source.addEventListener('done', (event) => {

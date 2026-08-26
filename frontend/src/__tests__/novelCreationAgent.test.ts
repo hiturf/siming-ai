@@ -1,0 +1,117 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import { runCreationAgentTurn, type CreationAgentTurnEvent } from '../services/novelCreationAgent'
+
+function sseResponse(events: CreationAgentTurnEvent[]) {
+  const chunks = events.map((event) => new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`))
+  let index = 0
+  return {
+    ok: true,
+    status: 200,
+    body: {
+      getReader: () => ({
+        read: async () => index < chunks.length
+          ? { done: false, value: chunks[index++] }
+          : { done: true, value: undefined },
+        releaseLock: vi.fn(),
+      }),
+    },
+    json: async () => ({}),
+  }
+}
+
+describe('creation Agent SSE client', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('reconnects with the same id and last sequence without duplicating events', async () => {
+    const requests: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      requests.push(request)
+      if (requests.length === 1) {
+        return sseResponse([{
+          client_turn_id: 'turn-1',
+          sequence: 1,
+          type: 'turn_started',
+          message: '已接收',
+          data: {},
+        }])
+      }
+      return sseResponse([
+        {
+          client_turn_id: 'turn-1',
+          sequence: 2,
+          type: 'reply_delta',
+          message: '',
+          data: { delta: '完成' },
+        },
+        {
+          client_turn_id: 'turn-1',
+          sequence: 3,
+          type: 'complete',
+          message: '本轮完成',
+          data: { reply: '完成', turn_persisted: true },
+        },
+      ])
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const received: number[] = []
+
+    const result = await runCreationAgentTurn('session-1', '继续', undefined, {
+      clientTurnId: 'turn-1',
+      onEvent: (event) => received.push(event.sequence),
+    })
+
+    expect(result.reply).toBe('完成')
+    expect(received).toEqual([1, 2, 3])
+    expect(requests).toHaveLength(2)
+    expect(requests[0]).toMatchObject({ client_turn_id: 'turn-1', after_sequence: 0 })
+    expect(requests[1]).toMatchObject({ client_turn_id: 'turn-1', after_sequence: 1 })
+  })
+
+  it('retries an initial network connection failure with the same id', async () => {
+    const requests: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>)
+      if (requests.length === 1) throw new TypeError('network disconnected')
+      return sseResponse([{
+        client_turn_id: 'turn-network',
+        sequence: 1,
+        type: 'complete',
+        message: '本轮完成',
+        data: { reply: '已恢复', turn_persisted: true },
+      }])
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await runCreationAgentTurn('session-1', '继续', undefined, {
+      clientTurnId: 'turn-network',
+    })
+
+    expect(result.reply).toBe('已恢复')
+    expect(requests).toHaveLength(2)
+    expect(requests[0]).toMatchObject({ client_turn_id: 'turn-network', after_sequence: 0 })
+    expect(requests[1]).toMatchObject({ client_turn_id: 'turn-network', after_sequence: 0 })
+  })
+
+  it('surfaces a terminal SSE error without silently falling back or retrying', async () => {
+    const fetchMock = vi.fn(async () => sseResponse([{
+      client_turn_id: 'turn-error',
+      sequence: 1,
+      type: 'error',
+      message: 'revision conflict',
+      data: { error_type: 'revision_conflict' },
+    }]))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const error = await runCreationAgentTurn('session-1', '修改', undefined, {
+      clientTurnId: 'turn-error',
+    }).catch((caught: unknown) => caught)
+
+    expect(error).toMatchObject({
+      message: 'revision conflict',
+      detail: { error_type: 'revision_conflict' },
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})

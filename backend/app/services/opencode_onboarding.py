@@ -25,7 +25,6 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from app.ai.local_cli_adapter import (
-    OPENCODE_DEFAULT_MODEL,
     OPENCODE_MODELS,
     discover_local_cli_models,
     hidden_subprocess_kwargs,
@@ -48,6 +47,22 @@ from app.services.opencode_activation import (
     test_model as _activation_test_model,
 )
 from app.services.opencode_release_catalog import managed_windows_release
+from app.services.opencode_command_runtime import (
+    command_version as _probe_command_version,
+    free_model_options as _free_model_options,
+    is_free_model as is_free_opencode_model,
+    resolve_command as _resolve_command,
+    subprocess_command as _subprocess_command,
+)
+from app.services.windows_user_path import (
+    broadcast_environment_change as _broadcast_environment_change,
+    configure_user_path as _configure_user_path,
+    path_integration_supported as _path_integration_supported,
+    read_current_user_path as _read_current_user_path,
+    user_path_status as _user_path_status,
+    windows_path_contains as _windows_path_contains,
+    write_current_user_path as _write_current_user_path,
+)
 
 OPENCODE_RELEASES_URL = "https://github.com/anomalyco/opencode/releases/latest"
 OPENCODE_INSTALL_DOCS_URL = "https://opencode.ai/docs/#install"
@@ -69,6 +84,7 @@ async def _test_opencode_model(command: str, model: str) -> None:
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 _activation_start_lock = threading.Lock()
+_user_path_lock = threading.Lock()
 _inspection_cache: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
 _inspection_cache_lock = threading.Lock()
 _auth_sessions_lock = threading.Lock()
@@ -125,69 +141,39 @@ def managed_opencode_command() -> Path:
     return managed_opencode_root() / "bin" / "opencode.exe"
 
 
-def _resolve_candidate(candidate: str | None) -> str | None:
-    value = str(candidate or "").strip().strip('"')
-    if not value:
-        return None
-    path = Path(value).expanduser()
-    if path.is_file():
-        return str(path.resolve())
-    resolved = shutil.which(value)
-    return str(Path(resolved).resolve()) if resolved else None
+def managed_opencode_path_status(command: str | None = None) -> dict[str, Any]:
+    return _user_path_status(
+        command,
+        managed_opencode_command(),
+        supported=_path_integration_supported(),
+        read_path=_read_current_user_path,
+    )
+
+
+def configure_managed_opencode_path(*, enabled: bool = True) -> dict[str, Any]:
+    command = managed_opencode_command()
+    with _user_path_lock:
+        changes = _configure_user_path(
+            command,
+            enabled=enabled,
+            supported=_path_integration_supported(),
+            read_path=_read_current_user_path,
+            write_path=_write_current_user_path,
+            broadcast=_broadcast_environment_change,
+        )
+    clear_opencode_inspection_cache()
+    return {
+        **managed_opencode_path_status(str(command)),
+        "changed": changes["registry_changed"] or changes["process_changed"],
+    }
 
 
 def resolve_opencode_command(preferred: str | None = None) -> str | None:
-    candidates = [preferred, str(managed_opencode_command()), "opencode.cmd", "opencode.exe", "opencode"]
-    for candidate in candidates:
-        resolved = _resolve_candidate(candidate)
-        if resolved:
-            return resolved
-    return None
-
-
-def _subprocess_command(command: str, args: list[str]) -> list[str]:
-    if os.name == "nt" and Path(command).suffix.lower() in {".cmd", ".bat"}:
-        return ["cmd.exe", "/d", "/s", "/c", command, *args]
-    return [command, *args]
+    return _resolve_command(preferred, managed_opencode_command())
 
 
 def _command_version(command: str, *, timeout: int = 5) -> str | None:
-    try:
-        result = subprocess.run(
-            _subprocess_command(command, ["--version"]),
-            cwd=tempfile.gettempdir(),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            **hidden_subprocess_kwargs(),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    value = (result.stdout or result.stderr or "").strip().splitlines()
-    return value[0][:100] if value else None
-
-
-def is_free_opencode_model(model_id: str) -> bool:
-    normalized = str(model_id or "").strip().lower()
-    return normalized.endswith("-free") or normalized == "opencode/big-pickle"
-
-
-def _free_model_options(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    free = []
-    for item in models:
-        model_id = str(item.get("id") or "").strip()
-        if not is_free_opencode_model(model_id):
-            continue
-        free.append({
-            "id": model_id,
-            "display_name": str(item.get("display_name") or model_id),
-            "recommended": model_id == OPENCODE_DEFAULT_MODEL,
-        })
-    return free
+    return _probe_command_version(command, timeout=timeout)
 
 
 def _inspection_cache_key(command: str | None) -> tuple[str, int]:
@@ -218,7 +204,9 @@ def inspect_opencode(
         with _inspection_cache_lock:
             cached = _inspection_cache.get(cache_key)
             if cached and now - cached[0] < INSPECTION_CACHE_SECONDS:
-                return deepcopy(cached[1])
+                result = deepcopy(cached[1])
+                result["path_integration"] = managed_opencode_path_status(command)
+                return result
 
     version = _command_version(command, timeout=min(max(timeout, 2), 6)) if command else None
     discovered = discover_local_cli_models("opencode_cli", command, timeout=timeout) if command else []
@@ -249,6 +237,7 @@ def inspect_opencode(
         "recommended_model": recommended,
         "platform_supported": os.name == "nt" and platform.machine().lower() in {"amd64", "x86_64", "arm64", "aarch64"},
         "install_location": str(managed_opencode_command()),
+        "path_integration": managed_opencode_path_status(command),
         "official_links": {
             "releases": OPENCODE_RELEASES_URL,
             "install_docs": OPENCODE_INSTALL_DOCS_URL,
@@ -754,6 +743,7 @@ def _install_worker(job_id: str) -> None:
             free_models=inspected["free_models"],
             recommended_model=inspected["recommended_model"],
             sha256=expected_sha256,
+            path_integration=managed_opencode_path_status(inspected["command"]),
         )
     except Exception as exc:
         _set_job(
@@ -826,6 +816,7 @@ def _activation_payload(job: Any) -> dict[str, Any]:
         "attempt_count": job.attempt_count or 0,
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+        "path_integration": managed_opencode_path_status(job.command),
     }
 
 

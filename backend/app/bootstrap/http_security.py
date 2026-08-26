@@ -111,7 +111,7 @@ REMOTE_ANDROID_AUTHORING_PATHS: dict[str, frozenset[str]] = {
     "/api/v1/novel-creation/presets": frozenset({"GET"}),
     "/api/v1/novel-creation/sessions": frozenset({"GET"}),
     "/api/v1/novel-creation/start": frozenset({"POST"}),
-    "/api/v1/novel-creation/apply": frozenset({"POST"}),
+    "/api/v1/novel-creation/finalize": frozenset({"POST"}),
     "/api/v1/novel-creation/sessions/{session_id}": frozenset({"GET", "PATCH", "DELETE"}),
     "/api/v1/novel-creation/agent-turn": frozenset({"POST"}),
     "/api/v1/novel-creation/sessions/{session_id}/runs": frozenset({"POST"}),

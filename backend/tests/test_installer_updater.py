@@ -42,6 +42,75 @@ class InstallerUpdaterTestCase(unittest.TestCase):
         )
         self.assertEqual(manifest["sha256"], "b" * 64)
 
+    @patch("app.installer_updater.legacy._request")
+    def test_gitee_release_exposes_domestic_mirror_source(self, mock_request):
+        mock_request.return_value = (b"c" * 64) + b"  Siming-Setup.exe\n"
+        release = {
+            "tag_name": "v9.9.9",
+            "assets": [
+                {
+                    "name": "Siming-Setup.exe",
+                    "browser_download_url": "https://gitee.test/Siming-Setup.exe",
+                },
+                {
+                    "name": "Siming-Setup.sha256",
+                    "browser_download_url": "https://gitee.test/Siming-Setup.sha256",
+                },
+            ],
+        }
+
+        manifest = installer_updater._manifest_from_release_payload(
+            "mirror/repo",
+            release,
+            download_source=installer_updater.DOWNLOAD_SOURCE_GITEE,
+        )
+
+        self.assertIsNotNone(manifest)
+        self.assertEqual(manifest["download_source"], "gitee")
+        self.assertEqual(manifest["download_source_label"], "Gitee 国内镜像")
+        self.assertEqual(manifest["releases_url"], "https://gitee.com/mirror/repo/releases")
+
+    def test_same_release_merges_gitee_and_github_download_sources(self):
+        checksum = "d" * 64
+        github = {
+            "version": "9.9.9",
+            "download_url": "https://github.test/Siming-Setup.exe",
+            "sha256": checksum,
+            "source": "https://github.test/release",
+            "releases_url": "https://github.test/releases",
+            "download_source": "github",
+            "download_source_label": "GitHub",
+            "asset_name": "Siming-Setup.exe",
+            "install_mode": "installer",
+        }
+        gitee = {
+            **github,
+            "download_url": "https://gitee.test/Siming-Setup.exe",
+            "source": "https://gitee.test/release",
+            "releases_url": "https://gitee.test/releases",
+            "download_source": "gitee",
+            "download_source_label": "Gitee 国内镜像",
+        }
+
+        manifest = installer_updater._merge_release_manifests([github, gitee])
+
+        self.assertIsNotNone(manifest)
+        self.assertEqual(
+            [source["key"] for source in manifest["download_sources"]],
+            ["github", "gitee"],
+        )
+        self.assertEqual(manifest["sha256"], checksum)
+        self.assertEqual(
+            [
+                source["key"]
+                for source in installer_updater._download_candidates(
+                    manifest,
+                    installer_updater.DOWNLOAD_SOURCE_GITEE,
+                )
+            ],
+            ["gitee"],
+        )
+
     def test_unsigned_installer_update_is_allowed_with_matching_sha256(self):
         content = b"unsigned setup"
         checksum = hashlib.sha256(content).hexdigest()
@@ -61,16 +130,20 @@ class InstallerUpdaterTestCase(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             home = Path(temp_dir)
-            with patch(
-                "app.installer_updater.find_latest_update",
-                return_value=manifest,
-            ), patch(
-                "app.installer_updater.legacy._download_to_file",
-                side_effect=write_download,
-            ), patch(
-                "app.installer_updater.legacy._require_valid_signature",
-                side_effect=RuntimeError("signature should not be checked"),
-            ) as require_signature:
+            with (
+                patch(
+                    "app.installer_updater.find_latest_update",
+                    return_value=manifest,
+                ),
+                patch(
+                    "app.installer_updater.legacy._download_to_file",
+                    side_effect=write_download,
+                ),
+                patch(
+                    "app.installer_updater.legacy._require_valid_signature",
+                    side_effect=RuntimeError("signature should not be checked"),
+                ) as require_signature,
+            ):
                 result = installer_updater.download_and_stage_update(home)
 
             staged = installer_updater.legacy._read_staged_update(home)
@@ -80,6 +153,68 @@ class InstallerUpdaterTestCase(unittest.TestCase):
             self.assertIsNone(result["staged_update"]["signature"])
             self.assertEqual(staged["sha256"], checksum)
             require_signature.assert_not_called()
+
+    def test_legacy_auto_download_falls_back_from_github_to_gitee(self):
+        content = b"mirrored setup"
+        checksum = hashlib.sha256(content).hexdigest()
+        manifest = {
+            "version": "9.9.9",
+            "download_url": "https://github.test/Siming-Setup.exe",
+            "sha256": checksum,
+            "source": "https://github.test/release",
+            "asset_name": "Siming-Setup.exe",
+            "install_mode": "installer",
+            "migration": False,
+            "download_sources": [
+                {
+                    "key": "gitee",
+                    "label": "Gitee 国内镜像",
+                    "download_url": "https://gitee.test/Siming-Setup.exe",
+                    "releases_url": "https://gitee.test/releases",
+                },
+                {
+                    "key": "github",
+                    "label": "GitHub",
+                    "download_url": "https://github.test/Siming-Setup.exe",
+                    "releases_url": "https://github.test/releases",
+                },
+            ],
+        }
+        attempted_urls = []
+
+        def write_download(url, target, timeout=120):
+            del timeout
+            attempted_urls.append(url)
+            if "github" in url:
+                raise OSError("official source unavailable")
+            Path(target).write_bytes(content)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            with (
+                patch(
+                    "app.installer_updater.find_latest_update",
+                    return_value=manifest,
+                ),
+                patch(
+                    "app.installer_updater.legacy._download_to_file",
+                    side_effect=write_download,
+                ),
+            ):
+                result = installer_updater.download_and_stage_update(home)
+
+        self.assertEqual(
+            attempted_urls,
+            [
+                "https://github.test/Siming-Setup.exe",
+                "https://gitee.test/Siming-Setup.exe",
+            ],
+        )
+        self.assertEqual(result["staged_update"]["download_source"], "gitee")
+        self.assertEqual(
+            result["staged_update"]["download_source_label"],
+            "Gitee 国内镜像",
+        )
 
     def test_staged_installer_still_rejects_sha256_mismatch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -118,13 +253,17 @@ class InstallerUpdaterTestCase(unittest.TestCase):
                 "signature": None,
                 "install_mode": "installer",
             }
-            with patch(
-                "app.installer_updater.legacy._current_packaged_executable",
-                return_value=current,
-            ), patch(
-                "app.installer_updater._validate_staged_update",
-                return_value=staged,
-            ), patch("app.installer_updater.subprocess.Popen") as popen:
+            with (
+                patch(
+                    "app.installer_updater.legacy._current_packaged_executable",
+                    return_value=current,
+                ),
+                patch(
+                    "app.installer_updater._validate_staged_update",
+                    return_value=staged,
+                ),
+                patch("app.installer_updater.subprocess.Popen") as popen,
+            ):
                 result = installer_updater.schedule_staged_update_install(root)
 
             command = popen.call_args.args[0]
@@ -149,13 +288,17 @@ class InstallerUpdaterTestCase(unittest.TestCase):
                 "signature": None,
                 "install_mode": "installer",
             }
-            with patch(
-                "app.installer_updater.legacy._current_packaged_executable",
-                return_value=current,
-            ), patch(
-                "app.installer_updater._validate_staged_update",
-                return_value=staged,
-            ), patch("app.installer_updater.subprocess.Popen") as popen:
+            with (
+                patch(
+                    "app.installer_updater.legacy._current_packaged_executable",
+                    return_value=current,
+                ),
+                patch(
+                    "app.installer_updater._validate_staged_update",
+                    return_value=staged,
+                ),
+                patch("app.installer_updater.subprocess.Popen") as popen,
+            ):
                 result = installer_updater.schedule_staged_update_install(root)
 
             command = popen.call_args.args[0]

@@ -1,9 +1,4 @@
-"""V2 novel creation workspace contracts and deterministic stage assembly.
-
-The legacy blueprint generator remains responsible for model interaction. This
-module turns its result into a resumable, editable session draft and guarantees
-that final submission has the same story granularity as later cataloging.
-"""
+"""Novel creation workspace contracts and deterministic stage assembly."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -20,11 +15,9 @@ from app.services.novel_creation_contract import (
     STAGE_LABELS,
     STAGE_ORDER,
 )
-from app.services.novel_creation_compatibility import project_legacy_draft, projected_generation_blockers
 from app.services.novel_creation_failures import clear_stage_failure
 from app.services.novel_creation_conflicts import artifact_conflict_projection
 from app.services.novel_creation_patch import normalize_patch_operation
-from app.services.novel_creation_values import requested_volume_count as _requested_volume_count
 from app.services.novel_creation_runs import add_run_event, complete_run, confirm_run  # noqa: F401
 from app.services.novel_creation_runs import create_run, fail_run, serialize_run  # noqa: F401
 
@@ -171,7 +164,12 @@ def _preset(preset_id: str | None) -> dict[str, Any] | None:
     return None
 
 
-def initialize_session_draft(session: NovelCreationSession, values: dict[str, Any] | None = None) -> dict[str, Any]:
+def initialize_session_draft(
+    session: NovelCreationSession,
+    values: dict[str, Any] | None = None,
+    *,
+    persist: bool = True,
+) -> dict[str, Any]:
     values = _dict(values)
     preset_id = _text(values.get("preset_id") or session.genre, "free")
     preset = _preset(preset_id)
@@ -282,78 +280,20 @@ def initialize_session_draft(session: NovelCreationSession, values: dict[str, An
         "concept_seeds": _dict(existing.get("concept_seeds")),
         "selected_concept_id": existing.get("selected_concept_id"),
         "stages": stages,
+        "artifact_locks": _dict(existing.get("artifact_locks")),
+        "interview": _dict(existing.get("interview")),
         "quick_mode": bool(existing.get("quick_mode", False)),
         "created_at": existing.get("created_at") or _now(),
         "updated_at": _now(),
     }
-    session.schema_version = SCHEMA_VERSION
-    session.current_stage = session.current_stage or "constraints"
-    session.draft_json = draft
-    session.user_brief = form["brief"] or None
-    session.genre = form["genre"] or None
-    session.target_audience = form["target_audience"] or None
-    session.platform = form["platform"] or None
-    return draft
-
-
-def concept_cards(blueprints: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    cards: list[dict[str, Any]] = []
-    for index, blueprint in enumerate(blueprints[:3]):
-        protagonist = _dict(blueprint.get("protagonist"))
-        coverage = _dict(blueprint.get("requirement_coverage"))
-        creative = _dict(blueprint.get("creative_slots"))
-        golden = _dict(blueprint.get("golden_three"))
-        cards.append({
-            "id": f"concept-{index + 1}",
-            "source_index": index,
-            "title": _text(blueprint.get("title"), f"创意方向 {index + 1}"),
-            "subtitle": _text(blueprint.get("subtitle") or blueprint.get("genre_positioning")),
-            "logline": _text(blueprint.get("logline") or blueprint.get("premise")),
-            "protagonist_seed": {
-                "name": _text(protagonist.get("name"), "待命名主角"),
-                "identity": _text(protagonist.get("background")),
-                "goal": _text(protagonist.get("goal")),
-                "lack": _text(protagonist.get("weakness") or protagonist.get("conflict")),
-            },
-            "world_hook": _text(creative.get("world_rules") or blueprint.get("world_hook") or blueprint.get("premise")),
-            "core_conflict": _text(blueprint.get("core_conflict") or protagonist.get("conflict")),
-            "story_engine": _text(creative.get("story_engine") or blueprint.get("story_engine")),
-            "opening_hook": _text(golden.get("opening_scene") or golden.get("chapter_1")),
-            "differentiators": _list(blueprint.get("selling_points"))[:4],
-            "risks": _list(blueprint.get("risks"))[:3],
-            "coverage": {
-                "score": int(coverage.get("score") or 0),
-                "covered": _list(coverage.get("covered")),
-                "missing": _list(coverage.get("missing")),
-            },
-        })
-    return cards
-
-
-def attach_concepts(session: NovelCreationSession, blueprints: list[dict[str, Any]]) -> dict[str, Any]:
-    draft = deepcopy(initialize_session_draft(session))
-    draft["concepts"] = concept_cards(blueprints)
-    # Legacy full-blueprint flows retain their source in blueprint_json. Clear
-    # compact seeds so a stale compact selection can never win over it.
-    draft["concept_seeds"] = {}
-    draft["selected_concept_id"] = None
-    draft["stages"]["concepts"] = {"status": "generated", "data": {"options": draft["concepts"]}, "updated_at": _now()}
-    draft["updated_at"] = _now()
-    session.draft_json = deepcopy(draft)
-    session.current_stage = "concepts"
-    session.status = "reviewing"
-    session.revision = int(session.revision or 0) + 1
-    from app.services.novel_creation_versions import record_artifact_version
-
-    record_artifact_version(
-        session,
-        "concepts",
-        draft["stages"]["concepts"]["data"],
-        revision=int(session.revision or 0),
-        status="generated",
-        source="legacy_blueprint",
-        change_type="generate",
-    )
+    if persist:
+        session.schema_version = SCHEMA_VERSION
+        session.current_stage = session.current_stage or "constraints"
+        session.draft_json = draft
+        session.user_brief = form["brief"] or None
+        session.genre = form["genre"] or None
+        session.target_audience = form["target_audience"] or None
+        session.platform = form["platform"] or None
     return draft
 
 
@@ -377,7 +317,7 @@ def save_compact_concepts(
     *,
     source: str = "model",
 ) -> dict[str, Any]:
-    """Persist compact concept cards without changing legacy blueprint_json."""
+    """Persist the current concept cards and their project seeds."""
     draft = deepcopy(initialize_session_draft(session))
     cards: list[dict[str, Any]] = []
     seeds: dict[str, dict[str, Any]] = {}
@@ -414,10 +354,8 @@ def save_compact_concepts(
         cards.append(card)
         seeds[concept_id] = deepcopy(card)
 
-    expected_count = 1
-    if len(cards) != expected_count:
-        label = "作者方案" if expected_count == 1 else "轻量创意"
-        raise ValueError(f"{label}必须恰好包含{expected_count}张有效创意卡")
+    if not cards:
+        raise ValueError("创意方向没有可用的方案卡")
 
     draft["concepts"] = cards
     draft["concept_seeds"] = seeds
@@ -447,15 +385,9 @@ def save_compact_concepts(
     return draft["stages"]["concepts"]
 
 
-def generation_blockers(session: NovelCreationSession, stage: str, draft_override: dict[str, Any] | None = None) -> list[dict[str, str]]:
-    """Return confirmed-stage prerequisites that prevent a generation run."""
-    draft = project_legacy_draft(_dict(draft_override) if draft_override is not None else _dict(session.draft_json), STAGE_ORDER)
-    return projected_generation_blockers(draft, stage, STAGE_ORDER, STAGE_LABELS)
-
-
 def build_stage_flow(session: NovelCreationSession, draft_override: dict[str, Any] | None = None) -> dict[str, Any]:
     """Project stored stage data into an author-facing, recoverable workflow."""
-    draft = project_legacy_draft(_dict(draft_override) if draft_override is not None else _dict(session.draft_json), STAGE_ORDER)
+    draft = deepcopy(draft_override) if isinstance(draft_override, dict) else deepcopy(initialize_session_draft(session))
     stages = _dict(draft.get("stages"))
     items: dict[str, dict[str, Any]] = {}
 
@@ -481,41 +413,28 @@ def build_stage_flow(session: NovelCreationSession, draft_override: dict[str, An
             status = _text(state.get("status"), "pending")
             if status == "confirmed":
                 continue
-            if not generation_blockers(session, stage):
-                recommended_stage = stage
-                break
+            recommended_stage = stage
+            break
     if recommended_stage is None:
         recommended_stage = "final_review"
 
     for index, stage in enumerate(STAGE_ORDER):
         state = _dict(stages.get(stage))
         status = _text(state.get("status"), "pending")
-        blockers = generation_blockers(session, stage, draft)
         soft_dependencies = _soft_dependencies(draft, stage)
         has_data = state.get("data") is not None
-        can_generate = stage not in {"constraints", "concepts"} and not blockers
-        can_confirm = has_data and status in {"generated", "stale"} and not blockers
-        can_view = (
-            can_generate
-            or has_data
-            or status in {"generated", "confirmed", "stale"}
-            or stage in {attention_stage, recommended_stage}
-        )
-        actions = ["view"] if can_view else []
+        can_confirm = has_data and status in {"generated", "stale"}
+        actions = ["view"]
         if has_data:
             actions.append("edit")
-        if can_generate:
-            actions.append("regenerate" if has_data else "generate")
+        actions.append("regenerate" if has_data else "generate")
         if can_confirm:
             actions.append("confirm")
         items[stage] = {
             "stage": stage,
             "label": STAGE_LABELS[stage],
             "status": status,
-            "can_view": can_view,
-            "can_generate": can_generate,
             "can_confirm": can_confirm,
-            "blocked_by": blockers,
             "soft_dependencies": soft_dependencies,
             "actions": actions,
             "next_stage": STAGE_ORDER[index + 1] if index + 1 < len(STAGE_ORDER) else None,
@@ -535,7 +454,7 @@ def build_stage_flow(session: NovelCreationSession, draft_override: dict[str, An
 
 
 def serialize_session(session: NovelCreationSession, include_runs: bool = True) -> dict[str, Any]:
-    projected_draft = project_legacy_draft(_dict(session.draft_json), STAGE_ORDER)
+    projected_draft = deepcopy(initialize_session_draft(session, persist=False))
     projected_stages = _dict(projected_draft.get("stages"))
     projected_final = _dict(projected_stages.get("final_review"))
     if projected_final.get("data") is not None and projected_final.get("status") in {"generated", "confirmed"}:
@@ -591,7 +510,7 @@ def serialize_creation_artifact(session: NovelCreationSession, stage: str) -> di
     """Return one creation artifact with its workflow and provenance metadata."""
     if stage not in STAGE_ORDER:
         raise ValueError(f"unknown stage: {stage}")
-    draft = project_legacy_draft(_dict(session.draft_json), STAGE_ORDER)
+    draft = deepcopy(initialize_session_draft(session))
     state = _dict(_dict(draft.get("stages")).get(stage))
     flow = build_stage_flow(session, draft)["items"][stage]
     locks = _dict(draft.get("artifact_locks"))
@@ -637,10 +556,10 @@ def list_creation_artifacts(session: NovelCreationSession) -> list[dict[str, Any
 
 
 def creation_artifact_dependencies(session: NovelCreationSession, stage: str) -> dict[str, Any]:
-    """Describe blockers and retained downstream data that a change may stale."""
+    """Describe advisory inputs and retained downstream data that a change may stale."""
     if stage not in STAGE_ORDER:
         raise ValueError(f"unknown stage: {stage}")
-    draft = project_legacy_draft(_dict(session.draft_json), STAGE_ORDER)
+    draft = deepcopy(initialize_session_draft(session))
     downstream = []
     for name in IMPACT_DEPENDENCIES.get(stage, ()):
         state = _dict(_dict(draft.get("stages")).get(name))
@@ -653,7 +572,6 @@ def creation_artifact_dependencies(session: NovelCreationSession, stage: str) ->
             })
     return {
         "artifact": stage,
-        "hard_dependencies": generation_blockers(session, stage, draft),
         "soft_dependencies": _soft_dependencies(draft, stage),
         "affected_artifacts": downstream,
     }
@@ -909,7 +827,12 @@ def undo_creation_artifact(session: NovelCreationSession, stage: str) -> dict[st
     }
 
 
-def patch_session(session: NovelCreationSession, patch: dict[str, Any]) -> dict[str, Any]:
+def patch_session(
+    session: NovelCreationSession,
+    patch: dict[str, Any],
+    *,
+    source: str = "author",
+) -> dict[str, Any]:
     draft = initialize_session_draft(session)
     before_form = _dict(draft.get("form"))
     before_author_source = {
@@ -942,7 +865,12 @@ def patch_session(session: NovelCreationSession, patch: dict[str, Any]) -> dict[
         draft["locked_requirements"] = [_text(item) for item in value if _text(item)]
     if draft["form"] != before_form:
         _invalidate_after(draft, "constraints")
-        draft["stages"]["constraints"] = {"status": "generated", "data": deepcopy(draft["form"]), "updated_at": _now()}
+        draft["stages"]["constraints"] = {
+            "status": "generated",
+            "data": deepcopy(draft["form"]),
+            "source": source,
+            "updated_at": _now(),
+        }
     after_author_source = {
         "creation_mode": _text(draft.get("creation_mode"), "explore"),
         "author_brief": _text(draft.get("author_brief")),
@@ -972,7 +900,7 @@ def patch_session(session: NovelCreationSession, patch: dict[str, Any]) -> dict[
             draft["form"],
             revision=int(session.revision or 0),
             status="generated",
-            source="author",
+            source=source,
             change_type="session_patch",
         )
     concept_stage = _dict(draft.get("stages", {}).get("concepts"))
@@ -989,13 +917,13 @@ def patch_session(session: NovelCreationSession, patch: dict[str, Any]) -> dict[
     return draft
 
 
-def _compact_seed_blueprint(seed: dict[str, Any], form: dict[str, Any]) -> dict[str, Any]:
+def _project_seed_payload(seed: dict[str, Any], form: dict[str, Any]) -> dict[str, Any]:
     protagonist = _dict(seed.get("protagonist_seed"))
     title = _text(seed.get("title"), "未命名小说")
-    logline = _text(seed.get("logline"))
-    world_hook = _text(seed.get("world_hook"))
-    core_conflict = _text(seed.get("core_conflict"))
-    opening_hook = _text(seed.get("opening_hook"))
+    logline = _text(seed.get("logline") or form.get("brief"), "按作者提供的立项信息继续完善故事")
+    world_hook = _text(seed.get("world_hook") or form.get("world_tone") or logline)
+    core_conflict = _text(seed.get("core_conflict") or form.get("story_structure") or logline)
+    opening_hook = _text(seed.get("opening_hook") or core_conflict)
     protagonist_name = _text(protagonist.get("name"), "待命名主角")
     return {
         "title": title,
@@ -1005,9 +933,13 @@ def _compact_seed_blueprint(seed: dict[str, Any], form: dict[str, Any]) -> dict[
         "logline": logline,
         "premise": logline,
         "core_conflict": core_conflict,
+        "writing_style": _text(form.get("writing_style"), "遵循作者指定的类型与叙事语气"),
+        "world_tone": _text(form.get("world_tone"), "围绕作者设定保持统一且可追溯的世界规则"),
+        "story_structure": _text(form.get("story_structure"), "由核心目标、阻力、选择和后果持续推进"),
+        "pacing": _text(form.get("pacing"), "每章推动事件或关系变化并兑现阶段钩子"),
         "protagonist": {
             "name": protagonist_name,
-            "goal": _text(protagonist.get("goal")),
+            "goal": _text(protagonist.get("goal"), "推动作者设定的核心目标"),
             "weakness": _text(protagonist.get("lack")),
             "conflict": core_conflict,
             "background": _text(protagonist.get("identity")),
@@ -1034,20 +966,30 @@ def _compact_seed_blueprint(seed: dict[str, Any], form: dict[str, Any]) -> dict[
     }
 
 
-def _selected_blueprint(session: NovelCreationSession, draft_override: dict[str, Any] | None = None) -> dict[str, Any]:
+def _selected_project_seed(
+    session: NovelCreationSession,
+    draft_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     draft = deepcopy(draft_override) if isinstance(draft_override, dict) else initialize_session_draft(session)
     selected_id = draft.get("selected_concept_id")
-    selected = next((item for item in draft.get("concepts", []) if item.get("id") == selected_id), None)
-    if not selected:
-        raise ValueError("请先选择一个创意方向")
+    concepts = [item for item in _list(draft.get("concepts")) if isinstance(item, dict)]
+    selected = next((item for item in concepts if item.get("id") == selected_id), concepts[0] if concepts else None)
+    selected_id = _text(_dict(selected).get("id"))
     compact_seed = _dict(draft.get("concept_seeds")).get(selected_id)
     if isinstance(compact_seed, dict):
-        return _compact_seed_blueprint(compact_seed, _dict(draft.get("form")))
-    blueprints = session.blueprint_json if isinstance(session.blueprint_json, list) else [session.blueprint_json]
-    index = int(selected.get("source_index") or 0)
-    if index >= len(blueprints) or not isinstance(blueprints[index], dict):
-        raise ValueError("当前创意方向缺少完整方案来源，请重新生成方向")
-    return deepcopy(blueprints[index])
+        return _project_seed_payload(compact_seed, _dict(draft.get("form")))
+    if selected:
+        return _project_seed_payload(selected, _dict(draft.get("form")))
+    form = _dict(draft.get("form"))
+    brief = _text(draft.get("author_brief") or form.get("brief") or session.user_brief)
+    outline = _text(draft.get("author_outline"))
+    return _project_seed_payload({
+        "title": _text(form.get("title") or brief[:20], "未命名小说"),
+        "logline": brief or outline,
+        "world_hook": form.get("world_tone") or brief,
+        "core_conflict": outline or brief,
+        "opening_hook": outline[:200] or brief[:200],
+    }, form)
 
 
 def _profile(character: dict[str, Any], index: int) -> dict[str, Any]:
@@ -1085,12 +1027,12 @@ def _opening_outline_chapter_count(form: dict[str, Any]) -> int:
     return OPENING_OUTLINE_CHAPTER_COUNT
 
 
-def _opening_outline(blueprint: dict[str, Any], form: dict[str, Any]) -> dict[str, Any]:
-    raw_nodes = [item for item in _list(blueprint.get("outline")) if isinstance(item, dict)]
+def _opening_outline(project_seed: dict[str, Any], form: dict[str, Any]) -> dict[str, Any]:
+    raw_nodes = [item for item in _list(project_seed.get("outline")) if isinstance(item, dict)]
     chapter_sources = [item for item in raw_nodes if _text(item.get("node_type"), "chapter") == "chapter"]
-    protagonist = _dict(blueprint.get("protagonist"))
+    protagonist = _dict(project_seed.get("protagonist"))
     protagonist_name = _text(protagonist.get("name"), "主角")
-    core_conflict = _text(blueprint.get("core_conflict") or protagonist.get("conflict"), "核心矛盾持续升级")
+    core_conflict = _text(project_seed.get("core_conflict") or protagonist.get("conflict"), "核心矛盾持续升级")
     location = _text(protagonist.get("current_location"), "故事起点")
     chapters: list[dict[str, Any]] = []
     sections: list[dict[str, Any]] = []
@@ -1155,22 +1097,22 @@ def derive_stage(
     if stage == "concepts":
         selected = draft.get("selected_concept_id")
         return {"options": _list(draft.get("concepts")), "selected_concept_id": selected}
-    blueprint = _selected_blueprint(session, draft)
+    project_seed = _selected_project_seed(session, draft)
     if stage == "world_style":
         return {
-            "writing_style": _text(form.get("writing_style") or blueprint.get("writing_style")),
-            "world_tone": _text(form.get("world_tone")),
-            "story_structure": _text(form.get("story_structure")),
-            "pacing": _text(form.get("pacing")),
-            "style_rules": _list(blueprint.get("style_rules")),
-            "forbidden_patterns": _list(form.get("avoid")) + _list(blueprint.get("forbidden_patterns")),
-            "worldbuilding": _list(blueprint.get("worldbuilding")),
+            "writing_style": _text(form.get("writing_style") or project_seed.get("writing_style")),
+            "world_tone": _text(form.get("world_tone") or project_seed.get("world_tone")),
+            "story_structure": _text(form.get("story_structure") or project_seed.get("story_structure")),
+            "pacing": _text(form.get("pacing") or project_seed.get("pacing")),
+            "style_rules": _list(project_seed.get("style_rules")),
+            "forbidden_patterns": _list(form.get("avoid")) + _list(project_seed.get("forbidden_patterns")),
+            "worldbuilding": _list(project_seed.get("worldbuilding")),
             "display_groups": ["世界规则", "力量与资源", "社会与文化", "历史与冲突", "生活与感官"],
         }
     if stage == "characters":
-        protagonist = _dict(blueprint.get("protagonist"))
+        protagonist = _dict(project_seed.get("protagonist"))
         protagonist["role_type"] = "protagonist"
-        rows = [protagonist] + [item for item in _list(blueprint.get("characters")) if isinstance(item, dict)]
+        rows = [protagonist] + [item for item in _list(project_seed.get("characters")) if isinstance(item, dict)]
         unique: list[dict[str, Any]] = []
         seen: set[str] = set()
         for index, row in enumerate(rows):
@@ -1181,9 +1123,9 @@ def derive_stage(
             item = deepcopy(row)
             item["profile"] = _profile(item, index)
             unique.append(item)
-        return {"characters": unique, "relationships": _list(blueprint.get("relationships"))}
+        return {"characters": unique, "relationships": _list(project_seed.get("relationships"))}
     if stage == "locations":
-        entries = [item for item in _list(blueprint.get("worldbuilding")) if isinstance(item, dict)]
+        entries = [item for item in _list(project_seed.get("worldbuilding")) if isinstance(item, dict)]
         locations = [item for item in entries if _text(item.get("dimension")) in {"geography", "factions", "location", "organization"}]
         if not locations:
             locations = entries[:6]
@@ -1198,10 +1140,9 @@ def derive_stage(
             })
         return {"entries": locations, "relations": relations}
     if stage == "macro_outline":
-        volumes = _list(blueprint.get("volume_outline"))
+        volumes = _list(project_seed.get("volume_outline"))
         target_chapters = int(form.get("target_chapters") or 240)
-        requested_volume_count = _requested_volume_count(draft)
-        volume_count = requested_volume_count or min(12, max(3, round(target_chapters / 100)))
+        volume_count = max(1, len(volumes))
         volumes = volumes[:volume_count]
         while len(volumes) < volume_count:
             index = len(volumes)
@@ -1217,16 +1158,15 @@ def derive_stage(
             volume["start_chapter"] = index * span + 1
             volume["end_chapter"] = target_chapters if index == len(volumes) - 1 else (index + 1) * span
         return {
-            "story_overview": _text(blueprint.get("premise") or blueprint.get("logline")),
-            "core_conflict": _text(blueprint.get("core_conflict")),
-            "ending_direction": _text(blueprint.get("ending_direction"), "主角必须以最终选择回应开篇提出的核心问题"),
+            "story_overview": _text(project_seed.get("premise") or project_seed.get("logline")),
+            "core_conflict": _text(project_seed.get("core_conflict")),
+            "ending_direction": _text(project_seed.get("ending_direction"), "主角必须以最终选择回应开篇提出的核心问题"),
             "target_chapters": target_chapters,
-            "requested_volume_count": requested_volume_count,
             "volumes": volumes,
             "stage_plan": [{"name": _text(item.get("title")), "range": [item.get("start_chapter"), item.get("end_chapter")], "promise": _text(item.get("summary"))} for item in volumes if isinstance(item, dict)],
         }
     if stage == "opening_outline":
-        return _opening_outline(blueprint, form)
+        return _opening_outline(project_seed, form)
     stages = draft.get("stages", {})
     opening_state = _dict(stages.get("opening_outline"))
     opening_confirmed = opening_state.get("status") == "confirmed"
@@ -1236,15 +1176,12 @@ def derive_stage(
     opening = _dict(opening_state.get("data")) if opening_confirmed else {}
     characters = _dict(stages.get("characters", {}).get("data")) or derive_stage(session, "characters", draft)
     world = _dict(stages.get("world_style", {}).get("data")) or derive_stage(session, "world_style", draft)
-    blocking = []
-    for required_stage in ("constraints", "concepts", "world_style", "characters", "locations", "macro_outline"):
-        status = _dict(stages.get(required_stage)).get("status")
-        if status != "confirmed":
-            blocking.append(f"{STAGE_LABELS[required_stage]}尚未确认或需要重新生成")
     if opening_confirmed:
         opening_chapter_count = _opening_outline_chapter_count(form)
         if len(opening.get("chapters", [])) != opening_chapter_count:
-            blocking.append(f"已确认的前{opening_chapter_count}章细纲不完整")
+            warnings = [f"已确认的前{opening_chapter_count}章细纲不完整"]
+        else:
+            warnings = []
         section_counts: dict[str, int] = {}
         for section in opening.get("sections", []):
             parent = _text(section.get("parent_client_id"))
@@ -1255,19 +1192,21 @@ def derive_stage(
             if isinstance(chapter, dict)
         ]
         if any(not chapter_id or section_counts.get(chapter_id, 0) not in range(2, 7) for chapter_id in chapter_ids):
-            blocking.append("已确认的开篇细纲中，每章必须包含2至6个场景事件")
+            warnings.append("已确认的开篇细纲中，每章应包含2至6个场景事件")
+    else:
+        warnings = []
     if not characters.get("characters"):
-        blocking.append("缺少角色档案")
+        warnings.append("当前没有角色档案，可在正式作品中继续补充")
     if not world.get("worldbuilding"):
-        blocking.append("缺少世界观条目")
-    warnings = ["后续章节仅保留宏观卷纲，写作前再按批次展开细纲"]
+        warnings.append("当前没有世界观条目，可在正式作品中继续补充")
+    warnings.append("后续章节仅保留宏观卷纲，写作前再按批次展开细纲")
     if not opening_confirmed:
         warnings.append(
             "开篇细纲尚未确认，本次只写入核心立项资料；可在正式作品中继续生成和完善章节。"
         )
     return {
-        "ready": not blocking,
-        "blocking": blocking,
+        "ready": True,
+        "blocking": [],
         "warnings": warnings,
         "counts": {
             "characters": len(characters.get("characters", [])),
@@ -1371,12 +1310,11 @@ def save_stage(
         options = data.get("options")
         if isinstance(options, list):
             draft["concepts"] = deepcopy(options)
-            if not _list(session.blueprint_json):
-                draft["concept_seeds"] = {
-                    _text(item.get("id")): deepcopy(item)
-                    for item in options
-                    if isinstance(item, dict) and _text(item.get("id"))
-                }
+            draft["concept_seeds"] = {
+                _text(item.get("id")): deepcopy(item)
+                for item in options
+                if isinstance(item, dict) and _text(item.get("id"))
+            }
         selected_id = data.get("selected_concept_id")
         if selected_id:
             draft["selected_concept_id"] = selected_id
@@ -1416,20 +1354,11 @@ def save_stage(
     return draft["stages"][stage]
 
 
-def build_apply_blueprint(session: NovelCreationSession) -> dict[str, Any]:
-    blueprint = _selected_blueprint(session)
-    draft = project_legacy_draft(initialize_session_draft(session), STAGE_ORDER)
+def build_project_materialization_payload(session: NovelCreationSession) -> dict[str, Any]:
+    project_payload = _selected_project_seed(session)
+    draft = deepcopy(initialize_session_draft(session))
     stages = draft.get("stages", {})
-    unconfirmed = [
-        STAGE_LABELS[name]
-        for name in ("constraints", "concepts", "world_style", "characters", "locations", "macro_outline")
-        if _dict(stages.get(name)).get("status") != "confirmed"
-    ]
-    if unconfirmed:
-        raise ValueError("以下阶段尚未确认或已失效：" + "、".join(unconfirmed))
     final = derive_stage(session, "final_review", draft)
-    if not final.get("ready"):
-        raise ValueError("最终审阅未通过：" + "；".join(final.get("blocking", [])))
     characters = _dict(stages.get("characters", {}).get("data")) or derive_stage(session, "characters")
     world = _dict(stages.get("world_style", {}).get("data")) or derive_stage(session, "world_style")
     locations = _dict(stages.get("locations", {}).get("data")) or derive_stage(session, "locations")
@@ -1442,16 +1371,16 @@ def build_apply_blueprint(session: NovelCreationSession) -> dict[str, Any]:
     all_world = _list(world.get("worldbuilding"))
     known_titles = {_text(item.get("title")) for item in all_world if isinstance(item, dict)}
     all_world.extend(item for item in _list(locations.get("entries")) if isinstance(item, dict) and _text(item.get("title")) not in known_titles)
-    blueprint.update({
+    project_payload.update({
         "protagonist": protagonist,
         "characters": supporting,
         "relationships": _list(characters.get("relationships")),
-        "writing_style": _text(world.get("writing_style") or blueprint.get("writing_style")),
-        "world_tone": _text(world.get("world_tone") or blueprint.get("world_tone")),
-        "story_structure": _text(world.get("story_structure") or blueprint.get("story_structure")),
-        "pacing": _text(world.get("pacing") or blueprint.get("pacing")),
-        "style_rules": _list(world.get("style_rules")) or _list(blueprint.get("style_rules")),
-        "forbidden_patterns": _list(world.get("forbidden_patterns")) or _list(blueprint.get("forbidden_patterns")),
+        "writing_style": _text(world.get("writing_style") or project_payload.get("writing_style")),
+        "world_tone": _text(world.get("world_tone") or project_payload.get("world_tone")),
+        "story_structure": _text(world.get("story_structure") or project_payload.get("story_structure")),
+        "pacing": _text(world.get("pacing") or project_payload.get("pacing")),
+        "style_rules": _list(world.get("style_rules")) or _list(project_payload.get("style_rules")),
+        "forbidden_patterns": _list(world.get("forbidden_patterns")) or _list(project_payload.get("forbidden_patterns")),
         "worldbuilding": all_world,
         "worldbuilding_relations": _list(locations.get("relations")),
         "volume_outline": _list(macro.get("volumes")),
@@ -1459,4 +1388,4 @@ def build_apply_blueprint(session: NovelCreationSession) -> dict[str, Any]:
         "apply_warnings": _list(final.get("warnings")),
         "novel_creation_schema_version": SCHEMA_VERSION,
     })
-    return blueprint
+    return project_payload

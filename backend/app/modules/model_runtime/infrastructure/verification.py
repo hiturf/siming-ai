@@ -61,6 +61,7 @@ def _provider_label(provider: str) -> str:
         "qwen_code_cli": "Qwen Code CLI",
         "hermes_cli": "Hermes Agent CLI",
         "openclaw_cli": "OpenClaw CLI",
+        "dsh_cli": "DeepSeek Harness CLI",
         "custom_cli": "Custom Local CLI",
     }
     return labels.get(provider, provider)
@@ -266,7 +267,7 @@ class ProviderModelVerification:
                 model=request.model,
                 temperature=0,
                 max_tokens=512,
-                extra_body={"moshu_task_type": "chat"},
+                extra_body={"moshu_task_type": "assistant"},
             )
             reply = str(result.get("content") or "").strip()
             reasoning = str(result.get("reasoning_content") or "").strip()

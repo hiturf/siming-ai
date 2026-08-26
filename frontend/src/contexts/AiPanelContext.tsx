@@ -1,48 +1,94 @@
 import { createContext, useCallback, useContext, useMemo, useState } from 'react'
 
-interface AiPanelContextValue {
-  selectedOutlineNodeId: string | null
-  selectedCharacterId: string | null
+interface AiSelectionState {
   selectedText: string
   selectedTextChapterId: string | null
-  setAiContext: (partial: Partial<Omit<AiPanelContextValue, 'setAiContext' | 'refreshKey' | 'triggerRefresh'>>) => void
+}
+
+export interface GeneratedChapterDraft {
+  draftId: string
+  projectId: string
+  title: string
+  outlineNodeId: string | null
+  contextManifestId: string | null
+  savedChapterId: string | null
+  content: string
+  wordCount: number
+  status: 'pending' | 'saved' | 'superseded'
+}
+
+interface AiPanelContextValue extends AiSelectionState {
+  setAiContext: (partial: Partial<AiSelectionState>) => void
+  generatedDraft: GeneratedChapterDraft | null
+  openGeneratedDraft: (draft: GeneratedChapterDraft) => void
+  updateGeneratedDraft: (partial: Partial<GeneratedChapterDraft>) => void
+  clearGeneratedDraft: () => void
   refreshKey: number
   triggerRefresh: () => void
 }
 
 const AiPanelContext = createContext<AiPanelContextValue>({
-  selectedOutlineNodeId: null,
-  selectedCharacterId: null,
   selectedText: '',
   selectedTextChapterId: null,
   setAiContext: () => {},
+  generatedDraft: null,
+  openGeneratedDraft: () => {},
+  updateGeneratedDraft: () => {},
+  clearGeneratedDraft: () => {},
   refreshKey: 0,
   triggerRefresh: () => {},
 })
 
 export function AiPanelProvider({ children }: { children: React.ReactNode }) {
-  const [context, setContext] = useState<Omit<AiPanelContextValue, 'setAiContext' | 'refreshKey' | 'triggerRefresh'>>({
-    selectedOutlineNodeId: null,
-    selectedCharacterId: null,
+  const [context, setContext] = useState<AiSelectionState>({
     selectedText: '',
     selectedTextChapterId: null,
   })
+  const [generatedDraft, setGeneratedDraft] = useState<GeneratedChapterDraft | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
 
   const setAiContext = useCallback(
-    (partial: Partial<Omit<AiPanelContextValue, 'setAiContext' | 'refreshKey' | 'triggerRefresh'>>) => {
+    (partial: Partial<AiSelectionState>) => {
       setContext((prev) => ({ ...prev, ...partial }))
     },
     [],
   )
+
+  const openGeneratedDraft = useCallback((draft: GeneratedChapterDraft) => {
+    setGeneratedDraft(draft)
+  }, [])
+
+  const updateGeneratedDraft = useCallback((partial: Partial<GeneratedChapterDraft>) => {
+    setGeneratedDraft((current) => current ? { ...current, ...partial } : current)
+  }, [])
+
+  const clearGeneratedDraft = useCallback(() => setGeneratedDraft(null), [])
 
   const triggerRefresh = useCallback(() => {
     setRefreshKey((key) => key + 1)
   }, [])
 
   const value = useMemo<AiPanelContextValue>(
-    () => ({ ...context, setAiContext, refreshKey, triggerRefresh }),
-    [context, setAiContext, refreshKey, triggerRefresh],
+    () => ({
+      ...context,
+      setAiContext,
+      generatedDraft,
+      openGeneratedDraft,
+      updateGeneratedDraft,
+      clearGeneratedDraft,
+      refreshKey,
+      triggerRefresh,
+    }),
+    [
+      context,
+      setAiContext,
+      generatedDraft,
+      openGeneratedDraft,
+      updateGeneratedDraft,
+      clearGeneratedDraft,
+      refreshKey,
+      triggerRefresh,
+    ],
   )
 
   return <AiPanelContext.Provider value={value}>{children}</AiPanelContext.Provider>

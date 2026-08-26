@@ -83,8 +83,6 @@
         "update_character": "authoring.character",
         "list_chapters": "authoring.chapter",
         "search_chapters": "authoring.chapter",
-        "create_chapter": "authoring.chapter",
-        "update_chapter": "authoring.chapter",
         "search_outline": "authoring.outline",
         "search_outline_tree": "authoring.outline",
         "create_outline_node": "authoring.outline",
@@ -120,6 +118,10 @@
           {
             "path": "backend/app/services/workspace/assistant_stream_runtime.py",
             "contains": "async def"
+          },
+          {
+            "path": "backend/app/architecture/tool_categories.py",
+            "contains": "TOOL_CATEGORY_CONTROLLER = \"set_tool_categories\""
           }
         ]
       },
@@ -158,9 +160,13 @@
             {
               "path": "mobile/android/app/src/main/java/com/siming/mobile/data/agent/MobileChapterWriteStore.kt",
               "contains": "internal class MobileChapterWriteStore("
+            },
+            {
+              "path": "mobile/android/app/src/main/java/com/siming/mobile/data/agent/PcToolCategoryContract.kt",
+              "contains": "internal class PcToolCategoryContract"
             }
           ],
-          "limitations": "提示词、工具 schema 与版本化上下文策略均由 PC 源生成；章节写作运行、草稿和完整 ContextManifest 已具备本地持久恢复，但通用 Agent 对话转录仍未进入 PC 的数据库级运行审计，检索仍是确定性词法降级。"
+          "limitations": "提示词、工具 schema、宽粒度类别控制器与版本化上下文策略均由 PC 源生成；章节写作运行、草稿和完整 ContextManifest 已具备本地持久恢复，但通用 Agent 对话转录仍未进入 PC 的数据库级运行审计，检索仍是确定性词法降级。"
         }
       },
       "side_effects": [],
@@ -229,33 +235,25 @@
               "path": "backend/app/services/gateway_legacy_replication.py",
               "contains": "if spec.model is Chapter and row_existed:"
             },
-            {
-              "path": "backend/app/modules/gateway/infrastructure/mutation_service.py",
-              "contains": "def _defer_post_commit_side_effects("
-            },
-            {
-              "path": "backend/app/routers/gateway.py",
-              "contains": "for mutation_id, project_id, chapter_id in service.take_deferred_chapter_cataloging()"
-            }
+        {
+          "path": "backend/app/modules/story/infrastructure/chapters.py",
+          "contains": "cataloging_required=bool(str(payload.get(\"content\") or \"\").strip())"
+        }
           ]
         },
         "android_standalone": {
           "support": "sync_replay",
           "source_refs": [
-            {
-              "path": "mobile/android/app/src/main/java/com/siming/mobile/data/agent/MobileWorkspaceAgent.kt",
-              "contains": "\"create_chapter\" -> createChapter"
-            },
-            {
-              "path": "mobile/android/app/src/main/java/com/siming/mobile/data/agent/MobileWorkspaceAgent.kt",
-              "contains": "\"update_chapter\" -> updateChapter"
-            },
-            {
-              "path": "mobile/android/app/src/main/java/com/siming/mobile/data/agent/MobileChapterWriteStore.kt",
-              "contains": "internal fun mobileChapterEntityId("
-            }
-          ],
-          "notes": "草稿、ContextManifest 和提交状态先写入本机运行日志；确定性章节 ID 与同一 outbox 修订防止重启/重试产生重复章节，连接 PC 后回放快照、检查点并在事务提交后启动正式建档。"
+        {
+          "path": "mobile/android/app/src/main/java/com/siming/mobile/data/agent/MobileWorkspaceAgent.kt",
+          "contains": "if (call.name == \"chapter_writer\" && result.string(\"status\") == \"ok\")"
+        },
+        {
+          "path": "mobile/android/app/src/main/java/com/siming/mobile/data/agent/MobileChapterWriteStore.kt",
+          "contains": "const val GENERATED = \"generated\""
+        }
+      ],
+      "notes": "草稿和 ContextManifest 先写入本机运行日志，写作模型随后立即停止；正式章节保存及是否启动建档由作者在界面选择。"
         }
       },
       "side_effects": [
@@ -277,14 +275,14 @@
           "path": "mobile/android/app/src/test/java/com/siming/mobile/data/local/CanonicalReplicaContractTest.kt",
           "contains": "standaloneAuthoringSnapshotDropsVersionRowsButKeepsDedicatedContextEntities"
         },
-        {
-          "path": "backend/tests/test_gateway_authoring_side_effect_parity.py",
-          "contains": "test_mobile_replay_matches_pc_chapter_lifecycle_and_is_idempotent"
-        },
-        {
-          "path": "mobile/android/app/src/test/java/com/siming/mobile/data/agent/MobileChapterWriteStoreTest.kt",
-          "contains": "commit transition and deterministic entity id make retries coalesce"
-        }
+      {
+        "path": "backend/tests/test_gateway_authoring_side_effect_parity.py",
+        "contains": "test_mobile_replay_matches_pc_save_only_lifecycle_and_is_idempotent"
+      },
+      {
+        "path": "mobile/android/app/src/test/java/com/siming/mobile/data/agent/MobileChapterWriteStoreTest.kt",
+        "contains": "draft journal has no formal chapter commit state"
+      }
       ]
     },
     {
@@ -1710,7 +1708,7 @@
               "contains": "internal fun mobileChapterWriteRunId("
             }
           ],
-          "limitations": "写章前创建或校验 ContextManifest，生成前持久化运行、成功后原子保存草稿与完整清单；同一请求使用确定性 run/entity ID，应用重启、断流和提交重试会合并到同一草稿/章节。检索仍为 Android 本地词法降级，审计未上传到 PC 账本。"
+      "limitations": "写章前创建或校验 ContextManifest，生成前持久化运行、成功后原子保存草稿与完整清单；同一请求使用确定性 run ID，应用重启和断流恢复到同一未保存草稿。正式保存与建档由作者操作。检索仍为 Android 本地词法降级，审计未上传到 PC 账本。"
         }
       },
       "side_effects": [
@@ -1733,10 +1731,10 @@
           "path": "mobile/android/app/src/test/java/com/siming/mobile/data/agent/MobileContextManifestTest.kt",
           "contains": "model changes make a cached manifest stale"
         },
-        {
-          "path": "mobile/android/app/src/test/java/com/siming/mobile/data/agent/MobileChapterWriteStoreTest.kt",
-          "contains": "commit transition and deterministic entity id make retries coalesce"
-        }
+      {
+        "path": "mobile/android/app/src/test/java/com/siming/mobile/data/agent/MobileChapterWriteStoreTest.kt",
+        "contains": "draft journal has no formal chapter commit state"
+      }
       ],
       "known_gaps": [
         "手机独立写章已具备持久 ContextManifest、取消状态和跨重启防重；仍缺 PC 语义检索和数据库级 AgentRun 审计。"

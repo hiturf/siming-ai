@@ -95,6 +95,27 @@ def _show_error(title: str, message: str) -> None:
         pass
 
 
+def _close_failed_desktop_window(window, *, status_text: str, message: str) -> None:
+    """Report an unrecoverable desktop boot error and release the singleton."""
+    try:
+        encoded_status = json.dumps(status_text, ensure_ascii=False)
+        window.evaluate_js(
+            "const status=document.getElementById('status');"
+            f"if(status){{status.textContent={encoded_status};"
+            "status.style.color='#b84233';}"
+            "const dots=document.getElementById('dots');"
+            "if(dots){dots.style.display='none';}"
+        )
+    except Exception as exc:
+        _log(f"Could not render startup failure in WebView: {exc}")
+
+    _show_error(f"{APP_NAME} 启动失败", message)
+    try:
+        window.destroy()
+    except Exception as exc:
+        _log(f"Could not close failed desktop window: {exc}")
+
+
 def _safe_print(message: str, *, error: bool = False) -> None:
     stream = sys.stderr if error else sys.stdout
     if stream is None:
@@ -555,6 +576,7 @@ def _run_mcp_server() -> None:
         default="",
         help="Required one-session boundary for the creation_session permission pack.",
     )
+    parser.add_argument("--tool-category-state-file", default="")
     parser.add_argument(
         "--permission-pack",
         default=os.environ.get("MOSHU_MCP_PERMISSION_PACK", "auto"),
@@ -588,6 +610,7 @@ def _run_mcp_server() -> None:
             project_id=args.project_id,
             permission_pack=args.permission_pack,
             creation_session_id=args.creation_session_id,
+            tool_category_state_file=args.tool_category_state_file,
         )
     finally:
         db.close()
@@ -654,7 +677,6 @@ def main() -> None:
         return
 
     server_controller: UvicornServerController | None = None
-    boot_thread: threading.Thread | None = None
     try:
         port = _find_free_port()
         home = _prepare_environment(port)
@@ -766,42 +788,26 @@ def main() -> None:
                     window.load_url(gui_url)
                 else:
                     _log("Server timeout (30s)")
-                    window.evaluate_js(
-                        "document.getElementById('status').textContent="
-                        "'启动超时，请检查日志后重试';"
-                        "document.getElementById('status').style.color='#b84233';"
-                        "document.getElementById('dots').style.display='none';"
+                    _close_failed_desktop_window(
+                        window,
+                        status_text="启动超时，请检查日志后重试",
+                        message=f"后端启动超时。\n日志：{_launcher_log_path()}",
                     )
             except Exception:
                 _log("Boot failed:\n" + traceback.format_exc())
-                try:
-                    window.evaluate_js(
-                        "document.getElementById('status').textContent='启动失败';"
-                        "document.getElementById('status').style.color='#b84233';"
-                        "document.getElementById('dots').style.display='none';"
-                    )
-                except Exception as exc:
-                    _log(f"Could not render startup failure in WebView: {exc}")
+                _close_failed_desktop_window(
+                    window,
+                    status_text="启动失败",
+                    message=f"应用初始化失败。\n日志：{_launcher_log_path()}",
+                )
 
-        boot_thread = threading.Thread(
-            target=_boot,
-            name="siming-desktop-boot",
-            daemon=True,
-        )
-        boot_thread.start()
-        _log("Window visible, boot thread started")
-        webview.start()
+        _log("Window visible, boot callback scheduled")
+        webview.start(_boot)
         _log("pywebview closed; graceful server shutdown requested")
     finally:
         if server_controller is not None:
             stopped = server_controller.stop(timeout=20.0)
             _log(f"Embedded server stopped cleanly={stopped}")
-        if (
-            boot_thread is not None
-            and boot_thread.is_alive()
-            and threading.current_thread() is not boot_thread
-        ):
-            boot_thread.join(timeout=2.0)
         instance.close()
 
 

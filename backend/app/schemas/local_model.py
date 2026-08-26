@@ -5,6 +5,8 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .config import TaskModelType
+
 
 class LocalModelBase(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
@@ -24,7 +26,7 @@ class RuntimeStartRequest(LocalModelBase):
     # impose a product ceiling: high-memory machines legitimately use much
     # larger context windows.
     context_length: Optional[int] = Field(None, ge=1)
-    task_type: str = Field("chat", max_length=30)
+    task_type: TaskModelType = "assistant"
     project_id: Optional[str] = Field(None, max_length=36)
 
 

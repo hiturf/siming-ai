@@ -444,7 +444,8 @@ internal fun MobileSettingsWorkspace(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(directApi.displayName, fontWeight = FontWeight.SemiBold)
-                    Text("模型：${directApi.model}")
+                    Text("默认模型：${directApi.model}")
+                    Text("已保存 ${directApi.availableModels.size} 个可选模型，${directApi.taskModels.size} 项任务单独指定")
                     SelectionContainer { Text(directApi.baseUrl, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall) }
                     Text("这些技术信息默认收起，不影响日常写作。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }

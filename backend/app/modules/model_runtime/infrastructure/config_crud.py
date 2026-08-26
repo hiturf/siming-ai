@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from .legacy_models import LocalModel
-from .models import APIConfig
+from .models import APIConfig, ModelTaskSetting
 
 
 class SqlAlchemyModelConfigCrud:
@@ -51,6 +51,24 @@ class SqlAlchemyModelConfigCrud:
 
     def list_local_models(self):
         return self.session.query(LocalModel).order_by(LocalModel.recommended_vram_gb.asc()).all()
+
+    def list_task_settings(self):
+        return self.session.query(ModelTaskSetting).order_by(ModelTaskSetting.task_type.asc()).all()
+
+    def get_task_setting(self, task_type: str):
+        return self.session.query(ModelTaskSetting).filter(
+            ModelTaskSetting.task_type == task_type
+        ).first()
+
+    def create_task_setting(self, **values: Any):
+        setting = ModelTaskSetting(**values)
+        self.session.add(setting)
+        return setting
+
+    def delete_task_settings_for_provider(self, provider: str) -> int:
+        return self.session.query(ModelTaskSetting).filter(
+            ModelTaskSetting.provider == provider
+        ).delete(synchronize_session=False)
 
 
 __all__ = ["SqlAlchemyModelConfigCrud"]

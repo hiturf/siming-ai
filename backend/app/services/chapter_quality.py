@@ -80,7 +80,7 @@ def _normalize_quality_report(raw_report: dict[str, Any]) -> dict[str, Any]:
 async def preview_chapter_quality(
     db: Session,
     project_id: str,
-    chapter_id: str,
+    chapter_id: str | None,
     *,
     content: str,
     title: str | None = None,
@@ -90,20 +90,22 @@ async def preview_chapter_quality(
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise NotFoundError("作品不存在")
-    chapter = (
-        db.query(Chapter)
-        .filter(Chapter.id == chapter_id, Chapter.project_id == project_id)
-        .first()
-    )
-    if not chapter:
-        raise NotFoundError("章节不存在")
+    chapter = None
+    if chapter_id:
+        chapter = (
+            db.query(Chapter)
+            .filter(Chapter.id == chapter_id, Chapter.project_id == project_id)
+            .first()
+        )
+        if not chapter:
+            raise NotFoundError("章节不存在")
 
     source = str(content or "")
     if len(source.strip()) < 20:
         raise ValidationError("正文太短，至少需要 20 个字符才能进行质量评分")
 
     messages = build_chapter_evaluation_messages(
-        chapter_title=str(title or chapter.title or "未命名章节").strip(),
+        chapter_title=str(title or (chapter.title if chapter else "") or "未命名章节").strip(),
         chapter_content=source,
     )
     extra_body = LLMGateway.local_cli_extra_body(
@@ -144,36 +146,38 @@ async def preview_chapter_quality(
         item["dimension"]: item["score"] * 10
         for item in report["scores"]
     }
-    metric = record_quality_metric(
-        db,
-        project_id,
-        {
-            "chapter_id": chapter.id,
-            "chapter_version": chapter.current_version or 1,
-            "plot_tension": score_by_dimension.get("悬念设置"),
-            "emotional_tension": score_by_dimension.get("角色塑造"),
-            "pacing_density": score_by_dimension.get("节奏控制"),
-            "character_consistency": score_by_dimension.get("角色塑造"),
-            "viewpoint_consistency": score_by_dimension.get("展示性描写"),
-            "world_consistency": score_by_dimension.get("情节推进"),
-            "passed": report["total_score"] >= 48,
-            "warnings": report["bottom3_improvements"],
-            "evidence": report["overall_assessment"],
-            "total_score": report["total_score"],
-            "max_score": report["max_score"],
-            "dimension_scores": report["scores"],
-            "overall_assessment": report["overall_assessment"],
-            "model": str(request_meta.get("model") or result.get("model") or model or ""),
-            "source": "manual_quality_button",
-        },
-    )
+    metric = None
+    if chapter is not None:
+        metric = record_quality_metric(
+            db,
+            project_id,
+            {
+                "chapter_id": chapter.id,
+                "chapter_version": chapter.current_version or 1,
+                "plot_tension": score_by_dimension.get("悬念设置"),
+                "emotional_tension": score_by_dimension.get("角色塑造"),
+                "pacing_density": score_by_dimension.get("节奏控制"),
+                "character_consistency": score_by_dimension.get("角色塑造"),
+                "viewpoint_consistency": score_by_dimension.get("展示性描写"),
+                "world_consistency": score_by_dimension.get("情节推进"),
+                "passed": report["total_score"] >= 48,
+                "warnings": report["bottom3_improvements"],
+                "evidence": report["overall_assessment"],
+                "total_score": report["total_score"],
+                "max_score": report["max_score"],
+                "dimension_scores": report["scores"],
+                "overall_assessment": report["overall_assessment"],
+                "model": str(request_meta.get("model") or result.get("model") or model or ""),
+                "source": "manual_quality_button",
+            },
+        )
     return {
-        "chapter_id": chapter.id,
+        "chapter_id": chapter.id if chapter else None,
         "word_count": count_words(source),
         "provider": str(request_meta.get("provider") or ""),
         "model": str(request_meta.get("model") or result.get("model") or model or ""),
         "mutated": False,
-        "recorded": True,
-        "quality_metric_id": metric.id,
+        "recorded": metric is not None,
+        "quality_metric_id": metric.id if metric else None,
         **report,
     }

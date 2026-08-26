@@ -16,6 +16,7 @@ class ToolDef:
     name: str
     description: str
     input_schema: dict[str, Any]
+    agent_category: str = ""
     required: list[str] = field(default_factory=list)
     tool_type: str = "read"
     idempotent: bool = False

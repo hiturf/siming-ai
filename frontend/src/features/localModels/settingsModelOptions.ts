@@ -32,6 +32,7 @@ export const PROVIDER_OPTIONS = [
   { value: 'qwen_code_cli', label: 'Qwen Code CLI（本机）' },
   { value: 'hermes_cli', label: 'Hermes Agent CLI（本机）' },
   { value: 'openclaw_cli', label: 'OpenClaw CLI（本机）' },
+  { value: 'dsh_cli', label: 'DeepSeek Harness CLI（本机）' },
   { value: 'custom_cli', label: '自定义本机 CLI' },
   { value: '__custom_openai_compatible__', label: '自定义 OpenAI 兼容' },
 ]
@@ -55,6 +56,7 @@ const PROVIDER_LABEL_MAP: Record<string, string> = {
   qwen_code_cli: 'Qwen Code CLI',
   hermes_cli: 'Hermes Agent CLI',
   openclaw_cli: 'OpenClaw CLI',
+  dsh_cli: 'DeepSeek Harness CLI',
   custom_cli: '自定义本机 CLI',
 }
 
@@ -74,6 +76,7 @@ const PROVIDER_COLOR_MAP: Record<string, string> = {
   qwen_code_cli: 'cyan',
   hermes_cli: 'purple',
   openclaw_cli: 'green',
+  dsh_cli: 'blue',
   custom_cli: 'default',
 }
 
@@ -103,6 +106,7 @@ const LOCAL_CLI_PROVIDERS = [
   'qwen_code_cli',
   'hermes_cli',
   'openclaw_cli',
+  'dsh_cli',
   'custom_cli',
 ]
 
@@ -142,6 +146,7 @@ export const LOCAL_CLI_MODEL_OPTIONS: Record<string, ModelOption[]> = {
   qwen_code_cli: [{ id: 'qwen-code-cli', display_name: 'qwen-code-cli' }],
   hermes_cli: [{ id: 'hermes-agent', display_name: 'hermes-agent' }],
   openclaw_cli: [{ id: 'openclaw-agent', display_name: 'openclaw-agent' }],
+  dsh_cli: [{ id: 'dsh-cli', display_name: '跟随 DSH headless 当前模型' }],
   custom_cli: [{ id: 'custom-cli', display_name: 'custom-cli' }],
 }
 
@@ -155,6 +160,7 @@ export const DEFAULT_CLI_COMMANDS: Record<string, string> = {
   qwen_code_cli: 'qwen',
   hermes_cli: 'hermes',
   openclaw_cli: 'openclaw',
+  dsh_cli: 'dsh',
   custom_cli: '',
 }
 
@@ -168,6 +174,7 @@ export const DEFAULT_CLI_ARGS: Record<string, string> = {
   qwen_code_cli: '["--output-format","text","{prompt}"]',
   hermes_cli: '["--oneshot","{prompt}"]',
   openclaw_cli: '["agent","--local","--json","--session-key","agent:siming:local-cli","--message","{prompt}"]',
+  dsh_cli: '["--profile","headless","{prompt}"]',
   custom_cli: '["{prompt}"]',
 }
 

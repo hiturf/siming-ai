@@ -1,11 +1,16 @@
 """DeepSeek adapter — uses OpenAI-compatible API format."""
 from typing import AsyncGenerator, Optional
 
-from openai import APIError, APITimeoutError, APIConnectionError, AuthenticationError
+from openai import APIConnectionError, APIError, APITimeoutError, AuthenticationError
 
-from .base import BaseAdapter
-from .openai_adapter import compact_openai_kwargs, create_openai_compatible_client, _extract_tool_calls
 from ..core.exceptions import LLMError
+from .base import BaseAdapter
+from .openai_adapter import (
+    _extract_tool_calls,
+    compact_openai_kwargs,
+    create_openai_compatible_client,
+    normalize_openai_tool_call_delta,
+)
 
 
 def _provider_extra_body(extra_body: Optional[dict]) -> dict:
@@ -111,6 +116,7 @@ class DeepSeekAdapter(BaseAdapter):
     ) -> AsyncGenerator[str, None]:
         client = self._get_client()
         model = self._normalize_model(model)
+        self.last_stream_finish_reason = None
         kwargs = compact_openai_kwargs(dict(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens, stream=True))
         kwargs["extra_body"] = _plain_text_extra_body(extra_body)
         try:
@@ -121,6 +127,8 @@ class DeepSeekAdapter(BaseAdapter):
                 choices = getattr(chunk, "choices", None) or []
                 if not choices:
                     continue
+                if getattr(choices[0], "finish_reason", None):
+                    self.last_stream_finish_reason = str(choices[0].finish_reason)
                 delta = getattr(choices[0], "delta", None)
                 if delta is None:
                     continue
@@ -131,6 +139,7 @@ class DeepSeekAdapter(BaseAdapter):
                 if content:
                     content_emitted = True
                     yield content
+            self.last_stream_finish_reason = self.last_stream_finish_reason or "incomplete"
             if not content_emitted and reasoning_received:
                 raise LLMError(
                     "DeepSeek 已返回思考内容，但最终回答为空。系统可提高输出上限或使用无思考补偿重试；原始思考模式无需永久关闭。"
@@ -206,20 +215,15 @@ class DeepSeekAdapter(BaseAdapter):
                 tool_calls = getattr(delta, "tool_calls", None)
                 if tool_calls:
                     for tc in tool_calls:
-                        idx = tc.index
-                        if idx not in tool_call_buffers:
-                            tool_call_buffers[idx] = {"id": tc.id or "", "name": "", "arguments": ""}
-                        buf = tool_call_buffers[idx]
-                        if tc.id:
-                            buf["id"] = tc.id
-                        if tc.function and tc.function.name:
-                            buf["name"] = tc.function.name
-                        if tc.function and tc.function.arguments:
-                            buf["arguments"] += tc.function.arguments
-                            yield {"type": "tool_call_delta", "index": idx, "id": buf["id"], "name": None, "arguments_delta": tc.function.arguments}
-                        elif tc.id:
-                            yield {"type": "tool_call_delta", "index": idx, "id": tc.id, "name": tc.function.name if tc.function else None, "arguments_delta": ""}
-            yield {"type": "done", "finish_reason": finish_reason or "stop", "usage": usage, "reasoning_content": reasoning_buffer}
+                        event = normalize_openai_tool_call_delta(tc, tool_call_buffers)
+                        if event:
+                            yield event
+            yield {
+                "type": "done",
+                "finish_reason": finish_reason or "incomplete",
+                "usage": usage,
+                "reasoning_content": reasoning_buffer,
+            }
         except AuthenticationError as e:
             raise LLMError(f"DeepSeek API Key 无效: {e}")
         except APITimeoutError as e:

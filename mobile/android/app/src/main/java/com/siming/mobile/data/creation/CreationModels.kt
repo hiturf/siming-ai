@@ -1,5 +1,7 @@
 package com.siming.mobile.data.creation
 
+import kotlinx.serialization.json.JsonObject
+
 data class CreationStartInput(
     val creationMode: String,
     val brief: String,
@@ -29,4 +31,13 @@ data class CreationProgress(
     val sessionId: String = "",
     val activity: String = "",
     val running: Boolean = false,
+)
+
+data class CreationAgentProgressEvent(
+    val type: String,
+    val message: String,
+    val status: String = "running",
+    val data: JsonObject = JsonObject(emptyMap()),
+    val clientTurnId: String = "",
+    val sequence: Long = 0,
 )

@@ -12,8 +12,8 @@ class WriteTypesTest(unittest.TestCase):
     """Verify supported write types."""
 
     def test_write_types_defined(self):
-        self.assertIn("create_chapter", WRITE_TYPES)
-        self.assertIn("update_chapter", WRITE_TYPES)
+        self.assertNotIn("create_chapter", WRITE_TYPES)
+        self.assertNotIn("update_chapter", WRITE_TYPES)
         self.assertIn("create_character", WRITE_TYPES)
         self.assertIn("create_worldbuilding", WRITE_TYPES)
 
@@ -28,7 +28,7 @@ class RequestWriteTest(unittest.TestCase):
         from unittest.mock import MagicMock
         db = MagicMock()
         db.query.return_value.filter.return_value.first.return_value = None
-        result = request_write(db, "nonexistent", "create_chapter", "test")
+        result = request_write(db, "nonexistent", "create_character", "test")
         self.assertEqual(result["status"], "error")
 
     def test_invalid_write_type_returns_error(self):

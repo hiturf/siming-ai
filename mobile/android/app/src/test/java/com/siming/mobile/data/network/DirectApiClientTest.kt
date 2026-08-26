@@ -24,6 +24,23 @@ import okhttp3.mockwebserver.RecordedRequest
 
 class DirectApiClientTest {
     @Test
+    fun `direct api task model overrides default without losing provider catalog`() {
+        val config = DirectApiConfig(
+            displayName = "test",
+            baseUrl = "https://api.example.test/v1",
+            apiKey = "secret",
+            model = "general-model",
+            availableModels = listOf("general-model", "writer-model"),
+            taskModels = mapOf(DirectApiConfig.TASK_WRITING to "writer-model"),
+        )
+
+        assertEquals("writer-model", config.forTask(DirectApiConfig.TASK_WRITING).model)
+        assertEquals("general-model", config.forTask(DirectApiConfig.TASK_ASSISTANT).model)
+        assertEquals(config.availableModels, config.summary().availableModels)
+        assertEquals("writer-model", config.summary().taskModels[DirectApiConfig.TASK_WRITING])
+    }
+
+    @Test
     fun `model discovery falls back to v1 and keeps authorization private`() = withServer(
         object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
@@ -124,6 +141,115 @@ class DirectApiClientTest {
     }
 
     @Test
+    fun `standalone text resumes from verified checkpoint after length stop`() {
+        val attempts = AtomicInteger()
+        withServer(
+            object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    assertEquals("/chat/completions", request.path)
+                    val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+                    assertTrue(body.getValue("stream").jsonPrimitive.content.toBoolean())
+                    return if (attempts.incrementAndGet() == 1) {
+                        sseResponse(
+                            """{"choices":[{"delta":{"content":"第一段"},"finish_reason":"length"}]}""",
+                        )
+                    } else {
+                        val messages = body.getValue("messages").jsonArray.map { it.jsonObject }
+                        val resumeRequest = messages.last().getValue("content").jsonPrimitive.content
+                        val expected = resumeRequest.substringAfter("：\n")
+                        sseResponse(
+                            """{"choices":[{"delta":{"content":"$expected 第二段"},"finish_reason":"stop"}]}""",
+                        )
+                    }
+                }
+            },
+        ) { server ->
+            val checkpoints = mutableListOf<String>()
+            val result = runBlocking {
+                testClient().completeResumable(
+                    config(server, DirectApiConfig.PROTOCOL_CHAT_COMPLETIONS),
+                    "system",
+                    "user",
+                    onCheckpoint = { checkpoints += it },
+                )
+            }
+            assertEquals("第一段 第二段", result)
+            assertEquals(listOf("第一段", "第一段 第二段"), checkpoints)
+            assertEquals(2, attempts.get())
+        }
+    }
+
+    @Test
+    fun `responses stream uses the same verified checkpoint resume contract`() {
+        val attempts = AtomicInteger()
+        withServer(
+            object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    assertEquals("/responses", request.path)
+                    val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+                    return if (attempts.incrementAndGet() == 1) {
+                        sseResponse(
+                            """{"type":"response.output_text.delta","delta":"第一段"}""",
+                            """{"type":"response.incomplete","response":{"status":"incomplete"}}""",
+                        )
+                    } else {
+                        val input = body.getValue("input").jsonArray.map { it.jsonObject }
+                        val expected = input.last().getValue("content").jsonPrimitive.content
+                            .substringAfter("：\n")
+                        sseResponse(
+                            """{"type":"response.output_text.delta","delta":"$expected 第二段"}""",
+                            """{"type":"response.completed","response":{"status":"completed"}}""",
+                        )
+                    }
+                }
+            },
+        ) { server ->
+            val result = runBlocking {
+                testClient().completeResumable(
+                    config(server, DirectApiConfig.PROTOCOL_RESPONSES),
+                    "system",
+                    "user",
+                )
+            }
+            assertEquals("第一段 第二段", result)
+            assertEquals(2, attempts.get())
+        }
+    }
+
+    @Test
+    fun `standalone text rejects an unverified resume seam`() {
+        val attempts = AtomicInteger()
+        withServer(
+            object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = if (attempts.incrementAndGet() == 1) {
+                    sseResponse(
+                        """{"choices":[{"delta":{"content":"安全前缀"},"finish_reason":"length"}]}""",
+                    )
+                } else {
+                    sseResponse(
+                        """{"choices":[{"delta":{"content":"没有握手的重复前缀"},"finish_reason":"stop"}]}""",
+                    )
+                }
+            },
+        ) { server ->
+            val checkpoints = mutableListOf<String>()
+            assertFailsWith<IllegalArgumentException> {
+                runBlocking {
+                    testClient().completeResumable(
+                        config(server, DirectApiConfig.PROTOCOL_CHAT_COMPLETIONS),
+                        "system",
+                        "user",
+                        maxResumeAttempts = 1,
+                        onCheckpoint = { checkpoints += it },
+                    )
+                }
+            }
+            assertEquals(listOf("安全前缀"), checkpoints)
+            assertEquals(2, attempts.get())
+        }
+    }
+
+    @Test
     fun `chat agent turn sends PC tools and parses native function calls`() = withServer(
         object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
@@ -133,7 +259,7 @@ class DirectApiClientTest {
                 assertEquals("get_project_info", body.getValue("tools").jsonArray[0]
                     .jsonObject.getValue("function").jsonObject.getValue("name").jsonPrimitive.content)
                 return jsonResponse(
-                    """{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"get_project_info","arguments":"{\"id\":\"project-1\"}"}}]}}]}""",
+                    """{"choices":[{"message":{"role":"assistant","content":null,"reasoning_content":"先读取作品资料","tool_calls":[{"id":"call-1","type":"function","function":{"name":"get_project_info","arguments":"{\"id\":\"project-1\"}"}}]}}],"usage":{"prompt_tokens":37,"completion_tokens":5,"total_tokens":42}}""",
                 )
             }
         },
@@ -148,6 +274,9 @@ class DirectApiClientTest {
         assertEquals("get_project_info", turn.toolCalls.single().name)
         assertEquals("project-1", turn.toolCalls.single().arguments["id"]?.jsonPrimitive?.content)
         assertEquals("call-1", turn.toolCalls.single().id)
+        assertEquals(37, turn.promptTokens)
+        assertEquals("先读取作品资料", turn.reasoningContent)
+        assertEquals("先读取作品资料", turn.assistantMessage["reasoning_content"]?.jsonPrimitive?.content)
     }
 
     @Test
@@ -160,7 +289,7 @@ class DirectApiClientTest {
                 assertTrue(input.any { it["type"]?.jsonPrimitive?.content == "function_call" })
                 assertTrue(input.any { it["type"]?.jsonPrimitive?.content == "function_call_output" })
                 return jsonResponse(
-                    """{"output":[{"type":"function_call","call_id":"call-2","name":"list_chapters","arguments":"{}"}]}""",
+                    """{"output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"先核对章节列表"}]},{"type":"function_call","call_id":"call-2","name":"list_chapters","arguments":"{}"}],"usage":{"input_tokens":51,"output_tokens":4,"total_tokens":55}}""",
                 )
             }
         },
@@ -194,6 +323,8 @@ class DirectApiClientTest {
                 tools = singleTool("list_chapters"),
             )
         }
+        assertEquals(51, turn.promptTokens)
+        assertEquals("先核对章节列表", turn.reasoningContent)
         assertEquals("list_chapters", turn.toolCalls.single().name)
         assertEquals("call-2", turn.toolCalls.single().id)
     }
@@ -247,6 +378,11 @@ class DirectApiClientTest {
         .setResponseCode(status)
         .setHeader("Content-Type", "application/json")
         .setBody(body)
+
+    private fun sseResponse(vararg events: String) = MockResponse()
+        .setResponseCode(200)
+        .setHeader("Content-Type", "text/event-stream")
+        .setBody(events.joinToString(separator = "\n\n", postfix = "\n\ndata: [DONE]\n\n") { "data: $it" })
 
     private fun withServer(dispatcher: Dispatcher, block: (MockWebServer) -> Unit) {
         MockWebServer().use { server ->

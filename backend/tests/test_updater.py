@@ -35,7 +35,10 @@ class UpdaterVersionTestCase(unittest.TestCase):
             "tag_name": "v0.1.2",
             "html_url": "https://github.com/example/repo/releases/tag/v0.1.2",
             "assets": [
-                {"name": "NovelWritingAgent.exe", "browser_download_url": "https://example.test/legacy.exe"},
+                {
+                    "name": "NovelWritingAgent.exe",
+                    "browser_download_url": "https://example.test/legacy.exe",
+                },
                 {"name": "Moshu.exe", "browser_download_url": "https://example.test/moshu.exe"},
                 {"name": "Siming.exe", "browser_download_url": "https://example.test/siming.exe"},
                 {"name": "sha256.txt", "browser_download_url": "https://example.test/sha256.txt"},
@@ -54,7 +57,10 @@ class UpdaterVersionTestCase(unittest.TestCase):
         mock_request_json.return_value = {
             "tag_name": "v0.1.2",
             "assets": [
-                {"name": "NovelWritingAgent.exe", "browser_download_url": "https://example.test/legacy.exe"},
+                {
+                    "name": "NovelWritingAgent.exe",
+                    "browser_download_url": "https://example.test/legacy.exe",
+                },
             ],
         }
 
@@ -115,6 +121,21 @@ class UpdaterVersionTestCase(unittest.TestCase):
     def test_siming_disable_update_env_var(self):
         self.assertIsNone(updater.find_latest_update())
 
+    @patch.dict("os.environ", {"SIMING_GITHUB_TOKEN": "secret-token"}, clear=True)
+    def test_github_token_is_not_sent_to_mirror_or_custom_hosts(self):
+        self.assertNotIn(
+            "Authorization",
+            updater._request_headers("https://gitee.com/example/repo/releases"),
+        )
+        self.assertNotIn(
+            "Authorization",
+            updater._request_headers("https://updates.example.test/manifest.json"),
+        )
+        self.assertEqual(
+            updater._request_headers("https://api.github.com/repos/example/repo")["Authorization"],
+            "Bearer secret-token",
+        )
+
     @patch("app.updater._request_json")
     def test_url_manifest_requires_download_url(self, mock_request_json):
         mock_request_json.return_value = {
@@ -174,9 +195,13 @@ class UpdaterVersionTestCase(unittest.TestCase):
         signature = {"valid": True, "status": "Valid", "subject": "CN=Siming", "thumbprint": "ABC"}
         with tempfile.TemporaryDirectory() as temp_dir:
             home = Path(temp_dir)
-            with patch("app.updater.find_latest_update", return_value=manifest), patch(
-                "app.updater._download_to_file", side_effect=write_download
-            ), patch("app.updater._require_valid_signature", return_value=signature) as verify_signature:
+            with (
+                patch("app.updater.find_latest_update", return_value=manifest),
+                patch("app.updater._download_to_file", side_effect=write_download),
+                patch(
+                    "app.updater._require_valid_signature", return_value=signature
+                ) as verify_signature,
+            ):
                 result = updater.download_and_stage_update(home)
 
             staged = updater._read_staged_update(home)
@@ -203,9 +228,13 @@ class UpdaterVersionTestCase(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             home = Path(temp_dir)
-            with patch("app.updater.find_latest_update", return_value=manifest), patch(
-                "app.updater._download_to_file", side_effect=write_download
-            ), patch("app.updater._require_valid_signature", side_effect=RuntimeError("untrusted")):
+            with (
+                patch("app.updater.find_latest_update", return_value=manifest),
+                patch("app.updater._download_to_file", side_effect=write_download),
+                patch(
+                    "app.updater._require_valid_signature", side_effect=RuntimeError("untrusted")
+                ),
+            ):
                 with self.assertRaisesRegex(RuntimeError, "untrusted"):
                     updater.download_and_stage_update(home)
 
@@ -226,9 +255,11 @@ class UpdaterVersionTestCase(unittest.TestCase):
                 "sha256": "a" * 64,
                 "signature": {"valid": True, "status": "Valid"},
             }
-            with patch("app.updater._current_packaged_executable", return_value=current), patch(
-                "app.updater._validate_staged_update", return_value=staged_payload
-            ), patch("app.updater.subprocess.Popen") as popen:
+            with (
+                patch("app.updater._current_packaged_executable", return_value=current),
+                patch("app.updater._validate_staged_update", return_value=staged_payload),
+                patch("app.updater.subprocess.Popen") as popen,
+            ):
                 result = updater.schedule_staged_update_install(root)
 
             self.assertTrue(result["restart_scheduled"])

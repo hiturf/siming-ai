@@ -7,27 +7,36 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.ai.local_cli_adapter import (
+    DEFAULT_CLI_MODELS,
     OPENCODE_DEFAULT_MODEL,
+    OPENCODE_MODELS,
+    OPENCODE_RETIRED_MODELS,
     CLIPermissionRequiredError,
     CLIStalledError,
+    CLITurnTerminal,
     LocalCLIAdapter,
     communicate_with_cli_quota_detection,
     detect_cli_auth_error,
     detect_cli_permission_request,
     detect_cli_quota_error,
     discover_local_cli_models,
+    effective_local_cli_model,
     ensure_opencode_logging_args,
     extract_cli_error,
+    extract_cli_runtime_error,
     hidden_subprocess_kwargs,
+    inspect_opencode_turn,
     local_cli_model_options,
     messages_to_prompt,
     parse_cli_args,
     parse_cli_launch,
+    preferred_local_cli_model,
 )
-from app.ai.local_cli_prompt import prepare_opencode_launch
+from app.ai.local_cli_prompt import prepare_direct_mcp_launch, prepare_opencode_launch
 from app.core.exceptions import LLMError
 
 
@@ -112,6 +121,30 @@ class LocalCLIAdapterHelperTestCase(unittest.TestCase):
                 OPENCODE_DEFAULT_MODEL,
                 "hello",
             ],
+        )
+
+    def test_opencode_default_uses_a_current_free_model(self):
+        self.assertEqual(OPENCODE_DEFAULT_MODEL, "opencode/big-pickle")
+        self.assertEqual(DEFAULT_CLI_MODELS["opencode_cli"], OPENCODE_DEFAULT_MODEL)
+        self.assertNotIn("opencode/deepseek-v4-flash-free", OPENCODE_MODELS)
+
+    def test_retired_opencode_models_are_mapped_to_the_current_default(self):
+        for model in OPENCODE_RETIRED_MODELS:
+            self.assertEqual(
+                effective_local_cli_model("opencode_cli", model),
+                OPENCODE_DEFAULT_MODEL,
+            )
+
+    @patch("app.ai.local_cli_models.discover_local_cli_models")
+    def test_opencode_preferred_model_uses_a_discovered_current_free_model(self, discover):
+        discover.return_value = [
+            {"id": "opencode/paid-model", "display_name": "Paid"},
+            {"id": "opencode/hy3-free", "display_name": "Free"},
+        ]
+
+        self.assertEqual(
+            preferred_local_cli_model("opencode_cli", "opencode"),
+            "opencode/hy3-free",
         )
 
     def test_opencode_long_prompt_is_not_moved_to_stdin(self):
@@ -291,6 +324,37 @@ class LocalCLIAdapterHelperTestCase(unittest.TestCase):
             ],
         )
 
+    def test_dsh_default_args_use_headless_profile(self):
+        launch = parse_cli_launch(None, "dsh_cli", "hello", "dsh-cli")
+        self.assertEqual(launch.args, ["--profile", "headless", "hello"])
+
+    def test_dsh_direct_mcp_uses_one_turn_patch(self):
+        adapter = LocalCLIAdapter(api_key="", base_url="dsh_cli", cli_command="dsh")
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "app.ai.local_cli_prompt.resolve_siming_mcp_server",
+            return_value={
+                "command": r"D:\Siming\python.exe",
+                "args": [r"D:\Siming\moshu-mcp-server.py", "--creation-session-id", "session-1"],
+                "cwd": r"D:\Siming",
+            },
+        ):
+            launch, env = prepare_direct_mcp_launch(
+                adapter,
+                adapter._launch("read and update", "dsh-cli"),
+                cwd=directory,
+                env=adapter._isolated_environment({}, True),
+                permission_pack="creation_session",
+                creation_session_id="session-1",
+            )
+            patch_path = Path(launch.args[launch.args.index("--patch") + 1])
+            payload = json.loads(patch_path.read_text(encoding="utf-8"))
+
+        config = payload[0]["insert"][0]["config"]
+        self.assertEqual(config["serverName"], "siming_turn")
+        self.assertEqual(config["args"][-1], "session-1")
+        self.assertEqual(launch.args[-1], "read and update")
+        self.assertNotIn("NO_MCP", env)
+
     def test_normalize_jsonl_output_extracts_text(self):
         adapter = LocalCLIAdapter(api_key="", base_url="codex_cli", cli_command="codex")
         text = adapter._normalize_output('{"type":"message","content":"hello"}\n{"delta":" world"}\n')
@@ -312,6 +376,93 @@ class LocalCLIAdapterHelperTestCase(unittest.TestCase):
             '{"type":"step_finish","sessionID":"session-1","part":{"type":"step-finish"}}\n'
         )
         self.assertEqual(text, "")
+
+    def test_inspect_opencode_turn_marks_unknown_finish_as_incomplete(self):
+        state = inspect_opencode_turn(
+            '{"type":"step_start","sessionID":"ses-1","part":{"type":"step-start"}}\n'
+            '{"type":"step_finish","sessionID":"ses-1",'
+            '"part":{"type":"step-finish","reason":"unknown"}}\n'
+        )
+        self.assertEqual(state.session_id, "ses-1")
+        self.assertEqual(state.finish_reason, "unknown")
+        self.assertTrue(state.incomplete)
+
+    def test_inspect_opencode_turn_accepts_stop_finish(self):
+        state = inspect_opencode_turn(
+            '{"type":"step_start","sessionID":"ses-1","part":{"type":"step-start"}}\n'
+            '{"type":"step_finish","sessionID":"ses-1",'
+            '"part":{"type":"step-finish","reason":"stop"}}\n'
+        )
+        self.assertFalse(state.incomplete)
+
+    def test_opencode_zero_exit_runtime_error_is_not_silently_discarded(self):
+        error = extract_cli_runtime_error(
+            'timestamp=2026-08-22T00:37:02Z level=ERROR message="stream error" '
+            'error.error="AI_APICallError: Service Unavailable"'
+        )
+        self.assertEqual(error, "AI_APICallError: Service Unavailable")
+
+    def test_opencode_unknown_finish_continues_the_same_session_once(self):
+        adapter = LocalCLIAdapter(
+            api_key="",
+            base_url="opencode_cli",
+            cli_command="opencode",
+        )
+        incomplete = (
+            b'{"type":"step_start","sessionID":"ses-1",'
+            b'"part":{"type":"step-start"}}\n'
+            b'{"type":"step_finish","sessionID":"ses-1",'
+            b'"part":{"type":"step-finish","reason":"unknown"}}\n'
+        )
+        completed = (
+            '{"type":"step_start","sessionID":"ses-1",'
+            '"part":{"type":"step-start"}}\n'
+            '{"type":"text","sessionID":"ses-1",'
+            '"part":{"type":"text","text":"已完成"}}\n'
+            '{"type":"step_finish","sessionID":"ses-1",'
+            '"part":{"type":"step-finish","reason":"stop"}}\n'
+        ).encode("utf-8")
+        process = SimpleNamespace(returncode=0)
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            adapter,
+            "_command",
+            return_value="opencode",
+        ), patch(
+            "app.ai.local_cli_adapter.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ) as create_process, patch(
+            "app.ai.local_cli_adapter.communicate_with_cli_quota_detection",
+            new=AsyncMock(side_effect=[(incomplete, b""), (completed, b"")]),
+        ) as communicate:
+            result = asyncio.run(adapter._run_once(
+                "执行任务",
+                "opencode/big-pickle",
+                {
+                    "local_cli_isolated": True,
+                    "_local_cli_isolated_cwd": directory,
+                    "local_cli_timeout_seconds": 0,
+                    "local_cli_resume_incomplete_opencode": True,
+                    "local_cli_mcp_creation_session_id": "creation-1",
+                    "local_cli_quiet_seconds": 120,
+                    "local_cli_suspected_stall_seconds": 300,
+                    "local_cli_stalled_seconds": 600,
+                },
+            ))
+
+        self.assertEqual(result, "已完成")
+        self.assertEqual(create_process.await_count, 2)
+        resume_args = create_process.await_args_list[1].args
+        self.assertIn("--session", resume_args)
+        self.assertIn("ses-1", resume_args)
+        calls = communicate.await_args_list
+        self.assertIsNone(calls[0].kwargs["timeout_seconds"])
+        self.assertIsNone(calls[1].kwargs["timeout_seconds"])
+        for call in calls:
+            self.assertTrue(callable(call.kwargs["external_activity_probe"]))
+            self.assertEqual(call.kwargs["quiet_seconds"], 120)
+            self.assertEqual(call.kwargs["suspected_stall_seconds"], 300)
+            self.assertEqual(call.kwargs["stalled_seconds"], 600)
 
     def test_normalize_opencode_tool_use_does_not_become_model_text(self):
         adapter = LocalCLIAdapter(api_key="", base_url="opencode_cli", cli_command="opencode")
@@ -504,6 +655,36 @@ class LocalCLIAdapterHelperTestCase(unittest.TestCase):
         with self.assertRaisesRegex(CLIStalledError, "确认卡住"):
             asyncio.run(run_silent_cli())
 
+    def test_persisted_chapter_draft_immediately_stops_cli_process(self):
+        async def run_cli_until_draft():
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import time; print('writing', flush=True); time.sleep(5)",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **hidden_subprocess_kwargs(),
+            )
+            probes = 0
+
+            def terminal_probe():
+                nonlocal probes
+                probes += 1
+                return "draft-1" if probes >= 2 else None
+
+            return await communicate_with_cli_quota_detection(
+                process,
+                timeout_seconds=10,
+                terminal_probe=terminal_probe,
+                terminal_poll_seconds=0.1,
+                poll_seconds=0.1,
+            )
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(CLITurnTerminal, "draft-1"):
+            asyncio.run(run_cli_until_draft())
+        self.assertLess(time.monotonic() - started, 3)
+
     def test_runtime_cwd_does_not_fall_back_to_process_cwd(self):
         with patch.dict(
             "app.ai.local_cli_adapter.os.environ",
@@ -527,7 +708,7 @@ class LocalCLIAdapterHelperTestCase(unittest.TestCase):
         ):
             result = asyncio.run(adapter._run(
                 "Reply exactly CLI_OK",
-                "opencode/deepseek-v4-flash-free",
+                OPENCODE_DEFAULT_MODEL,
                 {"local_cli_isolated": True},
             ))
 
@@ -549,7 +730,7 @@ class LocalCLIAdapterHelperTestCase(unittest.TestCase):
                     "model",
                     {
                         "local_cli_isolated": False,
-                        "local_cli_permission_granted": True,
+                        "local_cli_mcp_authorized": True,
                     },
                 ))
 
@@ -627,7 +808,7 @@ class LocalCLIAdapterHelperTestCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             launch, prompt_file = adapter._opencode_family_launch(
                 prompt="[SYSTEM]\nroute the request\n[USER]\nwrite chapter one",
-                model="opencode/deepseek-v4-flash-free",
+                model=OPENCODE_DEFAULT_MODEL,
                 cwd=directory,
                 attachments=[],
                 allow_mcp=False,
@@ -647,7 +828,7 @@ class LocalCLIAdapterHelperTestCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             launch, prompt_file = adapter._opencode_family_launch(
                 prompt="[SYSTEM]\nroute the request\n[USER]\nwrite chapter one",
-                model="opencode/deepseek-v4-flash-free",
+                model=OPENCODE_DEFAULT_MODEL,
                 cwd=directory,
                 attachments=[],
                 allow_mcp=False,
@@ -667,7 +848,7 @@ class LocalCLIAdapterHelperTestCase(unittest.TestCase):
             attachment.write_text("reference", encoding="utf-8")
             launch, prompt_file = adapter._opencode_family_launch(
                 prompt="[SYSTEM]\nroute the request\n[USER]\nwrite chapter one",
-                model="opencode/deepseek-v4-flash-free",
+                model=OPENCODE_DEFAULT_MODEL,
                 cwd=directory,
                 attachments=[str(attachment)],
                 allow_mcp=False,
@@ -687,7 +868,7 @@ class LocalCLIAdapterHelperTestCase(unittest.TestCase):
             _launch, _prompt_file, env = prepare_opencode_launch(
                 adapter,
                 prompt="读取本轮快照",
-                model="opencode/deepseek-v4-flash-free",
+                model=OPENCODE_DEFAULT_MODEL,
                 cwd=directory,
                 attachments=[],
                 allow_mcp=False,
@@ -724,7 +905,7 @@ class LocalCLIAdapterHelperTestCase(unittest.TestCase):
             launch, _prompt_file, env = prepare_opencode_launch(
                 adapter,
                 prompt="更新目标字数",
-                model="opencode/deepseek-v4-flash-free",
+                model=OPENCODE_DEFAULT_MODEL,
                 cwd=directory,
                 attachments=[],
                 allow_mcp=True,

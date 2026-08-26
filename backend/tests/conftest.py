@@ -2,8 +2,12 @@
 import importlib
 import os
 import sys
+from pathlib import Path
+from tempfile import mkdtemp
 from unittest.mock import MagicMock
 
+_TEST_DATABASE = Path(mkdtemp(prefix="siming-pytest-")).resolve() / "suite.db"
+os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DATABASE.as_posix()}"
 os.environ.setdefault("MOSHU_DISABLE_AUTO_MCP_SETUP", "1")
 
 

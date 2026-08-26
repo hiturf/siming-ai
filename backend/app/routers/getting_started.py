@@ -24,12 +24,14 @@ from ..services.opencode_onboarding import (
     OPENCODE_INSTALL_DOCS_URL,
     OPENCODE_MODELS_DOCS_URL,
     OPENCODE_RELEASES_URL,
+    configure_managed_opencode_path,
     get_latest_opencode_activation_job,
     get_opencode_activation_job,
     get_opencode_install_job,
     inspect_opencode,
     is_free_opencode_model,
     managed_opencode_command,
+    managed_opencode_path_status,
     open_opencode_authentication,
     resolve_opencode_command,
     retry_opencode_activation,
@@ -52,6 +54,20 @@ class OpenCodeActivateRequest(BaseModel):
 
 class OpenCodeCredentialRequest(BaseModel):
     credential: SecretStr = Field(..., min_length=1, max_length=4096)
+
+
+class OpenCodePathConfigureRequest(BaseModel):
+    enabled: bool = True
+
+
+class OpenCodePathStatus(BaseModel):
+    supported: bool
+    managed_install: bool
+    configured: bool
+    directory: str
+    scope: str = "user"
+    requires_new_terminal: bool = True
+    changed: bool = False
 
 
 class FreeModelOption(BaseModel):
@@ -90,6 +106,7 @@ class OpenCodeActivationStatus(BaseModel):
     attempt_count: int = 0
     created_at: str | None = None
     updated_at: str | None = None
+    path_integration: OpenCodePathStatus | None = None
 
 
 class GettingStartedStatus(BaseModel):
@@ -117,6 +134,7 @@ class GettingStartedStatus(BaseModel):
     available_model: dict[str, str | None] | None = None
     activation_job: OpenCodeActivationStatus | None = None
     opencode_mcp_configured: bool = False
+    path_integration: OpenCodePathStatus
     official_links: dict[str, str] = Field(default_factory=dict)
 
     model_config = {"protected_namespaces": ()}
@@ -169,6 +187,7 @@ def _getting_started_summary(db: Session) -> dict:
         # model explicitly from model settings.
         "activation_job": None if has_usable_model else get_latest_opencode_activation_job(db),
         "opencode_mcp_configured": opencode_mcp_configured,
+        "path_integration": managed_opencode_path_status(state.opencode_command),
         "official_links": {
             "releases": OPENCODE_RELEASES_URL,
             "install_docs": OPENCODE_INSTALL_DOCS_URL,
@@ -240,6 +259,26 @@ def activate_opencode(
         raise ValidationError(str(exc)) from exc
     return ApiResponse.success(data=job, message="免费写作能力正在准备")
 
+
+@router.put(
+    "/config/getting-started/opencode/path",
+    response_model=ApiResponse[OpenCodePathStatus],
+)
+def configure_opencode_path(payload: OpenCodePathConfigureRequest):
+    """Opt in or out of the managed OpenCode directory in the current-user PATH."""
+
+    try:
+        result = configure_managed_opencode_path(enabled=payload.enabled)
+    except RuntimeError as exc:
+        raise ValidationError(str(exc)) from exc
+    return ApiResponse.success(
+        data=result,
+        message=(
+            "OpenCode 已添加到当前用户 PATH，请打开新终端使用"
+            if payload.enabled
+            else "OpenCode 已从当前用户 PATH 移除"
+        ),
+    )
 
 
 @router.post("/config/getting-started/opencode/mcp/configure")

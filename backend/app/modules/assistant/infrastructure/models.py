@@ -31,12 +31,6 @@ class AssistantConversation(Base):
     title = Column(String(200), nullable=False, default="新对话")
     scope = Column(String(50), nullable=False, default="writer")
     canonical_conversation_id = Column(String(36), nullable=True, unique=True, index=True)
-    current_chapter_id = Column(
-        String(36), ForeignKey("chapters.id", ondelete="SET NULL"), nullable=True
-    )
-    current_outline_node_id = Column(
-        String(36), ForeignKey("outline_nodes.id", ondelete="SET NULL"), nullable=True
-    )
     model = Column(String(512), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -71,12 +65,11 @@ class SystemAssistantConversation(Base):
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
     title = Column(String(200), nullable=False, default="新对话")
-    scope_type = Column(String(30), nullable=False, default="system")
+    scope_type = Column(String(30), nullable=False)
     scope_id = Column(String(36), nullable=True)
     project_id = Column(String(36), ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
     creation_session_id = Column(String(36), nullable=True)
     user_brief = Column(Text, nullable=True)
-    blueprint_json = Column(JSON, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
     messages = relationship(
@@ -135,7 +128,6 @@ class AssistantRun(Base):
     status = Column(String(30), nullable=False, default="running")
     phase = Column(String(50), nullable=True)
     scope = Column(String(50), nullable=True)
-    assistant_mode = Column(String(20), nullable=True)
     model = Column(String(512), nullable=True)
     current_iteration = Column(Integer, default=0)
     error = Column(Text, nullable=True)
@@ -194,49 +186,6 @@ class AssistantRunStep(Base):
     )
 
 
-class ChapterWriteClaim(Base):
-    """Durable reservation that prevents concurrent writes for one outline chapter."""
-
-    __tablename__ = "chapter_write_claims"
-
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
-    target_key = Column(String(300), nullable=False)
-    idempotency_key = Column(String(300), nullable=False)
-    claim_token = Column(String(36), nullable=False, default=generate_uuid)
-    status = Column(String(20), nullable=False, default="running")
-    run_id = Column(
-        String(36), ForeignKey("assistant_runs.id", ondelete="SET NULL"), nullable=True
-    )
-    operation_id = Column(
-        String(36), ForeignKey("operation_runs.id", ondelete="SET NULL"), nullable=True
-    )
-    chapter_id = Column(
-        String(36), ForeignKey("chapters.id", ondelete="SET NULL"), nullable=True
-    )
-    result_json = Column(Text, nullable=True)
-    error = Column(Text, nullable=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
-    completed_at = Column(DateTime, nullable=True)
-
-    __table_args__ = (
-        UniqueConstraint(
-            "project_id", "idempotency_key", name="uq_chapter_write_claim_identity"
-        ),
-        Index(
-            "uq_chapter_write_claim_active_target",
-            "project_id",
-            "target_key",
-            unique=True,
-            sqlite_where=(status == "running"),
-            postgresql_where=(status == "running"),
-        ),
-        Index("ix_chapter_write_claim_status", "status", "updated_at"),
-        Index("ix_chapter_write_claim_run", "run_id"),
-    )
-
-
 class AssistantMemory(Base):
     __tablename__ = "assistant_memories"
 
@@ -263,6 +212,10 @@ class ChapterDraft(Base):
     context_manifest_id = Column(
         String(36), ForeignKey("context_manifests.id", ondelete="SET NULL"), nullable=True
     )
+    saved_chapter_id = Column(
+        String(36), ForeignKey("chapters.id", ondelete="SET NULL"), nullable=True
+    )
+    status = Column(String(20), nullable=False, default="pending")
     content = Column(Text, nullable=False, default="")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -348,7 +301,6 @@ __all__ = [
     "SystemAssistantMessage",
     "AssistantRun",
     "AssistantRunStep",
-    "ChapterWriteClaim",
     "AssistantMemory",
     "ChapterDraft",
     "RagDocument",

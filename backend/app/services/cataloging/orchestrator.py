@@ -5,7 +5,6 @@ from app.architecture.uow import commit_session
 
 import asyncio
 import json
-import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +16,7 @@ from ...ai.local_cli_adapter import is_local_cli_provider
 from ...modules.model_runtime.application.execution import model_executor as LLMGateway
 from ...database.models import CatalogingCandidate, CatalogingChapterRun, CatalogingJob, Chapter, Project
 from ...database.session import SessionLocal
+from ...database.write_coordination import DatabaseWriteLockTimeout
 from ...modules.story.application.content_sync import (
     enqueue_project_sync,
     ensure_chapter_mirror,
@@ -25,34 +25,32 @@ from ..story_granularity import CHARACTER_PROFILE_FIELDS
 from .applier import apply_candidates_for_run, candidate_to_dict
 from .candidate_io import candidate_has_usable_summary
 from .candidate_store import (
-    ensure_required_chapter_outline,
     recover_candidates_from_response_text,
     try_create_candidates,
 )
-from .candidate_validation import (
-    candidate_coverage_error_message,
-    candidate_coverage_review_message,
-    candidate_coverage_should_retry,
-    inspect_candidate_coverage,
+from .candidate_retry import (
+    append_incremental_candidate_retry as _append_incremental_candidate_retry,
+    candidate_coverage_error as _candidate_coverage_error,
+    candidate_coverage_requires_model_retry as _candidate_coverage_requires_model_retry,
+    candidate_coverage_review as _candidate_coverage_review,
 )
+from .candidate_validation import candidate_coverage_error_message, inspect_candidate_coverage
 from .constants import (
     CATALOGING_FACTS_PROMPT_LIMIT,
     CATALOGING_MAX_TOKENS,
     CATALOGING_STAGE_MAX_ATTEMPTS,
     CATALOGING_TIMEOUT_SECONDS,
 )
-from .context import build_full_cataloging_context, ordered_chapters
+from .context import ordered_chapters
 from .facts import facts_text, try_parse_fact_line
-from .fact_store import clear_candidates_for_run, clear_facts_for_run, create_fact, load_facts_for_run
+from .fact_store import clear_facts_for_run, create_fact, load_facts_for_run
 from .jsonl import clean_jsonl_text
 from .job_control import refresh_job_progress
 from .model_selection import cataloging_extra_body
 from .staged_prompts import (
-    CATALOGING_MERGED_SYSTEM_PROMPT,
     CATALOGING_RESOLUTION_SYSTEM_PROMPT,
     FACT_EXTRACTION_SYSTEM_PROMPT,
     build_fact_extraction_prompt,
-    build_merged_cataloging_prompt,
     build_resolution_prompt,
 )
 from .targeted_context import build_targeted_context
@@ -137,31 +135,6 @@ def run_to_dict(run: CatalogingChapterRun) -> dict[str, Any]:
     }
 
 
-def _candidate_coverage_for_run(db: Session, run: CatalogingChapterRun):
-    candidates = (
-        db.query(CatalogingCandidate)
-        .filter(CatalogingCandidate.chapter_run_id == run.id)
-        .filter(CatalogingCandidate.status != "rejected")
-        .all()
-    )
-    return inspect_candidate_coverage(candidates, db=db, project_id=run.project_id)
-
-
-def _candidate_coverage_error(db: Session, run: CatalogingChapterRun) -> str:
-    coverage = _candidate_coverage_for_run(db, run)
-    if coverage.is_complete:
-        return ""
-    return candidate_coverage_error_message(coverage)
-
-
-def _candidate_coverage_requires_model_retry(db: Session, run: CatalogingChapterRun) -> bool:
-    return candidate_coverage_should_retry(_candidate_coverage_for_run(db, run))
-
-
-def _candidate_coverage_review(db: Session, run: CatalogingChapterRun) -> str:
-    return candidate_coverage_review_message(_candidate_coverage_for_run(db, run))
-
-
 def _recover_complete_candidate_response(
     db: Session,
     job: CatalogingJob,
@@ -199,18 +172,6 @@ def _model_provider(model: str | None) -> str:
 
 def _is_local_runtime_provider(provider: str) -> bool:
     return provider == "local_llama_cpp"
-
-
-def _cataloging_pipeline_mode(provider: str | None = None) -> str:
-    if _is_local_runtime_provider(provider or ""):
-        return "staged"
-    # Quality-first default: facts provide an independent inventory that the
-    # final candidate manifest must satisfy.  A single model response can omit
-    # both an entity and its declaration and otherwise appear "complete".
-    value = os.getenv("SIMING_CATALOGING_PIPELINE", "staged").strip().lower()
-    if value in {"merged", "single", "single_stage", "single-stage"}:
-        return "merged"
-    return "staged"
 
 
 def _chapter_prompt_content(content: str, *, local_runtime: bool) -> str:
@@ -306,41 +267,6 @@ def _salvage_facts_from_text(text: str) -> list[dict[str, Any]]:
     return facts
 
 
-def _fallback_summary_from_chapter(chapter_title: str, chapter_content: str) -> str:
-    text = re.sub(r"\s+", " ", (chapter_content or "").strip())
-    if not text:
-        return f"{chapter_title}：章节正文为空，已创建最低可用章节概览。"
-    sentences = re.split(r"(?<=[。！？!?])", text)
-    summary = "".join(sentences[:3]).strip() or text[:240]
-    if len(summary) > 260:
-        summary = summary[:260].rstrip() + "..."
-    return summary
-
-
-def _fallback_facts_from_chapter(chapter_title: str, chapter_content: str) -> list[dict[str, Any]]:
-    summary = _fallback_summary_from_chapter(chapter_title, chapter_content)
-    return [
-        {
-            "fact_type": "chapter_overview",
-            "confidence": 0.45,
-            "evidence": "本地模型未输出可解析事实，系统按章节正文生成最低可用概览。",
-            "payload": {"summary": summary, "key_events": [summary[:80]], "uncertainty": "自动兜底事实，建议人工复核"},
-        },
-        {
-            "fact_type": "outline_fact",
-            "confidence": 0.45,
-            "evidence": "章节标题与正文摘要",
-            "payload": {
-                "title_hint": chapter_title or "未命名章节",
-                "node_type": "chapter",
-                "summary": summary,
-                "characters": [],
-                "hook": "自动兜底生成，后续可重新建档优化",
-            },
-        },
-    ]
-
-
 def create_cataloging_job(
     db: Session,
     project_id: str,
@@ -393,6 +319,7 @@ def create_cataloging_job(
             job_id=job.id,
             project_id=project_id,
             chapter_id=chapter.id,
+            chapter_version=chapter.current_version or 1,
             status="pending",
             chapter_order=index,
         ))
@@ -504,297 +431,8 @@ async def stream_cataloging_job(project_id: str, job_id: str) -> AsyncGenerator[
         db.close()
 
 
-async def _extract_run_merged(db: Session, job: CatalogingJob, run: CatalogingChapterRun) -> AsyncGenerator[str, None]:
-    chapter = db.query(Chapter).filter(Chapter.id == run.chapter_id, Chapter.project_id == job.project_id).first()
-    if not chapter:
-        run.status = "failed"
-        run.error = "章节不存在"
-        commit_session(db)
-        yield sse_event({"type": "chapter_failed", "run": run_to_dict(run), "error": run.error})
-        return
-
-    project = db.query(Project).filter(Project.id == job.project_id).first()
-    project_folder = ""
-    chapter_file = ""
-    if project:
-        folder, path = ensure_chapter_mirror(db, project, chapter, index=run.chapter_order + 1, source="cataloging")
-        project_folder = str(folder)
-        chapter_file = str(path)
-
-    chapter_text = chapter.content or ""
-    if not chapter_text and chapter_file:
-        try:
-            chapter_text = Path(chapter_file).read_text(encoding="utf-8")
-        except Exception:
-            chapter_text = ""
-
-    run.status = "extracting"
-    run.started_at = run.started_at or datetime.utcnow()
-    job.status = "running"
-    job.current_chapter_id = chapter.id
-    job.blocked_chapter_id = None
-    commit_session(db)
-    yield sse_event({"type": "chapter_started", "job": job_to_dict(job), "run": run_to_dict(run)})
-
-    clear_candidates_for_run(db, run)
-    clear_facts_for_run(db, run)
-    commit_session(db)
-
-    provider = _model_provider(job.model)
-    use_file_references = bool(chapter_file and is_local_cli_provider(provider))
-    context_json = ""
-    if not use_file_references:
-        context_json = json.dumps(
-            build_full_cataloging_context(db, job.project_id, chapter),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-
-    raw_parts: list[str] = []
-    bad_lines: list[str] = []
-    candidate_count = 0
-    has_summary = False
-    previous_retry_reason = ""
-    yield sse_event({
-        "type": "cataloging_stage",
-        "message": "单阶段建档：读取章节与已有角色/世界观/大纲，直接生成候选卡片",
-        "run": run_to_dict(run),
-    })
-
-    try:
-        for attempt in range(1, CATALOGING_STAGE_MAX_ATTEMPTS + 1):
-            candidate_buffer = ""
-            bad_lines = []
-            attempt_parts: list[str] = []
-            if attempt > 1:
-                raw_parts.append(f"\n\n=== MERGED CATALOGING RETRY {attempt} ===\n")
-            try:
-                merged_prompt = build_merged_cataloging_prompt(
-                    chapter_title=chapter.title,
-                    chapter_content=_chapter_prompt_content(
-                        chapter_text,
-                        local_runtime=_is_local_runtime_provider(provider),
-                    ),
-                    context_json=context_json,
-                    chapter_file=chapter_file,
-                    project_folder=project_folder,
-                    use_file_references=use_file_references,
-                )
-                if previous_retry_reason:
-                    merged_prompt += (
-                        "\n\n【上一轮校验未通过，必须修正】\n"
-                        f"{previous_retry_reason}\n"
-                        "重新输出完整标准 JSONL；不要复用错误结构，不要输出聚合总对象。"
-                    )
-                stream = LLMGateway.stream_chat_completion(
-                    messages=[
-                        {"role": "system", "content": CATALOGING_MERGED_SYSTEM_PROMPT},
-                        {"role": "user", "content": merged_prompt},
-                    ],
-                    model=job.model,
-                    temperature=0.1,
-                    max_tokens=CATALOGING_MAX_TOKENS,
-                    timeout=CATALOGING_TIMEOUT_SECONDS,
-                    retry=1,
-                    extra_body=cataloging_extra_body(
-                        job.model,
-                        cwd=project_folder or None,
-                        attachments=[chapter_file] if use_file_references else None,
-                    ),
-                )
-                async for chunk in stream:
-                    raw_parts.append(chunk)
-                    attempt_parts.append(chunk)
-                    candidate_buffer += chunk
-                    lines = candidate_buffer.splitlines(keepends=True)
-                    if lines and not lines[-1].endswith(("\n", "\r")):
-                        candidate_buffer = lines.pop()
-                    else:
-                        candidate_buffer = ""
-                    for line in lines:
-                        created_results = try_create_candidates(db, job, run, line, candidate_count)
-                        for created in created_results:
-                            if created.get("bad_line"):
-                                bad_lines.append(created["bad_line"])
-                                yield sse_event({"type": "parse_warning", "run": run_to_dict(run), "line": created["bad_line"][:500], "error": created["error"]})
-                            if created.get("skipped"):
-                                reason = created.get("reason") or "候选缺少有效内容，已跳过"
-                                yield sse_event({
-                                    "type": "candidate_skipped",
-                                    "run": run_to_dict(run),
-                                    "message": reason,
-                                    "reason": reason,
-                                })
-                            candidate = created.get("candidate")
-                            if candidate:
-                                candidate_count += 1
-                                has_summary = has_summary or candidate_has_usable_summary(candidate)
-                                commit_session(db)
-                                yield sse_event({"type": "candidate_created", "candidate": candidate_to_dict(candidate), "run": run_to_dict(run)})
-                tail = clean_jsonl_text(candidate_buffer)
-                if tail:
-                    for created in try_create_candidates(db, job, run, tail, candidate_count):
-                        if created.get("bad_line"):
-                            bad_lines.append(created["bad_line"])
-                        if created.get("skipped"):
-                            reason = created.get("reason") or "候选缺少有效内容，已跳过"
-                            yield sse_event({
-                                "type": "candidate_skipped",
-                                "run": run_to_dict(run),
-                                "message": reason,
-                                "reason": reason,
-                            })
-                        if created.get("candidate"):
-                            candidate = created["candidate"]
-                            candidate_count += 1
-                            has_summary = has_summary or candidate_has_usable_summary(candidate)
-                            commit_session(db)
-                            yield sse_event({"type": "candidate_created", "candidate": candidate_to_dict(candidate), "run": run_to_dict(run)})
-
-                projected_outline = ensure_required_chapter_outline(db, job, run)
-                if projected_outline:
-                    candidate_count += 1
-                    commit_session(db)
-                    yield sse_event({
-                        "type": "candidate_created",
-                        "candidate": candidate_to_dict(projected_outline),
-                        "run": run_to_dict(run),
-                        "deterministic": True,
-                    })
-                coverage_reason = _candidate_coverage_error(db, run)
-                if bad_lines or coverage_reason:
-                    recovery, recovered_candidates = _recover_complete_candidate_response(
-                        db,
-                        job,
-                        run,
-                        "".join(attempt_parts),
-                        source_task="merged_response_recovery",
-                    )
-                    for candidate in recovered_candidates:
-                        candidate_count += 1
-                        has_summary = has_summary or candidate_has_usable_summary(candidate)
-                        yield sse_event({
-                            "type": "candidate_created",
-                            "candidate": candidate_to_dict(candidate),
-                            "run": run_to_dict(run),
-                            "recovered": True,
-                        })
-                    coverage_reason = _candidate_coverage_error(db, run)
-                    if recovery["coverage"].is_complete and not coverage_reason:
-                        bad_lines = []
-
-                retry_reason = (
-                    f"{len(bad_lines)} 行 JSONL 解析失败"
-                    if bad_lines
-                    else coverage_reason
-                )
-                if not retry_reason:
-                    break
-                if not bad_lines and not _candidate_coverage_requires_model_retry(db, run):
-                    break
-                if attempt >= CATALOGING_STAGE_MAX_ATTEMPTS:
-                    break
-                clear_candidates_for_run(db, run)
-                commit_session(db)
-                candidate_count = 0
-                has_summary = False
-                previous_retry_reason = retry_reason
-                yield sse_event({
-                    "type": "cataloging_retry",
-                    "stage": "merged_candidate_generation",
-                    "message": f"单阶段建档失败，正在自动重试 {attempt + 1}/{CATALOGING_STAGE_MAX_ATTEMPTS}",
-                    "attempt": attempt + 1,
-                    "max_attempts": CATALOGING_STAGE_MAX_ATTEMPTS,
-                    "error": retry_reason,
-                    "run": run_to_dict(run),
-                })
-            except Exception as exc:
-                recovery, recovered_candidates = _recover_complete_candidate_response(
-                    db,
-                    job,
-                    run,
-                    "".join(attempt_parts),
-                    source_task="merged_interrupted_response_recovery",
-                )
-                if recovery["coverage"].is_complete:
-                    for candidate in recovered_candidates:
-                        candidate_count += 1
-                        has_summary = has_summary or candidate_has_usable_summary(candidate)
-                        yield sse_event({
-                            "type": "candidate_created",
-                            "candidate": candidate_to_dict(candidate),
-                            "run": run_to_dict(run),
-                            "recovered": True,
-                        })
-                    bad_lines = []
-                    break
-                if attempt >= CATALOGING_STAGE_MAX_ATTEMPTS:
-                    raise
-                clear_candidates_for_run(db, run)
-                commit_session(db)
-                candidate_count = 0
-                has_summary = False
-                candidate_buffer = ""
-                bad_lines = []
-                previous_retry_reason = str(exc)
-                raw_parts.append(f"\n[MERGED CATALOGING FAILED: {exc}]\n")
-                yield sse_event({
-                    "type": "cataloging_retry",
-                    "stage": "merged_candidate_generation",
-                    "message": f"单阶段建档失败，正在自动重试 {attempt + 1}/{CATALOGING_STAGE_MAX_ATTEMPTS}",
-                    "attempt": attempt + 1,
-                    "max_attempts": CATALOGING_STAGE_MAX_ATTEMPTS,
-                    "error": str(exc),
-                    "run": run_to_dict(run),
-                })
-    except Exception as exc:
-        run.status = "failed"
-        run.error = str(exc)
-        run.raw_output = _merged_raw_output(raw_parts)
-        job.status = "paused_on_failure"
-        job.blocked_chapter_id = run.chapter_id
-        job.error = run.error
-        commit_session(db)
-        yield sse_event({"type": "chapter_failed", "run": run_to_dict(run), "error": run.error})
-        return
-
-    run.raw_output = _merged_raw_output(raw_parts)
-    if bad_lines:
-        run.status = "failed"
-        run.error = f"{len(bad_lines)} 行 JSONL 解析失败，已暂停在当前章节"
-        job.status = "paused_on_failure"
-        job.blocked_chapter_id = run.chapter_id
-        job.error = run.error
-        commit_session(db)
-        yield sse_event({"type": "chapter_failed", "run": run_to_dict(run), "error": run.error, "bad_lines": bad_lines[:5]})
-        return
-    coverage_error = _candidate_coverage_error(db, run)
-    if coverage_error:
-        run.status = "failed"
-        run.error = f"{coverage_error}，已暂停在当前章节"
-        job.status = "paused_on_failure"
-        job.blocked_chapter_id = run.chapter_id
-        job.error = run.error
-        commit_session(db)
-        yield sse_event({"type": "chapter_failed", "run": run_to_dict(run), "error": run.error})
-        return
-
-    coverage_review = _candidate_coverage_review(db, run)
-    run.status = "awaiting_confirmation"
-    run.completed_at = datetime.utcnow()
-    run.error = None
-    run.review_warning = coverage_review or None
-    commit_session(db)
-    yield sse_event({"type": "chapter_extracted", "run": run_to_dict(run), "candidate_count": candidate_count})
-
-
 async def _extract_run(db: Session, job: CatalogingJob, run: CatalogingChapterRun) -> AsyncGenerator[str, None]:
     provider = _model_provider(job.model)
-    if _cataloging_pipeline_mode(provider) == "merged" and run.status != "facts_saved":
-        async for event in _extract_run_merged(db, job, run):
-            yield event
-        return
-
     chapter = db.query(Chapter).filter(Chapter.id == run.chapter_id, Chapter.project_id == job.project_id).first()
     if not chapter:
         run.status = "failed"
@@ -918,50 +556,10 @@ async def _extract_run(db: Session, job: CatalogingJob, run: CatalogingChapterRu
                                 "fact": fact,
                                 "run": run_to_dict(run),
                             })
-                    if not facts and local_runtime and attempt >= CATALOGING_STAGE_MAX_ATTEMPTS:
-                        fallback_facts = _fallback_facts_from_chapter(chapter.title, chapter_text)
-                        for fact in fallback_facts:
-                            facts.append(fact)
-                            create_fact(db, job, run, fact, len(facts) - 1)
-                            commit_session(db)
-                            yield sse_event({
-                                "type": "fact_extracted",
-                                "message": f"已生成兜底事实: {fact.get('fact_type')}",
-                                "fact": fact,
-                                "run": run_to_dict(run),
-                            })
-                        yield sse_event({
-                            "type": "cataloging_warning",
-                            "stage": "fact_extraction",
-                            "message": "本地模型未输出可解析事实，已生成最低可用事实继续建档；建议完成后人工复核。",
-                            "run": run_to_dict(run),
-                        })
                     if not facts:
                         raise ValueError("模型未输出可用事实")
                     break
                 except Exception as exc:
-                    if attempt >= CATALOGING_STAGE_MAX_ATTEMPTS and local_runtime:
-                        clear_facts_for_run(db, run)
-                        commit_session(db)
-                        facts = []
-                        fallback_facts = _fallback_facts_from_chapter(chapter.title, chapter_text)
-                        for fact in fallback_facts:
-                            facts.append(fact)
-                            create_fact(db, job, run, fact, len(facts) - 1)
-                            commit_session(db)
-                            yield sse_event({
-                                "type": "fact_extracted",
-                                "message": f"已生成兜底事实: {fact.get('fact_type')}",
-                                "fact": fact,
-                                "run": run_to_dict(run),
-                            })
-                        yield sse_event({
-                            "type": "cataloging_warning",
-                            "stage": "fact_extraction",
-                            "message": f"第一阶段本地模型失败（{exc}），已用最低可用事实继续建档；建议完成后人工复核。",
-                            "run": run_to_dict(run),
-                        })
-                        break
                     if attempt >= CATALOGING_STAGE_MAX_ATTEMPTS:
                         raise
                     clear_facts_for_run(db, run)
@@ -1011,10 +609,9 @@ async def _extract_run(db: Session, job: CatalogingJob, run: CatalogingChapterRu
                     chapter.title,
                 )
                 if previous_retry_reason:
-                    resolution_prompt += (
-                        "\n\n【上一轮校验未通过，必须修正】\n"
-                        f"{previous_retry_reason}\n"
-                        "重新输出完整标准 JSONL；不要复用错误结构，不要输出聚合总对象。"
+                    resolution_prompt = _append_incremental_candidate_retry(
+                        resolution_prompt,
+                        previous_retry_reason,
                     )
                 candidate_stream = LLMGateway.stream_chat_completion(
                     messages=[
@@ -1078,16 +675,6 @@ async def _extract_run(db: Session, job: CatalogingJob, run: CatalogingChapterRu
                             has_summary = has_summary or candidate_has_usable_summary(candidate)
                             commit_session(db)
                             yield sse_event({"type": "candidate_created", "candidate": candidate_to_dict(candidate), "run": run_to_dict(run)})
-                projected_outline = ensure_required_chapter_outline(db, job, run)
-                if projected_outline:
-                    candidate_count += 1
-                    commit_session(db)
-                    yield sse_event({
-                        "type": "candidate_created",
-                        "candidate": candidate_to_dict(projected_outline),
-                        "run": run_to_dict(run),
-                        "deterministic": True,
-                    })
                 coverage_reason = _candidate_coverage_error(db, run)
                 if bad_lines or coverage_reason:
                     recovery, recovered_candidates = _recover_complete_candidate_response(
@@ -1128,10 +715,6 @@ async def _extract_run(db: Session, job: CatalogingJob, run: CatalogingChapterRu
                             "run": run_to_dict(run),
                         })
                     break
-                clear_candidates_for_run(db, run)
-                commit_session(db)
-                candidate_count = 0
-                has_summary = False
                 previous_retry_reason = retry_reason
                 yield sse_event({
                     "type": "cataloging_retry",
@@ -1172,10 +755,6 @@ async def _extract_run(db: Session, job: CatalogingJob, run: CatalogingChapterRu
                     raise ValueError(f"第二阶段本地模型失败（{exc}），已暂停当前章节")
                 if attempt >= CATALOGING_STAGE_MAX_ATTEMPTS:
                     raise
-                clear_candidates_for_run(db, run)
-                commit_session(db)
-                candidate_count = 0
-                has_summary = False
                 candidate_buffer = ""
                 bad_lines = []
                 previous_retry_reason = str(exc)
@@ -1243,11 +822,6 @@ def _combined_raw_output(raw_fact_parts: list[str], raw_candidate_parts: list[st
         + "\n\n=== CANDIDATE RESOLUTION ===\n"
         + "".join(raw_candidate_parts)
     )
-    return value[-60000:]
-
-
-def _merged_raw_output(raw_parts: list[str]) -> str:
-    value = "=== MERGED CATALOGING ===\n" + "".join(raw_parts)
     return value[-60000:]
 
 
@@ -1412,11 +986,33 @@ def _compact_local_runtime_context(context: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _apply_run(db: Session, job: CatalogingJob, run: CatalogingChapterRun) -> AsyncGenerator[str, None]:
+    job_id = job.id
+    run_id = run.id
     run.status = "applying"
     job.status = "running"
     commit_session(db)
     yield sse_event({"type": "chapter_applying", "job": job_to_dict(job), "run": run_to_dict(run)})
-    events = apply_candidates_for_run(db, job, run)
+    events: list[dict[str, Any]] = []
+    for attempt in range(1, CATALOGING_STAGE_MAX_ATTEMPTS + 1):
+        try:
+            events = apply_candidates_for_run(db, job, run)
+            break
+        except DatabaseWriteLockTimeout:
+            db.rollback()
+            if attempt >= CATALOGING_STAGE_MAX_ATTEMPTS:
+                raise
+            # Never hold a transaction while backing off. Reload the durable
+            # job/run before replaying the idempotent, uncommitted apply batch.
+            yield sse_event({
+                "type": "chapter_apply_retry",
+                "job_id": job_id,
+                "chapter_run_id": run_id,
+                "attempt": attempt + 1,
+                "reason": "database_write_lock_timeout",
+            })
+            await asyncio.sleep(0.25 * (2 ** (attempt - 1)))
+            job = db.query(CatalogingJob).filter(CatalogingJob.id == job_id).one()
+            run = db.query(CatalogingChapterRun).filter(CatalogingChapterRun.id == run_id).one()
     has_failed = any(event["type"] == "candidate_apply_failed" for event in events)
     for event in events:
         commit_session(db)

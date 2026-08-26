@@ -1,21 +1,19 @@
 """Create and launch the canonical cataloging pipeline.
 
-Chapter writes, the cataloging UI, and workspace tools all enter cataloging
-through this module.  Keeping launch policy here prevents a second post-write
-candidate generator from drifting away from the main cataloging workflow.
+Author-triggered chapter cataloging and the cataloging UI enter the canonical
+worker through this module.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from ...ai.local_cli_adapter import DEFAULT_CLI_MODELS, is_local_cli_provider
+from ...ai.local_cli_adapter import is_local_cli_provider
 from ...architecture.uow import commit_session
 from ...database.models import (
-    APIConfig,
-    AgentRun,
     CatalogingChapterRun,
     CatalogingJob,
     Chapter,
@@ -23,6 +21,7 @@ from ...database.models import (
 )
 from ...database.session import SessionLocal
 from .job_control import cancel_job, refresh_job_progress
+from .constants import JOB_RUNNING_STATUSES
 from .local_cli_agent import (
     cancel_local_cli_cataloging_worker,
     ensure_local_cli_cataloging_worker,
@@ -31,71 +30,13 @@ from .model_selection import cataloging_model_selection
 from .orchestrator import create_cataloging_job, job_to_dict, stream_cataloging_job
 
 
-AUTO_CHAPTER_WRITE_SOURCE = "chapter_write"
+CHAPTER_SAVE_SOURCE = "chapter_save"
 _LAUNCH_TASKS: dict[str, asyncio.Task[None]] = {}
 _TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled"}
+logger = logging.getLogger(__name__)
 
 
-def _configured_cli_model(db: Session, provider: str) -> str | None:
-    config = (
-        db.query(APIConfig)
-        .filter(
-            APIConfig.provider_type == "local_cli",
-            APIConfig.provider == provider,
-        )
-        .first()
-    )
-    if not config:
-        return None
-    model = config.default_model or DEFAULT_CLI_MODELS.get(provider, provider)
-    return f"{provider}:{model}"
-
-
-def resolve_write_cataloging_route(
-    db: Session,
-    args: dict[str, Any],
-    *,
-    project_id: str | None = None,
-) -> tuple[str | None, str | None, str | None]:
-    """Return ``(model_override, backend_override, provider_override)``.
-
-    Internal writes keep the model selected by the writer.  A managed local
-    CLI write resolves its provider from the trusted AgentRun marker injected
-    by the MCP adapter.  An unmanaged MCP client gets an external-agent job and
-    never silently spends the user's internal API credits.
-    """
-
-    explicit_model = str(
-        args.get("_cataloging_model")
-        or args.get("cataloging_model")
-        or args.get("model")
-        or ""
-    ).strip() or None
-    execution_route = str(args.get("_context_execution_route") or "").strip()
-    agent_run_id = str(args.get("_source_agent_run_id") or "").strip()
-    if execution_route not in {"external_mcp", "local_cli_agent"}:
-        return explicit_model, None, None
-
-    provider = ""
-    if agent_run_id:
-        run = (
-            db.query(AgentRun)
-            .filter(
-                AgentRun.id == agent_run_id,
-                AgentRun.source == "internal_cli",
-                *([AgentRun.project_id == project_id] if project_id else []),
-            )
-            .first()
-        )
-        provider = str(getattr(run, "client_name", "") or "").strip().lower()
-    if provider:
-        cli_model = _configured_cli_model(db, provider)
-        if cli_model:
-            return cli_model, "local_cli_agent", provider
-    return None, "external_agent", provider or None
-
-
-def _cancel_superseded_write_jobs(
+def cancel_superseded_chapter_cataloging_jobs(
     db: Session,
     project_id: str,
     chapter_ids: list[str],
@@ -107,7 +48,7 @@ def _cancel_superseded_write_jobs(
         .join(CatalogingChapterRun, CatalogingChapterRun.job_id == CatalogingJob.id)
         .filter(
             CatalogingJob.project_id == project_id,
-            CatalogingJob.model_source.like(f"{AUTO_CHAPTER_WRITE_SOURCE}:%"),
+            CatalogingJob.model_source.like(f"{CHAPTER_SAVE_SOURCE}:%"),
             CatalogingJob.status.notin_(_TERMINAL_JOB_STATUSES),
             CatalogingChapterRun.chapter_id.in_(chapter_ids),
         )
@@ -124,6 +65,161 @@ def _cancel_superseded_write_jobs(
     if cancelled:
         commit_session(db)
     return cancelled
+
+
+def find_blocking_chapter_cataloging_job(
+    db: Session,
+    project_id: str,
+    *,
+    allow_chapter_id: str | None = None,
+) -> CatalogingJob | None:
+    """Return an unfinished auto-cataloging job that fences a new chapter.
+
+    A rewrite of the same chapter is allowed; its successful save supersedes
+    that chapter's older job. Any unfinished job for another chapter remains a
+    hard project-level prose fence.
+    """
+
+    query = (
+        db.query(CatalogingJob)
+        .join(CatalogingChapterRun, CatalogingChapterRun.job_id == CatalogingJob.id)
+        .filter(
+            CatalogingJob.project_id == project_id,
+            CatalogingJob.model_source.like(f"{CHAPTER_SAVE_SOURCE}:%"),
+            CatalogingJob.status.in_(JOB_RUNNING_STATUSES),
+        )
+    )
+    allowed = str(allow_chapter_id or "").strip()
+    if allowed:
+        query = query.filter(CatalogingChapterRun.chapter_id != allowed)
+    return query.order_by(CatalogingJob.updated_at.desc(), CatalogingJob.created_at.desc()).first()
+
+
+def cataloging_block_result(tool: str, job: CatalogingJob) -> dict[str, Any]:
+    from ..workspace.turn_control import AssistantTurnDirective, apply_turn_directive
+
+    result = {
+        "tool": tool,
+        "status": "blocked",
+        "detail": "上一章建档尚未处理完成，本轮未生成下一章。",
+        "data": {
+            "blocking_job_id": job.id,
+            "operation_id": job.operation_id,
+            "cataloging_status": job.status,
+            "blocked_chapter_id": job.blocked_chapter_id or job.current_chapter_id,
+            "allowed_actions": ["retry", "open_cataloging"],
+        },
+    }
+    return apply_turn_directive(result, AssistantTurnDirective.BLOCKED_ON_CATALOGING)
+
+
+def find_cataloging_required_chapter(
+    db: Session,
+    project_id: str,
+    *,
+    allow_chapter_id: str | None = None,
+) -> Chapter | None:
+    """Return a saved chapter whose current version still needs cataloging."""
+    query = db.query(Chapter).filter(
+        Chapter.project_id == project_id,
+        Chapter.cataloging_required.is_(True),
+    )
+    allowed = str(allow_chapter_id or "").strip()
+    if allowed:
+        query = query.filter(Chapter.id != allowed)
+    return query.order_by(Chapter.updated_at.desc(), Chapter.created_at.desc()).first()
+
+
+def cataloging_required_block_result(tool: str, chapter: Chapter) -> dict[str, Any]:
+    from ..workspace.turn_control import AssistantTurnDirective, apply_turn_directive
+
+    return apply_turn_directive(
+        {
+            "tool": tool,
+            "status": "blocked",
+            "detail": f"《{chapter.title}》已保存但尚未完成建档，本轮未生成下一章。",
+            "data": {
+                "blocked_chapter_id": chapter.id,
+                "cataloging_required": True,
+                "allowed_actions": ["start_cataloging", "open_cataloging"],
+            },
+        },
+        AssistantTurnDirective.BLOCKED_ON_CATALOGING,
+    )
+
+
+def _pause_failed_worker(
+    db: Session,
+    job: CatalogingJob,
+    message: str,
+    failure_class: str,
+) -> None:
+    run = (
+        db.query(CatalogingChapterRun)
+        .filter(
+            CatalogingChapterRun.job_id == job.id,
+            CatalogingChapterRun.status.notin_(
+                ["completed", "completed_with_warnings", "skipped_by_user"]
+            ),
+        )
+        .order_by(CatalogingChapterRun.chapter_order.asc())
+        .first()
+    )
+    if run:
+        run.status = "failed"
+        run.error = message
+        job.blocked_chapter_id = run.chapter_id
+        job.current_chapter_id = run.chapter_id
+    job.status = "paused_on_failure"
+    job.error = message
+    refresh_job_progress(db, job)
+    operation = db.query(OperationRun).filter(OperationRun.id == job.operation_id).first()
+    if operation:
+        operation.failure_class = failure_class[:80]
+        operation.health_status = "disconnected" if failure_class == "interrupted" else "stalled"
+        operation.next_action = "请重试当前建档章节，或取消任务后重新建档"
+
+
+def mark_cataloging_worker_failure(
+    job_id: str,
+    error: BaseException | str,
+    *,
+    failure_class: str,
+) -> bool:
+    """Persist a retryable worker failure with a fresh database session."""
+
+    db = SessionLocal()
+    try:
+        job = db.query(CatalogingJob).filter(CatalogingJob.id == job_id).first()
+        if not job or job.status in _TERMINAL_JOB_STATUSES:
+            return False
+        message = str(error or "作品建档后台任务意外停止").strip()[:2000]
+        _pause_failed_worker(db, job, message, failure_class)
+        commit_session(db)
+        return True
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to persist cataloging worker failure for %s", job_id)
+        return False
+    finally:
+        db.close()
+
+
+def mark_interrupted_cataloging_jobs(db: Session) -> int:
+    """Convert internal workers lost across process restart into retryable jobs."""
+
+    jobs = (
+        db.query(CatalogingJob)
+        .filter(
+            CatalogingJob.execution_backend == "internal_llm",
+            CatalogingJob.status.in_(["queued", "running"]),
+        )
+        .all()
+    )
+    for job in jobs:
+        message = "司命上次关闭时章节建档仍在运行，后台 worker 已中断，请重试当前章节"
+        _pause_failed_worker(db, job, message, "interrupted")
+    return len(jobs)
 
 
 def create_and_queue_cataloging_job(
@@ -162,8 +258,8 @@ def create_and_queue_cataloging_job(
         backend = "local_cli_agent" if is_local_cli_provider(provider) else "internal_llm"
 
     cancelled = (
-        _cancel_superseded_write_jobs(db, project_id, chapter_ids)
-        if trigger_source == AUTO_CHAPTER_WRITE_SOURCE
+        cancel_superseded_chapter_cataloging_jobs(db, project_id, chapter_ids)
+        if trigger_source == CHAPTER_SAVE_SOURCE
         else []
     )
     model_source = f"{trigger_source}:{selection_source}"[:50]
@@ -177,7 +273,7 @@ def create_and_queue_cataloging_job(
         model_source=model_source,
         provider=provider or None,
     )
-    if trigger_source == AUTO_CHAPTER_WRITE_SOURCE and job.operation_id:
+    if trigger_source == CHAPTER_SAVE_SOURCE and job.operation_id:
         operation = (
             db.query(OperationRun)
             .filter(OperationRun.id == job.operation_id)
@@ -198,11 +294,11 @@ def create_and_queue_cataloging_job(
             else f"{len(chapter_titles)} 个章节"
         )
         if operation:
-            operation.title = f"{chapter_label}自动建档"[:300]
-            operation.tool_mode = f"auto_chapter_write:{backend}"[:80]
+            operation.title = f"{chapter_label}章节建档"[:300]
+            operation.tool_mode = f"chapter_save:{backend}"[:80]
             operation.current_message = (
-                f"{chapter_label}已保存，正在自动建档。"
-                "立即生成下一章可能影响上下文质量，请耐心等待建档完成。"
+                f"{chapter_label}已保存，作者已启动建档。"
+                "下一章写作已锁定；只有当前版本建档完成后才会解锁。"
             )
             commit_session(db)
     queued = False
@@ -211,7 +307,7 @@ def create_and_queue_cataloging_job(
         queued = True
     data = job_to_dict(job)
     data.update({
-        "auto_started": run_now,
+        "started": run_now,
         "worker_queued": queued,
         "trigger_source": trigger_source,
         "superseded_job_ids": cancelled,
@@ -239,12 +335,12 @@ async def run_cataloging_job(job_id: str) -> None:
             return
         project_id = job.project_id
     except Exception as exc:
-        job = db.query(CatalogingJob).filter(CatalogingJob.id == job_id).first()
-        if job and job.status not in _TERMINAL_JOB_STATUSES:
-            job.status = "paused_on_failure"
-            job.error = f"自动建档启动失败：{exc}"[:2000]
-            refresh_job_progress(db, job)
-            commit_session(db)
+        db.rollback()
+        mark_cataloging_worker_failure(
+            job_id,
+            f"章节建档启动失败：{exc}",
+            failure_class=type(exc).__name__,
+        )
         return
     finally:
         db.close()
@@ -252,10 +348,20 @@ async def run_cataloging_job(job_id: str) -> None:
     try:
         async for _event in stream_cataloging_job(project_id, job_id):
             pass
-    except Exception:
-        # The canonical stream records its own chapter/job failure state.  The
-        # durable job remains visible and retryable from the task list.
-        return
+    except asyncio.CancelledError as exc:
+        mark_cataloging_worker_failure(
+            job_id,
+            "章节建档 worker 被中断",
+            failure_class="interrupted",
+        )
+        raise exc
+    except Exception as exc:
+        mark_cataloging_worker_failure(
+            job_id,
+            f"章节建档执行失败：{exc}",
+            failure_class=type(exc).__name__,
+        )
+        logger.exception("Cataloging worker failed for %s", job_id)
 
 
 def queue_cataloging_job(job_id: str) -> asyncio.Task[None]:
@@ -272,9 +378,15 @@ def queue_cataloging_job(job_id: str) -> asyncio.Task[None]:
 
 
 __all__ = [
-    "AUTO_CHAPTER_WRITE_SOURCE",
+    "CHAPTER_SAVE_SOURCE",
+    "cancel_superseded_chapter_cataloging_jobs",
+    "cataloging_block_result",
+    "cataloging_required_block_result",
     "create_and_queue_cataloging_job",
+    "find_blocking_chapter_cataloging_job",
+    "find_cataloging_required_chapter",
+    "mark_cataloging_worker_failure",
+    "mark_interrupted_cataloging_jobs",
     "queue_cataloging_job",
-    "resolve_write_cataloging_route",
     "run_cataloging_job",
 ]

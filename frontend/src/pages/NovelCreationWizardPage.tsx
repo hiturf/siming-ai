@@ -6,7 +6,6 @@ import {
   Button,
   Card,
   Collapse,
-  Descriptions,
   Form,
   Input,
   InputNumber,
@@ -74,7 +73,7 @@ function NovelCreationWizardPage() {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const [form] = Form.useForm<CreationFormValues>()
-  const { modelOptions, defaultModel, hasModels, loading: modelsLoading } = useModelOptions()
+  const { modelOptions, defaultModel, hasModels, loading: modelsLoading } = useModelOptions('planning')
   const [catalog, setCatalog] = useState<PresetCatalog | null>(null)
   const [sessions, setSessions] = useState<CreationSession[]>([])
   const [session, setSession] = useState<CreationSession | null>(null)
@@ -125,10 +124,6 @@ function NovelCreationWizardPage() {
   const currentStage = (
     requestedStage
     && CORE_STAGES.includes(requestedStage)
-    && (
-      session?.stage_flow?.items?.[requestedStage]?.can_view
-      || session?.stage_flow?.items?.[requestedStage]?.can_generate
-    )
   )
     ? requestedStage
     : attentionStage && CORE_STAGES.includes(attentionStage)
@@ -179,10 +174,7 @@ function NovelCreationWizardPage() {
       next.set('session', loaded.id)
       const existingStage = next.get('stage')
       const flow = loaded.stage_flow
-      const targetStage = existingStage && (
-        flow?.items?.[existingStage]?.can_view
-        || flow?.items?.[existingStage]?.can_generate
-      )
+      const targetStage = existingStage && CORE_STAGES.includes(existingStage)
         ? existingStage
         : flow?.attention_stage || flow?.recommended_stage || loaded.current_stage
       if (targetStage && CORE_STAGES.includes(targetStage)) next.set('stage', targetStage)
@@ -426,7 +418,7 @@ function NovelCreationWizardPage() {
     const authorLed = (creationPath || session?.draft?.creation_mode) === 'author_led'
     setRunMessage(operation === 'refine'
       ? '正在按你的要求调整当前方案...'
-      : authorLed ? '正在忠实整理作者方案...' : '正在理解创作约束并生成一套创意方向...')
+      : authorLed ? '正在忠实整理作者方案...' : '正在理解创作约束并生成创意方向...')
     setRunProgress(0)
     setResultRevisionNotice('')
     editedDuringRunRef.current = false
@@ -490,36 +482,6 @@ function NovelCreationWizardPage() {
       setStageActionError(errorText(error))
       message.error(errorText(error))
       return false
-    }
-  }
-
-  const confirmConceptOnly = async (conceptId: string) => {
-    if (!session) return
-    setBusy(true)
-    try {
-      const selection = await apiClient.patch<ApiResponse<CreationSession>>(`/novel-creation/sessions/${session.id}`, {
-        selected_concept_id: conceptId,
-        quick_mode: false,
-        expected_revision: session.revision,
-      })
-      const constraints = await apiClient.post<ApiResponse<CreationSession>>(`/novel-creation/sessions/${session.id}/stages/constraints/confirm`, {
-        data: selection.data.data.draft?.form,
-        confirm: true,
-        source: 'author',
-        expected_revision: selection.data.data.revision,
-      })
-      const confirmation = await apiClient.post<ApiResponse<CreationSession>>(`/novel-creation/sessions/${session.id}/stages/concepts/confirm`, {
-        data: { options: concepts, selected_concept_id: conceptId },
-        confirm: true,
-        source: 'author',
-        expected_revision: constraints.data.data.revision,
-      })
-      setSession(confirmation.data.data)
-      message.success('当前创意方向已确认；不会自动生成其他数据')
-    } catch (error) {
-      message.error(errorText(error))
-    } finally {
-      setBusy(false)
     }
   }
 
@@ -639,11 +601,11 @@ function NovelCreationWizardPage() {
     if (!session) return
     setBusy(true)
     try {
-      const response = await apiClient.post<ApiResponse<{ project_id: string; warnings?: string[] }>>('/novel-creation/apply', { session_id: session.id, mode: 'auto' })
+      const response = await apiClient.post<ApiResponse<{ project_id: string; warnings?: string[] }>>('/novel-creation/finalize', { session_id: session.id })
       const warnings = response.data.data.warnings || []
       if (warnings.length) message.warning(warnings.join('；'))
       else message.success('正式作品已创建，正在进入工作区')
-      navigate(`/project/${response.data.data.project_id}`)
+      navigate(`/project/${response.data.data.project_id}?assistant=open`)
     } catch (error) {
       message.error(errorText(error))
     } finally {
@@ -697,12 +659,8 @@ function NovelCreationWizardPage() {
 
   if (!catalog) return <div className="creation-loading"><Spin size="large" /><Text>正在加载立项工作台...</Text></div>
 
-  const inConceptSelection = concepts.length > 0 && !selectedConceptId
-  const inWorkbench = Boolean(selectedConceptId)
-  const finalData = session?.draft?.stages.final_review?.data as Record<string, unknown> | undefined
   const recommendedStageLabel = recommendedStage ? stageLabels[recommendedStage] || recommendedStage : ''
   const nextStageLabel = nextStage ? stageLabels[nextStage] || nextStage : recommendedStageLabel
-  const currentBlockers = currentStageFlow?.blocked_by || []
   const authorLed = (session?.draft?.creation_mode || creationPath) === 'author_led'
   const showPathChooser = !session && !creationPath
 
@@ -719,8 +677,8 @@ function NovelCreationWizardPage() {
             {session && <Button icon={<RobotOutlined />} onClick={() => navigate(assistantReturnUrl)}>返回原对话</Button>}
             {session && <Tag color="processing">草稿修订 {session.revision}</Tag>}
             {saveNotice && <Tag color={saveNotice.includes('失败') ? 'warning' : 'default'}>{saveNotice}</Tag>}
-            {!inWorkbench && hasModels && modelOptions.length > 1 && <Select aria-label="选择本阶段模型" loading={modelsLoading} value={selectedModel} onChange={setSelectedModel} options={modelOptions} placeholder="切换可用模型" style={{ minWidth: 260 }} />}
-            {!inWorkbench && hasModels && modelOptions.length === 1 && <Tag color="success">AI 已准备好</Tag>}
+            {!session && hasModels && modelOptions.length > 1 && <Select aria-label="选择本阶段模型" loading={modelsLoading} value={selectedModel} onChange={setSelectedModel} options={modelOptions} placeholder="切换可用模型" style={{ minWidth: 260 }} />}
+            {!session && hasModels && modelOptions.length === 1 && <Tag color="success">AI 已准备好</Tag>}
             <Button icon={<SettingOutlined />} onClick={() => navigate('/settings')}>配置模型</Button>
             {!session && creationPath && <Button onClick={() => setCreationPath(null)}>重新选择起点</Button>}
             {session && <Button onClick={resetWorkspace} disabled={busy}>新建立项</Button>}
@@ -749,7 +707,7 @@ function NovelCreationWizardPage() {
               <button type="button" className="creation-path-card" onClick={() => setCreationPath('explore')}>
                 <span className="creation-path-icon"><CompassOutlined /></span>
                 <strong>帮我探索创意</strong>
-                <span>从一个画面或念头出发，生成一套故事方向；之后可随时通过对话局部调整。</span>
+                <span>从一个画面或念头出发，生成故事方向；之后可随时通过对话局部调整。</span>
                 <em>生成一个方向</em>
               </button>
               <button type="button" className="creation-path-card" onClick={() => navigate('/dashboard?create=import')}>
@@ -875,40 +833,7 @@ function NovelCreationWizardPage() {
               </section>
             )}
           </div>
-        ) : inConceptSelection ? (
-          <main className="creation-concepts-main">
-            {authorLed && session?.draft && (
-              <section className="creation-author-source" aria-label="作者原始设定">
-                <div><LockOutlined /><Text strong>作者原始设定</Text><Tag color="success">持续锁定</Tag></div>
-                <Paragraph>{session.draft.author_brief || session.draft.form.brief}</Paragraph>
-                {session.draft.author_outline && <Collapse ghost items={[{ key: 'outline', label: '查看已有大纲原文', children: <pre>{session.draft.author_outline}</pre> }]} />}
-                <Space wrap>{session.draft.locked_requirements?.map((item) => <Tag key={item}>{item}</Tag>)}</Space>
-              </section>
-            )}
-            <div className="creation-section-heading"><div><Title level={3}>{authorLed ? '检查作者方案' : '完善故事发动机'}</Title><Paragraph>{authorLed ? 'AI 只整理和补全了你的方案。继续前可手动编辑，或写明要求让 AI 定向调整。' : '这里先形成一套清晰方向。你可以继续对话调整，不需要在多套方案之间抽选。'}</Paragraph></div><Space wrap><Button onClick={() => openEditor('concepts')} disabled={busy}>编辑方案内容</Button><Button icon={<EditOutlined />} onClick={() => openRefine('concepts')} disabled={busy}>让 AI 按要求调整</Button><Button icon={<ReloadOutlined />} onClick={() => void generateConcepts('regenerate')} loading={busy}>{authorLed ? '重新整理方案' : '重新生成方向'}</Button></Space></div>
-            <div className={`creation-concept-grid is-single ${authorLed ? 'is-author-led' : ''}`}>
-              {concepts.map((concept) => (
-                <Card key={concept.id} className="creation-concept-card" title={<span>{concept.title}</span>} extra={<Tag>{concept.coverage?.score || 0}% 覆盖</Tag>}>
-                  <Text type="secondary">{concept.subtitle}</Text>
-                  <Paragraph className="creation-logline">{concept.logline}</Paragraph>
-                  <Descriptions column={1} size="small">
-                    <Descriptions.Item label="主角">{concept.protagonist_seed?.name} · {concept.protagonist_seed?.goal}</Descriptions.Item>
-                    <Descriptions.Item label="世界钩子">{concept.world_hook}</Descriptions.Item>
-                    <Descriptions.Item label="核心冲突">{concept.core_conflict}</Descriptions.Item>
-                    <Descriptions.Item label="故事发动机">{concept.story_engine}</Descriptions.Item>
-                    <Descriptions.Item label="开篇钩子">{concept.opening_hook}</Descriptions.Item>
-                  </Descriptions>
-                  <Space className="creation-differentiators" wrap>{concept.differentiators?.map((item) => <Tag color="blue" key={item}>{item}</Tag>)}</Space>
-                  {concept.risks?.length > 0 && <Alert className="creation-risk" type="warning" message={concept.risks.join('；')} />}
-                  <div className="creation-concept-actions">
-                    <Button icon={<RobotOutlined />} onClick={() => navigate(assistantReturnUrl)} disabled={busy}>返回聊天继续调整</Button>
-                    <Button type="primary" onClick={() => void confirmConceptOnly(concept.id)} disabled={busy}>确认当前方向</Button>
-                  </div>
-                </Card>
-              ))}
-            </div>
-          </main>
-        ) : inWorkbench ? (
+        ) : session ? (
           <main className="creation-workbench">
             <aside className="creation-stage-nav">
               <Title level={4}>立项进度</Title>
@@ -917,20 +842,12 @@ function NovelCreationWizardPage() {
                 current={Math.max(0, CORE_STAGES.indexOf(currentStage))}
                 onChange={(index) => {
                   const stage = CORE_STAGES[index]
-                  const canView = (
-                    session?.stage_flow?.items?.[stage]?.can_view
-                    || session?.stage_flow?.items?.[stage]?.can_generate
-                  ) ?? Boolean(session?.draft?.stages?.[stage]?.data || stage === currentStage)
-                  if (canView) viewStage(stage)
+                  viewStage(stage)
                 }}
                 items={CORE_STAGES.map((stage) => {
                   const state = session?.draft?.stages[stage]
-                  const flow = session?.stage_flow?.items?.[stage]
-                  const canView = (flow?.can_view || flow?.can_generate)
-                    ?? Boolean(state?.data || stage === currentStage)
                   return {
                     title: stageLabels[stage] || stage,
-                    disabled: !canView,
                     status: state?.status === 'confirmed'
                       ? 'finish'
                       : state?.status === 'stale'
@@ -941,7 +858,6 @@ function NovelCreationWizardPage() {
                     description: (
                       <Space direction="vertical" size={2}>
                         <Tag color={stageTone(state?.status)}>{stageStatusLabel(state?.status)}</Tag>
-                        {!canView && flow?.blocked_by?.[0] && <Text type="secondary">需先处理{flow.blocked_by[0].label}</Text>}
                       </Space>
                     ),
                   }
@@ -980,7 +896,7 @@ function NovelCreationWizardPage() {
                 </div>
                 <Space wrap>
                   <Select aria-label="选择当前阶段模型" value={selectedModel} onChange={setSelectedModel} options={modelOptions} style={{ minWidth: 250 }} />
-                  <Button icon={<ReloadOutlined />} onClick={() => void startStageRun(currentStage, false, session, 'regenerate')} disabled={busy || currentStageFlow?.can_generate === false}>重新生成</Button>
+                  <Button icon={<ReloadOutlined />} onClick={() => void startStageRun(currentStage, false, session, 'regenerate')} disabled={busy}>重新生成</Button>
                   <Button onClick={() => openRefine(currentStage)} disabled={!currentStageState?.data || busy}>让 AI 按要求调整</Button>
                   <Button icon={<EditOutlined />} onClick={() => openEditor()} disabled={!currentStageState?.data || busy}>编辑阶段内容</Button>
                 </Space>
@@ -990,21 +906,11 @@ function NovelCreationWizardPage() {
                 status={currentStageState?.status}
                 hasData={Boolean(currentStageState?.data)}
                 staleReason={currentStageState?.stale_reason}
-                blockers={currentBlockers}
                 error={stageActionError}
                 recommendedStageLabel={recommendedStageLabel}
                 canRetryNext={Boolean(recommendedStage && recommendedStage !== currentStage)}
-                onViewStage={viewStage}
                 onRetryNext={() => void continueFromConfirmedStage()}
               />
-              {currentStageState?.source === 'contract_fallback' && (
-                <Alert
-                  type="warning"
-                  showIcon
-                  message="本阶段已采用安全结构继续"
-                  description="模型回复为空或格式不可用。内容没有丢失，你可以直接检查、编辑，或选择其他模型重新生成本阶段。"
-                />
-              )}
               <StagePreview stage={currentStage} data={currentStageState?.data} />
               <StageActionBar
                 currentStage={currentStage}
@@ -1012,14 +918,12 @@ function NovelCreationWizardPage() {
                 hasData={Boolean(currentStageState?.data)}
                 busy={busy}
                 createdProjectId={session.created_project_id}
-                finalReady={Boolean(finalData?.ready)}
                 recommendedStage={recommendedStage}
                 recommendedStageLabel={recommendedStageLabel}
                 nextStageLabel={nextStageLabel}
-                canGenerate={Boolean(currentStageFlow?.can_generate)}
                 currentStageLabel={stageLabels[currentStage] || currentStage}
                 onOpenProject={() => {
-                  if (session.created_project_id) navigate(`/project/${session.created_project_id}`)
+                  if (session.created_project_id) navigate(`/project/${session.created_project_id}?assistant=open`)
                 }}
                 onCreateProject={() => void createProject()}
                 onConfirmOnly={() => void confirmCurrentStage(false)}
@@ -1056,7 +960,6 @@ function NovelCreationWizardPage() {
             || session.runs?.find((run) => run.id === session.last_error?.run_id)?.stage
           const retryStage = failedStage && [...CORE_STAGES, 'concepts'].includes(failedStage) ? failedStage : currentStage
           const retryLabel = session.last_error.failed_stage_label || stageLabels[retryStage] || retryStage
-          const retryBlocker = session.stage_flow?.items?.[retryStage]?.blocked_by?.[0]
           return (
             <Alert
               className="creation-error-band"
@@ -1064,9 +967,7 @@ function NovelCreationWizardPage() {
               showIcon
               message={session.last_error.message || '阶段运行失败'}
               description={session.last_error.next_action}
-              action={retryBlocker
-                ? <Button onClick={() => viewStage(retryBlocker.stage)}>先修复“{retryBlocker.label}”</Button>
-                : <Button onClick={() => retryStage === 'concepts' ? void generateConcepts() : void startStageRun(retryStage)}>重试“{retryLabel}”</Button>}
+              action={<Button onClick={() => retryStage === 'concepts' ? void generateConcepts() : void startStageRun(retryStage)}>重试“{retryLabel}”</Button>}
             />
           )
         })()}

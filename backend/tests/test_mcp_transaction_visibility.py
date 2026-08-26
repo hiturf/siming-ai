@@ -13,6 +13,20 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
+def chapter_target_db():
+    db = MagicMock()
+    outline = MagicMock(id="o1", title="Test Chapter", node_type="chapter")
+    outline_query = MagicMock()
+    outline_query.filter.return_value = outline_query
+    outline_query.first.return_value = outline
+    chapter_query = MagicMock()
+    chapter_query.filter.return_value = chapter_query
+    chapter_query.order_by.return_value = chapter_query
+    chapter_query.first.return_value = None
+    db.query.side_effect = [outline_query, chapter_query]
+    return db
+
+
 class TransactionVisibilityTest(unittest.TestCase):
     """Verify MCP tool calls produce visible database changes."""
 
@@ -20,11 +34,14 @@ class TransactionVisibilityTest(unittest.TestCase):
         """Successful tool execution should return status=ok."""
         from app.services.workspace.tools.external_writing import save_external_chapter_draft
 
-        with patch("app.services.workspace.generated_drafts.store_chapter_draft", return_value="draft-tv-1"):
-            db = MagicMock()
+        with patch("app.services.workspace.generated_drafts.store_chapter_draft", return_value="draft-tv-1"), \
+             patch("app.services.workspace.generated_drafts.find_pending_chapter_draft", return_value=None), \
+             patch("app.services.cataloging.launcher.find_blocking_chapter_cataloging_job", return_value=None), \
+             patch("app.services.cataloging.launcher.find_cataloging_required_chapter", return_value=None):
+            db = chapter_target_db()
             result = asyncio.run(save_external_chapter_draft(db, "p1", {
                 "content": "Test content for transaction visibility",
-                "title": "Test Chapter",
+                "outline_node_id": "o1",
             }))
         self.assertEqual(result["status"], "ok")
         self.assertIn("draft_id", result["data"])
@@ -84,13 +101,16 @@ class ReadAfterWriteVerificationTest(unittest.TestCase):
         )
 
         with patch("app.services.workspace.generated_drafts.store_chapter_draft", return_value="draft-raw-1"), \
-             patch("app.services.workspace.generated_drafts.get_chapter_draft", return_value="Saved content"):
-            db = MagicMock()
+             patch("app.services.workspace.generated_drafts.get_chapter_draft", return_value="Saved content"), \
+             patch("app.services.workspace.generated_drafts.find_pending_chapter_draft", return_value=None), \
+             patch("app.services.cataloging.launcher.find_blocking_chapter_cataloging_job", return_value=None), \
+             patch("app.services.cataloging.launcher.find_cataloging_required_chapter", return_value=None):
+            db = chapter_target_db()
 
             # Save
             save_result = asyncio.run(save_external_chapter_draft(db, "p1", {
                 "content": "Saved content",
-                "title": "Test",
+                "outline_node_id": "o1",
             }))
             self.assertEqual(save_result["status"], "ok")
             draft_id = save_result["data"]["draft_id"]

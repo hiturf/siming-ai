@@ -1,47 +1,47 @@
 """Durable execution log for workspace assistant runs."""
 from __future__ import annotations
 
-from app.architecture.uow import commit_session
-
 import json
 from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.architecture.uow import commit_session
+
 from ...core.utils import utc_isoformat
 from ...database.models import (
-    AgentPlan,
     AssistantMessage,
     AssistantRun,
     AssistantRunStep,
 )
 from ...modules.model_runtime.application.execution import model_executor as LLMGateway
-from ..operation_runtime import ensure_operation, fail_operation, finish_operation, record_operation_signal
-
-
-MAX_JSON_CHARS = 80_000
+from ..operation_runtime import (
+    ensure_operation,
+    fail_operation,
+    finish_operation,
+    record_operation_signal,
+)
+from .run_step_payloads import (
+    serialize_step_request,
+    serialize_step_result,
+    step_request_retry_block_reason,
+)
 
 
 def resolve_assistant_model(model: str | None) -> str | None:
     """Resolve and pin the effective provider/model used by one assistant run."""
 
     try:
-        provider, model_name = LLMGateway.model_identity(model)
+        selection = LLMGateway.select_model_for_task(
+            task_type="assistant",
+            model_override=model,
+        )
+        provider, model_name = LLMGateway.model_identity(selection.model)
         return f"{provider}:{model_name}"
     except Exception:
         normalized = str(model or "").strip()
         return normalized or None
-
-
-def _safe_json(data: Any, *, max_chars: int = MAX_JSON_CHARS) -> str:
-    try:
-        text = json.dumps(data, ensure_ascii=False, default=str)
-    except Exception:
-        text = json.dumps(str(data), ensure_ascii=False)
-    if len(text) > max_chars:
-        return text[:max_chars] + "...[truncated]"
-    return text
 
 
 def _message_payload(message: AssistantMessage) -> dict[str, Any]:
@@ -99,27 +99,6 @@ def _finish_running_children(
         step.completed_at = now
         step.updated_at = now
 
-    plan_status = "cancelled" if status == "cancelled" else "interrupted" if status == "interrupted" else "error"
-    plans = (
-        db.query(AgentPlan)
-        .filter(
-            AgentPlan.assistant_run_id == run.id,
-            AgentPlan.status.in_(["pending", "running"]),
-        )
-        .all()
-    )
-    for plan in plans:
-        plan.status = plan_status
-        plan.error = detail
-        plan.updated_at = now
-        plan.completed_at = now
-        for step in plan.steps:
-            if step.status == "running":
-                step.status = status
-                step.error = detail
-                step.detail = step.detail or detail
-                step.updated_at = now
-                step.completed_at = now
 
 
 def create_assistant_run(
@@ -130,7 +109,6 @@ def create_assistant_run(
     user_message_id: str | None,
     assistant_message_id: str | None,
     scope: str,
-    assistant_mode: str,
     model: str | None,
 ) -> AssistantRun:
     model = resolve_assistant_model(model)
@@ -140,7 +118,6 @@ def create_assistant_run(
         user_message_id=user_message_id,
         assistant_message_id=assistant_message_id,
         scope=scope,
-        assistant_mode=assistant_mode,
         model=model,
         status="running",
         phase="setup",
@@ -160,7 +137,7 @@ def create_assistant_run(
         phase="setup",
         message="正在准备作品上下文",
         model_source=model,
-        tool_mode=assistant_mode,
+        tool_mode="workspace_assistant",
         resume_url=f"/project/{project_id}",
         can_pause=False,
         can_cancel=True,
@@ -198,7 +175,7 @@ def start_run_step(
         tool=tool,
         status="running",
         iteration=iteration or 0,
-        request_json=_safe_json(request) if request is not None else None,
+        request_json=serialize_step_request(request) if request is not None else None,
         detail=detail,
         idempotency_key=idempotency_key,
         started_at=now,
@@ -230,7 +207,7 @@ def finish_run_step(
         return
     now = datetime.utcnow()
     step.status = status
-    step.result_json = _safe_json(result) if result is not None else step.result_json
+    step.result_json = serialize_step_result(result) if result is not None else step.result_json
     step.detail = detail if detail is not None else step.detail
     step.error = error
     step.completed_at = now
@@ -345,7 +322,6 @@ def run_payload(run: AssistantRun) -> dict:
         "status": run.status,
         "phase": run.phase,
         "scope": run.scope,
-        "assistant_mode": run.assistant_mode,
         "model": run.model,
         "current_iteration": run.current_iteration or 0,
         "error": run.error,
@@ -356,6 +332,7 @@ def run_payload(run: AssistantRun) -> dict:
 
 
 def step_payload(step: AssistantRunStep) -> dict:
+    retry_block_reason = step_request_retry_block_reason(step.request_json)
     return {
         "id": step.id,
         "run_id": step.run_id,
@@ -369,6 +346,12 @@ def step_payload(step: AssistantRunStep) -> dict:
         "retry_of_step_id": step.retry_of_step_id,
         "resolved_step_id": step.resolved_step_id,
         "idempotency_key": step.idempotency_key,
+        "can_retry": bool(
+            step.tool
+            and step.status in {"error", "interrupted"}
+            and retry_block_reason is None
+        ),
+        "retry_block_reason": retry_block_reason,
         "started_at": utc_isoformat(step.started_at),
         "completed_at": utc_isoformat(step.completed_at),
     }
@@ -400,9 +383,6 @@ def mark_interrupted_assistant_runs(db: Session) -> int:
             status="error",
             content=run.error,
         )
-    from .idempotency import mark_interrupted_chapter_write_claims
-
-    mark_interrupted_chapter_write_claims(db)
     if runs:
         db.flush()
     return len(runs)

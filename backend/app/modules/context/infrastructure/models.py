@@ -19,6 +19,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 
+from ....core.model_limits import DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS
 from ....database.models_support import generate_uuid
 from ....database.session import Base
 
@@ -29,7 +30,11 @@ class ModelContextProfile(Base):
     id = Column(String(36), primary_key=True, default=generate_uuid)
     provider = Column(String(80), nullable=False)
     model_name = Column(String(512), nullable=False)
-    context_window_tokens = Column(Integer, nullable=False, default=16384)
+    context_window_tokens = Column(
+        Integer,
+        nullable=False,
+        default=DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS,
+    )
     max_output_tokens = Column(Integer, nullable=True)
     safety_margin_tokens = Column(Integer, nullable=False, default=512)
     enabled = Column(Boolean, nullable=False, default=True)
@@ -54,7 +59,11 @@ class ContextManifest(Base):
     execution_route = Column(String(50), nullable=False, default="internal_api")
     policy_version = Column(Integer, nullable=False, default=1)
     status = Column(String(30), nullable=False, default="ready")
-    context_window_tokens = Column(Integer, nullable=False, default=16384)
+    context_window_tokens = Column(
+        Integer,
+        nullable=False,
+        default=DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS,
+    )
     input_budget_tokens = Column(Integer, nullable=False, default=0)
     output_reserve_tokens = Column(Integer, nullable=False, default=0)
     safety_margin_tokens = Column(Integer, nullable=False, default=512)

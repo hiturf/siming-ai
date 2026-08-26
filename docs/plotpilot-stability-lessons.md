@@ -31,7 +31,8 @@ Siming's stack.
 
 - `sync_project_files` defaults to database-to-files export. File-to-database
   import requires `confirm_import_from_files=true`.
-- External and local CLI writers must save long text through Siming tools, then
-  call `create_chapter` or `update_chapter`.
+- External and local CLI writers must store one independent unsaved draft with
+  `save_external_chapter_draft` and stop. Only the author can promote it through
+  **Save and catalog** or **Save only** in the UI.
 - Storage health reports expose orphan chapter mirror files so direct filesystem
   writes can be repaired explicitly.

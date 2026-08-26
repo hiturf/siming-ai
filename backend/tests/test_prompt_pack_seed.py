@@ -16,7 +16,6 @@ class BuiltinPacksDefinitionTest(unittest.TestCase):
         required = {
             "new_project_setup",
             "chapter_writing_quality",
-            "chapter_writing_fast",
             "chapter_review_quality",
             "character_design",
             "worldbuilding_design",
@@ -66,7 +65,7 @@ class BuiltinPacksDefinitionTest(unittest.TestCase):
                     self.assertGreater(len(pack["forbidden_patterns_json"]), 0)
 
     def test_base_writing_packs_defer_review_and_de_ai_material(self):
-        writing_packs = {"chapter_writing_quality", "chapter_writing_fast"}
+        writing_packs = {"chapter_writing_quality"}
         for pack in BUILTIN_PACKS:
             if pack["pack_id"] in writing_packs:
                 with self.subTest(pack_id=pack["pack_id"]):
@@ -78,10 +77,11 @@ class BuiltinPacksDefinitionTest(unittest.TestCase):
                     )
                     self.assertNotIn("self_review", workflow)
                     self.assertNotIn("detect_patterns", workflow)
-                    self.assertIn("skip_style_repair=true", workflow)
+                    self.assertIn("save_external_chapter_draft", workflow)
+                    self.assertIn("立即结束", workflow)
 
     def test_pack_count(self):
-        self.assertEqual(len(BUILTIN_PACKS), 13)
+        self.assertEqual(len(BUILTIN_PACKS), 12)
 
 
 class SeedFunctionTest(unittest.TestCase):

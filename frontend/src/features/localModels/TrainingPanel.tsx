@@ -22,6 +22,14 @@ import type { CatalogResponse, HardwareProfile, TrainingDataset, TrainingJob } f
 
 const { Paragraph } = Typography
 
+const TRAINABLE_MODEL_KEYS = new Set([
+  'qwen3.5-4b-q4',
+  'qwen3.5-9b-q4',
+  'qwen3.5-27b-q4',
+  'qwen3.8-27b-q4',
+])
+const LARGE_TRAINING_MODEL_KEYS = new Set(['qwen3.5-27b-q4', 'qwen3.8-27b-q4'])
+
 interface Props {
   hardware: HardwareProfile | null
   catalog: CatalogResponse | null
@@ -45,7 +53,10 @@ export default function TrainingPanel({
   const [jobForm] = Form.useForm()
 
   const trainableModels = useMemo(
-    () => (catalog?.items || []).filter((item) => item.model_key !== 'qwen3.5-27b-q4' || (hardware?.vram_gb || 0) >= 24),
+    () => (catalog?.items || []).filter((item) => (
+      TRAINABLE_MODEL_KEYS.has(item.model_key)
+      && (!LARGE_TRAINING_MODEL_KEYS.has(item.model_key) || (hardware?.vram_gb || 0) >= 24)
+    )),
     [catalog, hardware],
   )
 
@@ -104,7 +115,7 @@ export default function TrainingPanel({
         showIcon
         type="warning"
         message="LoRA 训练 Beta"
-        description="首次训练会下载隔离环境。14B QLoRA 建议 24GB 以上显存；16GB 显存优先选择 8B。数据和产物只保存在本机。"
+        description="首次训练会下载隔离环境。27B QLoRA 建议 24GB 以上显存；显存不足时优先选择 4B 或 9B。数据和产物只保存在本机。"
       />
 
       <Card

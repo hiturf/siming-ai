@@ -14,7 +14,6 @@ from app.modules.assistant.infrastructure.models import (
     AssistantMessage,
     AssistantRun,
     AssistantRunStep,
-    ChapterWriteClaim,
     ChapterDraft,
     RagChunk,
     RagChunkEmbedding,
@@ -93,10 +92,8 @@ from app.modules.model_runtime.infrastructure.legacy_models import (
     TrainingDataset,
     TrainingJob,
 )
-from app.modules.model_runtime.infrastructure.models import APIConfig, LocalModelTaskSetting
+from app.modules.model_runtime.infrastructure.models import APIConfig, ModelTaskSetting
 from app.modules.operations.infrastructure.legacy_models import (
-    AgentPlan,
-    AgentPlanStep,
     AgentRun,
     AgentRunEvent,
     ScheduledTask,
@@ -150,7 +147,6 @@ __all__ = [
     "SystemAssistantMessage",
     "AssistantRun",
     "AssistantRunStep",
-    "ChapterWriteClaim",
     "AssistantMemory",
     "ChapterDraft",
     "RagDocument",
@@ -178,8 +174,6 @@ __all__ = [
     "NovelCreationSession",
     "NovelCreationStageRun",
     "NovelCreationStageEvent",
-    "AgentPlan",
-    "AgentPlanStep",
     "ScheduledTask",
     "AgentRun",
     "AgentRunEvent",
@@ -200,7 +194,7 @@ __all__ = [
     "ContextRebuildProject",
     "ModelContextProfile",
     "APIConfig",
-    "LocalModelTaskSetting",
+    "ModelTaskSetting",
     "OperationEvent",
     "OperationRun",
     "ContentSyncJob",

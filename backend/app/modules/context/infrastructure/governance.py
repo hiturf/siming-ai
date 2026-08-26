@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ....architecture.uow import SqlAlchemyUnitOfWork
+from ....core.model_limits import DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS
 from ....services.context_orchestrator import ContextOrchestrator
 from .models import ContextManifest, ContextRebuildJob, ModelContextProfile
 
@@ -62,8 +63,11 @@ class SqlAlchemyContextGovernance:
                 for row in rows
             ],
             "fallback": {
-                "context_window_tokens": 16384,
-                "reason": "Unknown models use a conservative 16K profile.",
+                "context_window_tokens": DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS,
+                "reason": (
+                    "Models without an exact profile use the platform 1M context default; "
+                    "the configured or built-in model output limit still applies."
+                ),
             },
             "semantic": ContextOrchestrator(session).semantic_status(),
         }

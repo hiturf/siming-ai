@@ -17,7 +17,6 @@ from ....services.context_builders import (
     _build_recent_summaries,
 )
 from ....prompts.style_prompts import build_style_context
-from ....prompts.writing_task_prompts import build_writing_directives
 from ....services.style_rules import (
     STYLE_PROMPTS,
     _repair_forbidden_sentence_text,
@@ -42,20 +41,11 @@ async def rewrite_text(
 
     style_ctx = build_style_context(project)
     style_instruction = STYLE_PROMPTS.get(style, "") if style else ""
-    writing_directives = build_writing_directives(
-        project_title=project.title or "",
-        project_description=project.description or "",
-        project_tags=project.tags,
-        requirements=f"改写 {prompt or ''} {style or ''}",
-        source_text=text,
-    )
-
     messages = build_rewrite_messages(
         style_context=style_ctx,
         style_instruction=style_instruction,
         prompt=prompt,
         text=text,
-        writing_directives=writing_directives,
     )
 
     model = str(args.get("model") or "") or None
@@ -112,19 +102,10 @@ async def expand_text(
         return {"tool": "expand_text", "status": "skipped", "detail": "项目不存在", "data": {}}
 
     style_ctx = build_style_context(project)
-    writing_directives = build_writing_directives(
-        project_title=project.title or "",
-        project_description=project.description or "",
-        project_tags=project.tags,
-        requirements=f"扩写 {prompt or ''}",
-        source_text=text,
-    )
-
     messages = build_expand_messages(
         style_context=style_ctx,
         prompt=prompt,
         text=text,
-        writing_directives=writing_directives,
     )
 
     model = str(args.get("model") or "") or None
@@ -183,22 +164,12 @@ async def continue_text(
     style_ctx = build_style_context(project)
     summaries = _build_recent_summaries(db, project_id, limit=5)
     outline_ctx = _build_outline_context(db, project_id, outline_node_id) if outline_node_id else "无指定大纲节点。"
-    writing_directives = build_writing_directives(
-        project_title=project.title or "",
-        project_description=project.description or "",
-        project_tags=project.tags,
-        outline_context=outline_ctx,
-        requirements=f"续写 {prompt or ''}",
-        source_text=text,
-    )
-
     messages = build_continue_messages(
         style_context=style_ctx,
         outline_context=outline_ctx,
         summaries=summaries,
         prompt=prompt,
         text=text,
-        writing_directives=writing_directives,
     )
 
     model = str(args.get("model") or "") or None

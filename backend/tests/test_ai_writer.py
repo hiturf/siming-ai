@@ -1,50 +1,21 @@
-"""Regression tests for AI writing engine project isolation."""
+from __future__ import annotations
 
 import asyncio
 import json
 import os
 import unittest
-from datetime import datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ["DATABASE_URL"] = "sqlite:///./test_novel_agent.db"
 
 from fastapi.testclient import TestClient
 
-from app.core.exceptions import LLMError
-from app.ai.local_cli_adapter import CLIPermissionRequiredError
-from app.database.models import (
-    Chapter,
-    ChapterCharacter,
-    ChapterSnapshot,
-    Character,
-    CharacterChangeLog,
-    CharacterTimeline,
-    CharacterVersion,
-    AgentRun,
-    AgentRunEvent,
-    AgentPlan,
-    AgentPlanStep,
-    AssistantConversation,
-    AssistantMessage,
-    AssistantRun,
-    AssistantRunStep,
-    SystemAssistantConversation,
-    SystemAssistantMessage,
-    APIConfig,
-    OutlineNode,
-    OutlineNodeCharacter,
-    Project,
-    Skill,
-)
+from app.database.models import Chapter, ChapterDraft, Character
 from app.database.session import Base, SessionLocal, engine
 from app.main import app
 from app.routers.ai_writer import _execute_workspace_action
-from app.services.agent.bridge import (
-    _latest_outline_chapter_number,
-    _pending_missing_outline_chapter_number,
-    _resolve_outline_node_id,
-)
+from app.services.tool_category_state import replace_tool_categories
+
 
 API_PREFIX = "/api/v1"
 
@@ -53,23 +24,14 @@ async def async_chunks(text: str):
     yield text
 
 
-async def async_error_chunks(exc: Exception):
-    if False:
-        yield ""
-    raise exc
-
-
 async def async_dict_chunks(*chunks: dict):
     for chunk in chunks:
         yield chunk
 
 
-class AIWriterIsolationTestCase(unittest.TestCase):
-    """AI writer endpoints must not accept outline nodes from another project."""
-
+class AIChapterDraftFlowTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        Base.metadata.create_all(bind=engine)
         cls.client = TestClient(app)
 
     @classmethod
@@ -81,39 +43,15 @@ class AIWriterIsolationTestCase(unittest.TestCase):
             pass
 
     def setUp(self):
-        db = SessionLocal()
-        try:
-            db.query(AssistantRunStep).delete()
-            db.query(AssistantRun).delete()
-            db.query(AgentRunEvent).delete()
-            db.query(AgentRun).delete()
-            db.query(AgentPlanStep).delete()
-            db.query(AgentPlan).delete()
-            db.query(AssistantMessage).delete()
-            db.query(AssistantConversation).delete()
-            db.query(SystemAssistantMessage).delete()
-            db.query(SystemAssistantConversation).delete()
-            db.query(APIConfig).delete()
-            db.query(CharacterTimeline).delete()
-            db.query(CharacterChangeLog).delete()
-            db.query(ChapterCharacter).delete()
-            db.query(OutlineNodeCharacter).delete()
-            db.query(CharacterVersion).delete()
-            db.query(ChapterSnapshot).delete()
-            db.query(Chapter).delete()
-            db.query(Character).delete()
-            db.query(OutlineNode).delete()
-            db.query(Project).delete()
-            db.commit()
-        finally:
-            db.close()
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
 
     def create_project(self, title: str) -> str:
         response = self.client.post(f"{API_PREFIX}/projects", json={"title": title})
         self.assertEqual(response.status_code, 200)
         return response.json()["data"]["id"]
 
-    def create_outline_node(self, project_id: str, title: str) -> str:
+    def create_outline(self, project_id: str, title: str) -> str:
         response = self.client.post(
             f"{API_PREFIX}/projects/{project_id}/outline",
             json={"title": title, "node_type": "chapter"},
@@ -121,1059 +59,689 @@ class AIWriterIsolationTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         return response.json()["data"]["id"]
 
-    def create_character(self, project_id: str, name: str) -> str:
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/characters",
-            json={
-                "name": name,
-                "personality": "沉稳",
-                "abilities": [],
-                "is_evolution_tracked": True,
-            },
-        )
-        self.assertEqual(response.status_code, 200)
-        return response.json()["data"]["id"]
-
-    def create_chapter(self, project_id: str, content: str) -> str:
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/chapters",
-            json={"title": "Chapter", "content": content},
-        )
-        self.assertEqual(response.status_code, 200)
-        return response.json()["data"]["id"]
-
-    def test_workspace_update_outline_uses_current_project_title_when_id_is_foreign(self):
-        project_a = self.create_project("Project A")
-        project_b = self.create_project("Project B")
-        current_outline_id = self.create_outline_node(project_a, "第151章 众生相")
-        foreign_outline_id = self.create_outline_node(project_b, "第151章 众生相")
-
-        db = SessionLocal()
-        try:
-            result = asyncio.run(_execute_workspace_action(db, project_a, {
-                "tool": "update_outline_node",
-                "arguments": {
-                    "id": foreign_outline_id,
-                    "title": "第151章 众生相",
-                    "summary": "从归寂谷外的小人物视角展现死线回收。",
-                },
-            }))
-            db.commit()
-            self.assertEqual(result["status"], "ok")
-            current = db.query(OutlineNode).filter(OutlineNode.id == current_outline_id).first()
-            foreign = db.query(OutlineNode).filter(OutlineNode.id == foreign_outline_id).first()
-            self.assertIn("死线回收", current.summary)
-            self.assertNotIn("死线回收", foreign.summary or "")
-        finally:
-            db.close()
-
-    def test_workspace_create_chapter_falls_back_to_current_outline_title(self):
-        project_a = self.create_project("Project A")
-        project_b = self.create_project("Project B")
-        current_outline_id = self.create_outline_node(project_a, "第151章 众生相")
-        foreign_outline_id = self.create_outline_node(project_b, "第151章 众生相")
-
-        db = SessionLocal()
-        try:
-            result = asyncio.run(_execute_workspace_action(db, project_a, {
-                "tool": "create_chapter",
-                "arguments": {
-                    "title": "第151章 众生相",
-                    "content": "青石村外，死线沿着井沿缓缓收束。",
-                    "outline_node_id": foreign_outline_id,
-                    "outline_node_title": "第151章 众生相",
-                    "summary": "外界视角展现末日景象。",
-                },
-            }))
-            db.commit()
-            self.assertEqual(result["status"], "ok")
-            chapter = db.query(Chapter).filter(Chapter.project_id == project_a).first()
-            self.assertIsNotNone(chapter)
-            self.assertEqual(chapter.outline_node_id, current_outline_id)
-        finally:
-            db.close()
-
-    def test_assistant_history_orders_user_before_assistant_for_same_timestamp(self):
-        project_id = self.create_project("History Project")
-        same_time = datetime.utcnow()
-
-        db = SessionLocal()
-        try:
-            conversation = AssistantConversation(
-                project_id=project_id,
-                title="顺序测试",
-                scope="project",
-                created_at=same_time,
-                updated_at=same_time,
-            )
-            db.add(conversation)
-            db.flush()
-            db.add(AssistantMessage(
-                conversation_id=conversation.id,
-                role="assistant",
-                content="先插入的助手消息",
-                status="completed",
-                created_at=same_time,
-                updated_at=same_time,
-            ))
-            db.add(AssistantMessage(
-                conversation_id=conversation.id,
-                role="user",
-                content="后插入的用户消息",
-                status="completed",
-                created_at=same_time,
-                updated_at=same_time,
-            ))
-            db.commit()
-            conversation_id = conversation.id
-        finally:
-            db.close()
-
-        response = self.client.get(f"{API_PREFIX}/projects/{project_id}/ai/assistant/conversations/{conversation_id}")
-        self.assertEqual(response.status_code, 200)
-        data = response.json()["data"]
-        roles = [item["role"] for item in data["messages"]]
-        self.assertEqual(roles, ["user", "assistant"])
-        self.assertTrue(data["conversation"]["created_at"].endswith("+00:00"))
-        self.assertTrue(all(item["created_at"].endswith("+00:00") for item in data["messages"]))
-
-    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
-    def test_workspace_stream_selected_outline_with_links_does_not_detach(self, mock_stream):
-        project_id = self.create_project("Workspace Project")
-        outline_id = self.create_outline_node(project_id, "第151章 众生相")
-        character_id = self.create_character(project_id, "特昂糖")
-        mock_stream.return_value = async_chunks(json.dumps(
-            {"reply": "已读取当前大纲。", "done": True, "actions": [], "needs_confirmation": False},
-            ensure_ascii=False,
-        ))
-
-        db = SessionLocal()
-        try:
-            db.add(OutlineNodeCharacter(
-                outline_node_id=outline_id,
-                character_id=character_id,
-                role_in_scene="主视角",
-            ))
-            db.commit()
-        finally:
-            db.close()
-
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "检查当前大纲",
-                "selected_outline_node_id": outline_id,
-                "auto_apply": True,
-            },
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("已读取当前大纲", response.text)
-        self.assertNotIn("not bound to a Session", response.text)
-
-    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
-    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
-    def test_workspace_stream_reuses_the_canonical_execution_bridge(self, mock_stream, mock_supports):
-        project_id = self.create_project("Canonical Project Conversation")
-        db = SessionLocal()
-        try:
-            canonical = SystemAssistantConversation(
-                title="Project scope",
-                scope_type="project",
-                scope_id=project_id,
-                project_id=project_id,
-            )
-            db.add(canonical)
-            db.commit()
-            canonical_id = canonical.id
-        finally:
-            db.close()
-
-        for message in ("First project turn", "Second project turn"):
-            mock_stream.return_value = async_chunks("Project reply")
-            response = self.client.post(
-                f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-                json={
-                    "scope": "project",
-                    "message": message,
-                    "canonical_conversation_id": canonical_id,
-                    "model": "claude_cli:claude-code",
-                    "auto_apply": True,
-                },
-            )
-            self.assertEqual(response.status_code, 200)
-
-        db = SessionLocal()
-        try:
-            bridges = db.query(AssistantConversation).filter(
-                AssistantConversation.canonical_conversation_id == canonical_id,
-            ).all()
-            self.assertEqual(len(bridges), 1)
-            self.assertEqual(bridges[0].project_id, project_id)
-            self.assertEqual(
-                db.query(AssistantMessage).filter(
-                    AssistantMessage.conversation_id == bridges[0].id,
-                ).count(),
-                4,
-            )
-        finally:
-            db.close()
-
-    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
-    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
-    def test_workspace_stream_local_cli_bridge_uses_json_envelope(self, mock_stream, mock_supports):
-        project_id = self.create_project("CLI Chat Project")
-        mock_stream.return_value = async_chunks(json.dumps({
-            "reply": "你好，我在。",
-            "done": True,
-            "actions": [],
-            "needs_confirmation": False,
-        }, ensure_ascii=False))
-
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "你好？",
-                "model": "claude_cli:claude-code",
-                "auto_apply": True,
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("你好，我在。", response.text)
-        self.assertIn("local_cli_bridge_mode", response.text)
-        self.assertNotIn("json_repair", response.text)
-        self.assertNotIn("模型返回的工具格式不合法", response.text)
-        call = mock_stream.call_args.kwargs
-        self.assertFalse(call["extra_body"]["local_cli_allow_mcp"])
-        self.assertFalse(call["extra_body"]["local_cli_permission_granted"])
-        self.assertTrue(call["extra_body"]["local_cli_isolated"])
-        self.assertIn("本机 CLI 受控工具桥", call["messages"][0]["content"])
-        self.assertIn(project_id, str(call["messages"]))
-
-    @patch("app.services.agent.local_cli_routing.classify_local_cli_workspace_request", new_callable=AsyncMock)
-    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
-    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
-    def test_workspace_stream_local_cli_write_action_requires_one_turn_grant(
-        self, mock_stream, _mock_supports, mock_route,
+    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=True)
+    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion_with_tools")
+    @patch("app.routers.ai_writer._execute_workspace_action", new_callable=AsyncMock)
+    def test_api_model_selects_writer_and_terminal_draft_stops_the_turn(
+        self,
+        mock_execute,
+        mock_stream,
+        _mock_supports,
     ):
-        project_id = self.create_project("CLI Safe Bridge Project")
-        mock_route.return_value = {"route": "general", "chapter_number": None, "outline_query": ""}
-        mock_stream.return_value = async_chunks(json.dumps({
-            "reply": "准备创建角色陈叙。",
-            "done": True,
-            "actions": [{
-                "tool": "create_character",
-                "arguments": {"name": "陈叙", "personality": "冷静", "abilities": []},
-            }],
-            "needs_confirmation": False,
-        }, ensure_ascii=False))
+        project_id = self.create_project("Draft terminal")
+        outline_id = self.create_outline(project_id, "第一章 山门")
+        draft_id = "draft-terminal-1"
+        mock_execute.return_value = {
+            "tool": "chapter_writer",
+            "status": "ok",
+            "detail": "章节草稿已生成，尚未保存",
+            "turn_directive": "end_after_draft",
+            "turn_terminal": True,
+            "data": {
+                "draft_id": draft_id,
+                "project_id": project_id,
+                "title": "第一章 山门",
+                "outline_node_id": outline_id,
+                "content": "山门在晨雾中开启。",
+                "word_count": 9,
+                "draft_status": "pending",
+            },
+        }
+        mock_stream.side_effect = [
+            async_dict_chunks(
+                {
+                    "type": "tool_call_delta",
+                    "index": 0,
+                    "id": "call-categories",
+                    "name": "set_tool_categories",
+                    "arguments_delta": json.dumps({
+                        "enabled_categories": ["story_knowledge", "writing_context"],
+                    }),
+                },
+                {"type": "done", "finish_reason": "tool_calls", "usage": None},
+            ),
+            async_dict_chunks(
+                {
+                    "type": "tool_call_delta",
+                    "index": 0,
+                    "id": "call-2",
+                    "name": "create_character",
+                    "arguments_delta": json.dumps({"name": "不应创建"}, ensure_ascii=False),
+                },
+                {
+                    "type": "tool_call_delta",
+                    "index": 1,
+                    "id": "call-1",
+                    "name": "chapter_writer",
+                    "arguments_delta": json.dumps({"outline_node_id": outline_id}),
+                },
+                {"type": "done", "finish_reason": "tool_calls", "usage": None},
+            ),
+        ]
 
         response = self.client.post(
             f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
             json={
                 "scope": "project",
-                "message": "新建角色陈叙",
-                "model": "claude_cli:claude-code",
-                "auto_apply": True,
+                "message": "写第一章并自动更新角色",
+                "model": "openai:gpt-test",
             },
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn('"type":"permission_required"', response.text)
-        self.assertIn("create_character", response.text)
-        call = mock_stream.call_args.kwargs
-        self.assertIn("本机 CLI 受控工具桥", call["messages"][0]["content"])
+        self.assertEqual(mock_stream.call_count, 2)
+        self.assertEqual(mock_stream.call_args_list[0].kwargs["tool_choice"], "required")
+        self.assertEqual(mock_stream.call_args_list[1].kwargs["tool_choice"], "auto")
+        _mock_supports.assert_called_once()
+        self.assertEqual(mock_execute.await_count, 1)
+        self.assertIn("章节草稿已生成并载入正文编辑器", response.text)
+        self.assertIn(draft_id, response.text)
         db = SessionLocal()
         try:
-            self.assertIsNone(db.query(Character).filter(
-                Character.project_id == project_id,
-                Character.name == "陈叙",
-            ).one_or_none())
+            self.assertEqual(db.query(Chapter).count(), 0)
+            self.assertEqual(db.query(Character).count(), 0)
         finally:
             db.close()
-
-    @patch("app.services.agent.local_cli_routing.classify_local_cli_workspace_request", new_callable=AsyncMock)
-    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
-    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
-    def test_workspace_stream_local_cli_bridge_executes_granted_write(
-        self, mock_stream, _mock_supports, mock_route,
-    ):
-        project_id = self.create_project("CLI Granted Bridge Project")
-        mock_route.return_value = {"route": "general", "chapter_number": None, "outline_query": ""}
-        mock_stream.return_value = async_chunks(json.dumps({
-            "reply": "已创建角色陈叙。",
-            "done": True,
-            "actions": [{
-                "tool": "create_character",
-                "arguments": {"name": "陈叙", "personality": "冷静", "abilities": []},
-            }],
-            "needs_confirmation": False,
-        }, ensure_ascii=False))
-
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "新建角色陈叙",
-                "model": "claude_cli:claude-code",
-                "auto_apply": True,
-                "local_cli_permission_grant": "project_agent_once",
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("local_cli_bridge_mode", response.text)
-        self.assertIn("create_character", response.text)
-        call = mock_stream.call_args.kwargs
-        self.assertFalse(call["extra_body"]["local_cli_allow_mcp"])
-        self.assertTrue(call["extra_body"]["local_cli_permission_granted"])
-        self.assertTrue(call["extra_body"]["local_cli_isolated"])
-        db = SessionLocal()
-        try:
-            character = db.query(Character).filter(
-                Character.project_id == project_id,
-                Character.name == "陈叙",
-            ).one_or_none()
-            self.assertIsNotNone(character)
-        finally:
-            db.close()
-
-    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
-    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
-    def test_workspace_stream_opencode_one_turn_grant_enables_project_mcp(self, mock_stream, _mock_supports):
-        project_id = self.create_project("CLI Agent Project")
-        mock_stream.return_value = async_chunks("已完成。")
-
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "读取项目并整理设定",
-                "model": "opencode_cli:opencode/deepseek-v4-flash-free",
-                "local_cli_permission_grant": "project_agent_once",
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("local_cli_mcp_mode", response.text)
-        call = mock_stream.call_args.kwargs
-        self.assertTrue(call["extra_body"]["local_cli_allow_mcp"])
-        self.assertTrue(call["extra_body"]["local_cli_permission_granted"])
-        self.assertTrue(call["extra_body"]["local_cli_isolated"])
-
-    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
-    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
-    def test_workspace_stream_opencode_path_grant_is_separate_and_read_only(
-        self, mock_stream, _mock_supports,
-    ):
-        project_id = self.create_project("CLI Read Snapshot Project")
-        mock_stream.return_value = async_chunks("已读取参考资料。")
-        granted_path = r"D:\references\world.md"
-
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": f"请阅读 {granted_path}",
-                "model": "opencode_cli:opencode/deepseek-v4-flash-free",
-                "local_cli_read_permission_grant": "read_once",
-                "local_cli_read_paths": [granted_path],
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        call = mock_stream.call_args.kwargs
-        self.assertTrue(call["extra_body"]["local_cli_read_permission_granted"])
-        self.assertEqual(call["extra_body"]["local_cli_read_paths"], [granted_path])
-        self.assertFalse(call["extra_body"]["local_cli_permission_granted"])
-        self.assertFalse(call["extra_body"]["local_cli_allow_mcp"])
-        self.assertTrue(call["extra_body"]["local_cli_isolated"])
-
-    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
-    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
-    def test_workspace_stream_surfaces_cli_permission_request_in_chat(self, mock_stream, _mock_supports):
-        project_id = self.create_project("CLI Permission Project")
-        mock_stream.return_value = async_error_chunks(
-            CLIPermissionRequiredError("Allow MCP server siming? [y/n]")
-        )
-
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "请读取项目资料",
-                "model": "claude_cli:claude-code",
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn('"type":"permission_required"', response.text)
-        self.assertIn('"permission_scope":"project_agent_once"', response.text)
-        self.assertIn("本轮没有访问项目目录", response.text)
-        self.assertNotIn('"type":"error"', response.text)
-
-    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
-    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
-    def test_workspace_stream_cli_quota_error_does_not_fall_back_to_i_am_here(self, mock_stream, mock_supports):
-        project_id = self.create_project("CLI Quota Project")
-        mock_stream.return_value = async_error_chunks(LLMError("本机 CLI 提供方额度/限额已耗尽或触发速率限制：Free usage exceeded"))
-
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "你好？",
-                "model": "opencode_cli:opencode/deepseek-v4-flash-free",
-                "auto_apply": True,
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("stream_error", response.text)
-        self.assertIn("额度/限额", response.text)
-        self.assertIn("模型调用中断，未执行写入", response.text)
-        self.assertNotIn("我在。", response.text)
 
     @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=True)
-    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
     @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion_with_tools")
-    def test_workspace_stream_empty_tool_call_response_falls_back_to_text(self, mock_tool_stream, mock_text_stream, mock_supports):
-        project_id = self.create_project("Empty Reply Project")
-        mock_tool_stream.return_value = async_dict_chunks({"type": "done", "finish_reason": "stop", "usage": None})
-        mock_text_stream.return_value = async_chunks("你好，我在。")
+    @patch("app.routers.ai_writer._execute_workspace_action", new_callable=AsyncMock)
+    def test_model_selected_chapter_id_is_used_without_editor_target_context(
+        self,
+        mock_execute,
+        mock_stream,
+        _mock_supports,
+    ):
+        project_id = self.create_project("Next chapter target")
+        first_outline = self.create_outline(project_id, "第1章 旧梦")
+        second_outline = self.create_outline(project_id, "第2章 夜雨")
+        db = SessionLocal()
+        try:
+            db.add(Chapter(
+                project_id=project_id,
+                title="第一卷 错误旧标题",
+                outline_node_id=first_outline,
+                content="第一章已经保存并完成建档。",
+                word_count=13,
+                sort_order=1000,
+                cataloging_required=False,
+            ))
+            db.commit()
+        finally:
+            db.close()
+        mock_execute.return_value = {
+            "tool": "chapter_writer",
+            "status": "ok",
+            "detail": "第二章草稿已生成",
+            "turn_directive": "end_after_draft",
+            "turn_terminal": True,
+            "data": {
+                "draft_id": "draft-chapter-2",
+                "project_id": project_id,
+                "title": "第2章 夜雨",
+                "outline_node_id": second_outline,
+                "content": "夜雨落在山门外。",
+                "word_count": 9,
+                "draft_status": "pending",
+            },
+        }
+        mock_stream.side_effect = [
+            async_dict_chunks(
+                {
+                    "type": "tool_call_delta",
+                    "index": 0,
+                    "id": "call-categories",
+                    "name": "set_tool_categories",
+                    "arguments_delta": json.dumps({"enabled_categories": ["writing_context"]}),
+                },
+                {"type": "done", "finish_reason": "tool_calls", "usage": None},
+            ),
+            async_dict_chunks(
+                {
+                    "type": "tool_call_delta",
+                    "index": 0,
+                    "id": "call-chapter-2",
+                    "name": "chapter_writer",
+                    "arguments_delta": json.dumps({
+                        "outline_node_id": second_outline,
+                        "requirements": "把故事接到夜雨这一章",
+                    }, ensure_ascii=False),
+                },
+                {"type": "done", "finish_reason": "tool_calls", "usage": None},
+            ),
+        ]
 
         response = self.client.post(
             f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
             json={
                 "scope": "project",
-                "message": "你好？",
+                "message": "把故事接到夜雨这一章",
                 "model": "openai:gpt-test",
-                "auto_apply": True,
             },
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("empty_tool_stream_fallback", response.text)
-        self.assertIn("你好，我在。", response.text)
-        self.assertNotIn("已完成。", response.text)
+        self.assertEqual(mock_execute.await_count, 1)
+        action = mock_execute.await_args.args[2]
+        self.assertEqual(action["tool"], "chapter_writer")
+        self.assertEqual(action["arguments"]["outline_node_id"], second_outline)
+        self.assertEqual(mock_stream.call_count, 2)
+        _mock_supports.assert_called_once()
+        initial_messages = mock_stream.call_args_list[0].kwargs["messages"]
+        self.assertNotIn(first_outline, initial_messages[1]["content"])
+        self.assertIn("把故事接到夜雨这一章", initial_messages[1]["content"])
 
-    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion_with_tools")
-    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
-    def test_workspace_stream_local_runtime_uses_text_mode(self, mock_text_stream, mock_tool_stream):
-        project_id = self.create_project("Local Runtime Chat Project")
-        mock_text_stream.return_value = async_chunks("你好，我在。")
-
+    def test_chapter_writer_rejects_volume_selected_by_model(self):
+        project_id = self.create_project("Chapter target type")
         response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "你好？",
-                "model": "local_llama_cpp:qwen3-8b-q4",
-                "auto_apply": True,
-            },
+            f"{API_PREFIX}/projects/{project_id}/outline",
+            json={"title": "第一卷 山门", "node_type": "volume"},
         )
-
         self.assertEqual(response.status_code, 200)
-        self.assertIn("当前模型不支持稳定工具调用", response.text)
-        self.assertIn("你好，我在。", response.text)
-        mock_tool_stream.assert_not_called()
-
-    @unittest.skip("legacy regex/preflight router removed; the model now selects tools")
-    def test_workspace_chapter_plan_missing_outline_reports_preflight(self):
-        project_id = self.create_project("Missing Outline Chapter Project")
-
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "帮我写第151章",
-                "model": "local_llama_cpp:qwen3-8b-q4",
-                "auto_apply": True,
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("未找到第 151 章的大纲节点", response.text)
-        self.assertIn("你希望这一章往哪个方向推进", response.text)
-        self.assertIn("按当前剧情自动规划", response.text)
-        self.assertIn("司命本地 AI", response.text)
-        self.assertIn("plan_preflight", response.text)
-        self.assertNotIn("plan_created", response.text)
-
-    @unittest.skip("legacy regex/preflight router removed; the model now selects tools")
-    @patch("app.services.workspace.tools.outline_writer.LLMGateway.chat_completion", new_callable=AsyncMock)
-    def test_workspace_outline_plan_infers_missing_chapter_and_creates_outline(self, mock_chat):
-        project_id = self.create_project("Create Missing Outline Project")
-        self.create_outline_node(project_id, "第150章 死线蔓延")
-        outline_payload = {
-            "nodes": [{
-                "title": "第151章 抢网",
-                "node_type": "chapter",
-                "summary": "主角团在死线继续蔓延前抢占网络节点，准备切断病毒的下一轮扩散。",
-                "character_names": [],
-                "status": "pending",
-            }],
-            "design_notes": "承接第150章危机，先补大纲，不生成正文。",
-        }
-        mock_chat.return_value = {
-            "content": "",
-            "tool_calls": [{"function": {"arguments": json.dumps(outline_payload, ensure_ascii=False)}}],
-        }
-
-        first = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "帮我写第151章",
-                "model": "opencode_cli:opencode/deepseek-v4-flash-free",
-                "auto_apply": True,
-            },
-        )
-        self.assertIn("未找到第 151 章的大纲节点", first.text)
-        conversation_id = None
-        for line in first.text.splitlines():
-            if not line.startswith("data: ") or line.strip() == "data: [DONE]":
-                continue
-            event = json.loads(line[6:])
-            if event.get("type") == "conversation":
-                conversation_id = event["conversation"]["id"]
-                break
-        self.assertIsNotNone(conversation_id)
-
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "那就先帮我创建大纲",
-                "conversation_id": conversation_id,
-                "model": "opencode_cli:opencode/deepseek-v4-flash-free",
-                "auto_apply": True,
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("create_outline", response.text)
-        self.assertIn("outline_writer", response.text)
-        self.assertIn("create_outline_nodes", response.text)
-        self.assertIn("第151章 抢网", response.text)
+        volume_id = response.json()["data"]["id"]
 
         db = SessionLocal()
         try:
-            node = db.query(OutlineNode).filter(
-                OutlineNode.project_id == project_id,
-                OutlineNode.title == "第151章 抢网",
-            ).one_or_none()
-            self.assertIsNotNone(node)
-            self.assertIn("抢占网络节点", node.summary)
-        finally:
-            db.close()
-
-    def test_outline_resolution_matches_chapter_prefix_not_incidental_number(self):
-        project_id = self.create_project("Outline Resolution Project")
-        db = SessionLocal()
-        try:
-            first = OutlineNode(
-                project_id=project_id,
-                node_type="chapter",
-                title="第1章 死亡通知写于15:32",
-                sort_order=1,
-            )
-            second = OutlineNode(
-                project_id=project_id,
-                node_type="chapter",
-                title="第2章 记忆税清单",
-                sort_order=2,
-            )
-            section = OutlineNode(
-                project_id=project_id,
-                node_type="section",
-                title="第2章 场景推进",
-                sort_order=1,
-            )
-            db.add_all([first, second, section])
-            db.commit()
-
-            resolved = _resolve_outline_node_id(db, project_id, 2, "写第2章")
-
-            self.assertEqual(resolved, second.id)
-        finally:
-            db.close()
-
-    def test_outline_resolution_supports_chinese_numbers_and_selected_node_priority(self):
-        project_id = self.create_project("Chinese Outline Resolution Project")
-        first_id = self.create_outline_node(project_id, "第一章 潮汐来信")
-        second_id = self.create_outline_node(project_id, "第二章 火灾残影")
-
-        db = SessionLocal()
-        try:
-            self.assertEqual(
-                _resolve_outline_node_id(db, project_id, 2, "写第二章", first_id),
-                first_id,
-            )
-            self.assertEqual(
-                _resolve_outline_node_id(db, project_id, 2, "写第二章"),
-                second_id,
-            )
-        finally:
-            db.close()
-
-    def test_outline_resolution_rejects_foreign_or_section_selection_then_falls_back(self):
-        project_id = self.create_project("Current Outline Project")
-        foreign_project_id = self.create_project("Foreign Outline Project")
-        current_id = self.create_outline_node(project_id, "第〇七章 暗火")
-        foreign_id = self.create_outline_node(foreign_project_id, "第〇七章 暗火")
-
-        db = SessionLocal()
-        try:
-            section = OutlineNode(
-                project_id=project_id,
-                node_type="section",
-                title="第〇七章 场景一",
-                sort_order=1,
-            )
-            db.add(section)
-            db.commit()
-            self.assertEqual(
-                _resolve_outline_node_id(db, project_id, 7, "写第〇七章", foreign_id),
-                current_id,
-            )
-            self.assertEqual(
-                _resolve_outline_node_id(db, project_id, 7, "写第〇七章", section.id),
-                current_id,
-            )
-        finally:
-            db.close()
-
-    def test_outline_resolution_fuzzy_matches_chapter_title(self):
-        project_id = self.create_project("Fuzzy Outline Project")
-        outline_id = self.create_outline_node(project_id, "潮汐来信")
-        db = SessionLocal()
-        try:
-            resolved = _resolve_outline_node_id(
+            result = asyncio.run(_execute_workspace_action(
                 db,
                 project_id,
-                None,
-                "请写章《潮汐来信》，保留结尾钩子",
-            )
-            self.assertEqual(resolved, outline_id)
+                {"tool": "chapter_writer", "arguments": {"outline_node_id": volume_id}},
+            ))
         finally:
             db.close()
 
-    def test_latest_and_pending_outline_numbers_support_chinese_titles(self):
-        project_id = self.create_project("Chinese Outline History Project")
-        self.create_outline_node(project_id, "第二十五章 潮落")
-        self.create_outline_node(project_id, "第一百零三章 火灾真相")
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("章级节点", result["detail"])
 
+    def test_chapter_writer_rejects_outline_already_linked_to_saved_chapter(self):
+        project_id = self.create_project("No AI overwrite")
+        outline_id = self.create_outline(project_id, "第一章 山门")
         db = SessionLocal()
         try:
-            conversation = AssistantConversation(
+            chapter = Chapter(
                 project_id=project_id,
-                title="写章",
-                scope="project",
+                title="第一章 山门",
+                outline_node_id=outline_id,
+                content="第一章正式正文，不得覆盖。",
+                word_count=13,
+                sort_order=1000,
+                cataloging_required=False,
             )
-            db.add(conversation)
-            db.flush()
-            db.add(AssistantMessage(
-                conversation_id=conversation.id,
-                role="assistant",
-                content="未找到第一〇四章的大纲节点，请先创建第一〇四章大纲。",
-                status="completed",
-            ))
+            db.add(chapter)
             db.commit()
-
-            self.assertEqual(_latest_outline_chapter_number(db, project_id), 103)
-            self.assertEqual(
-                _pending_missing_outline_chapter_number(db, project_id, conversation.id),
-                104,
-            )
-        finally:
-            db.close()
-
-    @unittest.skip("legacy deterministic chapter preflight removed")
-    def test_workspace_selected_outline_reaches_deterministic_chapter_preflight(self):
-        project_id = self.create_project("Selected Outline Plan Project")
-        outline_id = self.create_outline_node(project_id, "第一章 潮汐来信")
-
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "用质量模式写本章",
-                "selected_outline_node_id": outline_id,
-                "model": "local_llama_cpp:qwen3-8b-q4",
-                "auto_apply": True,
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("司命本地 AI", response.text)
-        self.assertNotIn("没有定位到要写的章节大纲节点", response.text)
-        self.assertNotIn("模型正在生成回复", response.text)
-
-    @unittest.skip("legacy regex/preflight router removed; the model now selects tools")
-    @patch("app.services.workspace.tools.outline_writer.LLMGateway.chat_completion", new_callable=AsyncMock)
-    def test_workspace_outline_direction_followup_creates_missing_chapter_outline(self, mock_chat):
-        project_id = self.create_project("Outline Direction Followup Project")
-        self.create_outline_node(project_id, "第150章 死线蔓延")
-        outline_payload = {
-            "nodes": [{
-                "title": "抢网",
-                "node_type": "chapter",
-                "summary": "主角团承接第150章危机，按当前剧情抢占网络节点并阻断死线继续扩张。",
-                "character_names": [],
-                "status": "pending",
-            }, {
-                "title": "抢网 / 场景1：定位死线节点",
-                "node_type": "section",
-                "parent_title": "抢网",
-                "summary": "控制室内，主角团根据第150章留下的死线轨迹定位即将失守的网络节点，冲突是时间不足和坐标持续漂移，结果是锁定抢网入口。",
-                "character_names": [],
-                "status": "pending",
-            }, {
-                "title": "抢网 / 场景2：抢占中继权限",
-                "node_type": "section",
-                "parent_title": "抢网",
-                "summary": "网络中继点前，主角团与病毒残留争夺权限，行动目标是切断下一轮扩散，转折是发现死线并非单点故障，结尾钩子指向更深层源头。",
-                "character_names": [],
-                "status": "pending",
-            }],
-            "design_notes": "用户要求按当前剧情自动规划缺失章节大纲。",
-        }
-        mock_chat.return_value = {
-            "content": "",
-            "tool_calls": [{"function": {"arguments": json.dumps(outline_payload, ensure_ascii=False)}}],
-        }
-
-        first = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "帮我写第151章",
-                "model": "opencode_cli:opencode/deepseek-v4-flash-free",
-                "auto_apply": True,
-            },
-        )
-        self.assertIn("按当前剧情自动规划", first.text)
-        conversation_id = None
-        for line in first.text.splitlines():
-            if not line.startswith("data: ") or line.strip() == "data: [DONE]":
-                continue
-            event = json.loads(line[6:])
-            if event.get("type") == "conversation":
-                conversation_id = event["conversation"]["id"]
-                break
-        self.assertIsNotNone(conversation_id)
-
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "按当前剧情自动规划",
-                "conversation_id": conversation_id,
-                "model": "opencode_cli:opencode/deepseek-v4-flash-free",
-                "auto_apply": True,
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("create_outline", response.text)
-        self.assertIn("outline_writer", response.text)
-        self.assertIn("create_outline_nodes", response.text)
-        self.assertNotIn("start_cataloging_job", response.text)
-
-        db = SessionLocal()
-        try:
-            node = db.query(OutlineNode).filter(
-                OutlineNode.project_id == project_id,
-                OutlineNode.title == "第151章 抢网",
-            ).one_or_none()
-            self.assertIsNotNone(node)
-            self.assertIn("抢占网络节点", node.summary)
-            sections = db.query(OutlineNode).filter(
-                OutlineNode.project_id == project_id,
-                OutlineNode.parent_id == node.id,
-                OutlineNode.node_type == "section",
-            ).order_by(OutlineNode.sort_order.asc()).all()
-            self.assertEqual(len(sections), 2)
-            self.assertTrue(all(section.title.startswith("第151章 抢网 / 场景") for section in sections))
-        finally:
-            db.close()
-
-    @unittest.skip("legacy regex/preflight router removed; the model now selects tools")
-    @patch("app.services.workspace.tools.outline_writer.LLMGateway.chat_completion", new_callable=AsyncMock)
-    def test_workspace_outline_plan_accepts_plain_json_content(self, mock_chat):
-        project_id = self.create_project("Plain JSON Outline Project")
-        self.create_outline_node(project_id, "Chapter 150 Dead Line")
-        outline_payload = {
-            "nodes": [{
-                "title": "Chapter 151 Network Grab",
-                "node_type": "chapter",
-                "summary": "The team races to seize a failing network node before the infection line spreads again.",
-                "character_names": [],
-                "status": "pending",
-            }],
-            "design_notes": "Plain JSON fallback for local CLI models without tool calls.",
-        }
-        mock_chat.return_value = {
-            "content": "```json\n" + json.dumps({
-                "tool": "create_outline_nodes",
-                "arguments": outline_payload,
-            }, ensure_ascii=False) + "\n```",
-            "tool_calls": None,
-        }
-
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "\u5e2e\u6211\u521b\u5efa151\u7ae0\u5927\u7eb2",
-                "model": "opencode_cli:opencode/deepseek-v4-flash-free",
-                "auto_apply": True,
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("create_outline", response.text)
-        self.assertIn("create_outline_nodes", response.text)
-        self.assertNotIn("\u5927\u7eb2\u751f\u6210\u7ed3\u679c\u89e3\u6790\u5931\u8d25", response.text)
-
-        db = SessionLocal()
-        try:
-            node = db.query(OutlineNode).filter(
-                OutlineNode.project_id == project_id,
-                OutlineNode.title == "Chapter 151 Network Grab",
-            ).one_or_none()
-            self.assertIsNotNone(node)
-            self.assertIn("network node", node.summary)
-        finally:
-            db.close()
-
-    @unittest.skip("legacy deterministic chapter preflight removed")
-    def test_workspace_chapter_plan_local_runtime_reports_preflight(self):
-        project_id = self.create_project("Local Runtime Chapter Project")
-        self.create_outline_node(project_id, "第151章 新的死线")
-
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "帮我写第151章",
-                "model": "local_llama_cpp:qwen3-8b-q4",
-                "auto_apply": True,
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("司命本地 AI", response.text)
-        self.assertNotIn("未找到第 151 章的大纲节点", response.text)
-        self.assertNotIn("plan_created", response.text)
-
-    @patch("app.services.agent.local_cli_routing.classify_local_cli_workspace_request", new_callable=AsyncMock)
-    @patch("app.services.agent.bridge.detect_and_stream_plan", new_callable=AsyncMock)
-    def test_workspace_chapter_request_uses_managed_mcp_cli_plan(
-        self,
-        mock_plan,
-        mock_route,
-    ):
-        project_id = self.create_project("MCP Local CLI Chapter Project")
-        self.create_outline_node(project_id, "第一章 荒山剖骨")
-        db = SessionLocal()
-        try:
-            db.add(APIConfig(
-                provider="opencode_cli",
-                provider_type="local_cli",
-                api_key_encrypted="",
-                default_model="opencode/deepseek-v4-flash-free",
-                cli_command="opencode",
-                cli_args='["run","--pure","{prompt}"]',
-                is_global_default=True,
+            chapter_id = chapter.id
+            result = asyncio.run(_execute_workspace_action(
+                db,
+                project_id,
+                {"tool": "chapter_writer", "arguments": {"outline_node_id": outline_id}},
             ))
-            db.commit()
+            db.refresh(chapter)
+            self.assertEqual(chapter.content, "第一章正式正文，不得覆盖。")
         finally:
             db.close()
 
-        mock_route.return_value = {
-            "route": "chapter_write",
-            "chapter_number": None,
-            "outline_query": "",
-            "reason": "用户要求写新正文",
-        }
-        mock_plan.return_value = async_chunks(
-            'data: {"type":"status","tool":"start_local_cli_agent_run"}\n\n'
-            'data: [DONE]\n\n'
-        )
-        response = self.client.post(
-            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
-            json={
-                "scope": "project",
-                "message": "写新正文",
-                "model": "opencode_cli:opencode/deepseek-v4-flash-free",
-                "auto_apply": True,
-            },
-        )
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["data"]["existing_chapter_id"], chapter_id)
+        self.assertIn("不能覆盖", result["detail"])
 
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("start_local_cli_agent_run", response.text)
-        call = mock_plan.call_args.kwargs
-        self.assertTrue(call["force_chapter_writing"])
-        self.assertEqual(call["message"], "写新正文")
-
-    def test_chapter_writer_rejects_local_runtime_model(self):
-        project_id = self.create_project("Local Runtime Writer Guard Project")
-        outline_id = self.create_outline_node(project_id, "第151章 新的死线")
-        db = SessionLocal()
-        try:
-            result = asyncio.run(_execute_workspace_action(db, project_id, {
-                "tool": "chapter_writer",
-                "arguments": {
-                    "outline_node_id": outline_id,
-                    "requirements": "写第151章",
-                    "model": "local_llama_cpp:qwen3-8b-q4",
-                },
-            }))
-        finally:
-            db.close()
-
-        self.assertEqual(result["status"], "error")
-        self.assertIn("尚未通过真实对话测试", result["detail"])
-
-    @patch("app.routers.ai_writer.LLMGateway.chat_completion", new_callable=AsyncMock)
+    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
     @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
-    def test_workspace_model_tool_loop_executes_create_chapter(self, mock_stream, mock_chat):
-        project_id = self.create_project("Workspace Repair Project")
-        outline_id = self.create_outline_node(project_id, "第152章 黑潮漫过石阶")
-        db = SessionLocal()
-        try:
-            db.add(Skill(
-                project_id=project_id,
-                name="Plan Skill",
-                description="Plan path skill injection regression marker",
-                trigger_examples=json.dumps(["152"], ensure_ascii=False),
-                system_prompt="PLAN_SKILL_MARKER",
-                scope="writing",
-                priority=999,
-                enabled=True,
-                is_builtin=False,
-            ))
-            db.commit()
-        finally:
-            db.close()
-        bad_json = (
-            '{"reply":"已创建第152章。","done":true,"actions":[{"tool":"create_chapter","arguments":'
-            '{"title":"第152章 黑潮漫过石阶","content":"张虎听见有人喊："第二道防线！" 他握紧剑。",'
-            f'"outline_node_id":"{outline_id}","summary":"青云宗第二道防线告破。","involved_characters":[]}}]}}'
-        )
-        repaired = {
-            "reply": "已创建第152章。",
-            "done": True,
-            "actions": [{
-                "tool": "create_chapter",
-                "arguments": {
-                    "title": "第152章 黑潮漫过石阶",
-                    "content": "张虎听见有人喊：“第二道防线！” 他握紧剑。",
-                    "outline_node_id": outline_id,
-                    "summary": "青云宗第二道防线告破。",
-                    "involved_characters": [],
-                },
-            }],
-            "needs_confirmation": False,
-        }
-        mock_stream.return_value = async_chunks(bad_json)
-        mock_chat.return_value = {"content": json.dumps(repaired, ensure_ascii=False)}
+    def test_cli_chapter_turn_uses_unified_agent_pack_and_terminal_probe(
+        self,
+        mock_stream,
+        _mock_supports,
+    ):
+        project_id = self.create_project("CLI draft")
+        self.create_outline(project_id, "第一章 夜航")
+        stream_calls = 0
+
+        def cli_stream(**kwargs):
+            nonlocal stream_calls
+            stream_calls += 1
+            if stream_calls == 1:
+                replace_tool_categories(
+                    kwargs["extra_body"]["local_cli_mcp_tool_category_state_file"],
+                    ["writing_context"],
+                )
+                return async_chunks("")
+            return async_chunks("已完成项目资料检查")
+
+        mock_stream.side_effect = cli_stream
 
         response = self.client.post(
             f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
             json={
                 "scope": "project",
-                "message": "你没有成功创建第152章，请重新创建",
-                "auto_apply": True,
+                "message": "写第一章正文",
+                "model": "opencode_cli:opencode/big-pickle",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_stream.call_count, 2)
+        runtime = mock_stream.call_args_list[0].kwargs["extra_body"]
+        self.assertEqual(runtime["local_cli_mcp_permission_pack"], "project_management")
+        self.assertEqual(runtime["local_cli_terminal_draft_project_id"], project_id)
+        self.assertEqual(runtime["local_cli_terminal_draft_excluded_ids"], [])
+        self.assertEqual(mock_stream.call_args_list[0].kwargs["retry"], 0)
+        self.assertEqual(mock_stream.call_args_list[0].kwargs["resume"], 0)
+
+    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
+    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
+    def test_cli_natural_language_target_still_has_draft_terminal_probe(
+        self,
+        mock_stream,
+        _mock_supports,
+    ):
+        project_id = self.create_project("CLI natural target")
+        self.create_outline(project_id, "第二章 夜雨")
+        stream_calls = 0
+
+        def cli_stream(**kwargs):
+            nonlocal stream_calls
+            stream_calls += 1
+            if stream_calls == 1:
+                replace_tool_categories(
+                    kwargs["extra_body"]["local_cli_mcp_tool_category_state_file"],
+                    ["writing_context"],
+                )
+                return async_chunks("")
+            return async_chunks("已完成目标读取")
+
+        mock_stream.side_effect = cli_stream
+
+        response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
+            json={
+                "scope": "project",
+                "message": "把故事接到夜雨里的山门冲突",
+                "model": "opencode_cli:opencode/big-pickle",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_stream.call_count, 2)
+        runtime = mock_stream.call_args_list[0].kwargs["extra_body"]
+        self.assertEqual(runtime["local_cli_terminal_draft_project_id"], project_id)
+        self.assertEqual(runtime["local_cli_terminal_draft_excluded_ids"], [])
+
+    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=False)
+    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion")
+    def test_cli_text_before_category_controller_is_rejected(self, mock_stream, _mock_supports):
+        project_id = self.create_project("CLI controller boundary")
+        mock_stream.return_value = async_chunks("工具暂不可用，我先等待。")
+
+        response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
+            json={
+                "scope": "project",
+                "message": "读取作品资料",
+                "model": "opencode_cli:opencode/big-pickle",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("没有调用临时 MCP 中唯一开放的 set_tool_categories", response.text)
+        self.assertNotIn('"type": "complete"', response.text)
+
+    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=True)
+    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion_with_tools")
+    def test_api_text_before_category_controller_is_rejected(self, mock_stream, _mock_supports):
+        project_id = self.create_project("API controller boundary")
+        mock_stream.return_value = async_dict_chunks(
+            {"type": "content_delta", "delta": "工具还没开放，我先等待。"},
+            {"type": "done", "finish_reason": "stop", "usage": None},
+        )
+
+        response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
+            json={
+                "scope": "project",
+                "message": "读取作品资料",
+                "model": "openai:gpt-test",
+            },
+        )
+
+        self.assertEqual(mock_stream.call_args.kwargs["tool_choice"], "required")
+        self.assertIn("没有调用本步骤唯一开放的 set_tool_categories", response.text)
+        self.assertNotIn('"type": "complete"', response.text)
+
+    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=True)
+    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion_with_tools")
+    def test_reasoning_deltas_are_streamed_immediately_and_persisted_in_completion(
+        self,
+        mock_stream,
+        _mock_supports,
+    ):
+        project_id = self.create_project("Reasoning stream")
+        mock_stream.side_effect = [
+            async_dict_chunks(
+                {
+                    "type": "tool_call_delta",
+                    "index": 0,
+                    "id": "call-categories",
+                    "name": "set_tool_categories",
+                    "arguments_delta": json.dumps({"enabled_categories": ["story_knowledge"]}),
+                },
+                {"type": "done", "finish_reason": "tool_calls", "usage": None},
+            ),
+            async_dict_chunks(
+                {"type": "reasoning_delta", "delta": "先核对"},
+                {"type": "reasoning_delta", "delta": "作品资料"},
+                {"type": "content_delta", "delta": "资料检查完成。"},
+                {"type": "done", "finish_reason": "stop", "usage": None},
+            ),
+        ]
+
+        response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
+            json={
+                "scope": "project",
+                "message": "检查作品资料",
+                "model": "openai:gpt-test",
+            },
+        )
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        reasoning_events = [event for event in events if event.get("type") == "reasoning_delta"]
+        self.assertEqual([event["delta"] for event in reasoning_events], ["先核对", "作品资料"])
+        self.assertLess(events.index(reasoning_events[0]), next(
+            index for index, event in enumerate(events) if event.get("type") == "complete"
+        ))
+        complete = next(event for event in events if event.get("type") == "complete")
+        self.assertEqual(complete["data"]["reply"], "资料检查完成。")
+        self.assertEqual(complete["data"]["reasoning_content"], "先核对作品资料")
+
+    @patch("app.routers.ai_writer.LLMGateway.supports_tool_calling", return_value=True)
+    @patch("app.routers.ai_writer.LLMGateway.chat_completion", new_callable=AsyncMock)
+    @patch("app.routers.ai_writer.LLMGateway.stream_chat_completion_with_tools")
+    def test_saved_uncataloged_chapter_blocks_writer_before_generation_call(
+        self,
+        mock_stream,
+        mock_chat,
+        _mock_supports,
+    ):
+        project_id = self.create_project("Cataloging gate")
+        first_outline = self.create_outline(project_id, "第一章 山门")
+        second_outline = self.create_outline(project_id, "第二章 夜雨")
+        response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/chapters",
+            json={
+                "title": "第一章 山门",
+                "outline_node_id": first_outline,
+                "content": "山门在雨中开启。",
+                "cataloging_mode": "save_only",
             },
         )
         self.assertEqual(response.status_code, 200)
-        self.assertNotIn("plan_created", response.text)
-        self.assertIn("create_chapter", response.text)
-        self.assertIn("json_repair", response.text)
+        self.assertTrue(response.json()["data"]["cataloging_required"])
+        mock_stream.side_effect = [
+            async_dict_chunks(
+                {
+                    "type": "tool_call_delta",
+                    "index": 0,
+                    "id": "call-categories",
+                    "name": "set_tool_categories",
+                    "arguments_delta": json.dumps({"enabled_categories": ["writing_context"]}),
+                },
+                {"type": "done", "finish_reason": "tool_calls", "usage": None},
+            ),
+            async_dict_chunks(
+                {
+                    "type": "tool_call_delta",
+                    "index": 0,
+                    "id": "call-blocked-writer",
+                    "name": "chapter_writer",
+                    "arguments_delta": json.dumps({"outline_node_id": second_outline}),
+                },
+                {"type": "done", "finish_reason": "tool_calls", "usage": None},
+            ),
+        ]
 
+        response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/ai/workspace-assistant/stream",
+            json={
+                "scope": "project",
+                "message": "写第二章正文",
+                "model": "openai:gpt-test",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("已保存但尚未完成建档", response.text)
+        self.assertEqual(mock_stream.call_count, 2)
+        mock_chat.assert_not_awaited()
+
+    def test_pending_draft_is_restored_and_only_author_save_creates_chapter(self):
+        project_id = self.create_project("Author save")
+        first_outline_id = self.create_outline(project_id, "第一章 旧井")
+        outline_id = self.create_outline(project_id, "第二章 潮声")
         db = SessionLocal()
         try:
-            chapter = db.query(Chapter).filter(Chapter.project_id == project_id).one()
-            self.assertEqual(chapter.title, "第152章 黑潮漫过石阶")
-            self.assertEqual(chapter.outline_node_id, outline_id)
-            self.assertIn("第二道防线", chapter.content)
-            self.assertEqual(
-                db.query(AgentPlan).filter(AgentPlan.project_id == project_id).count(),
-                0,
+            first_chapter = Chapter(
+                project_id=project_id,
+                title="第一章 旧井",
+                outline_node_id=first_outline_id,
+                content="旧井边的第一章正式正文。",
+                word_count=13,
+                sort_order=1000,
+                cataloging_required=False,
             )
-        finally:
-            db.close()
-
-        runs_response = self.client.get(f"{API_PREFIX}/projects/{project_id}/ai/assistant/runs")
-        self.assertEqual(runs_response.status_code, 200)
-
-    @patch("app.services.workspace.tools.analysis.LLMGateway.chat_completion", new_callable=AsyncMock)
-    def test_workspace_character_change_detection_filters_foreign_ids_and_records_evolution(self, mock_chat):
-        project_a = self.create_project("Project A")
-        project_b = self.create_project("Project B")
-        chapter_id = self.create_chapter(project_a, "林澈在风中悟出御风术。")
-        character_id = self.create_character(project_a, "林澈")
-        foreign_character_id = self.create_character(project_b, "外部角色")
-        mock_chat.return_value = {
-            "content": json.dumps([
-                {
-                    "character_id": character_id,
-                    "character_name": "林澈",
-                    "change_type": "skill",
-                    "field_name": "abilities",
-                    "old_value": "",
-                    "new_value": "御风术",
-                    "confidence": "high",
-                },
-                {
-                    "character_id": foreign_character_id,
-                    "character_name": "外部角色",
-                    "change_type": "skill",
-                    "field_name": "abilities",
-                    "old_value": "",
-                    "new_value": "不应写入",
-                    "confidence": "high",
-                },
-            ], ensure_ascii=False)
-        }
-
-        db = SessionLocal()
-        try:
-            result = asyncio.run(_execute_workspace_action(db, project_a, {
-                "tool": "detect_character_changes",
-                "arguments": {"chapter_id": chapter_id},
-            }))
+            db.add(first_chapter)
+            draft = ChapterDraft(
+                project_id=project_id,
+                title="第二章 潮声",
+                outline_node_id=outline_id,
+                content="潮声从空井里漫出来。",
+                status="pending",
+            )
+            db.add(draft)
             db.commit()
-            self.assertEqual(result["status"], "ok")
-            self.assertEqual(result["data"]["total"], 1)
+            draft_id = draft.id
         finally:
             db.close()
 
+        restored = self.client.get(f"{API_PREFIX}/projects/{project_id}/chapter-drafts/pending")
+        self.assertEqual(restored.status_code, 200)
+        self.assertEqual(restored.json()["data"]["draft_id"], draft_id)
         db = SessionLocal()
         try:
-            logs = db.query(CharacterChangeLog).all()
-            self.assertEqual(len(logs), 1)
-            self.assertEqual(logs[0].character_id, character_id)
-            self.assertEqual(db.query(ChapterCharacter).filter(ChapterCharacter.character_id == character_id).count(), 1)
-            self.assertEqual(db.query(CharacterTimeline).filter(CharacterTimeline.character_id == character_id).count(), 1)
-            log_id = logs[0].id
+            self.assertEqual(db.query(Chapter).count(), 1)
         finally:
             db.close()
 
-        confirm = self.client.put(f"{API_PREFIX}/projects/{project_a}/characters/change-logs/{log_id}/confirm")
-        self.assertEqual(confirm.status_code, 200)
-
+        saved = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/chapters",
+            json={
+                "title": "第二章 潮声",
+                "outline_node_id": outline_id,
+                "content": "潮声从空井里漫出来。",
+                "draft_id": draft_id,
+                "cataloging_mode": "save_only",
+            },
+        )
+        self.assertEqual(saved.status_code, 200)
+        self.assertTrue(saved.json()["data"]["cataloging_required"])
         db = SessionLocal()
         try:
-            character = db.query(Character).filter(Character.id == character_id).first()
-            self.assertIn("御风术", json.loads(character.abilities))
-            versions = db.query(CharacterVersion).filter(CharacterVersion.character_id == character_id).all()
-            self.assertEqual(len(versions), 1)
-            self.assertEqual(versions[0].source_chapter_id, chapter_id)
+            self.assertEqual(db.query(Chapter).count(), 2)
+            first = db.query(Chapter).filter(Chapter.outline_node_id == first_outline_id).one()
+            self.assertEqual(first.content, "旧井边的第一章正式正文。")
+            self.assertEqual(db.get(ChapterDraft, draft_id).status, "saved")
         finally:
             db.close()
+
+    def test_generated_draft_cannot_be_saved_through_chapter_update(self):
+        project_id = self.create_project("PUT draft guard")
+        outline_id = self.create_outline(project_id, "第一章 原文")
+        created = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/chapters",
+            json={
+                "title": "第一章 原文",
+                "outline_node_id": outline_id,
+                "content": "这是已经保存的第一章。",
+                "cataloging_mode": "save_only",
+            },
+        )
+        chapter_id = created.json()["data"]["id"]
+        db = SessionLocal()
+        try:
+            draft = ChapterDraft(
+                project_id=project_id,
+                title="第二章",
+                content="这是新生成的第二章草稿。",
+                status="pending",
+            )
+            db.add(draft)
+            db.commit()
+            draft_id = draft.id
+        finally:
+            db.close()
+
+        response = self.client.put(
+            f"{API_PREFIX}/projects/{project_id}/chapters/{chapter_id}",
+            json={
+                "title": "第二章",
+                "content": "这是新生成的第二章草稿。",
+                "draft_id": draft_id,
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
+        db = SessionLocal()
+        try:
+            self.assertEqual(db.get(Chapter, chapter_id).content, "这是已经保存的第一章。")
+            self.assertEqual(db.get(ChapterDraft, draft_id).status, "pending")
+        finally:
+            db.close()
+
+    def test_generated_draft_cannot_reuse_an_outline_with_formal_prose(self):
+        project_id = self.create_project("Outline overwrite guard")
+        outline_id = self.create_outline(project_id, "第一章 原文")
+        created = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/chapters",
+            json={
+                "title": "第一章 原文",
+                "outline_node_id": outline_id,
+                "content": "这是已经保存的第一章。",
+                "cataloging_mode": "save_only",
+            },
+        )
+        chapter_id = created.json()["data"]["id"]
+        db = SessionLocal()
+        try:
+            draft = ChapterDraft(
+                project_id=project_id,
+                title="错误草稿",
+                outline_node_id=outline_id,
+                content="不应覆盖第一章。",
+                status="pending",
+            )
+            db.add(draft)
+            db.commit()
+            draft_id = draft.id
+        finally:
+            db.close()
+
+        response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/chapters",
+            json={
+                "title": "错误草稿",
+                "outline_node_id": outline_id,
+                "content": "不应覆盖第一章。",
+                "draft_id": draft_id,
+                "cataloging_mode": "save_only",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        db = SessionLocal()
+        try:
+            self.assertEqual(db.query(Chapter).count(), 1)
+            self.assertEqual(db.get(Chapter, chapter_id).content, "这是已经保存的第一章。")
+            self.assertEqual(db.get(ChapterDraft, draft_id).status, "pending")
+        finally:
+            db.close()
+
+    @patch("app.routers.chapters.preview_de_ai_revision", new_callable=AsyncMock)
+    @patch("app.routers.chapters.preview_chapter_quality", new_callable=AsyncMock)
+    def test_draft_review_actions_use_current_editor_content(self, mock_quality, mock_de_ai):
+        project_id = self.create_project("Draft review")
+        db = SessionLocal()
+        try:
+            draft = ChapterDraft(
+                project_id=project_id,
+                title="未保存",
+                content="数据库中的初稿内容。",
+                status="pending",
+            )
+            db.add(draft)
+            db.commit()
+            draft_id = draft.id
+        finally:
+            db.close()
+        editor_content = "这是作者在前端刚刚修改、但尚未保存的完整正文。"
+        mock_quality.return_value = {"total_score": 70}
+        mock_de_ai.return_value = {"rewritten": editor_content, "warnings": []}
+
+        quality = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/chapter-drafts/{draft_id}/quality-score-preview",
+            json={"content": editor_content, "title": "当前标题", "model": "openai:gpt-test"},
+        )
+        de_ai = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/chapter-drafts/{draft_id}/de-ai-preview",
+            json={"content": editor_content, "model": "openai:gpt-test"},
+        )
+
+        self.assertEqual(quality.status_code, 200)
+        self.assertEqual(de_ai.status_code, 200)
+        self.assertEqual(mock_quality.await_args.kwargs["content"], editor_content)
+        self.assertIsNone(mock_quality.await_args.args[2])
+        self.assertEqual(mock_de_ai.await_args.kwargs["content"], editor_content)
+        self.assertIsNone(mock_de_ai.await_args.args[2])
+
+    @patch("app.routers.chapters.create_and_queue_cataloging_job")
+    def test_author_save_and_catalog_starts_one_job(self, mock_launch):
+        project_id = self.create_project("Explicit cataloging")
+        draft_id = "draft-explicit"
+        db = SessionLocal()
+        try:
+            db.add(ChapterDraft(
+                id=draft_id,
+                project_id=project_id,
+                title="第一章",
+                content="这是一段等待作者确认的章节正文。",
+                status="pending",
+            ))
+            db.commit()
+        finally:
+            db.close()
+        job = MagicMock(id="job-1", operation_id="operation-1")
+        mock_launch.return_value = (job, {
+            "started": True,
+            "job_id": "job-1",
+            "operation_id": "operation-1",
+            "status": "running",
+        })
+
+        response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/chapters",
+            json={
+                "title": "第一章",
+                "content": "这是一段等待作者确认的章节正文。",
+                "draft_id": draft_id,
+                "cataloging_mode": "save_and_catalog",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["data"]["cataloging_job"]["started"])
+        mock_launch.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

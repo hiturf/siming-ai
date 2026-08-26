@@ -39,8 +39,8 @@ class McpToolListTest(unittest.TestCase):
         names = {t.name for t in tools}
 
         write_patterns = [
-            "create_project", "create_character", "create_chapter",
-            "update_project_info", "update_character", "update_chapter",
+            "create_project", "create_character",
+            "update_project_info", "update_character",
             "delete_project", "delete_character", "delete_chapter",
             "merge_duplicate_characters",
             "import_text_as_chapters", "import_file_as_chapters", "import_file_as_project",
@@ -119,31 +119,13 @@ class McpToolSchemaTest(unittest.TestCase):
         self.assertIn("run_id", by_name["search_chapters"].input_schema["properties"])
         self.assertIn("run_id", by_name["report_agent_progress"].input_schema["properties"])
 
-    def test_mcp_exports_creation_model_requirement(self):
-        project_tools = list_mcp_tools(permission_pack="project_writing")
-        by_name = {t.name: t for t in project_tools}
-
-        stage_tool = by_name["generate_novel_creation_stage"]
-        self.assertIn("explicit Siming model", stage_tool.description)
-        self.assertIn("not inherited", stage_tool.description)
-        self.assertIn(
-            "Required when stage or artifact is concepts or all",
-            stage_tool.input_schema["properties"]["model"]["description"],
-        )
-        self.assertEqual(
-            stage_tool.input_schema["allOf"][0]["then"]["required"],
-            ["model"],
-        )
-
+    def test_creation_session_mcp_never_exposes_model_spawning_tools(self):
         creation_tools = list_mcp_tools(permission_pack="creation_session")
         creation_by_name = {t.name: t for t in creation_tools}
-        artifact_tool = creation_by_name["generate_creation_artifact"]
-        self.assertIn("artifact is concepts or all", artifact_tool.description)
-        self.assertIn("patch_creation_artifact instead", artifact_tool.description)
-        self.assertEqual(
-            artifact_tool.input_schema["allOf"][0]["if"]["properties"]["artifact"]["enum"],
-            ["all", "concepts"],
-        )
+        self.assertIn("patch_creation_artifact", creation_by_name)
+        self.assertNotIn("generate_creation_artifact", creation_by_name)
+        self.assertNotIn("refine_creation_artifact", creation_by_name)
+        self.assertNotIn("regenerate_creation_artifact", creation_by_name)
 
 
 class PermissionFilterTest(unittest.TestCase):

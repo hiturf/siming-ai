@@ -105,7 +105,7 @@ $env:SIMING_INNO_ISCC = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 
 ## 应用内更新
 
-安装版查找 GitHub Release 中的：
+安装版同时查找 GitHub 官方 Release 与 Gitee 同步镜像中的：
 
 ```text
 Siming-Setup.exe
@@ -114,12 +114,15 @@ Siming-Setup.sha256
 
 用户在设置页确认更新后，司命会：
 
-1. 下载新安装包到 `%LOCALAPPDATA%\Siming\updates`。
-2. 校验 SHA-256。
-3. 校验 Windows Authenticode 可信签名。
-4. 用户点击安装后，退出当前司命。
-5. 以静默模式运行新安装包，并强制使用当前安装目录。
-6. Inno Setup 覆盖程序文件并重新启动司命。
+1. 展示已包含同一版本资产的 GitHub 与 Gitee 线路，由用户明确选择本次下载源。
+2. 下载新安装包到 `%LOCALAPPDATA%\Siming\updates`。
+3. 校验 SHA-256。
+4. 配置可信证书后校验 Windows Authenticode 签名与时间戳；当前无证书阶段暂不执行此项。
+5. 用户点击安装后，退出当前司命。
+6. 以静默模式运行新安装包，并强制使用当前安装目录。
+7. Inno Setup 覆盖程序文件并重新启动司命。
+
+设置页始终提供“Gitee 镜像下载”和“GitHub 全部版本”浏览器入口，供网络受限、下载失败或需要历史版本时手动选择。
 
 升级时会沿用之前的安装目录和附加任务选择，因此用户第一次安装时如果取消了桌面快捷方式，后续更新不会擅自重新创建。
 
@@ -127,11 +130,12 @@ Siming-Setup.sha256
 
 ### 更新安全要求
 
-应用内更新只接受同时满足以下条件的 Windows 更新资产：
+应用内更新当前只接受满足以下条件的 Windows 更新资产：
 
 1. SHA-256 与发布校验值一致。
-2. Windows Authenticode 签名可信。
-3. 签名包含可信时间戳。
+2. GitHub 与 Gitee 同版本的校验值不冲突；发生冲突的镜像线路不会进入可用下载源。
+
+Windows Authenticode 签名与可信时间戳仍是正式发布目标。项目取得证书并启用 `WINDOWS_SIGNATURE_VERIFICATION_REQUIRED` 后，签名验证会重新成为安装前的强制条件。
 
 正式签名需要 GitHub Actions Secrets：
 
@@ -159,7 +163,7 @@ SIMING_WINDOWS_CODESIGN_PASSWORD
   -RequireTrustedSignature
 ```
 
-没有 Windows 代码签名证书时，只能发布供用户主动下载的手动安装资产；应用内更新器不会降低签名要求。
+没有 Windows 代码签名证书时，应用内更新仍要求发布 SHA-256 并在下载后复核，但不会执行 Authenticode 校验。SHA-256 只能确认下载内容与发布清单一致，不能替代发布者身份认证。
 
 ## GitHub Release
 
@@ -243,6 +247,7 @@ ghcr.io/teangtang1122/siming-ai-gateway:latest
 
 ```bat
 set SIMING_UPDATE_REPO=owner/repo
+set SIMING_UPDATE_MIRROR_REPO=owner/repo
 set SIMING_UPDATE_MANIFEST_URL=https://example.com/update.json
 set SIMING_DISABLE_UPDATE=1
 ```

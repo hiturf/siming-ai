@@ -29,18 +29,19 @@ class APIConfig(Base):
     max_output_tokens = Column(Integer, nullable=True)
     deconstruct_input_char_limit = Column(Integer, nullable=True)
     deconstruct_item_char_limit = Column(Integer, nullable=True)
+    available_models_json = Column(JSON, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-class LocalModelTaskSetting(Base):
-    __tablename__ = "local_model_task_settings"
+class ModelTaskSetting(Base):
+    __tablename__ = "model_task_settings"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
     task_type = Column(String(30), nullable=False, unique=True)
-    model_key = Column(String(512), nullable=False)
+    provider = Column(String(50), nullable=False)
+    model_name = Column(String(512), nullable=False)
     adapter_ids = Column(JSON, nullable=True)
     context_length = Column(Integer, nullable=True)
-    allow_api_fallback = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)

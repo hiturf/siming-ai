@@ -68,7 +68,7 @@ class ContentStoreFileSourceTestCase(unittest.TestCase):
         refresh_project_from_files(self.db, project.id)
         self.assertEqual(chapter.content.strip(), "特昂糖看见石狮子。")
 
-    def test_explicit_character_mirror_import_normalizes_role_type(self):
+    def test_explicit_character_mirror_import_requires_structured_role_type(self):
         project = self._project()
         character = Character(project_id=project.id, name="特昂糖", role_type="protagonist")
         self.db.add(character)
@@ -78,13 +78,13 @@ class ContentStoreFileSourceTestCase(unittest.TestCase):
 
         path = Path(project.folder_path) / character.content_file_path
         data = json.loads(path.read_text(encoding="utf-8"))
-        data["role_type"] = "主角，穿越者，陆家三岁孙女"
+        data["role_type"] = "unknown-role"
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
         refresh_project_from_files(self.db, project.id)
 
-        self.assertEqual(character.role_type, "protagonist")
-        self.assertIn("身份补充：穿越者、陆家三岁孙女", character.background)
+        self.assertEqual(character.role_type, "other")
+        self.assertIsNone(character.background)
 
     def test_project_file_tools_read_write_search(self):
         project = self._project()

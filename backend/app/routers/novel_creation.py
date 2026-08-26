@@ -13,7 +13,7 @@ from typing import Any, Awaitable, Callable, Literal
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -21,14 +21,17 @@ from ..modules.model_runtime.application.execution import model_executor as LLMG
 from ..ai.local_cli_adapter import is_local_cli_provider
 from ..core.exceptions import ValidationError
 from ..core.response import ApiResponse
-from ..database.session import get_db
-from ..database.session import SessionLocal
+from ..database.session import SessionLocal, get_db
 from ..schemas.novel_creation import (
     NovelCreationStageRunResponse,
     NovelCreationStageRunStartData,
 )
 from ..schemas.ai_writer import MobileProviderEnvelope
 from ..modules.creation.interfaces.session_dependencies import novel_creation_session_store
+from ..modules.assistant.application.system_conversations import SystemConversationStore
+from ..modules.assistant.interfaces.system_conversation_dependencies import (
+    get_system_conversation_store,
+)
 from ..modules.operations.interfaces.dependencies import get_operation_service
 from ..services.novel_creation_claims import (
     claim_or_replay_creation_run,
@@ -73,7 +76,6 @@ from ..services.novel_creation_workspace import (
     add_run_event,
     create_run,
     confirm_run,
-    generation_blockers,
     get_presets,
     creation_artifact_dependencies,
     list_creation_artifacts,
@@ -97,13 +99,18 @@ from ..services.operation_runtime import (
     unregister_operation_actions,
 )
 from ..services.workspace.tools.novel_creation import (
-    apply_novel_blueprint,
-    draft_novel_blueprint,
-    review_novel_blueprint,
+    finalize_creation_session,
     start_novel_creation_session,
 )
-from ..services.workspace.tools.novel_creation_v2 import _validate_stage, submit_novel_creation_stage
+from ..services.workspace.tools.novel_creation_v2 import _validate_stage, save_creation_artifact
 from ..services.novel_creation_task_runtime import schedule_creation_stage
+from ..services.creation_agent_turn_runtime import (
+    CreationAgentTurnInput,
+    CreationTurnScopeError,
+    creation_agent_conversation,
+    creation_agent_turn_stream,
+    produce_creation_agent_turn,
+)
 from .novel_creation_support import idempotent_confirmation_response
 
 router = APIRouter(tags=["novel-creation"])
@@ -113,7 +120,7 @@ def _operation_model_identity(model: str | None) -> tuple[str | None, str]:
     effective_model = model
     try:
         selection = LLMGateway.select_model_for_task(
-            task_type="novel_creation",
+            task_type="planning",
             model_override=model,
         )
         effective_model = selection.model or effective_model
@@ -246,7 +253,7 @@ def _resolve_mobile_creation_provider(
 
 
 class NovelCreationStartRequest(BaseModel):
-    mode: str = "template"
+    mode: Literal["internal_llm", "external_agent"] = "internal_llm"
     user_brief: str = ""
     target_audience: str = ""
     genre: str = ""
@@ -268,31 +275,8 @@ class NovelCreationStartRequest(BaseModel):
     locked_requirements: list[str] = Field(default_factory=list, max_length=100)
 
 
-class NovelCreationDraftRequest(BaseModel):
+class NovelCreationFinalizeRequest(BaseModel):
     session_id: str
-    execution_mode: Literal["template", "hybrid", "external_agent", "internal_llm"] = "hybrid"
-    model: str | None = None
-    user_brief: str = ""
-    feedback: str = ""
-    revision_mode: Literal["initial", "refine", "regenerate"] = "initial"
-    enhance_with_llm: bool = False
-    skip_questions: bool = False
-    answers: dict[str, str] | None = None
-    qa_history: list[dict[str, str]] | None = None
-    depth: Literal["concept", "full"] = "full"
-
-
-class NovelCreationReviewRequest(BaseModel):
-    session_id: str
-    execution_mode: Literal["template", "hybrid", "external_agent", "internal_llm"] = "hybrid"
-    blueprint: Any | None = None
-
-
-class NovelCreationApplyRequest(BaseModel):
-    session_id: str
-    blueprint_index: int = Field(0, ge=0)
-    mode: Literal["manual", "auto"] = "auto"
-    blueprint: Any | None = None
 
 
 def _tool_response(result: dict[str, Any]) -> ApiResponse:
@@ -309,25 +293,13 @@ async def start_creation(payload: NovelCreationStartRequest, db: Session = Depen
     return _tool_response(result)
 
 
-@router.post("/novel-creation/draft")
-async def draft_blueprints(payload: NovelCreationDraftRequest, db: Session = Depends(get_db)):
-    result = await draft_novel_blueprint(db, "", payload.model_dump())
-    return _tool_response(result)
-
-
-@router.post("/novel-creation/review")
-async def review_blueprint(payload: NovelCreationReviewRequest, db: Session = Depends(get_db)):
-    result = await review_novel_blueprint(db, "", payload.model_dump())
-    return _tool_response(result)
-
-
-@router.post("/novel-creation/apply")
-async def apply_blueprint(
-    payload: NovelCreationApplyRequest,
+@router.post("/novel-creation/finalize")
+async def finalize_creation(
+    payload: NovelCreationFinalizeRequest,
     request: Request,
     db: Session = Depends(get_db),
 ):
-    result = await apply_novel_blueprint(db, "", payload.model_dump())
+    result = await finalize_creation_session(db, "", payload.model_dump())
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     project_id = str(data.get("project_id") or "")
     if (
@@ -407,7 +379,6 @@ class NovelCreationStageRunRequest(BaseModel):
 class NovelCreationStageConfirmRequest(BaseModel):
     data: dict[str, Any] | None = None
     confirm: bool = True
-    source: str = "author"
     expected_revision: int | None = None
 
 
@@ -418,7 +389,6 @@ class NovelCreationConfirmAndGenerateRequest(NovelCreationStageConfirmRequest):
 
 class NovelCreationStagePatchRequest(BaseModel):
     data: dict[str, Any]
-    source: str = "author"
     expected_revision: int
 
 
@@ -466,6 +436,29 @@ async def list_creation_sessions(
         include_completed=include_completed or bool(project_id),
         limit=30,
     )
+    # Creation sessions intentionally keep durable project identifiers rather
+    # than foreign keys, so deleting a work does not erase its planning audit
+    # trail. User-facing lists must omit that orphaned context entirely.
+    def linked_project_ids(item) -> set[str]:
+        return {
+            str(project_ref).strip()
+            for project_ref in (item.created_project_id, item.source_project_id)
+            if str(project_ref or "").strip()
+        }
+
+    project_refs = {
+        project_ref
+        for item in sessions
+        for project_ref in linked_project_ids(item)
+    }
+    if project_refs:
+        from ..core.db_helpers import existing_project_ids
+
+        live_project_ids = existing_project_ids(db, project_refs)
+        sessions = [
+            item for item in sessions
+            if linked_project_ids(item).issubset(live_project_ids)
+        ]
     if project_id:
         sessions = [
             item for item in sessions
@@ -785,18 +778,6 @@ async def start_creation_stage_run(
         request,
         binding_id=session_id,
     )
-    blocked_by = generation_blockers(session, payload.stage)
-    if blocked_by:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "请先确认前置阶段，再生成当前内容。",
-                "failure_class": "stage_blocked",
-                "blocked_by": blocked_by,
-                "session": serialize_session(session),
-                "next_action": f"返回“{blocked_by[0]['label']}”完成确认。",
-            },
-        )
     existing = store.running_stage(session_id, payload.stage)
     if existing:
         return ApiResponse.success(
@@ -924,13 +905,18 @@ async def stream_creation_stage_run(
 
     async def events():
         sent = initial_after
+        operation_progress_signature: tuple[Any, ...] | None = None
         tick = 0
         while True:
             db = SessionLocal()
             try:
                 run = novel_creation_session_store(db).run(run_id)
                 if not run:
-                    yield "event: error\ndata: " + json.dumps({"message": "阶段任务不存在"}, ensure_ascii=False) + "\n\n"
+                    yield (
+                        "event: error\ndata: "
+                        + json.dumps({"message": "阶段任务不存在"}, ensure_ascii=False)
+                        + "\n\n"
+                    )
                     return
                 if tick == 0:
                     yield (
@@ -950,9 +936,48 @@ async def stream_creation_stage_run(
                         "message": event.message,
                         "payload": event.payload_json,
                     }
-                    yield f"id: {event.sequence}\nevent: {event.event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    yield (
+                        f"id: {event.sequence}\nevent: {event.event_type}\ndata: "
+                        f"{json.dumps(payload, ensure_ascii=False)}\n\n"
+                    )
                 sent = max([int(event.sequence or 0) for event in rows] or [sent])
-                if run.status in {"completed", "waiting_user", "waiting_author", "failed", "cancelled", "interrupted"}:
+                operation = (
+                    get_operation_service().get(run.operation_id, include_events=False)
+                    if run.operation_id
+                    else None
+                )
+                metrics = (
+                    operation.get("process_metrics")
+                    if operation and isinstance(operation.get("process_metrics"), dict)
+                    else {}
+                )
+                if metrics.get("kind") == "model_output":
+                    signature = (
+                        metrics.get("output_chars"),
+                        metrics.get("output_preview"),
+                        metrics.get("attempt"),
+                    )
+                    if signature != operation_progress_signature:
+                        operation_progress_signature = signature
+                        payload = {
+                            "event_type": "model_output",
+                            "status": run.status,
+                            "message": operation.get("current_message"),
+                            "payload": metrics,
+                        }
+                        yield (
+                            "event: model_output\ndata: "
+                            + json.dumps(payload, ensure_ascii=False)
+                            + "\n\n"
+                        )
+                if run.status in {
+                    "completed",
+                    "waiting_user",
+                    "waiting_author",
+                    "failed",
+                    "cancelled",
+                    "interrupted",
+                }:
                     from ..services.novel_creation_run_presentation import present_serialized_run
 
                     terminal_run = await present_serialized_run(
@@ -960,14 +985,18 @@ async def stream_creation_stage_run(
                         run=run,
                         model=run.model_source,
                     )
-                    yield "event: done\ndata: " + json.dumps(terminal_run, ensure_ascii=False) + "\n\n"
+                    yield (
+                        "event: done\ndata: "
+                        + json.dumps(terminal_run, ensure_ascii=False)
+                        + "\n\n"
+                    )
                     return
             finally:
                 db.close()
             tick += 1
             if tick % 20 == 0:
                 yield "event: heartbeat\ndata: {}\n\n"
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.2)
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
@@ -1048,12 +1077,12 @@ async def confirm_creation_stage(session_id: str, stage: str, payload: NovelCrea
                 "session": serialize_session(session),
             },
         )
-    result = await submit_novel_creation_stage(db, "", {
+    result = await save_creation_artifact(db, "", {
         "session_id": session_id,
         "stage": stage,
         "data": payload.data if payload.data is not None else confirmation.current_data,
         "confirm": payload.confirm,
-        "source": payload.source,
+        "source": "author",
         "expected_revision": payload.expected_revision,
     })
     if payload.confirm:
@@ -1086,12 +1115,12 @@ async def update_creation_stage(session_id: str, stage: str, payload: NovelCreat
                 "session": serialize_session(session),
             },
         )
-    result = await submit_novel_creation_stage(db, "", {
+    result = await save_creation_artifact(db, "", {
         "session_id": session_id,
         "stage": stage,
         "data": payload.data,
         "confirm": False,
-        "source": payload.source,
+        "source": "author",
         "expected_revision": payload.expected_revision,
     })
     return _tool_response(result)
@@ -1276,22 +1305,13 @@ async def undo_creation_artifact_endpoint(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-class SystemChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=1_000_000)
-    model: str | None = None
-    context: dict[str, Any] | None = None  # {blueprints, sessionId, brief, importedFiles, history}
-
-
 class AssistantInputRouteRequest(BaseModel):
     source_name: str = Field(default="聊天长文本.txt", min_length=1, max_length=500)
     source_text: str = Field(min_length=1, max_length=5_000_000)
     source_kind: Literal["long_text", "attachment"] = "attachment"
     user_instruction: str = Field(default="", max_length=1_000_000)
-    clarification_question: str = Field(default="", max_length=500)
-    clarification_answer: str = Field(default="", max_length=20_000)
-    clarification_already_asked: bool = False
     clarification_history: list[dict[str, Any]] = Field(default_factory=list)
-    context_scope: Literal["system", "creation", "project"] = "system"
+    context_scope: Literal["creation", "project"] = "creation"
     active_project_id: str = Field(default="", max_length=36)
     creation_session_id: str = Field(default="", max_length=36)
     history: list[dict[str, Any]] = Field(default_factory=list, max_length=12)
@@ -1311,11 +1331,8 @@ async def route_assistant_input(payload: AssistantInputRouteRequest):
 async def route_assistant_input_file(
     file: UploadFile = File(...),
     user_instruction: str = Form(default=""),
-    clarification_question: str = Form(default=""),
-    clarification_answer: str = Form(default=""),
-    clarification_already_asked: bool = Form(default=False),
     clarification_history: str = Form(default="[]"),
-    context_scope: Literal["system", "creation", "project"] = Form(default="system"),
+    context_scope: Literal["creation", "project"] = Form(default="creation"),
     active_project_id: str = Form(default=""),
     creation_session_id: str = Form(default=""),
     history: str = Form(default="[]"),
@@ -1345,9 +1362,6 @@ async def route_assistant_input_file(
         source_text=source_text,
         source_kind="attachment",
         user_instruction=user_instruction,
-        clarification_question=clarification_question,
-        clarification_answer=clarification_answer,
-        clarification_already_asked=clarification_already_asked,
         clarification_history=(
             parsed_clarification_history
             if isinstance(parsed_clarification_history, list)
@@ -1362,72 +1376,29 @@ async def route_assistant_input_file(
     return ApiResponse.success(data=result, message="文件内容与处理意图已判断")
 
 
-@router.post("/novel-creation/system-chat")
-async def system_chat(payload: SystemChatRequest, db: Session = Depends(get_db)):
-    """General conversation endpoint for system assistant without project context."""
-    from app.services.workspace.tools.novel_creation import system_chat_completion
-
-    operation_id = _start_inline_operation(
-        db,
-        source_kind="system_chat",
-        title="司命对话",
-        phase="generating_reply",
-        model=payload.model,
-        resume_url="/gui",
-        input_value={"message": payload.message, "context": payload.context or {}, "model": payload.model},
-    )
-
-    async def run_chat() -> dict[str, Any]:
-        return await system_chat_completion(
-            message=payload.message,
-            context=payload.context or {},
-            model=payload.model,
-        )
-
-    try:
-        result = await _run_inline_operation(operation_id, run_chat, success_message="司命已返回回复")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise _inline_operation_http_error(exc) from exc
-    return ApiResponse.success(data=result)
-
-
-class CreationConversationCommandRequest(BaseModel):
-    session_id: str
-    stage: str
-    instruction: str | None = None
-    model: str | None = None
-    expected_revision: int | None = None
-    entity_type: Literal[
-        "worldbuilding", "character", "relationship", "location", "faction",
-        "world_relation", "volume", "chapter_outline", "scene_outline",
-    ] | None = None
-    entity_count: int | None = Field(default=None, ge=1, le=20)
-    action: Literal["generate_artifact", "refine_artifact", "open_editor"] = "refine_artifact"
-
-    @model_validator(mode="after")
-    def validate_entity_target(self) -> "CreationConversationCommandRequest":
-        if self.entity_type and self.entity_type not in ENTITY_TYPES_BY_ARTIFACT.get(self.stage, frozenset()):
-            raise ValueError("目标实体类型不属于当前立项对象")
-        if self.entity_type and self.action != "generate_artifact":
-            raise ValueError("新增实体只能使用 generate_artifact")
-        return self
-
-
 class CreationAgentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     session_id: str
     message: str = Field(min_length=1, max_length=1_000_000)
+    client_turn_id: str = Field(min_length=36, max_length=36)
+    after_sequence: int = Field(default=0, ge=0)
     model: str | None = None
-    history: list[dict[str, str]] = Field(default_factory=list, max_length=20)
+    conversation_id: str | None = Field(default=None, max_length=100)
+    assistant_message_id: str | None = Field(default=None, max_length=100)
     model_route: Literal["pc", "mobile"] = "pc"
     mobile_provider: MobileProviderEnvelope | None = Field(default=None, repr=False, exclude=True)
-    local_cli_permission_grant: Literal["chat_only", "creation_agent_once"] = "chat_only"
     local_cli_read_permission_grant: Literal["none", "read_once"] = "none"
     local_cli_read_paths: list[str] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def require_mobile_provider_envelope(self) -> "CreationAgentRequest":
+        try:
+            uuid.UUID(self.client_turn_id)
+        except ValueError as exc:
+            raise ValueError("client_turn_id 必须是 UUID") from exc
+        if self.assistant_message_id and not self.conversation_id:
+            raise ValueError("assistant_message_id requires conversation_id")
         if self.model_route == "mobile" and self.mobile_provider is None:
             raise ValueError("选择手机模型线路时必须提供加密凭据")
         if self.model_route == "pc" and self.mobile_provider is not None:
@@ -1435,138 +1406,83 @@ class CreationAgentRequest(BaseModel):
         return self
 
 
-@router.post("/novel-creation/agent-turn")
+@router.post(
+    "/novel-creation/agent-turn",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "description": "Reconnectable Creation Agent event stream",
+            "content": {"text/event-stream": {"schema": {"type": "string"}}},
+        },
+    },
+)
 async def creation_agent_turn(
     payload: CreationAgentRequest,
     request: Request,
     db: Session = Depends(get_db),
+    conversations: SystemConversationStore = Depends(get_system_conversation_store),
 ):
     session = novel_creation_session_store(db).session(payload.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="立项草稿不存在")
-    from ..services.novel_creation_agent import run_creation_agent
-
+    session_id = str(session.id)
+    try:
+        creation_agent_conversation(
+            conversations,
+            session_id=session_id,
+            conversation_id=payload.conversation_id,
+        )
+    except CreationTurnScopeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     request_provider = _resolve_mobile_creation_provider(
         db,
         payload,
         request,
-        binding_id=session.id,
+        binding_id=session_id,
     )
-
-    async def run_agent() -> dict[str, Any]:
-        return await run_creation_agent(
-            db,
-            session=session,
-            message=payload.message,
-            model=payload.model,
-            history=payload.history,
-            local_cli_write_granted=payload.local_cli_permission_grant == "creation_agent_once",
-            local_cli_read_paths=(
-                list(payload.local_cli_read_paths)
-                if payload.local_cli_read_permission_grant == "read_once" else []
-            ),
-        )
-
-    if request_provider is None:
-        result = await run_agent()
-    else:
-        from ..modules.model_runtime.application.request_override import use_request_provider
-        with use_request_provider(request_provider):
-            result = await run_agent()
-    return ApiResponse.success(data=result)
-
-
-@router.post("/novel-creation/conversation-command")
-async def creation_conversation_command(
-    payload: CreationConversationCommandRequest,
-    db: Session = Depends(get_db),
-):
-    if payload.stage not in {*STAGE_ORDER, "all"}:
-        raise HTTPException(status_code=400, detail="未知立项阶段")
-    store = novel_creation_session_store(db)
-    session = store.session(payload.session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="立项草稿不存在")
-    if payload.expected_revision is not None and int(session.revision or 0) != payload.expected_revision:
-        raise HTTPException(status_code=409, detail="立项草稿版本已经变化")
-    if payload.action == "open_editor":
-        return ApiResponse.success(data={
-            "ui_directive": {"navigate": True, "url": f"/novel-creation?session={session.id}&stage={payload.stage}"},
-            "summary": f"已打开{STAGE_LABELS.get(payload.stage, payload.stage)}完整编辑器",
-        })
-    operation = "refine" if payload.action == "refine_artifact" else "generate"
-    entity_id: str | None = None
-    if operation == "refine" and payload.stage in {"characters", "locations", "macro_outline", "opening_outline", "world_style"}:
-        candidates = []
-        for item in list_creation_entities(session, artifact=payload.stage):
-            data = item.get("data") if isinstance(item.get("data"), dict) else {}
-            labels = {
-                str(data.get("name") or "").strip(),
-                str(data.get("title") or "").strip(),
-                str(data.get("role") or data.get("role_type") or "").strip(),
-            }
-            labels.discard("")
-            if any(label in payload.instruction for label in labels):
-                candidates.append(item)
-        if len(candidates) == 1:
-            entity_id = str(candidates[0]["id"])
-    request = {
-        "session_id": session.id,
-        "stage": payload.stage,
-        "operation": operation,
-        "instruction": payload.instruction,
+    request_fingerprint = hashlib.sha256(json.dumps({
+        "session_id": session_id,
+        "message": payload.message,
         "model": payload.model,
-        "expected_revision": int(session.revision or 0),
-        "entity_id": entity_id,
-        "entity_type": payload.entity_type,
-        "entity_count": payload.entity_count,
-    }
-    snapshot_hash = input_snapshot_hash(session.draft_json if isinstance(session.draft_json, dict) else {})
-    command_key = creation_idempotency_key(
-        session_id=session.id,
-        stage=payload.stage,
-        operation=operation,
-        request=request,
-        input_revision=int(session.revision or 0),
-        input_snapshot_hash=snapshot_hash,
-    )
-    artifact_claim_key = (
-        f"{payload.stage}:entity:{entity_id}"
-        if entity_id else
-        f"{payload.stage}:new:{payload.entity_type}"
-        if payload.entity_type else
-        payload.stage
-    )
-    claim, replayed = claim_or_replay_creation_run(
-        db,
-        session_id=session.id,
-        artifact_key=artifact_claim_key,
-        idempotency_key=command_key,
-        input_revision=int(session.revision or 0),
-        input_snapshot_hash=snapshot_hash,
-    )
-    if replayed and claim.run_id:
-        run = store.run(claim.run_id)
-        if run:
-            return ApiResponse.success(data={
-                "run": serialize_run(run),
-                "ui_directive": {"navigate": False},
-                "summary": f"正在继续{STAGE_LABELS.get(payload.stage, payload.stage)}任务",
-            })
-    run = create_run(db, session, payload.stage, request, claim_id=claim.id, idempotency_key=command_key)
-    commit_session(db)
-    schedule_creation_stage(run.id, session.id, request, operation_id=run.operation_id)
-    return ApiResponse.success(data={
-        "run": serialize_run(run),
-        "ui_directive": {"navigate": False},
-        "summary": (
-            f"已开始定向调整{candidates[0]['data'].get('name') or candidates[0]['data'].get('title')}，其他对象会保持不变。"
-            if entity_id else
-            f"已开始按你的描述新增{ {'character': '角色', 'relationship': '人物关系', 'location': '地点', 'faction': '势力', 'volume': '分卷', 'chapter_outline': '章节细纲', 'scene_outline': '场景细纲', 'worldbuilding': '世界设定', 'world_relation': '世界关系'}.get(payload.entity_type, '立项对象') }，数量由本次对话要求决定，现有内容会保持不变。"
-            if payload.entity_type else
-            f"已开始{STAGE_LABELS.get(payload.stage, payload.stage)}{('调整' if operation == 'refine' else '生成')}，你可以继续在对话中补充要求。"
+        "conversation_id": payload.conversation_id,
+        "assistant_message_id": payload.assistant_message_id,
+        "model_route": payload.model_route,
+        "local_cli_read_permission_grant": payload.local_cli_read_permission_grant,
+        "local_cli_read_paths": payload.local_cli_read_paths,
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+    turn_input = CreationAgentTurnInput(
+        session_id=session_id,
+        message=payload.message,
+        client_turn_id=payload.client_turn_id,
+        model=payload.model,
+        conversation_id=payload.conversation_id,
+        assistant_message_id=payload.assistant_message_id,
+        local_cli_read_paths=(
+            tuple(payload.local_cli_read_paths)
+            if payload.local_cli_read_permission_grant == "read_once" else ()
         ),
-    })
+        request_provider=request_provider,
+    )
+
+    async def produce(publish: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
+        await produce_creation_agent_turn(turn_input, publish)
+
+
+    return StreamingResponse(
+        creation_agent_turn_stream(
+            client_turn_id=payload.client_turn_id,
+            request_fingerprint=request_fingerprint,
+            after_sequence=payload.after_sequence,
+            producer=produce,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 class SaveImportedFileRequest(BaseModel):
@@ -1744,12 +1660,9 @@ async def save_imported_file(payload: SaveImportedFileRequest):
     imported_dir = root / ".imported"
     imported_dir.mkdir(parents=True, exist_ok=True)
 
-    # Sanitize filename
     safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '-', payload.filename)
     safe_name = safe_name.strip(' .-')[:200]
 
-    # Add timestamp to avoid conflicts
-    from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     name_parts = safe_name.rsplit('.', 1)
     if len(name_parts) == 2:

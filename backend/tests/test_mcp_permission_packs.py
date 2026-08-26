@@ -75,8 +75,8 @@ class ProjectWritingPackTest(unittest.TestCase):
     """Verify project_writing pack contains correct tools."""
 
     def test_create_update_tools_in_writing_pack(self):
-        write_tools = ["create_chapter", "update_chapter", "create_character",
-                       "update_character", "create_worldbuilding_entry", "update_worldbuilding_entry"]
+        write_tools = ["create_character", "update_character",
+                       "create_worldbuilding_entry", "update_worldbuilding_entry"]
         for name in write_tools:
             td = registry.get(name)
             self.assertIsNotNone(td, f"Tool not found: {name}")
@@ -162,7 +162,7 @@ class WritesProjectDataTest(unittest.TestCase):
             self.assertFalse(td.writes_project_data, f"{name} should not write project data")
 
     def test_create_tools_write(self):
-        write_tools = ["create_chapter", "create_character", "create_worldbuilding_entry"]
+        write_tools = ["create_character", "create_worldbuilding_entry"]
         for name in write_tools:
             td = registry.get(name)
             self.assertTrue(td.writes_project_data, f"{name} should write project data")

@@ -223,9 +223,6 @@ class _EmptyConfigurations:
     def task_setting(self, task_type: str):
         return None
 
-    def record_failure(self, provider: str, error):
-        raise AssertionError("request-only provider failures must not mutate persisted readiness")
-
 
 def test_request_provider_override_is_context_scoped_and_non_persistent():
     runtime = ModelRuntime(_EmptyConfigurations())
@@ -238,13 +235,12 @@ def test_request_provider_override_is_context_scoped_and_non_persistent():
 
     with use_request_provider(ephemeral):
         assert runtime.provider_config("mobile_openai") is ephemeral
-        runtime.record_failure("mobile_openai", RuntimeError("temporary upstream error"))
 
     with pytest.raises(NotFoundError):
         runtime.provider_config("mobile_openai")
 
 
-def test_gateway_mobile_key_wraps_the_full_workspace_and_memory_pipeline(tmp_path, monkeypatch):
+def test_gateway_mobile_key_uses_one_workspace_model_path_without_hidden_calls(tmp_path, monkeypatch):
     monkeypatch.setenv("SIMING_RUNTIME_PROFILE", "gateway")
     monkeypatch.setenv("SIMING_HOME", str(tmp_path / "runtime"))
     monkeypatch.setattr(crypto, "_fernet", None)
@@ -314,22 +310,12 @@ def test_gateway_mobile_key_wraps_the_full_workspace_and_memory_pipeline(tmp_pat
         }
 
     async def fake_chat_completion(**kwargs):
-        observed["memory"] = get_model_runtime().provider_config("mobile_openai")
-        assert kwargs["model"] == "mobile_openai:gpt-compatible-model"
-        return {"content": "[]", "model": "gpt-compatible-model", "usage": {}}
+        raise AssertionError("工作区回合结束后不得再隐藏调用模型抽取记忆")
 
     async def fake_stream_chat_completion(**kwargs):
-        observed["workspace_fallback"] = get_model_runtime().provider_config("mobile_openai")
-        assert kwargs["model"] == "mobile_openai:gpt-compatible-model"
-        yield json.dumps(
-            {
-                "reply": "手机 Key 已按 PC 工作区流程执行。",
-                "done": True,
-                "actions": [],
-                "needs_confirmation": False,
-            },
-            ensure_ascii=False,
-        )
+        raise AssertionError("原生工具路径不得静默回退到普通文本流")
+        if False:
+            yield ""
 
     monkeypatch.setattr(
         LLMGateway,
@@ -346,10 +332,7 @@ def test_gateway_mobile_key_wraps_the_full_workspace_and_memory_pipeline(tmp_pat
                 f"/api/v1/projects/{project_id}/ai/workspace-assistant/stream",
                 headers={"authorization": f"Bearer {access_token}"},
                 json={
-                    "scope": "project",
                     "message": "检查手机 Key 是否贯穿完整 PC 工作区流程",
-                    "assistant_mode": "quality",
-                    "auto_apply": True,
                     "model_route": "mobile",
                     "mobile_provider": envelope.model_dump(),
                 },
@@ -358,8 +341,7 @@ def test_gateway_mobile_key_wraps_the_full_workspace_and_memory_pipeline(tmp_pat
         assert "手机 Key 已按 PC 工作区流程执行" in response.text
         assert "phone-secret-key" not in response.text
         assert observed["workspace"].api_key == "phone-secret-key"
-        assert "memory" in observed, response.text
-        assert observed["memory"].api_key == "phone-secret-key"
+        assert set(observed) == {"workspace"}
         assert active_request_provider() is None
     finally:
         app.dependency_overrides.clear()

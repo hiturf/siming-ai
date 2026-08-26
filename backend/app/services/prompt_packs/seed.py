@@ -74,18 +74,18 @@ BUILTIN_PACKS: list[dict[str, Any]] = [
             "- 创意方案要有差异化，不要只是换个名字。\n"
             "- 世界观要服务于剧情，不要为了设定而设定。\n"
             "- 角色要有明确的动机和冲突，不要写完美无缺的角色。"
-            "\n- 本机 CLI 和外部 Agent 只能读取镜像文件；阶段结果必须调用 submit_novel_creation_stage，最终创建必须调用 apply_novel_blueprint。"
+            "\n- API、本机 CLI 与外部 Agent 使用同一组会话工具；阶段结果通过结构化工具保存，最终创建调用 finalize_creation_session。"
             "\n- 不要直接创建项目文件，不要绕过会话草稿写数据库。"
         ),
         "workflow_json": [
             {"step": 1, "name": "constraints", "description": "保存可编辑创作约束，不创建正式作品"},
-            {"step": 2, "name": "concepts", "description": "通过 draft_novel_blueprint(depth=concept) 生成一张可持续调整的轻量概念卡"},
-            {"step": 3, "name": "world_style", "description": "生成并通过 submit_novel_creation_stage 提交文风与世界观"},
+            {"step": 2, "name": "concepts", "description": "生成并保存一张可持续调整的轻量概念卡"},
+            {"step": 3, "name": "world_style", "description": "生成并通过 patch_creation_artifact 保存文风与世界观"},
             {"step": 4, "name": "characters", "description": "提交带写作锁的角色与关系"},
             {"step": 5, "name": "locations", "description": "提交地点、势力及稳定关系"},
             {"step": 6, "name": "macro_outline", "description": "提交全书主线、阶段规划与卷纲"},
             {"step": 7, "name": "opening_outline", "description": "提交前3章章级节点与每章2至6个 section"},
-            {"step": 8, "name": "final_review", "description": "最终审阅后调用 apply_novel_blueprint"},
+            {"step": 8, "name": "final_review", "description": "最终审阅后调用 finalize_creation_session"},
         ],
         "quality_rubric_json": {
             "dimensions": [
@@ -115,49 +115,27 @@ BUILTIN_PACKS: list[dict[str, Any]] = [
             "【剧情设计】写作前先设计：场景、冲突、情绪曲线、转折点、结尾钩子。\n"
             "【角色对话】每个角色说话要符合性格，对话要有信息量，推动剧情或揭示性格。\n\n"
             "【输出】只输出正文，用\\n表示换行，对白可自由使用引号。\n\n"
-            "本任务只生成基础正文，不执行去除 AI 味改写或质量评分。正式保存会自动启动 "
-            "与作品建档页相同的统一建档流程。"
+            "本任务只生成基础正文，不执行去除 AI 味改写或质量评分。保存未入库草稿后立即结束，"
+            "正式保存和建档由作者在界面选择。"
         ),
         "workflow_json": [
             {"step": 1, "name": "prepare_context", "description": "调用 prepare_external_writing_context 获取上下文"},
             {"step": 2, "name": "write_chapter", "description": "一次生成基础正文 1800-2500字"},
-            {"step": 3, "name": "save_draft", "description": "调用 save_external_chapter_draft 保存草稿"},
-            {"step": 4, "name": "save_chapter", "description": "调用 create_chapter(skip_style_repair=true) 保存"},
-            {"step": 5, "name": "cataloging_started", "description": "确认章节写入结果返回统一建档任务 ID"},
+            {"step": 3, "name": "save_draft", "description": "调用 save_external_chapter_draft 保存未入库草稿并立即结束"},
         ],
         "quality_rubric_json": None,
         "forbidden_patterns_json": [],
         "tool_playbook_json": {
-            "create_chapter": {
+            "save_external_chapter_draft": {
                 "scenario": "external_writing",
                 "steps": [
                     "调用 prepare_external_writing_context 获取上下文",
                     "按照本提示词包的写作规则生成正文",
                     "调用 save_external_chapter_draft 存储草稿",
-                    "调用 create_chapter(skip_style_repair=true) 保存章节",
-                    "确认 create_chapter 返回 cataloging_job.job_id；不要重复生成建档候选",
+                    "立即结束本轮；正式保存和建档由作者在界面操作",
                 ],
             },
         },
-    },
-    {
-        "pack_id": "chapter_writing_fast",
-        "scope": "chapter_writing",
-        "title": "快速模式章节写作",
-        "summary": "少轮次直写的章节提示词，保留角色、设定、时间线和写后归档要求，适合快速出稿后再精修。",
-        "system_prompt": (
-            "快速入口兼容旧配置。实际种子写入时会替换为 chapter_writing_fast 的轻量直写提示词。\n"
-            "任何入口生成章节正文都必须遵守角色一致性、设定一致性、时间线一致性和写后归档契约。"
-        ),
-        "workflow_json": [
-            {"step": 1, "name": "prepare_context", "description": "读取基础写作所需上下文"},
-            {"step": 2, "name": "write_chapter", "description": "一次生成基础正文"},
-            {"step": 3, "name": "save_draft", "description": "保存完整草稿"},
-            {"step": 4, "name": "save_chapter", "description": "使用 skip_style_repair=true 保存章节"},
-            {"step": 5, "name": "archive_changes", "description": "写后归档连续性数据"},
-        ],
-        "quality_rubric_json": None,
-        "forbidden_patterns_json": [],
     },
     {
         "pack_id": "chapter_review_quality",
@@ -395,7 +373,7 @@ def _refresh_builtin_cataloging_pack_defs() -> None:
             pack["system_prompt"] = render_prompt(
                 "creation.novel.stage",
                 task_kind="协助作者完成新书立项",
-                task_rules="从创作约束和一套可持续调整的创意方向开始，按阶段确认，最终审阅前不创建正式作品。",
+                task_rules="从创作约束和本轮实际需要的创意方向开始，按阶段确认，最终审阅前不创建正式作品。",
             )
         spec_id = prompt_ids.get(pack_id)
         if spec_id:
@@ -441,21 +419,12 @@ def seed_builtin_packs(db: Session) -> int:
         if pack_data["pack_id"] == "cataloging_external_no_api":
             merged.update(cataloging_content)
 
-        if pack_data["pack_id"] in ("chapter_writing_quality", "chapter_writing_fast"):
-            from app.prompts.prompt_source import (
-                get_public_chapter_fast_system_prompt,
-                get_public_chapter_quality_system_prompt,
+        if pack_data["pack_id"] == "chapter_writing_quality":
+            from app.prompts.prompt_source import get_public_chapter_quality_system_prompt
+            merged["system_prompt"] = get_public_chapter_quality_system_prompt()
+            merged["summary"] = (
+                "聚焦一次正文生成的完整章节提示词；去除 AI 味和质量评审由独立操作按需执行。"
             )
-            if pack_data["pack_id"] == "chapter_writing_fast":
-                merged["system_prompt"] = get_public_chapter_fast_system_prompt()
-                merged["summary"] = (
-                    "少轮次直写的章节提示词，保留角色、设定、时间线和写后归档要求，适合快速出稿后再精修。"
-                )
-            else:
-                merged["system_prompt"] = get_public_chapter_quality_system_prompt()
-                merged["summary"] = (
-                    "聚焦一次正文生成的完整章节提示词；去除 AI 味和质量评审由独立操作按需执行。"
-                )
 
         # Inject analysis prompts from prompt_source (single source of truth)
         from app.prompts.prompt_source import (

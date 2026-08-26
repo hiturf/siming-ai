@@ -15,29 +15,33 @@ internal class PcPromptContract(context: Context) {
     }
 
     val sourceHash: String = root.string("source_sha256")
-    val toolSchemas: JsonArray = root["tool_schemas"] as JsonArray
+    private val allToolSchemas: JsonArray = root["tool_schemas"] as JsonArray
     val toolNames: Set<String> = (root["tool_names"] as JsonArray)
         .mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
         .toSet()
+    val toolCategories = PcToolCategoryContract(root)
 
-    fun workspaceSystem(scope: String): String = root.string("workspace_system_template").fill(
-        "scope_label" to SCOPE_LABELS.getOrDefault(scope, "项目规划"),
+    fun workspaceSystem(): String = root.string("workspace_system_template").fill(
         "outline_batch_count" to "3",
-        "auto_apply" to "是",
     )
+
+    fun toolSchemas(activeCategories: List<String>): JsonArray = toolCategories.toolSchemas(
+        allSchemas = allToolSchemas,
+        activeCategories = activeCategories,
+        eligibleNames = toolNames,
+    )
+
+    fun availableToolNames(activeCategories: List<String>): Set<String> =
+        toolCategories.availableToolNames(activeCategories, toolNames)
 
     fun initialUserMessage(
         project: JsonObject,
-        styleContext: String,
         userMessage: String,
     ): String = root.string("workspace_initial_user_template").fill(
+        "project_id" to project.string("id"),
         "project_title" to project.string("title").ifBlank { "未命名作品" },
-        "project_description" to project.string("description").ifBlank { "暂无" },
-        "style_context" to styleContext,
         "history_text" to "（无历史对话）",
-        "selected_context" to "当前没有选中对象。",
-        "previous_search_context" to "",
-        "memory_context" to "",
+        "explicit_context" to "",
         "user_message" to userMessage.trim(),
     )
 
@@ -69,7 +73,6 @@ internal class PcPromptContract(context: Context) {
     }
 
     fun chapterMessages(
-        mode: String,
         project: JsonObject,
         outlineContext: String,
         worldContext: String,
@@ -79,19 +82,8 @@ internal class PcPromptContract(context: Context) {
     ): List<JsonObject> {
         val chapter = root["chapter"] as JsonObject
         val style = styleContext(project)
-        val directives = writingDirectives(
-            project = project,
-            outlineContext = outlineContext,
-            worldContext = worldContext,
-            requirements = requirements,
-        )
-        val systemTemplate = if (mode == "fast") {
-            chapter.string("fast_system_template")
-        } else {
-            chapter.string("quality_system_template")
-        }
+        val systemTemplate = chapter.string("quality_system_template")
         val system = systemTemplate.fill(
-            "writing_directives" to directives,
             "style_context" to style,
         )
         var user = chapter.string("user_template").fill(
@@ -181,69 +173,6 @@ internal class PcPromptContract(context: Context) {
         )
     }
 
-    private fun writingDirectives(
-        project: JsonObject,
-        outlineContext: String,
-        worldContext: String,
-        requirements: String,
-    ): String {
-        val rules = root["writing_rules"] as JsonObject
-        val tags = project.tags()
-        val genreText = listOf(
-            project.string("title"),
-            project.string("description"),
-            tags.joinToString(" "),
-            worldContext.take(2_000),
-            requirements,
-        ).joinToString("\n").lowercase()
-        val taskText = listOf(requirements, outlineContext.take(2_000), "", "", "")
-            .joinToString("\n")
-            .lowercase()
-        val genres = selectRules(rules["genres"] as JsonArray, genreText, tags, 2)
-        var tasks = selectRules(rules["tasks"] as JsonArray, taskText, emptyList(), 3)
-        if (genres.isEmpty() && tasks.isEmpty()) tasks = listOf(rules["default"] as JsonObject)
-        return buildList {
-            add("【本次写作专项提示】")
-            if (genres.isNotEmpty()) {
-                add("类型路由：" + genres.joinToString("、") { it.string("label") })
-                genres.forEach { add("【${it.string("label")}写法】\n${it.string("body")}") }
-            }
-            if (tasks.isNotEmpty()) {
-                add("任务路由：" + tasks.joinToString("、") { it.string("label") })
-                tasks.forEach { add("【${it.string("label")}写法】\n${it.string("body")}") }
-            }
-            add("以上规则只用于生成正文；不要复述规则、不要输出分析、不要改变既定事实。")
-        }.joinToString("\n")
-    }
-
-    private fun selectRules(
-        rules: JsonArray,
-        text: String,
-        tags: List<String>,
-        limit: Int,
-    ): List<JsonObject> = rules.mapIndexedNotNull { index, raw ->
-        val rule = raw as? JsonObject ?: return@mapIndexedNotNull null
-        val keywords = (rule["keywords"] as? JsonArray).orEmpty()
-            .mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
-        val score = keywords.sumOf { keyword ->
-            (if (tags.any { tag -> keyword == tag || keyword in tag }) 3 else 0) +
-                (if (keyword.lowercase() in text) 1 else 0)
-        }
-        if (score > 0) Triple(score, index, rule) else null
-    }.sortedWith(compareByDescending<Triple<Int, Int, JsonObject>> { it.first }.thenBy { it.second })
-        .take(limit)
-        .map { it.third }
-
-    private fun JsonObject.tags(): List<String> {
-        val value = get("tags")
-        if (value is JsonArray) return value.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
-        val raw = (value as? JsonPrimitive)?.contentOrNull.orEmpty().trim()
-        if (raw.isBlank()) return emptyList()
-        val parsed = runCatching { json.parseToJsonElement(raw) as? JsonArray }.getOrNull()
-        return parsed?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
-            ?: raw.replace('，', ',').split(',').map(String::trim).filter(String::isNotBlank)
-    }
-
     private fun message(role: String, content: String) = JsonObject(
         mapOf("role" to JsonPrimitive(role), "content" to JsonPrimitive(content)),
     )
@@ -259,12 +188,6 @@ internal class PcPromptContract(context: Context) {
 
     companion object {
         const val ASSET_NAME = "pc_workspace_prompt_contract.json"
-        private val SCOPE_LABELS = mapOf(
-            "outline" to "大纲规划",
-            "characters" to "角色管理",
-            "worldbuilding" to "世界观管理",
-            "project" to "项目规划",
-        )
         private val WORLD_DIMENSIONS = setOf(
             "geography",
             "history",

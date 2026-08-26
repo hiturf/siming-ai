@@ -36,6 +36,9 @@ from app.services.external_agent.extended_clients import (
     hermes_command,
 )
 from app.services.external_agent.mcp_server_spec import resolve_siming_mcp_server
+from app.services.external_agent.local_cli_registration import (
+    ensure_detected_local_cli_model_configs as _ensure_detected_local_cli_model_configs,
+)
 
 LOCAL_MCP_PROVIDERS = {
     "claude_cli",
@@ -520,74 +523,13 @@ def auto_configure_detected_mcp_clients(
 
 
 def ensure_detected_local_cli_model_configs(db, *, explicit_consent: bool = False) -> list[str]:
-    """Register installed CLIs only inside an explicitly authorized flow."""
-
-    if not explicit_consent:
-        return []
-
-    from app.ai.local_cli_adapter import (
-        DEFAULT_CLI_ARGS,
-        DEFAULT_CLI_MODELS,
-        OPENCODE_LEGACY_MODEL,
-        preferred_local_cli_model,
+    return _ensure_detected_local_cli_model_configs(
+        db,
+        explicit_consent=explicit_consent,
+        resolve_command=_resolve_command,
+        cursor_command=cursor_command,
+        hermes_command=hermes_command,
     )
-    from app.core.crypto import encrypt
-    from app.database.models import APIConfig
-
-    descriptors = [
-        ("claude_cli", ["claude", "claude.exe"]),
-        ("codex_cli", ["codex.cmd", "codex", "codex.exe"]),
-        ("opencode_cli", ["opencode.cmd", "opencode", "opencode.exe"]),
-        ("mimocode_cli", ["mimo.cmd", "mimo", "mimo.exe"]),
-        ("cursor_cli", ["cursor-agent.cmd", "cursor-agent", "agent.cmd", "agent"]),
-        ("kilocode_cli", ["kilo.cmd", "kilo", "kilocode.cmd", "kilocode"]),
-        ("qwen_code_cli", ["qwen.cmd", "qwen", "qwencode.cmd", "qwencode"]),
-        ("hermes_cli", ["hermes.exe", "hermes"]),
-        ("openclaw_cli", ["openclaw.cmd", "openclaw", "openclaw.exe"]),
-    ]
-    created: list[str] = []
-    changed = False
-    for provider, commands in descriptors:
-        if provider == "cursor_cli":
-            command = cursor_command()
-        elif provider == "hermes_cli":
-            command = hermes_command()
-        else:
-            command = _resolve_command(None, commands)
-        if not command:
-            continue
-        existing = db.query(APIConfig).filter(APIConfig.provider == provider).first()
-        if existing:
-            if provider == "opencode_cli" and existing.default_model == OPENCODE_LEGACY_MODEL:
-                existing.default_model = DEFAULT_CLI_MODELS[provider]
-                legacy_args = json.dumps(
-                    ["run", "--dangerously-skip-permissions", "{prompt}"],
-                    ensure_ascii=False,
-                )
-                if existing.cli_args == legacy_args:
-                    existing.cli_args = json.dumps(DEFAULT_CLI_ARGS[provider], ensure_ascii=False)
-                changed = True
-            elif provider == "mimocode_cli" and existing.default_model == "mimocode-cli":
-                existing.default_model = preferred_local_cli_model(provider, command)
-                changed = True
-            continue
-        default_model = preferred_local_cli_model(provider, command) if provider == "mimocode_cli" else DEFAULT_CLI_MODELS[provider]
-        db.add(APIConfig(
-            provider=provider,
-            api_key_encrypted=encrypt("__local_cli__"),
-            default_model=default_model,
-            is_global_default=False,
-            base_url_override=None,
-            provider_type="local_cli",
-            cli_command=command,
-            cli_args=json.dumps(DEFAULT_CLI_ARGS[provider], ensure_ascii=False),
-            readiness_status="detected",
-            readiness_json='{"source":"auto_detect"}',
-        ))
-        created.append(provider)
-    if created or changed:
-        commit_session(db)
-    return created
 
 
 def migrate_legacy_external_agent_defaults(db, *, explicit_consent: bool = False) -> bool:

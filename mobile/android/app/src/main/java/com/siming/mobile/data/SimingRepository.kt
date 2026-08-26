@@ -5,7 +5,9 @@ import androidx.room.withTransaction
 import com.siming.mobile.BuildConfig
 import com.siming.mobile.data.agent.MobileWorkspaceAgent
 import com.siming.mobile.data.creation.CreationExecutionRoute
+import com.siming.mobile.data.creation.CreationAgentProgressEvent
 import com.siming.mobile.data.creation.CreationStartInput
+import com.siming.mobile.data.creation.CreationAgentTurnRecords
 import com.siming.mobile.data.creation.MobileCreationAgent
 import com.siming.mobile.data.creation.MobileCreationConversationAgent
 import com.siming.mobile.data.local.GatewayConnection
@@ -54,6 +56,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 
 @OptIn(ExperimentalSerializationApi::class)
@@ -116,14 +119,36 @@ class SimingRepository(context: Context) {
         apiKey: String,
         model: String,
         protocol: String,
+        availableModels: List<String>,
+        taskModels: Map<String, String>,
     ): DirectApiSummary {
         val existing = directApiStore.read()
+        val normalizedDefault = model.trim()
+        val normalizedCatalog = (listOf(normalizedDefault) + availableModels + taskModels.values)
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .distinct()
+        val normalizedTasks = taskModels.mapNotNull { (taskType, taskModel) ->
+            val normalizedModel = taskModel.trim()
+            if (
+                taskType !in DirectApiConfig.taskModelLabels ||
+                normalizedModel.isBlank() ||
+                normalizedModel == normalizedDefault ||
+                normalizedModel !in normalizedCatalog
+            ) {
+                null
+            } else {
+                taskType to normalizedModel
+            }
+        }.toMap()
         val config = DirectApiConfig(
             displayName = displayName.trim().ifBlank { "自定义 API" },
             baseUrl = baseUrl.trim().trimEnd('/'),
             apiKey = apiKey.trim().ifBlank { existing?.apiKey.orEmpty() },
-            model = model.trim(),
+            model = normalizedDefault,
             protocol = protocol,
+            availableModels = normalizedCatalog,
+            taskModels = normalizedTasks,
         )
         val probe = directApi.testAndResolve(config)
         val resolved = config.copy(protocol = probe.protocol)
@@ -1221,7 +1246,6 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
 
     suspend fun runAssistant(
         projectId: String,
-        scope: String,
         prompt: String,
         modelRoute: AssistantModelRoute,
         onEvent: suspend (String) -> Unit,
@@ -1229,7 +1253,7 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
         val connection = dao.connection()
         if (connection != null) {
             val directConfig = if (modelRoute == AssistantModelRoute.MobileKey) {
-                resolvedDirectConfig()
+                resolvedDirectConfig(DirectApiConfig.TASK_ASSISTANT)
             } else {
                 null
             }
@@ -1237,7 +1261,6 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
                 connection,
                 projectId,
                 WorkspaceAssistantRequest(
-                    scope = scope,
                     message = prompt,
                     modelRoute = if (directConfig == null) "pc" else "mobile",
                     mobileProvider = directConfig?.let {
@@ -1250,9 +1273,11 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
             return if (directConfig == null) AssistantRoute.GatewayPc else AssistantRoute.GatewayMobileKey
         }
 
-        val directConfig = directApiStore.read()?.let { resolvedDirectConfig() }
+        val directConfig = directApiStore.read()?.let {
+            resolvedDirectConfig(DirectApiConfig.TASK_ASSISTANT)
+        }
         if (directConfig != null) {
-            mobileWorkspaceAgent.run(projectId, scope, prompt, directConfig, onEvent)
+            mobileWorkspaceAgent.run(projectId, prompt, directConfig, onEvent)
             return AssistantRoute.DirectApi
         }
         error("请先配置手机直连 API，或连接自己的 Gateway")
@@ -1285,7 +1310,7 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
                 )
             }
             CreationExecutionRoute.MobileKey -> {
-                resolvedDirectConfig()
+                resolvedDirectConfig(DirectApiConfig.TASK_PLANNING)
                 val connection = dao.connection()
                 if (connection == null) {
                     tagCreationRoute(
@@ -1311,60 +1336,165 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
     suspend fun runCreationAgentTurn(
         sessionId: String,
         message: String,
-        onProgress: suspend (String) -> Unit = {},
+        onProgress: suspend (CreationAgentProgressEvent) -> Unit = {},
     ): JsonObject {
         require(message.isNotBlank()) { "请输入你想告诉 AI 的内容" }
         val current = loadCreationSession(sessionId)
-        val history = creationAgentHistory(current)
-        val userHistory = history + agentHistoryMessage("user", message)
-        saveCreationSession(withCreationAgentHistory(current, userHistory))
+        val turns = CreationAgentTurnRecords.turns(current)
+        val pendingTurn = CreationAgentTurnRecords.pending(message)
+        val pendingTurns = (turns + pendingTurn).takeLast(20)
+        val pendingSession = CreationAgentTurnRecords.withTurns(current, pendingTurns)
+        saveCreationSession(pendingSession)
         val route = creationRoute(current)
         val gatewayExecution = creationHost(current) == CREATION_HOST_GATEWAY
-        val updated = when {
-            route == CreationExecutionRoute.Pc || gatewayExecution -> {
-                val connection = requireConnection()
-                val mobileProvider = if (route == CreationExecutionRoute.MobileKey) {
-                    mobileProviderPayload(connection, sessionId)
-                } else null
-                onProgress(
-                    if (mobileProvider == null) "PC Creation Agent 正在读取并增量写入…"
-                    else "手机 Key 正在驱动 PC Creation Agent…"
-                )
-                val result = api.novelCreationAgentTurn(
-                    connection,
-                    buildJsonObject {
-                        put("session_id", sessionId)
-                        put("message", message)
-                        put("history", JsonArray(history.takeLast(12)))
-                        put("model_route", if (mobileProvider == null) "pc" else "mobile")
-                        mobileProvider?.let { put("mobile_provider", it) }
-                    },
-                )
-                val reply = result.string("reply").ifBlank { "已完成本轮立项工具调用" }
-                val fresh = tagCreationRoute(
-                    api.getNovelCreationSession(connection, sessionId),
-                    route,
-                    CREATION_HOST_GATEWAY,
-                )
-                withCreationAgentHistory(
-                    fresh,
-                    userHistory + agentHistoryMessage("assistant", reply),
-                )
+        val clientTurnId = UUID.randomUUID().toString()
+        val capturedProgress = mutableListOf<JsonElement>()
+        val seenSequences = mutableSetOf<Long>()
+        var localSequence = 0L
+        suspend fun emitProgress(event: CreationAgentProgressEvent) {
+            val sequence = if (event.sequence > 0) event.sequence else ++localSequence
+            if (sequence > 0 && !seenSequences.add(sequence)) return
+            localSequence = maxOf(localSequence, sequence)
+            val normalized = event.copy(
+                clientTurnId = event.clientTurnId.ifBlank { clientTurnId },
+                sequence = sequence,
+            )
+            capturedProgress += buildJsonObject {
+                put("client_turn_id", normalized.clientTurnId)
+                put("sequence", normalized.sequence)
+                put("type", normalized.type)
+                put("message", normalized.message)
+                put("status", normalized.status)
+                put("data", normalized.data)
             }
-            else -> {
-                onProgress("手机 Creation Agent 正在读取资料并执行工具…")
-                val result = mobileCreationConversationAgent.run(
-                    source = current,
-                    message = message,
-                    history = history,
-                    config = resolvedDirectConfig(),
-                    onProgress = onProgress,
-                )
-                withCreationAgentHistory(
-                    result.session,
-                    userHistory + agentHistoryMessage("assistant", result.reply),
-                )
+            onProgress(normalized)
+        }
+        val updated = try {
+            when {
+                route == CreationExecutionRoute.Pc || gatewayExecution -> {
+                    val connection = requireConnection()
+                    val mobileProvider = if (route == CreationExecutionRoute.MobileKey) {
+                        mobileProviderPayload(connection, sessionId)
+                    } else null
+                    val result = api.novelCreationAgentTurn(
+                        connection,
+                        buildJsonObject {
+                            put("session_id", sessionId)
+                            put("message", message)
+                            put("client_turn_id", clientTurnId)
+                            put("after_sequence", 0)
+                            CreationAgentTurnRecords.gatewayConversationId(current)
+                                .takeIf(String::isNotBlank)
+                                ?.let { put("conversation_id", it) }
+                            put("model_route", if (mobileProvider == null) "pc" else "mobile")
+                            mobileProvider?.let { put("mobile_provider", it) }
+                        },
+                    ) { event ->
+                        val data = event["data"] as? JsonObject ?: JsonObject(emptyMap())
+                        val type = event.string("type")
+                        emitProgress(CreationAgentProgressEvent(
+                            type = type,
+                            message = event.string("message"),
+                            status = data.string("status").ifBlank {
+                                when (type) {
+                                    "tool_completed", "complete" -> "ok"
+                                    "error" -> "error"
+                                    "cancelled" -> "cancelled"
+                                    else -> "running"
+                                }
+                            },
+                            data = data,
+                            clientTurnId = event.string("client_turn_id"),
+                            sequence = (event["sequence"] as? JsonPrimitive)?.longOrNull ?: 0L,
+                        ))
+                    }
+                    val reply = result.string("reply").ifBlank {
+                        "本轮服务没有返回可确认结果，因此无法确认读取或修改了立项数据。请重试。"
+                    }
+                    val fresh = tagCreationRoute(
+                        api.getNovelCreationSession(connection, sessionId),
+                        route,
+                        CREATION_HOST_GATEWAY,
+                    )
+                    val status = result.string("message_status")
+                        .takeIf { it in setOf("completed", "running", "error") }
+                        ?: "completed"
+                    val completedTurn = CreationAgentTurnRecords.complete(
+                        pending = pendingTurn,
+                        reply = reply,
+                        modelMessages = JsonArray(emptyList()),
+                        toolResults = result["tool_results"] as? JsonArray ?: JsonArray(emptyList()),
+                        replayable = false,
+                        status = status,
+                        executionRoute = "gateway",
+                        createdProjectId = result.string("created_project_id").takeIf(String::isNotBlank),
+                        progressEvents = JsonArray(capturedProgress),
+                        promptMetrics = (
+                            ((result["_turn_trace"] as? JsonObject)?.get("prompt_metrics") as? JsonArray)
+                                ?: (result["prompt_metrics"] as? JsonArray)
+                                ?: JsonArray(emptyList())
+                        ),
+                    )
+                    CreationAgentTurnRecords.withTurns(
+                        fresh,
+                        CreationAgentTurnRecords.replace(pendingTurns, completedTurn),
+                        gatewayConversationId = result.string("conversation_id"),
+                    )
+                }
+                else -> {
+                    emitProgress(CreationAgentProgressEvent(
+                        type = "turn_started",
+                        message = "已接收请求，正在准备手机本地立项上下文…",
+                    ))
+                    val result = mobileCreationConversationAgent.run(
+                        source = pendingSession,
+                        message = message,
+                        turns = turns,
+                        config = resolvedDirectConfig(DirectApiConfig.TASK_PLANNING),
+                        onProgress = ::emitProgress,
+                    )
+                    emitProgress(CreationAgentProgressEvent(
+                        type = "complete",
+                        message = "本轮立项处理完成",
+                        status = "ok",
+                    ))
+                    val completedTurn = CreationAgentTurnRecords.complete(
+                        pending = pendingTurn,
+                        reply = result.reply,
+                        modelMessages = result.modelMessages,
+                        toolResults = result.toolResults,
+                        replayable = result.replayable,
+                        status = result.status,
+                        executionRoute = "device",
+                        createdProjectId = result.createdProjectId,
+                        progressEvents = JsonArray(capturedProgress),
+                        promptMetrics = result.promptMetrics,
+                    )
+                    CreationAgentTurnRecords.withTurns(
+                        result.session,
+                        CreationAgentTurnRecords.replace(
+                            CreationAgentTurnRecords.turns(result.session),
+                            completedTurn,
+                        ),
+                    )
+                }
             }
+        } catch (error: CancellationException) {
+            val latest = runCatching { loadCreationSession(sessionId) }.getOrDefault(pendingSession)
+            val cancelled = CreationAgentTurnRecords.fail(pendingTurn, "本轮已取消，未确认的操作不会进入后续上下文。")
+            saveCreationSession(CreationAgentTurnRecords.withTurns(
+                latest,
+                CreationAgentTurnRecords.replace(CreationAgentTurnRecords.turns(latest), cancelled),
+            ))
+            throw error
+        } catch (error: Exception) {
+            val latest = runCatching { loadCreationSession(sessionId) }.getOrDefault(pendingSession)
+            val failed = CreationAgentTurnRecords.fail(pendingTurn, error.message ?: "本轮立项处理失败")
+            saveCreationSession(CreationAgentTurnRecords.withTurns(
+                latest,
+                CreationAgentTurnRecords.replace(CreationAgentTurnRecords.turns(latest), failed),
+            ))
+            throw error
         }
         saveCreationSession(updated)
         return updated
@@ -1391,7 +1521,7 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
                     current,
                     stage,
                     instruction.trim(),
-                    resolvedDirectConfig(),
+                    resolvedDirectConfig(DirectApiConfig.TASK_PLANNING),
                 ),
                 route,
                 CREATION_HOST_DEVICE,
@@ -1580,8 +1710,8 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
         val projectId = when {
             executionHost == CREATION_HOST_GATEWAY -> {
                 onProgress("正在通过 PC 立项服务创建正式作品…")
-                val applied = api.applyNovelCreation(requireConnection(), sessionId)
-                applied.string("project_id").ifBlank { error("PC 建档结果缺少 project_id") }
+                val finalized = api.finalizeNovelCreation(requireConnection(), sessionId)
+                finalized.string("project_id").ifBlank { error("PC 建档结果缺少 project_id") }
             }
             connection != null -> {
                 onProgress("正在把手机 V3 草稿提交给 PC 的正式建档流程…")
@@ -1613,7 +1743,7 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
     }
 
     private fun creationStartPayload(input: CreationStartInput): JsonObject = buildJsonObject {
-        put("mode", "hybrid")
+        put("mode", "internal_llm")
         put("user_brief", input.brief.trim())
         put("target_audience", input.targetAudience.trim())
         put("genre", input.genre.trim())
@@ -1633,24 +1763,6 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
         put("author_brief", if (input.creationMode == "author_led") input.brief.trim() else "")
         put("author_outline", input.authorOutline.trim())
         put("locked_requirements", JsonArray(input.lockedRequirements.map(::JsonPrimitive)))
-    }
-
-    private fun creationAgentHistory(session: JsonObject): List<JsonObject> =
-        (session.draft()["agent_history"] as? JsonArray)
-            .orEmpty()
-            .mapNotNull { it as? JsonObject }
-
-    private fun agentHistoryMessage(role: String, content: String): JsonObject = buildJsonObject {
-        put("id", UUID.randomUUID().toString())
-        put("role", role)
-        put("content", content)
-        put("created_at", Instant.now().toString())
-    }
-
-    private fun withCreationAgentHistory(session: JsonObject, history: List<JsonObject>): JsonObject {
-        val draft = session.draft().toMutableMap()
-        draft["agent_history"] = JsonArray(history.takeLast(40))
-        return JsonObject(session.toMutableMap().apply { put("draft", JsonObject(draft)) })
     }
 
     private suspend fun saveCreationSession(session: JsonObject) {
@@ -1676,7 +1788,10 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
     }
 
     private suspend fun loadCreationSession(sessionId: String): JsonObject {
-        return storedCreationSession(sessionId) ?: error("立项草稿不存在或已删除")
+        val stored = storedCreationSession(sessionId) ?: error("立项草稿不存在或已删除")
+        val migrated = CreationAgentTurnRecords.migrateLegacyHistory(stored)
+        if (migrated != stored) saveCreationSession(migrated)
+        return migrated
     }
 
     private suspend fun storedCreationSession(sessionId: String): JsonObject? {
@@ -1718,7 +1833,7 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
         sessionId: String,
     ): JsonObject {
         val envelope = MobileProviderEncryption.seal(
-            resolvedDirectConfig(),
+            resolvedDirectConfig(DirectApiConfig.TASK_PLANNING),
             connection,
             sessionId,
         )
@@ -1771,7 +1886,7 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
         var remote = api.startNovelCreation(
             connection,
             buildJsonObject {
-                put("mode", "hybrid")
+                put("mode", "internal_llm")
                 put("user_brief", local.string("user_brief"))
                 listOf("target_audience", "genre", "platform").forEach { key ->
                     put(key, form[key] ?: JsonPrimitive(local.string(key)))
@@ -1807,8 +1922,8 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
             )
         }
         onProgress("结构校验通过，正在执行 PC 正式建档…")
-        val applied = api.applyNovelCreation(connection, remoteId)
-        return applied.string("project_id").ifBlank { error("PC 建档结果缺少 project_id") }
+        val finalized = api.finalizeNovelCreation(connection, remoteId)
+        return finalized.string("project_id").ifBlank { error("PC 建档结果缺少 project_id") }
     }
 
     private suspend fun archiveLocalCreation(session: JsonObject): String {
@@ -2053,12 +2168,13 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
     private fun JsonObject.string(name: String): String = (get(name) as? JsonPrimitive)?.contentOrNull.orEmpty()
     private fun JsonObject.int(name: String): Int = (get(name) as? JsonPrimitive)?.intOrNull ?: 0
 
-    private suspend fun resolvedDirectConfig(): DirectApiConfig {
-        val config = directApiStore.read() ?: error("请先在设置中配置手机 API Key")
-        if (config.protocol != DirectApiConfig.PROTOCOL_AUTO) return config
-        val resolved = config.copy(protocol = directApi.testAndResolve(config).protocol)
+    private suspend fun resolvedDirectConfig(taskType: String): DirectApiConfig {
+        val stored = directApiStore.read() ?: error("请先在设置中配置手机 API Key")
+        val selected = stored.forTask(taskType)
+        if (stored.protocol != DirectApiConfig.PROTOCOL_AUTO) return selected
+        val resolved = stored.copy(protocol = directApi.testAndResolve(selected).protocol)
         directApiStore.save(resolved)
-        return resolved
+        return resolved.forTask(taskType)
     }
 
     suspend fun disconnect(clearOfflineData: Boolean): Boolean {

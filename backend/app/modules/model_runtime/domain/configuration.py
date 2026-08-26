@@ -18,10 +18,15 @@ class ModelProviderConfig:
 
 
 @dataclass(frozen=True)
-class LocalTaskModelSetting:
+class TaskModelSetting:
     task_type: str
-    model_key: str
+    provider: str
+    model_name: str
     context_length: int | None = None
+
+    @property
+    def model(self) -> str:
+        return f"{self.provider}:{self.model_name}"
 
 
 @dataclass(frozen=True)

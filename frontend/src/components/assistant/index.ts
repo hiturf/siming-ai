@@ -2,6 +2,7 @@
 export * from './types'
 export * from './constants'
 export { MessageList } from './MessageList'
+export { ReasoningDisclosure } from './ReasoningDisclosure'
 export { ToolLogPanel } from './ToolLogPanel'
 export { Composer } from './Composer'
 export { StepDetailModal } from './StepDetailModal'

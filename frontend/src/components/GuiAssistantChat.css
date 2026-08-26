@@ -714,6 +714,25 @@
   color: var(--ant-color-text-secondary);
 }
 
+.gui-chat-creation-run-preview {
+  display: grid;
+  gap: 3px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  overflow: hidden;
+  border: 1px solid var(--ant-color-border-secondary);
+  border-radius: 6px;
+  background: var(--ant-color-fill-quaternary);
+}
+
+.gui-chat-creation-run-preview .ant-typography:last-child {
+  overflow: hidden;
+  font-family: Consolas, "Cascadia Code", monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .gui-chat-creation-run-actions {
   display: flex;
   flex-wrap: wrap;
@@ -770,6 +789,49 @@
   word-break: break-word;
 }
 
+.gui-chat-msg-text {
+  white-space: pre-wrap;
+}
+
+.gui-chat-progress {
+  border-top: 1px solid var(--ant-color-border-secondary);
+  margin-top: 10px;
+  white-space: normal;
+}
+
+.gui-chat-progress .ant-collapse-header {
+  color: var(--ant-color-text-secondary) !important;
+  font-size: 12px;
+  padding: 8px 0 2px !important;
+}
+
+.gui-chat-progress .ant-collapse-content-box {
+  padding: 6px 0 0 !important;
+}
+
+.gui-chat-progress-list {
+  display: grid;
+  gap: 6px;
+}
+
+.gui-chat-progress-item {
+  align-items: flex-start;
+  color: var(--ant-color-text-secondary);
+  display: grid;
+  font-size: 12px;
+  gap: 7px;
+  grid-template-columns: 12px minmax(0, 1fr);
+  line-height: 1.45;
+}
+
+.gui-chat-progress-tool_completed {
+  color: var(--ant-color-success-text);
+}
+
+.gui-chat-progress-error {
+  color: var(--ant-color-error-text);
+}
+
 .gui-chat-msg-status {
   margin: 0 8px 6px 0;
 }
@@ -792,34 +854,6 @@
   padding-top: 10px;
 }
 
-.gui-chat-blueprints {
-  max-width: 1100px;
-  margin: 8px 0 24px;
-  padding: 16px;
-  border: 1px solid var(--ant-color-border-secondary);
-  border-radius: 10px;
-  background: var(--ant-color-bg-container);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.04);
-}
-
-.gui-chat-blueprints-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.gui-chat-blueprint-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.gui-chat-blueprint-grid-single {
-  grid-template-columns: minmax(0, 1fr);
-}
-
 .gui-chat-artifact-detail {
   max-height: min(66vh, 680px);
   margin: 0;
@@ -830,64 +864,6 @@
   background: var(--ant-color-fill-quaternary);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-}
-
-.gui-chat-blueprint-card {
-  border-radius: 8px;
-}
-
-.gui-chat-blueprint-card .ant-card-head {
-  min-height: 44px;
-}
-
-.gui-chat-blueprint-title {
-  display: inline-block;
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  vertical-align: bottom;
-  white-space: nowrap;
-}
-
-.gui-chat-blueprint-logline {
-  min-height: 88px;
-  margin: 0 !important;
-  color: var(--ant-color-text);
-  font-size: 13px;
-  line-height: 1.6;
-}
-
-.gui-chat-blueprint-premise {
-  margin: 0 !important;
-  color: var(--ant-color-text-secondary);
-  font-size: 12px;
-  line-height: 1.6;
-}
-
-.gui-chat-blueprint-card .ant-collapse {
-  margin: 0 -8px;
-}
-
-.gui-chat-blueprint-card .ant-collapse-header {
-  padding-block: 6px !important;
-}
-
-.gui-chat-blueprint-card .ant-collapse-content-box {
-  padding: 4px 8px 10px !important;
-}
-
-.gui-chat-blueprint-list {
-  margin: 6px 0 0 18px;
-  padding: 0;
-  color: var(--ant-color-text-secondary);
-  font-size: 12px;
-  line-height: 1.65;
-}
-
-.gui-chat-blueprint-details {
-  width: 100%;
-  margin-top: 4px;
-  font-size: 12px;
 }
 
 /* ── Composer ── */
@@ -1041,15 +1017,6 @@
 
   .gui-chat-msg {
     max-width: 94%;
-  }
-
-  .gui-chat-blueprints-head {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
-  .gui-chat-blueprint-grid {
-    grid-template-columns: 1fr;
   }
 
   .gui-chat-creation-panel-open.gui-chat-creation-panel-editor-open {

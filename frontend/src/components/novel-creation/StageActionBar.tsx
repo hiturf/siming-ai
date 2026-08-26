@@ -8,11 +8,9 @@ export function StageActionBar({
   hasData,
   busy,
   createdProjectId,
-  finalReady,
   recommendedStage,
   recommendedStageLabel,
   nextStageLabel,
-  canGenerate,
   currentStageLabel,
   onOpenProject,
   onCreateProject,
@@ -26,11 +24,9 @@ export function StageActionBar({
   hasData: boolean
   busy: boolean
   createdProjectId?: string | null
-  finalReady: boolean
   recommendedStage?: string | null
   recommendedStageLabel: string
   nextStageLabel: string
-  canGenerate: boolean
   currentStageLabel: string
   onOpenProject: () => void
   onCreateProject: () => void
@@ -44,7 +40,7 @@ export function StageActionBar({
     action = createdProjectId ? (
       <Button size="large" type="primary" icon={<BookOutlined />} onClick={onOpenProject}>进入已创建作品</Button>
     ) : (
-      <Button size="large" type="primary" icon={<CheckCircleOutlined />} disabled={!finalReady || busy} loading={busy} onClick={onCreateProject}>创建正式作品（开篇细纲可稍后完善）</Button>
+      <Button size="large" type="primary" icon={<CheckCircleOutlined />} disabled={busy} loading={busy} onClick={onCreateProject}>创建正式作品（开篇细纲可稍后完善）</Button>
     )
   } else if (status === 'generated' || status === 'stale') {
     action = (
@@ -69,7 +65,7 @@ export function StageActionBar({
         生成{recommendedStageLabel}
       </Button>
     )
-  } else if (canGenerate) {
+  } else {
     action = (
       <Button size="large" type="primary" icon={<PlayCircleOutlined />} disabled={busy} loading={busy} onClick={onGenerate}>
         生成{currentStageLabel}

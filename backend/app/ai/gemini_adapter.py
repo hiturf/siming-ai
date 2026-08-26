@@ -3,9 +3,15 @@ from typing import AsyncGenerator, Optional
 
 from openai import APIConnectionError, APIError, APITimeoutError, AuthenticationError
 
-from .base import BaseAdapter
-from .openai_adapter import compact_openai_kwargs, create_openai_compatible_client, _extract_tool_calls
 from ..core.exceptions import LLMError
+from .base import BaseAdapter
+from .openai_adapter import (
+    _extract_tool_calls,
+    compact_openai_kwargs,
+    create_openai_compatible_client,
+    message_reasoning_content,
+    normalize_openai_tool_call_delta,
+)
 
 
 class GeminiAdapter(BaseAdapter):
@@ -73,6 +79,7 @@ class GeminiAdapter(BaseAdapter):
             choice = response.choices[0]
             return {
                 "content": choice.message.content or "",
+                "reasoning_content": message_reasoning_content(choice.message),
                 "model": response.model,
                 "usage": self._usage_payload(response.usage),
                 "tool_calls": _extract_tool_calls(choice.message),
@@ -98,6 +105,7 @@ class GeminiAdapter(BaseAdapter):
     ) -> AsyncGenerator[str, None]:
         client = self._get_client()
         model = self._normalize_model(model)
+        self.last_stream_finish_reason = None
         kwargs = compact_openai_kwargs(dict(
             model=model,
             messages=messages,
@@ -111,9 +119,13 @@ class GeminiAdapter(BaseAdapter):
         try:
             stream = await client.chat.completions.create(**kwargs)
             async for chunk in stream:
+                finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+                if finish_reason:
+                    self.last_stream_finish_reason = str(finish_reason)
                 delta = chunk.choices[0].delta.content
                 if delta:
                     yield delta
+            self.last_stream_finish_reason = self.last_stream_finish_reason or "incomplete"
         except AuthenticationError as e:
             raise LLMError(f"Gemini API Key 无效: {e}")
         except APITimeoutError as e:
@@ -156,6 +168,7 @@ class GeminiAdapter(BaseAdapter):
             tool_call_buffers: dict[int, dict] = {}
             finish_reason = None
             usage = None
+            reasoning_buffer = ""
             async for chunk in stream:
                 delta = chunk.choices[0].delta
                 finish_reason = chunk.choices[0].finish_reason or finish_reason
@@ -163,34 +176,21 @@ class GeminiAdapter(BaseAdapter):
                     usage = self._usage_payload(chunk.usage)
                 if delta.content:
                     yield {"type": "content_delta", "delta": delta.content}
+                reasoning = message_reasoning_content(delta)
+                if reasoning:
+                    reasoning_buffer += reasoning
+                    yield {"type": "reasoning_delta", "delta": reasoning}
                 if delta.tool_calls:
                     for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tool_call_buffers:
-                            tool_call_buffers[idx] = {"id": tc.id or "", "name": "", "arguments": ""}
-                        buf = tool_call_buffers[idx]
-                        if tc.id:
-                            buf["id"] = tc.id
-                        if tc.function and tc.function.name:
-                            buf["name"] = tc.function.name
-                        if tc.function and tc.function.arguments:
-                            buf["arguments"] += tc.function.arguments
-                            yield {
-                                "type": "tool_call_delta",
-                                "index": idx,
-                                "id": buf["id"],
-                                "name": None,
-                                "arguments_delta": tc.function.arguments,
-                            }
-                        elif tc.id:
-                            yield {
-                                "type": "tool_call_delta",
-                                "index": idx,
-                                "id": tc.id,
-                                "name": tc.function.name if tc.function else None,
-                                "arguments_delta": "",
-                            }
-            yield {"type": "done", "finish_reason": finish_reason or "stop", "usage": usage}
+                        event = normalize_openai_tool_call_delta(tc, tool_call_buffers)
+                        if event:
+                            yield event
+            yield {
+                "type": "done",
+                "finish_reason": finish_reason or "incomplete",
+                "usage": usage,
+                "reasoning_content": reasoning_buffer,
+            }
         except AuthenticationError as e:
             raise LLMError(f"Gemini API Key 无效: {e}")
         except APITimeoutError as e:

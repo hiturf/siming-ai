@@ -21,7 +21,7 @@ class PcApiPathsTest {
   "/api/v1/novel-creation/sessions/session-1/stages/world_style/confirm",
   PcApiPaths.novelCreationStageConfirm("session-1", "world_style"),
         )
-        assertEquals("/api/v1/novel-creation/apply", PcApiPaths.NOVEL_CREATION_APPLY)
+        assertEquals("/api/v1/novel-creation/finalize", PcApiPaths.NOVEL_CREATION_FINALIZE)
     }
 
     @Test

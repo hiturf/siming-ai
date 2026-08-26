@@ -100,7 +100,11 @@ if (-not $SkipBuild) {
 
 # Step 2: Verify exe exists
 Write-Host "[2/6] Verifying Siming.exe..." -ForegroundColor Yellow
-$exePath = Join-Path $projectRoot $SimingExePath
+$exePath = if ([System.IO.Path]::IsPathRooted($SimingExePath)) {
+    [System.IO.Path]::GetFullPath($SimingExePath)
+} else {
+    Join-Path $projectRoot $SimingExePath
+}
 if (-not (Test-Path $exePath)) {
     Write-Host "ERROR: Siming.exe not found at $exePath" -ForegroundColor Red
     exit 1

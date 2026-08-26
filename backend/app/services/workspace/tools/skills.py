@@ -15,7 +15,6 @@ from ...skills.service import (
     list_skill_tools,
     list_skill_versions,
     list_skills as list_skill_records,
-    preview_skill_match,
     reset_skill_to_builtin,
     update_skill as update_skill_record,
 )
@@ -139,20 +138,6 @@ async def reset_skill(db: Session, project_id: str, args: dict[str, Any]) -> dic
         return {"tool": "reset_skill", "status": "skipped", "detail": "未找到技能"}
     data = reset_skill_to_builtin(db, project_id, skill_id)
     return {"tool": "reset_skill", "status": "ok", "detail": f"已恢复技能默认值：{data.get('name')}", "data": data}
-
-
-async def preview_skill_match_tool(db: Session, project_id: str, args: dict[str, Any]) -> dict:
-    message = str(args.get("message") or "").strip()
-    if not message:
-        return {"tool": "preview_skill_match", "status": "skipped", "detail": "测试消息为空"}
-    data = preview_skill_match(
-        db,
-        project_id,
-        message=message,
-        scope=str(args.get("scope") or "project"),
-        candidate=args.get("candidate") if isinstance(args.get("candidate"), dict) else None,
-    )
-    return {"tool": "preview_skill_match", "status": "ok", "detail": "已预览技能匹配", "data": data}
 
 
 async def list_skill_versions_tool(db: Session, project_id: str, args: dict[str, Any]) -> dict:

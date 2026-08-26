@@ -29,7 +29,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="chapter_writer",
-        description="生成章节正文。加载完整写作规则（行文/对话/去AI味/钩子/技法），将剧情设计和对白素材织成章节正文。创建章节前必须先调用此工具生成正文。",
+        description="基于尚未关联正式章节的章级大纲、作品上下文和写作要求，一次生成一份独立的未入库新章草稿；不会改写已有章节，成功后本轮结束。",
         input_schema={
             "outline_node_id": {"type": "string", "description": "对应的大纲节点ID（必填）"},
             "requirements": {"type": "string", "description": "写作要求或方向（可选）"},
@@ -37,20 +37,6 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "本章出场的角色名列表",
-            },
-            "previous_plot": {
-                "type": "object",
-                "description": "design_plot 返回的剧情设计JSON（可选，如有则传入）",
-            },
-            "previous_roleplay": {
-                "type": "array",
-                "items": {"type": "object"},
-                "description": "roleplay_character 或 dialogue_battle 返回的对白结果（可选，如有则传入）",
-            },
-            "mode": {
-                "type": "string",
-                "enum": ["fast", "quality"],
-                "description": "写作模式。fast 使用精简直写提示词和更少外围轮次；quality 使用完整技法流程。两者都必须遵守角色、设定、时间线一致性和写后归档契约。默认由系统注入。",
             },
         },
         required=["outline_node_id"],
@@ -181,7 +167,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="start_novel_creation_session",
-        description="Start a new novel creation session. API-free. Returns interview checklist and prompt pack.",
+        description="Start the canonical structured novel-creation session used by the conversational Agent.",
         input_schema={
             "mode": {"type": "string", "description": "internal_llm|external_agent"},
             "user_brief": {"type": "string", "description": "User's novel brief"},
@@ -194,95 +180,6 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         handler_name="start_novel_creation_session",
     ),
     ToolDef(
-        name="draft_novel_blueprint",
-        description="Draft novel blueprints for a creation session. Supports template, hybrid, internal_llm and external_agent modes.",
-        input_schema={
-            "session_id": {"type": "string", "description": "Creation session ID"},
-            "execution_mode": {
-                "type": "string",
-                "description": "template|hybrid|internal_llm|external_agent. hybrid uses template+LLM for creative output.",
-            },
-            "user_brief": {"type": "string", "description": "Additional user brief"},
-            "feedback": {
-                "type": "string",
-                "description": "User feedback for refining or regenerating previous blueprint options",
-            },
-            "revision_mode": {
-                "type": "string",
-                "description": "initial|refine|regenerate. Use refine to adjust current direction, regenerate to restart options from feedback.",
-            },
-            "enhance_with_llm": {
-                "type": "boolean",
-                "description": "Optional slow LLM enhancement. Default false keeps template drafting instant.",
-            },
-            "skip_questions": {
-                "type": "boolean",
-                "description": "Skip clarifying questions and generate blueprints directly. Default false.",
-            },
-            "depth": {
-                "type": "string",
-                "description": "concept|full. Concept returns three lightweight cards and keeps full source inside the session.",
-            },
-        },
-        required=["session_id"],
-        tool_type="read",
-        estimated_cost="free",
-        handler_name="draft_novel_blueprint",
-    ),
-    ToolDef(
-        name="review_novel_blueprint",
-        description="Review novel blueprints. Supports hybrid, internal_llm and external_agent modes.",
-        input_schema={
-            "session_id": {"type": "string", "description": "Creation session ID"},
-            "execution_mode": {
-                "type": "string",
-                "description": "hybrid|internal_llm|external_agent",
-            },
-            "blueprint": {
-                "type": "object",
-                "description": "Blueprint to review (optional, saves to session)",
-            },
-        },
-        required=["session_id"],
-        tool_type="read",
-        estimated_cost="free",
-        handler_name="review_novel_blueprint",
-    ),
-    ToolDef(
-        name="apply_novel_blueprint",
-        description="Apply a confirmed blueprint to create a real Siming project with characters, worldbuilding, and outline.",
-        input_schema={
-            "session_id": {"type": "string", "description": "Creation session ID"},
-            "blueprint_index": {
-                "type": "integer",
-                "description": "Which blueprint to apply (default 0)",
-            },
-            "mode": {
-                "type": "string",
-                "description": "manual|auto. Manual returns candidates, auto creates project.",
-            },
-            "blueprint": {
-                "type": "object",
-                "description": "Optional blueprint override to apply directly.",
-            },
-        },
-        required=["session_id"],
-        tool_type="write",
-        writes_project_data=True,
-        risk_level="medium",
-        estimated_cost="free",
-        handler_name="apply_novel_blueprint",
-    ),
-    ToolDef(
-        name="get_novel_creation_session",
-        description="Read a resumable V2 novel creation session, its stage states, checkpoints, and recent runs.",
-        input_schema={"session_id": {"type": "string", "description": "Creation session ID"}},
-        required=["session_id"],
-        tool_type="read",
-        estimated_cost="free",
-        handler_name="get_novel_creation_session",
-    ),
-    ToolDef(
         name="get_creation_session",
         description="Read the canonical creation session, including its scope, revision, workflow states, and provenance.",
         input_schema={"session_id": {"type": "string", "description": "Creation session ID"}},
@@ -293,7 +190,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="get_creation_snapshot",
-        description="Read an immutable revision-oriented snapshot of the session and all current artifact summaries.",
+        description="Read a compact immutable snapshot containing the current revision, author brief, constraints, artifact data, statuses, and locked paths. Runtime history is intentionally omitted.",
         input_schema={"session_id": {"type": "string", "description": "Creation session ID"}},
         required=["session_id"],
         tool_type="read",
@@ -385,7 +282,6 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             "artifact": {"type": "string", "description": "Creation artifact identifier"},
             "expected_revision": {"type": "integer", "description": "Required current session revision"},
             "changes": {"type": "array", "description": "Validated set|replace|append|remove|resize operations"},
-            "source": {"type": "string", "description": "author|assistant|external_agent"},
         },
         required=["session_id", "artifact", "expected_revision", "changes"],
         tool_type="write",
@@ -471,7 +367,6 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             "entity_id": {"type": "string", "description": "Creation entity ID"},
             "expected_revision": {"type": "integer", "description": "Required current session revision"},
             "changes": {"type": "array", "description": "Entity-relative JSON Pointer patch operations"},
-            "source": {"type": "string", "description": "author|assistant|external_agent"},
         },
         required=["entity_id", "expected_revision", "changes"],
         tool_type="write",
@@ -486,7 +381,6 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         input_schema={
             "entity_id": {"type": "string", "description": "Creation entity ID"},
             "expected_revision": {"type": "integer", "description": "Required current session revision"},
-            "source": {"type": "string", "description": "author|assistant|external_agent"},
         },
         required=["entity_id", "expected_revision"],
         tool_type="write",
@@ -535,80 +429,16 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         handler_name="restore_creation_artifact_version_tool",
     ),
     ToolDef(
-        name="generate_novel_creation_stage",
-        description=(
-            "Generate one V2 creation stage or the complete quick pipeline. "
-            "The concepts and all-stage routes require an explicit Siming model; "
-            "the external MCP client's own model is not inherited. External agents "
-            "using their current model should generate the data themselves and call "
-            "submit_novel_creation_stage. Saves only to the session draft; it never "
-            "writes project files."
-        ),
-        input_schema={
-            "session_id": {"type": "string", "description": "Creation session ID"},
-            "stage": {
-                "type": "string",
-                "description": "constraints|concepts|world_style|characters|locations|macro_outline|opening_outline|final_review|all",
-            },
-            "model": {
-                "type": "string",
-                "description": (
-                    "Required for concepts or all; optional for other stages. Must be "
-                    "a model identity already configured and tested in Siming. The "
-                    "external MCP client's model is not inherited."
-                ),
-            },
-            "use_model": {
-                "type": "boolean",
-                "description": "Use the selected model; must be true for concepts or all",
-            },
-            "auto_confirm": {
-                "type": "boolean",
-                "description": "Confirm generated stages automatically; intended for quick mode",
-            },
-            "session_patch": {
-                "type": "object",
-                "description": "Optional editable form or selected concept update before generation",
-            },
-            "operation": {"type": "string", "description": "generate|regenerate|refine"},
-            "instruction": {"type": "string", "description": "Required for refine; applies only to the selected target"},
-            "expected_revision": {"type": "integer", "description": "Required draft revision for safe writes"},
-            "entity_id": {"type": "string", "description": "Existing entity ID to refine or regenerate in isolation"},
-            "entity_type": {"type": "string", "description": "Entity type to generate as a new isolated entity"},
-        },
-        required=["session_id", "stage"],
-        tool_type="write",
-        writes_project_data=False,
-        risk_level="low",
-        estimated_cost="model_or_free",
-        handler_name="generate_novel_creation_stage",
-    ),
-    ToolDef(
-        name="submit_novel_creation_stage",
-        description="Submit and optionally confirm an edited V2 creation stage. Changes remain in the session until apply_novel_blueprint.",
-        input_schema={
-            "session_id": {"type": "string", "description": "Creation session ID"},
-            "stage": {"type": "string", "description": "Stage identifier"},
-            "data": {"type": "object", "description": "Author or external-agent stage result"},
-            "confirm": {"type": "boolean", "description": "Confirm this stage and continue"},
-            "source": {"type": "string", "description": "author|local_cli|external_agent|model"},
-        },
-        required=["session_id", "stage", "data"],
-        tool_type="write",
-        writes_project_data=False,
-        risk_level="low",
-        estimated_cost="free",
-        handler_name="submit_novel_creation_stage",
-    ),
-    ToolDef(
         name="confirm_creation_artifact",
-        description="Confirm exactly one current artifact. This operation never generates the current or next artifact.",
+        description=(
+            "Confirm the current artifact only when the latest user message explicitly approves "
+            "that current revision. Never confirm content generated or modified in the same turn. "
+            "This operation never generates the current or next artifact."
+        ),
         input_schema={
             "session_id": {"type": "string", "description": "Creation session ID"},
             "artifact": {"type": "string", "description": "Artifact identifier"},
             "expected_revision": {"type": "integer", "description": "Required current session revision"},
-            "data": {"type": "object", "description": "Optional edited artifact data; current data is used when omitted"},
-            "source": {"type": "string", "description": "author|assistant|external_agent"},
         },
         required=["session_id", "artifact", "expected_revision"],
         tool_type="write",
@@ -621,10 +451,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         name="generate_creation_artifact",
         description=(
             "Generate one artifact or one new entity inside an artifact as a durable "
-            "revision-protected run. When artifact is concepts or all, model must name "
-            "an available Siming model; the external MCP client's own model is not "
-            "inherited. To use the MCP client's current model, generate the structured "
-            "artifact in the client and save it with patch_creation_artifact instead."
+            "revision-protected run. When model is omitted, use the active default model."
         ),
         input_schema={
             "session_id": {"type": "string", "description": "Creation session ID"},
@@ -632,11 +459,11 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             "expected_revision": {"type": "integer", "description": "Required current session revision"},
             "model": {
                 "type": "string",
-                "description": "Required for concepts or all; optional for other artifacts",
+                "description": "Optional model identity; omitted uses the active default model",
             },
             "use_model": {
                 "type": "boolean",
-                "description": "Use the selected model; must be true for concepts or all",
+                "description": "Use model generation when a model is available",
             },
             "entity_type": {"type": "string", "description": "Optional entity type for isolated new-entity generation"},
             "instruction": {"type": "string", "description": "Optional generation direction"},
@@ -652,10 +479,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         name="refine_creation_artifact",
         description=(
             "Refine only the requested artifact or entity while preserving locks and "
-            "unrelated structured data. When artifact is concepts or all, model must "
-            "name an available Siming model; the external MCP client's own model is "
-            "not inherited. To use the MCP client's current model, refine the structured "
-            "artifact in the client and save it with patch_creation_artifact instead."
+            "unrelated structured data. When model is omitted, use the active default model."
         ),
         input_schema={
             "session_id": {"type": "string", "description": "Creation session ID"},
@@ -664,11 +488,11 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             "instruction": {"type": "string", "description": "Required localized refinement instruction"},
             "model": {
                 "type": "string",
-                "description": "Required for concepts or all; optional for other artifacts",
+                "description": "Optional model identity; omitted uses the active default model",
             },
             "use_model": {
                 "type": "boolean",
-                "description": "Use the selected model; must be true for concepts or all",
+                "description": "Use model generation when a model is available",
             },
             "entity_id": {"type": "string", "description": "Optional existing entity ID for isolated refinement"},
         },
@@ -683,11 +507,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         name="regenerate_creation_artifact",
         description=(
             "Regenerate only the selected artifact or entity using a new durable run "
-            "and a new idempotency context. When artifact is concepts or all, model "
-            "must name an available Siming model; the external MCP client's own model "
-            "is not inherited. To use the MCP client's current model, regenerate the "
-            "structured artifact in the client and save it with patch_creation_artifact "
-            "instead."
+            "and a new idempotency context. When model is omitted, use the active default model."
         ),
         input_schema={
             "session_id": {"type": "string", "description": "Creation session ID"},
@@ -696,11 +516,11 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             "instruction": {"type": "string", "description": "Optional replacement direction"},
             "model": {
                 "type": "string",
-                "description": "Required for concepts or all; optional for other artifacts",
+                "description": "Optional model identity; omitted uses the active default model",
             },
             "use_model": {
                 "type": "boolean",
-                "description": "Use the selected model; must be true for concepts or all",
+                "description": "Use model generation when a model is available",
             },
             "entity_id": {"type": "string", "description": "Optional existing entity ID for isolated regeneration"},
         },
@@ -732,7 +552,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="validate_creation_session",
-        description="Run the canonical dependency, stale-data, and referential consistency validation before finalization.",
+        description="Inspect dependency, stale-data, and referential consistency diagnostics.",
         input_schema={"session_id": {"type": "string", "description": "Creation session ID"}},
         required=["session_id"],
         tool_type="read",
@@ -741,7 +561,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="finalize_creation_session",
-        description="Validate and idempotently convert a confirmed creation session into a formal Siming project.",
+        description="Idempotently convert the current creation session into a formal Siming project.",
         input_schema={"session_id": {"type": "string", "description": "Creation session ID"}},
         required=["session_id"],
         tool_type="write",

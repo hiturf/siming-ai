@@ -113,10 +113,8 @@ class MobileCreationAgentTest {
         assertEquals("核心世界钩子", locations.array("entries").first().jsonObject.string("title"))
 
         val macro = agent.baseline(session, "macro_outline")
-        assertEquals(4, macro["requested_volume_count"]!!.jsonPrimitive.int)
-        assertEquals(4, macro.array("volumes").size)
-        assertEquals(60, macro.array("volumes").first().jsonObject["end_chapter"]!!.jsonPrimitive.int)
-        assertEquals(240, macro.array("volumes").last().jsonObject["end_chapter"]!!.jsonPrimitive.int)
+        assertEquals(1, macro.array("volumes").size)
+        assertEquals(240, macro.array("volumes").single().jsonObject["end_chapter"]!!.jsonPrimitive.int)
 
         val opening = agent.baseline(session, "opening_outline")
         assertEquals("第1章 林舟醒来时忘了姐姐的脸。", opening.array("chapters").first().jsonObject.string("title"))
@@ -151,26 +149,8 @@ class MobileCreationAgentTest {
 
         assertEquals(revision + 1, confirmed["revision"]!!.jsonPrimitive.int)
         assertEquals("concept-1", draft.string("selected_concept_id"))
-        assertEquals(1, draft.array("concepts").size)
+        assertEquals(2, draft.array("concepts").size)
         assertTrue(draft.objectValue("concept_seeds").containsKey("concept-1"))
-    }
-
-    @Test
-    fun malformedConceptSchemaFallsBackToSafeEditableDraft() {
-        val started = agent.start(
-            CreationStartInput(
-                creationMode = "author_led",
-                brief = "林舟在记忆城寻找失踪姐姐。",
-                lockedRequirements = listOf("主角必须叫林舟"),
-            ),
-        )
-        val raw = """{"concepts":[{"title":"记忆城","logline":"林舟寻找姐姐","protagonist_seed":{name, identity, goal, lack},"world_hook":"记忆会被消耗","core_conflict":"救人与保住记忆冲突","opening_hook":"林舟忘了姐姐的脸"}]}"""
-        val fallback = agent.safeFallbackData(started, "concepts", raw)
-        val card = fallback.array("options").first().jsonObject
-
-        assertTrue(card.string("logline").isNotBlank())
-        assertTrue(card.objectValue("protagonist_seed").string("identity").contains("林舟"))
-        assertTrue(card.array("risks").first().jsonPrimitive.content.contains("安全草稿"))
     }
 
     private fun conceptData(): JsonObject = buildJsonObject {
@@ -188,6 +168,20 @@ class MobileCreationAgentTest {
                 put("world_hook", "选择会生成可见的分岔世界。")
                 put("core_conflict", "两种人生无法同时保留。")
                 put("opening_hook", "两个自己同时敲响家门。")
+            })
+            add(buildJsonObject {
+                put("id", "concept-2")
+                put("title", "不选")
+                put("logline", "一个人拒绝两种人生后，必须创造第三条路。")
+                put("protagonist_seed", buildJsonObject {
+                    put("name", "周一")
+                    put("identity", "普通人")
+                    put("goal", "创造新选择")
+                    put("lack", "不相信自己能改变规则")
+                })
+                put("world_hook", "被拒绝的选择会反过来追逐选择者。")
+                put("core_conflict", "拒绝选择会同时失去两种人生。")
+                put("opening_hook", "家门外出现第三个从未存在的自己。")
             })
         })
     }

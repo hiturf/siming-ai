@@ -245,6 +245,12 @@ jobs:
           $ErrorActionPreference = "Stop"
           $installDir = Join-Path $env:RUNNER_TEMP "SimingInstallerSmoke"
           Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
+          $stalePromptDir = Join-Path $installDir "_internal\prompt_specs\assistant"
+          New-Item -ItemType Directory -Force -Path $stalePromptDir | Out-Null
+          $stalePromptFiles = @("workspace-fast.md", "chapter-fast.md", "chapter-fast-public.md")
+          foreach ($stalePromptFile in $stalePromptFiles) {
+            Set-Content -LiteralPath (Join-Path $stalePromptDir $stalePromptFile) -Value "stale"
+          }
           $process = Start-Process -FilePath (Resolve-Path "release\Siming-Setup.exe") -ArgumentList @(
             "/SP-",
             "/VERYSILENT",
@@ -265,6 +271,15 @@ jobs:
           if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
             throw "Installer smoke did not create an uninstaller."
           }
+          $staleSurvivors = @(
+            $stalePromptFiles |
+              Where-Object { Test-Path -LiteralPath (Join-Path $stalePromptDir $_) }
+          )
+          if ($staleSurvivors.Count -gt 0) {
+            throw "Installer left removed runtime files behind: $($staleSurvivors -join ', ')"
+          }
+          $env:SIMING_SMOKE_HOME = Join-Path $env:RUNNER_TEMP "SimingInstalledRuntimeSmoke"
+          & ./scripts/smoke-test-release.ps1 -SkipBuild -SimingExePath (Join-Path $installDir "Siming.exe")
 
       - name: Upload verified release assets
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'

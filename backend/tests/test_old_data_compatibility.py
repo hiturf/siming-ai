@@ -95,10 +95,8 @@ class OldDataCompatibilityTest(unittest.TestCase):
             record_external_quality_review,
         )
         from app.services.workspace.tools.novel_creation import (
+            finalize_creation_session,
             start_novel_creation_session,
-            draft_novel_blueprint,
-            review_novel_blueprint,
-            apply_novel_blueprint,
         )
         from app.services.workspace.tools.prompt_packs import (
             list_prompt_packs,
@@ -112,10 +110,8 @@ class OldDataCompatibilityTest(unittest.TestCase):
             save_external_chapter_draft,
             get_external_chapter_draft,
             record_external_quality_review,
+            finalize_creation_session,
             start_novel_creation_session,
-            draft_novel_blueprint,
-            review_novel_blueprint,
-            apply_novel_blueprint,
             list_prompt_packs,
             get_prompt_pack,
             get_tool_playbook,
@@ -126,7 +122,7 @@ class OldDataCompatibilityTest(unittest.TestCase):
     def test_prompt_pack_seed_importable(self):
         """Prompt pack seed module should be importable."""
         from app.services.prompt_packs.seed import BUILTIN_PACKS, seed_builtin_packs
-        self.assertEqual(len(BUILTIN_PACKS), 13)
+        self.assertEqual(len(BUILTIN_PACKS), 12)
         self.assertTrue(callable(seed_builtin_packs))
 
     def test_seed_refreshes_existing_builtin_prompt_pack(self):

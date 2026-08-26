@@ -17,7 +17,6 @@ from app.services.workspace.tools.memory import (
     VALID_CATEGORIES,
     LEGACY_CATEGORY_MAP,
 )
-from app.services.agent.bridge import _build_memory_context, _inject_memory_into_intent
 
 
 def run(coro):
@@ -143,35 +142,6 @@ class MemoryToolsTest(unittest.TestCase):
         result = run(recall(self.db, "proj-1", {}))
         self.assertEqual(len(result["data"]), 1)
         self.assertEqual(result["data"][0]["key"], "k1")
-
-    def test_plan_memory_context_injects_requirements_without_changing_outline_query(self):
-        run(remember(self.db, "proj-1", {
-            "key": "禁用表达",
-            "value": "少用比喻",
-            "category": "writing_style",
-            "importance": 9,
-        }))
-        run(remember(self.db, "proj-1", {
-            "key": "青石村",
-            "value": "村口有一口老井",
-            "category": "project_fact",
-            "importance": 8,
-        }))
-
-        context = _build_memory_context(self.db, "proj-1", "帮我写第151章，青石村视角")
-        self.assertIn("少用比喻", context)
-        self.assertIn("村口有一口老井", context)
-
-        intent = {
-            "intent_type": "chapter",
-            "requirements": "帮我写第151章",
-            "outline_query": "帮我写第151章",
-        }
-        enriched = _inject_memory_into_intent(intent, context)
-        self.assertIn("少用比喻", enriched["requirements"])
-        self.assertIn("村口有一口老井", enriched["requirements"])
-        self.assertEqual(enriched["outline_query"], "帮我写第151章")
-
 
 class RAGSyncTest(unittest.TestCase):
     def setUp(self):

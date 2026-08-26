@@ -37,6 +37,92 @@
   margin-top: 0;
 }
 
+.settings-update-route {
+  align-items: center;
+  background:
+    linear-gradient(110deg, color-mix(in srgb, var(--ant-color-primary-bg) 78%, transparent), transparent 70%),
+    var(--ant-color-fill-quaternary);
+  border: 1px solid color-mix(in srgb, var(--ant-color-primary) 24%, var(--ant-color-border-secondary));
+  border-radius: 10px;
+  display: flex;
+  gap: 18px;
+  justify-content: space-between;
+  padding: 13px 14px;
+}
+
+.settings-update-route-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.settings-update-source-actions {
+  flex: 0 0 auto;
+}
+
+.settings-update-manual {
+  border-top: 1px solid var(--ant-color-border-secondary);
+  display: grid;
+  gap: 12px;
+  margin-top: 2px;
+  padding-top: 14px;
+}
+
+.settings-update-manual-heading {
+  align-items: flex-start;
+  display: flex;
+  gap: 10px;
+}
+
+.settings-update-manual-heading > .anticon {
+  color: var(--ant-color-primary);
+  font-size: 18px;
+  margin-top: 2px;
+}
+
+.settings-update-manual-heading > div {
+  display: grid;
+  gap: 1px;
+}
+
+.settings-update-manual-links {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.settings-update-manual-links a {
+  align-items: center;
+  background: var(--ant-color-bg-container);
+  border: 1px solid var(--ant-color-border-secondary);
+  border-radius: 9px;
+  color: var(--ant-color-text);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  min-height: 58px;
+  padding: 10px 12px;
+  transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+}
+
+.settings-update-manual-links a:hover {
+  border-color: var(--ant-color-primary);
+  box-shadow: 0 5px 16px color-mix(in srgb, var(--ant-color-primary) 12%, transparent);
+  color: var(--ant-color-primary);
+  transform: translateY(-1px);
+}
+
+.settings-update-manual-links a > span:first-child {
+  display: grid;
+  gap: 2px;
+}
+
+.settings-update-manual-links small {
+  color: var(--ant-color-text-secondary);
+  font-size: 12px;
+  font-weight: 400;
+}
+
 .settings-readiness-message {
   display: block;
   max-width: 260px;
@@ -105,6 +191,29 @@
   max-width: 680px;
 }
 
+.settings-task-model-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.settings-task-model-item {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--ant-color-border-secondary);
+  border-radius: 10px;
+  background: var(--ant-color-fill-quaternary);
+}
+
+.settings-task-model-item .ant-typography {
+  margin: 2px 0 0;
+}
+
+.settings-task-model-item .ant-select {
+  width: 100%;
+}
+
 @media (max-width: 980px) {
   .settings-card .ant-table-wrapper {
     overflow-x: auto;
@@ -118,6 +227,19 @@
 
   .settings-card .ant-card-body {
     padding: 16px;
+  }
+
+  .settings-update-route {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .settings-update-source-actions {
+    width: 100%;
+  }
+
+  .settings-update-manual-links {
+    grid-template-columns: 1fr;
   }
 }
 .settings-cli-integrations > .ant-card-body {
@@ -188,5 +310,9 @@
 
   .settings-cli-item-main > .ant-typography {
     max-width: calc(100vw - 80px);
+  }
+
+  .settings-task-model-grid {
+    grid-template-columns: 1fr;
   }
 }
