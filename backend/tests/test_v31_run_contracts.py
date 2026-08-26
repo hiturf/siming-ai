@@ -438,10 +438,17 @@ def test_restart_releases_interrupted_creation_run_for_retry() -> None:
 
 def test_assistant_model_is_resolved_to_actual_provider_identity() -> None:
     with patch(
+        "app.services.workspace.run_log.LLMGateway.select_model_for_task",
+        return_value=SimpleNamespace(model="configured-assistant"),
+    ) as select_model, patch(
         "app.services.workspace.run_log.LLMGateway.model_identity",
         return_value=("openai", "gpt-actual"),
     ):
         assert resolve_assistant_model(None) == "openai:gpt-actual"
+    select_model.assert_called_once_with(
+        task_type="assistant",
+        model_override=None,
+    )
 
 
 def test_v2_session_is_read_as_v3_exploration_without_mutating_stored_draft() -> None:
