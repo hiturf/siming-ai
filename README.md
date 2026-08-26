@@ -23,7 +23,7 @@ Siming is a free and open-source, local-first AI workspace for planning, writing
 
 *新书立项工作台：先形成一套故事方向，再通过对话持续调整角色、世界观、卷纲和前 3 章细纲。图中内容均为虚构演示数据。*
 
-> **3.1.13 测试版** 将立项数据纳入作品上下文：多个对话可共享同一份立项，旧对话恢复自己的立项数据，正式作品可继续编辑来源立项；未选择上下文时首次发言会自动新建立项。AI 会先读取现有结构化数据，边追问边增量补充，而不是采访结束后一次性生成。历史变更请查看 [GitHub Releases](https://github.com/teangtang1122/siming-ai/releases)。
+> **当前源码版本 3.3.2** 统一了 API、本机 CLI、MCP、PC GUI 与 Android 的 Agent 工具和任务模型契约。每个 Agent 回合由模型先选择宽粒度工具类别；新章节始终先形成未保存草稿，保存、是否建档以及何时继续下一章均由作者决定。Android 现可独立完成新书立项、TXT 导入、离线写作与手机模型调用。完整变化见 [3.3.2 发布说明](docs/release-notes-3.3.2.md)。
 
 ## 它解决什么问题
 
@@ -147,6 +147,8 @@ Windows Release 提供 `Siming-Setup.exe` 与 `Siming-Setup.sha256`；Android �
 
 普通使用者只需要 `Siming-Setup.exe`。以下环境仅面向源码贡献者。
 
+源码开发使用 CPython 3.11。前端工具链以 `build-toolchain.json` 为准，当前为 Node.js 24.14.1 与 npm 11.11.0；Android 构建使用 JDK 17。Windows 正式打包还需要 Inno Setup，完整固定版本见 [Windows 安装与发布](PACKAGING.md)。
+
 ```powershell
 # 后端
 cd backend
@@ -157,19 +159,22 @@ uvicorn app.main:app --reload
 
 # 前端（新终端）
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
 提交前的常用检查：
 
 ```powershell
+backend\.venv\Scripts\python.exe backend\scripts\run_quality.py
 backend\.venv\Scripts\python.exe -m pytest backend/tests -q
+npm --prefix frontend run quality
 npm --prefix frontend run lint
 npm --prefix frontend test
 npm --prefix frontend run build
 npm --prefix frontend run test:e2e
 npm --prefix frontend run screenshots:readme
+backend\.venv\Scripts\python.exe scripts\check-mobile-pc-parity.py --check-doc docs\mobile-pc-parity.md
 cd mobile\android
 .\gradlew.bat testDebugUnitTest lintDebug assembleDebug
 ```

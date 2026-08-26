@@ -1,5 +1,7 @@
 # Siming 3.0 Security Review
 
+> 历史说明：本文记录 3.0.1 时点的审查结论，不是当前 3.3.x 的完整安全状态。现行 Gateway 边界见 [Gateway 威胁模型](gateway-threat-model.md)，当前 Windows 更新规则见 [未签名更新策略](../unsigned-update-policy.md) 与根目录 [Windows 安装与发布](../../PACKAGING.md)。
+
 Reviewed for `3.0.1`. This review covers repository code and deterministic tests; it is not a third-party penetration test.
 
 ## Closed Findings

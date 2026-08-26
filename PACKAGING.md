@@ -66,7 +66,7 @@ release\Siming-Setup.sha256
 
 `.siming-installed` 是安装版标记，更新器用它识别正式安装布局。这样日常启动不再依赖 onefile 每次启动时的完整自解包流程，运行时文件也可以由安装器统一覆盖和维护。
 
-构建脚本会根据 `backend/app/version.py` 中的 `APP_VERSION` 自动生成并嵌入 Windows 版本资源。安装后的 `Siming.exe` 包含 `CompanyName=teangtang1122`、`ProductName=司命 (Siming)`、文件说明、原始文件名以及文件/产品版本；例如应用版本 `3.3.0` 对应 Windows 数值文件版本 `3.3.0.0`。构建完成后会读取 PE 版本信息并校验这些字段，避免发布空白或版本漂移的主程序。
+构建脚本会根据 `backend/app/version.py` 中的 `APP_VERSION` 自动生成并嵌入 Windows 版本资源。安装后的 `Siming.exe` 包含 `CompanyName=teangtang1122`、`ProductName=司命 (Siming)`、文件说明、原始文件名以及文件/产品版本；应用版本 `X.Y.Z` 对应 Windows 数值文件版本 `X.Y.Z.0`。构建完成后会读取 PE 版本信息并校验这些字段，避免发布空白或版本漂移的主程序。
 
 ## 构建机要求
 
@@ -227,8 +227,9 @@ GitHub Actions 使用 `SIMING_ANDROID_KEYSTORE_BASE64` 保存同一密钥的 Bas
 构建和验证：
 
 ```powershell
+$version = (Get-Content frontend\package.json -Raw | ConvertFrom-Json).version
 .\scripts\build-android-release.ps1
-.\scripts\verify-android-release.ps1 -ExpectedVersion 3.2.1
+.\scripts\verify-android-release.ps1 -ExpectedVersion $version
 ```
 
 ## Gateway 容器

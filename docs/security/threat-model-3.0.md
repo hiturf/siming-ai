@@ -1,5 +1,7 @@
 # Siming 3.0 Threat Model
 
+> 历史说明：本文是 3.0 RC 阶段的桌面威胁模型快照，不描述后来加入的 Gateway 网络监听、Android 同步和当前未签名安装包策略。现行 Gateway 边界见 [Gateway 威胁模型](gateway-threat-model.md)，当前 Windows 更新规则见 [未签名更新策略](../unsigned-update-policy.md) 与根目录 [Windows 安装与发布](../../PACKAGING.md)。
+
 Status: RC review
 Scope: Windows desktop executable, loopback FastAPI service, SQLite data, local CLI/MCP integrations, model providers, updater and GitHub Releases.
 
