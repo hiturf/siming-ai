@@ -287,6 +287,20 @@ def test_artifact_patch_is_atomic_and_reports_downstream_impact():
     assert session.draft_json == saved
 
 
+def test_serializing_creation_artifact_does_not_mutate_the_session():
+    db = _db()
+    session = _ready_session(db)
+    draft = deepcopy(session.draft_json)
+    draft["updated_at"] = "2000-01-01T00:00:00Z"
+    session.draft_json = draft
+    saved = deepcopy(session.draft_json)
+
+    artifact = serialize_creation_artifact(session, "macro_outline")
+
+    assert artifact["data"]
+    assert session.draft_json == saved
+
+
 def test_artifact_patch_accepts_standard_json_patch_add_to_array():
     db = _db()
     session = _ready_session(db)

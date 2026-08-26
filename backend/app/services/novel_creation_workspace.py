@@ -510,7 +510,7 @@ def serialize_creation_artifact(session: NovelCreationSession, stage: str) -> di
     """Return one creation artifact with its workflow and provenance metadata."""
     if stage not in STAGE_ORDER:
         raise ValueError(f"unknown stage: {stage}")
-    draft = deepcopy(initialize_session_draft(session))
+    draft = deepcopy(initialize_session_draft(session, persist=False))
     state = _dict(_dict(draft.get("stages")).get(stage))
     flow = build_stage_flow(session, draft)["items"][stage]
     locks = _dict(draft.get("artifact_locks"))
