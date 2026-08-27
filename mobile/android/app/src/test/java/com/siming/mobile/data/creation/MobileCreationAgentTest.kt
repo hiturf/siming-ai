@@ -153,6 +153,33 @@ class MobileCreationAgentTest {
         assertTrue(draft.objectValue("concept_seeds").containsKey("concept-1"))
     }
 
+    @Test
+    fun editingCreationConstraintsKeepsPcFormProjectionAndStalesDownstreamArtifacts() {
+        var session = agent.start(
+            CreationStartInput(
+                creationMode = "explore",
+                brief = "一个关于选择的故事",
+                targetWords = 600_000,
+            ),
+        )
+        session = agent.confirmStage(session, "constraints")
+        session = agent.confirmStage(session, "concepts", conceptData())
+        val changedConstraints = JsonObject(
+            session.objectValue("draft").objectValue("form").toMutableMap().apply {
+                put("target_words", JsonPrimitive(800_000))
+            },
+        )
+
+        val updated = agent.replaceArtifact(session, "constraints", changedConstraints, "author")
+        val draft = updated.objectValue("draft")
+        val stages = draft.objectValue("stages")
+
+        assertEquals(changedConstraints, draft.objectValue("form"))
+        assertEquals("generated", stages.objectValue("constraints").string("status"))
+        assertEquals("stale", stages.objectValue("concepts").string("status"))
+        assertTrue(stages.objectValue("concepts").string("stale_reason").contains("创作约束"))
+    }
+
     private fun conceptData(): JsonObject = buildJsonObject {
         put("options", buildJsonArray {
             add(buildJsonObject {

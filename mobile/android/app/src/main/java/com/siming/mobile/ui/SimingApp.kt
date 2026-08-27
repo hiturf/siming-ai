@@ -383,7 +383,7 @@ private fun LibraryScreen(
                     EmptyPanel(
                         icon = Icons.AutoMirrored.Outlined.LibraryBooks,
                         title = "这里还没有作品",
-                        detail = "可以从零立项，也可以导入 TXT；连接 PC Gateway 后还可直接导入 DOCX。",
+                        detail = "可以从零立项，也可以直接导入 TXT 或 DOCX；连接 PC Gateway 时会自动使用 PC 权威导入服务。",
                     )
                 }
             } else {

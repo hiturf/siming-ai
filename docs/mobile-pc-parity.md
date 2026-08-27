@@ -13,7 +13,7 @@ PC 是小说数据、领域副作用和上下文治理的唯一权威实现。An
 | `assistant.workspace` | workspace assistant stream / MobileWorkspaceAgent | 调用 PC 权威接口 | 明确阻止 | 明确降级实现 | 部分对齐 |
 | `authoring.chapter` | /api/v1/projects/{project_id}/chapters | 调用 PC 权威接口 | 修订队列回放 | 修订队列回放 | 已对齐 |
 | `authoring.character` | /api/v1/projects/{project_id}/characters | 调用 PC 权威接口 | 修订队列回放 | 修订队列回放 | 已对齐 |
-| `authoring.document_import` | /api/v1/import/project-file | 调用 PC 权威接口 | 明确降级实现 | 明确降级实现 | 部分对齐 |
+| `authoring.document_import` | /api/v1/import/project-file | 调用 PC 权威接口 | 本地副本 | 本地副本 | 部分对齐 |
 | `authoring.export` | /api/v1/projects/{project_id}/export | 调用 PC 权威接口 | 明确降级实现 | 明确降级实现 | 部分对齐 |
 | `authoring.outline` | /api/v1/projects/{project_id}/outline | 调用 PC 权威接口 | 修订队列回放 | 修订队列回放 | 已对齐 |
 | `authoring.project` | /api/v1/projects/{project_id} | 调用 PC 权威接口 | 修订队列回放 | 修订队列回放 | 已对齐 |
@@ -83,10 +83,10 @@ PC 是小说数据、领域副作用和上下文治理的唯一权威实现。An
 - **幂等限制：** Android 一次只提交一个导入文件；服务端当前未接收独立 request key。
 - **PC：** PC 权威实现
 - **Android 在线：** 调用 PC 权威接口
-- **Android 离线：** 明确降级实现：离线只解析 TXT；DOCX 必须连接 PC Gateway，避免在 Android 复制第二套 Word 解析和批量建档实现。
-- **Android 独立 Agent：** 明确降级实现：手机独立模式可本地导入 TXT；DOCX 连接 Gateway 后复用 PC 权威导入服务。
+- **Android 离线：** 本地副本：本机直接解析 TXT / DOCX，TXT 与 PC 共用多编码回归样本且严格拒绝替换字符；作品和章节在同一本地事务中写入后进入 outbox。
+- **Android 独立 Agent：** 本地副本：手机独立模式可直接导入与 PC 相同的 TXT / DOCX，不要求 PC 正在运行。
 - **已知缺口：**
-  - 离线和手机独立模式不解析 DOCX；连接 PC 后 Android 已可选择并上传 DOCX 到同一权威导入入口。
+  - 离线和手机独立导入先在本地事务中建档，再经 outbox 回放，不会生成 PC 单次导入接口的服务端操作审计记录；TXT / DOCX 输入格式和 TXT 编码结果已对齐。
 
 ### `authoring.export` — 小说 TXT / Word / PDF 导出与本机保存
 
@@ -258,7 +258,7 @@ PC 是小说数据、领域副作用和上下文治理的唯一权威实现。An
 - **PC：** PC 权威实现
 - **Android 在线：** 调用 PC 权威接口
 - **Android 离线：** 本地副本：会话先保存在手机，正式归档后进入规范同步。
-- **Android 独立 Agent：** 明确降级实现：使用与 PC 构建时导出的 V3 PromptSpec、阶段结构、标准化、依赖失效和最终建档门槛；新增结构化建档页后，创意选择、阶段生成/编辑/确认、最终审阅和正式建档体验与 PC 对齐。手机独立执行仍没有 PC 服务端 durable Operation/AgentRun 审计记录。
+- **Android 独立 Agent：** 明确降级实现：使用与 PC 构建时导出的 V3 PromptSpec、八个完整阶段（包含创作约束）、标准化、依赖失效和最终建档门槛；结构化建档页中的创意选择、阶段生成/编辑/确认、最终审阅和正式建档体验与 PC 对齐。手机独立执行仍没有 PC 服务端 durable Operation/AgentRun 审计记录。
 - **已知缺口：**
   - 手机独立模式没有 PC 服务端 durable Operation/AgentRun 的暂停、恢复与审计记录；建档数据结构、确认门槛和用户操作已通过同源契约与回归测试对齐。
 

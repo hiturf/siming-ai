@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "utf8",
+      "filename": "utf8.txt",
+      "expected_encoding": "UTF-8",
+      "text": "第一章 风起\n这里是 UTF-8 正文。",
+      "base64": "56ys5LiA56ugIOmjjui1twrov5nph4zmmK8gVVRGLTgg5q2j5paH44CC"
+    },
+    {
+      "name": "utf8_bom",
+      "filename": "utf8_bom.txt",
+      "expected_encoding": "UTF-8 BOM",
+      "text": "第一章 风起\n这里是带 BOM 的正文。",
+      "base64": "77u/56ys5LiA56ugIOmjjui1twrov5nph4zmmK/luKYgQk9NIOeahOato+aWh+OAgg=="
+    },
+    {
+      "name": "utf16le",
+      "filename": "utf16le.txt",
+      "expected_encoding": "UTF-16LE",
+      "text": "第一章 风起\n这是 UTF-16LE 正文。",
+      "base64": "LHsATuB6IADOmHeNCgDZjy9mIABVAFQARgAtADEANgBMAEUAIABja4dlAjA="
+    },
+    {
+      "name": "utf16be_bom",
+      "filename": "utf16be_bom.txt",
+      "expected_encoding": "UTF-16BE",
+      "text": "第一章 风起\n这是 UTF-16BE 正文。",
+      "base64": "/v97LE4AeuAAIJjOjXcACo/ZZi8AIABVAFQARgAtADEANgBCAEUAIGtjZYcwAg=="
+    },
+    {
+      "name": "gb18030",
+      "filename": "gb18030.txt",
+      "expected_encoding": "GB18030",
+      "text": "第一章 风起\n这为国后发里时会来个们说对从实还进。",
+      "base64": "tdrSu9XCILfnxvAK1eLOqrn6uvO3osDvyrG74cC0uPbDx8u1ttS008q1u7m9+KGj"
+    },
+    {
+      "name": "big5_android_private_use_ambiguity",
+      "filename": "big5_android_private_use_ambiguity.txt",
+      "expected_encoding": "Big5",
+      "text": "第一章 風起\n夜色籠罩古城，劍客踏入酒館。",
+      "base64": "ssSkQLO5IK23sF8KqV2m4sWiuG6laquwoUG8Q6vIvfGkSrBzwF2hQw=="
+    },
+    {
+      "name": "big5",
+      "filename": "big5.txt",
+      "expected_encoding": "Big5",
+      "text": "第一章 風起\n這為國後發裡時會來個們說對從實還進。",
+      "base64": "ssSkQLO5IK23sF8Ks2+ssLDqq+G1b7jMrsm3fKjTrdOtzLuhue+xcbnqwdm2aaFD"
+    }
+  ]
+}

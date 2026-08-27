@@ -13,6 +13,22 @@ import org.junit.Test
 
 class CreationWorkbenchContractTest {
     @Test
+    fun visibleStagesPreservePcOrderIncludingCreationConstraints() {
+        val order = listOf("constraints", "concepts", "world_style", "final_review")
+        val labels = mapOf(
+            "constraints" to "创作约束",
+            "concepts" to "创意方向",
+            "world_style" to "文风与世界观",
+            "final_review" to "最终审阅",
+        )
+
+        val visible = CreationWorkbenchContract.visibleStages(order, labels)
+
+        assertEquals(order, visible.map { it.first })
+        assertEquals("constraints" to "创作约束", visible.first())
+    }
+
+    @Test
     fun archiveReadinessMatchesPcFinalizationGate() {
         val stages = mutableMapOf<String, JsonObject>()
         CreationWorkbenchContract.requiredArchiveStages.forEach { stage ->
