@@ -332,27 +332,43 @@ class DirectApiClient(
         } else {
             "chat/completions"
         }
+        var effectiveToolChoice = providerSafeToolChoice(config, toolChoice)
         var lastError: Throwable? = null
-        for (endpoint in endpointCandidates(config.baseUrl, path)) {
-            try {
-                val payload = if (protocol == DirectApiConfig.PROTOCOL_RESPONSES) {
-                    responsesAgentPayload(config, messages, tools, toolChoice, maxOutputTokens, temperature, extraBody)
-                } else {
-                    chatAgentPayload(config, messages, tools, toolChoice, maxOutputTokens, temperature, extraBody)
+        endpointLoop@ for (endpoint in endpointCandidates(config.baseUrl, path)) {
+            while (true) {
+                try {
+                    val payload = if (protocol == DirectApiConfig.PROTOCOL_RESPONSES) {
+                        responsesAgentPayload(
+                            config, messages, tools, effectiveToolChoice,
+                            maxOutputTokens, temperature, extraBody,
+                        )
+                    } else {
+                        chatAgentPayload(
+                            config, messages, tools, effectiveToolChoice,
+                            maxOutputTokens, temperature, extraBody,
+                        )
+                    }
+                    val response = executeWithRetry(endpoint, config.apiKey, json.encodeToString(payload))
+                    if (response.statusCode in PATH_FALLBACK_STATUS_CODES) break
+                    ensureSuccess(response)
+                    val root = json.parseToJsonElement(response.body).jsonObject
+                    return if (protocol == DirectApiConfig.PROTOCOL_RESPONSES) {
+                        parseResponsesAgentTurn(root)
+                    } else {
+                        parseChatAgentTurn(root)
+                    }
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    lastError = error
+                    if (effectiveToolChoice != null && error.isToolChoiceRejection()) {
+                        effectiveToolChoice = null
+                        continue
+                    }
+                    if (error is DirectApiHttpException && error.statusCode in PATH_FALLBACK_STATUS_CODES) {
+                        break
+                    }
+                    break@endpointLoop
                 }
-                val response = executeWithRetry(endpoint, config.apiKey, json.encodeToString(payload))
-                if (response.statusCode in PATH_FALLBACK_STATUS_CODES) continue
-                ensureSuccess(response)
-                val root = json.parseToJsonElement(response.body).jsonObject
-                return if (protocol == DirectApiConfig.PROTOCOL_RESPONSES) {
-                    parseResponsesAgentTurn(root)
-                } else {
-                    parseChatAgentTurn(root)
-                }
-            } catch (error: Exception) {
-                if (error is CancellationException) throw error
-                lastError = error
-                if (error !is DirectApiHttpException || error.statusCode !in PATH_FALLBACK_STATUS_CODES) break
             }
         }
         throw lastError ?: IOException("API 地址没有提供 $path 接口")
@@ -386,38 +402,73 @@ class DirectApiClient(
         } else {
             "chat/completions"
         }
-        val payload = if (protocol == DirectApiConfig.PROTOCOL_RESPONSES) {
-            responsesAgentPayload(
-                config, messages, tools, toolChoice, maxOutputTokens, temperature, extraBody,
-                stream = true,
-            )
-        } else {
-            chatAgentPayload(
-                config, messages, tools, toolChoice, maxOutputTokens, temperature, extraBody,
-                stream = true,
-            )
-        }
-        val body = json.encodeToString(payload)
+        var effectiveToolChoice = providerSafeToolChoice(config, toolChoice)
+        var visibleOutputEmitted = false
         var lastError: Throwable? = null
-        for (endpoint in endpointCandidates(config.baseUrl, path)) {
-            try {
-                return executeAgentStream(
-                    endpoint = endpoint,
-                    apiKey = config.apiKey,
-                    body = body,
-                    protocol = protocol,
-                    onContentDelta = onContentDelta,
-                    onReasoningDelta = onReasoningDelta,
-                )
-            } catch (error: Exception) {
-                if (error is CancellationException) throw error
-                lastError = error
-                if (error !is DirectApiHttpException || error.statusCode !in PATH_FALLBACK_STATUS_CODES) {
-                    break
+        endpointLoop@ for (endpoint in endpointCandidates(config.baseUrl, path)) {
+            while (true) {
+                val payload = if (protocol == DirectApiConfig.PROTOCOL_RESPONSES) {
+                    responsesAgentPayload(
+                        config, messages, tools, effectiveToolChoice,
+                        maxOutputTokens, temperature, extraBody, stream = true,
+                    )
+                } else {
+                    chatAgentPayload(
+                        config, messages, tools, effectiveToolChoice,
+                        maxOutputTokens, temperature, extraBody, stream = true,
+                    )
+                }
+                try {
+                    return executeAgentStream(
+                        endpoint = endpoint,
+                        apiKey = config.apiKey,
+                        body = json.encodeToString(payload),
+                        protocol = protocol,
+                        onContentDelta = { delta ->
+                            visibleOutputEmitted = true
+                            onContentDelta(delta)
+                        },
+                        onReasoningDelta = { delta ->
+                            visibleOutputEmitted = true
+                            onReasoningDelta(delta)
+                        },
+                    )
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    lastError = error
+                    if (
+                        effectiveToolChoice != null &&
+                        !visibleOutputEmitted &&
+                        error.isToolChoiceRejection()
+                    ) {
+                        effectiveToolChoice = null
+                        continue
+                    }
+                    if (error is DirectApiHttpException && error.statusCode in PATH_FALLBACK_STATUS_CODES) {
+                        break
+                    }
+                    break@endpointLoop
                 }
             }
         }
         throw lastError ?: IOException("API 地址没有提供 $path 接口")
+    }
+
+    /** Match the provider compatibility policy used by the PC model gateway. */
+    private fun providerSafeToolChoice(config: DirectApiConfig, requested: String?): String? {
+        if (requested == null) return null
+        val providerIdentity = listOf(config.displayName, config.baseUrl, config.model)
+            .joinToString(" ")
+            .lowercase()
+        return requested.takeUnless {
+            TOOL_CHOICE_UNSUPPORTED_THINKING_PROVIDERS.any(providerIdentity::contains)
+        }
+    }
+
+    private fun Throwable.isToolChoiceRejection(): Boolean {
+        if (this !is DirectApiHttpException) return false
+        val detail = message.orEmpty().lowercase()
+        return "tool_choice" in detail || "tool choice" in detail
     }
 
     private suspend fun completeResolved(
@@ -1283,6 +1334,7 @@ class DirectApiClient(
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val TRANSIENT_STATUS_CODES = setOf(500, 502, 503, 504)
         private val PATH_FALLBACK_STATUS_CODES = setOf(404, 405)
+        private val TOOL_CHOICE_UNSUPPORTED_THINKING_PROVIDERS = setOf("deepseek", "gemini")
         private val INCOMPLETE_FINISH_REASONS = setOf(
             "length",
             "max_tokens",

@@ -5,6 +5,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -389,6 +390,167 @@ class DirectApiClientTest {
         assertEquals("list_chapters", turn.toolCalls.single().name)
         assertEquals("call-r", turn.toolCalls.single().id)
         assertEquals(41, turn.promptTokens)
+    }
+
+    @Test
+    fun `deepseek thinking stream omits unsupported tool choice without disabling thinking`() = withServer(
+        object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+                assertFalse("tool_choice" in body)
+                assertEquals(
+                    "enabled",
+                    body.getValue("thinking").jsonObject.getValue("type").jsonPrimitive.content,
+                )
+                return sseResponse(
+                    """{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-deepseek","function":{"name":"get_project_info","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}""",
+                )
+            }
+        },
+    ) { server ->
+        val turn = runBlocking {
+            testClient().streamAgentTurn(
+                config(server, DirectApiConfig.PROTOCOL_CHAT_COMPLETIONS).copy(
+                    displayName = "DeepSeek",
+                    model = "deepseek-v4-pro",
+                ),
+                messages = listOf(buildJsonObject { put("role", "user"); put("content", "读取") }),
+                tools = singleTool("get_project_info"),
+                toolChoice = "required",
+                extraBody = buildJsonObject {
+                    put("thinking", buildJsonObject { put("type", "enabled") })
+                },
+            )
+        }
+        assertEquals("get_project_info", turn.toolCalls.single().name)
+    }
+
+    @Test
+    fun `gemini responses stream omits unsupported tool choice`() = withServer(
+        object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+                assertFalse("tool_choice" in body)
+                return sseResponse(
+                    """{"type":"response.output_item.added","item":{"type":"function_call","id":"item-gemini","call_id":"call-gemini","name":"list_chapters","arguments":"{}"}}""",
+                    """{"type":"response.completed","response":{"status":"completed","output":[]}}""",
+                )
+            }
+        },
+    ) { server ->
+        val turn = runBlocking {
+            testClient().streamAgentTurn(
+                config(server, DirectApiConfig.PROTOCOL_RESPONSES).copy(
+                    displayName = "Google Gemini",
+                    model = "gemini-2.5-flash",
+                ),
+                messages = listOf(buildJsonObject { put("role", "user"); put("content", "列出章节") }),
+                tools = singleTool("list_chapters"),
+                toolChoice = "auto",
+            )
+        }
+        assertEquals("list_chapters", turn.toolCalls.single().name)
+    }
+
+    @Test
+    fun `chat agent stream retries once without rejected tool choice`() {
+        val attempts = AtomicInteger()
+        withServer(
+            object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+                    return if (attempts.incrementAndGet() == 1) {
+                        assertEquals("required", body.getValue("tool_choice").jsonPrimitive.content)
+                        jsonResponse(
+                            """{"error":{"message":"thinking mode does not support this tool_choice"}}""",
+                            400,
+                        )
+                    } else {
+                        assertFalse("tool_choice" in body)
+                        sseResponse(
+                            """{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-retry","function":{"name":"get_project_info","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}""",
+                        )
+                    }
+                }
+            },
+        ) { server ->
+            val turn = runBlocking {
+                testClient().streamAgentTurn(
+                    config(server, DirectApiConfig.PROTOCOL_CHAT_COMPLETIONS),
+                    messages = listOf(buildJsonObject { put("role", "user"); put("content", "读取") }),
+                    tools = singleTool("get_project_info"),
+                    toolChoice = "required",
+                )
+            }
+            assertEquals("get_project_info", turn.toolCalls.single().name)
+            assertEquals(2, attempts.get())
+        }
+    }
+
+    @Test
+    fun `responses agent turn retries once without rejected tool choice`() {
+        val attempts = AtomicInteger()
+        withServer(
+            object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+                    return if (attempts.incrementAndGet() == 1) {
+                        assertEquals("auto", body.getValue("tool_choice").jsonPrimitive.content)
+                        jsonResponse(
+                            """{"error":{"message":"Thinking mode does not support this tool choice"}}""",
+                            400,
+                        )
+                    } else {
+                        assertFalse("tool_choice" in body)
+                        jsonResponse(
+                            """{"output":[{"type":"function_call","call_id":"call-responses-retry","name":"list_chapters","arguments":"{}"}]}""",
+                        )
+                    }
+                }
+            },
+        ) { server ->
+            val turn = runBlocking {
+                testClient().agentTurn(
+                    config(server, DirectApiConfig.PROTOCOL_RESPONSES),
+                    messages = listOf(buildJsonObject { put("role", "user"); put("content", "列出章节") }),
+                    tools = singleTool("list_chapters"),
+                    toolChoice = "auto",
+                )
+            }
+            assertEquals("list_chapters", turn.toolCalls.single().name)
+            assertEquals(2, attempts.get())
+        }
+    }
+
+    @Test
+    fun `tool choice rejection after visible output is not replayed`() {
+        val attempts = AtomicInteger()
+        withServer(
+            object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    attempts.incrementAndGet()
+                    return sseResponse(
+                        """{"type":"response.output_text.delta","delta":"已输出片段"}""",
+                        """{"type":"response.failed","error":{"message":"thinking mode does not support this tool_choice"}}""",
+                    )
+                }
+            },
+        ) { server ->
+            val content = mutableListOf<String>()
+            assertFailsWith<DirectApiHttpException> {
+                runBlocking {
+                    testClient().streamAgentTurn(
+                        config(server, DirectApiConfig.PROTOCOL_RESPONSES),
+                        messages = listOf(buildJsonObject { put("role", "user"); put("content", "继续") }),
+                        tools = singleTool("list_chapters"),
+                        toolChoice = "required",
+                        onContentDelta = { content += it },
+                    )
+                }
+            }
+            assertEquals(listOf("已输出片段"), content)
+            assertEquals(1, attempts.get())
+        }
     }
 
     @Test
