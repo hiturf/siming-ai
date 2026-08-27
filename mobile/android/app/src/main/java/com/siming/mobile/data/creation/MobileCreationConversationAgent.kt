@@ -74,9 +74,6 @@ internal class MobileCreationConversationAgent(
         messages += CreationAgentTurnRecords.replayMessages(turns)
         val userMessage = chatMessage("user", message)
         messages += userMessage
-        val extraBody = if (config.isDeepSeek()) buildJsonObject {
-            put("thinking", buildJsonObject { put("type", "disabled") })
-        } else null
 
         var finalReply = ""
         var iteration = 0
@@ -119,7 +116,6 @@ internal class MobileCreationConversationAgent(
                 },
                 maxOutputTokens = 6_000,
                 temperature = 0.25,
-                extraBody = extraBody,
                 onContentDelta = ::emitReplyDelta,
             )
             promptMetrics += promptMetric(
@@ -280,6 +276,11 @@ internal class MobileCreationConversationAgent(
                 "user",
                 "请根据以上真实工具结果，用两到四句中文说明本轮实际写入/读取了什么，然后提出一个基于当前数据缺口的后续问题。不要声称失败的写入已保存。",
             )
+            // This is a text-only summary, matching the PC DeepSeek adapter's
+            // plain-text path. Tool-capable turns above keep thinking enabled.
+            val summaryExtraBody = if (config.isDeepSeek()) buildJsonObject {
+                put("thinking", buildJsonObject { put("type", "disabled") })
+            } else null
             val summaryTurn = runCatching {
                 directApi.streamAgentTurn(
                     config = config,
@@ -287,7 +288,7 @@ internal class MobileCreationConversationAgent(
                     tools = JsonArray(emptyList()),
                     maxOutputTokens = 1_200,
                     temperature = 0.2,
-                    extraBody = extraBody,
+                    extraBody = summaryExtraBody,
                     onContentDelta = ::emitReplyDelta,
                 )
             }.getOrNull()
@@ -885,7 +886,8 @@ internal class MobileCreationConversationAgent(
     private fun JsonObject.intOrNull(name: String): Int? = (get(name) as? JsonPrimitive)?.intOrNull
     private fun JsonObject.stageState(stage: String): JsonObject = objectValue("draft").objectValue("stages").objectValue(stage)
     private fun JsonObject.stageData(stage: String): JsonObject = stageState(stage)["data"] as? JsonObject ?: JsonObject(emptyMap())
-    private fun DirectApiConfig.isDeepSeek(): Boolean = listOf(displayName, baseUrl, model).any { it.contains("deepseek", ignoreCase = true) }
+    private fun DirectApiConfig.isDeepSeek(): Boolean =
+        listOf(displayName, baseUrl, model).any { it.contains("deepseek", ignoreCase = true) }
 
     private data class ToolExecution(
         val session: JsonObject,

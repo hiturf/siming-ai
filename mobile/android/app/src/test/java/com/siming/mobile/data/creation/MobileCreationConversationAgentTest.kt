@@ -135,6 +135,42 @@ class MobileCreationConversationAgentTest {
     }
 
     @Test
+    fun `deepseek standalone conversation preserves thinking and omits unsupported tool choice`() {
+        val requests = AtomicInteger()
+        withServer(object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+                assertFalse("tool_choice" in body)
+                assertFalse("thinking" in body)
+                return if (requests.getAndIncrement() == 0) {
+                    chatStreamResponse(
+                        """{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-categories","type":"function","function":{"name":"set_tool_categories","arguments":"{\"enabled_categories\":[\"creation_data\"]}"}}]}}]}""",
+                    )
+                } else {
+                    chatStreamResponse(
+                        """{"choices":[{"message":{"role":"assistant","content":"思考模式与工具调用可以共同工作。"}}]}""",
+                    )
+                }
+            }
+        }) { server ->
+            val result = runBlocking {
+                agent().run(
+                    source = session(),
+                    message = "先检查当前资料",
+                    turns = emptyList(),
+                    config = config(server).copy(
+                        displayName = "DeepSeek",
+                        model = "deepseek-v4-pro",
+                    ),
+                )
+            }
+
+            assertEquals(2, requests.get())
+            assertEquals("思考模式与工具调用可以共同工作。", result.reply)
+        }
+    }
+
+    @Test
     fun `standalone agent rejects text before selecting tool categories`() {
         withServer(object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
