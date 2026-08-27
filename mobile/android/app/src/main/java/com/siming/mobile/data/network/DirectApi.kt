@@ -5,6 +5,7 @@ import java.util.concurrent.TimeUnit
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -120,6 +121,17 @@ private data class DirectStreamEvent(
     val terminal: Boolean = false,
     val error: String? = null,
 )
+
+private data class DirectAgentToolCallBuffer(
+    var id: String = "",
+    var name: String = "",
+    val arguments: StringBuilder = StringBuilder(),
+) {
+    fun replaceArguments(value: String) {
+        arguments.clear()
+        arguments.append(value)
+    }
+}
 
 private class DirectResumeHandshake(
     private val expectedPrefix: String,
@@ -346,6 +358,68 @@ class DirectApiClient(
         throw lastError ?: IOException("API 地址没有提供 $path 接口")
     }
 
+    /**
+     * A native function-calling turn whose visible text and reasoning are
+     * delivered from the provider SSE stream as they arrive. Tool calls are
+     * buffered until the provider marks the turn complete, so an interrupted
+     * stream can never execute partial JSON arguments.
+     */
+    suspend fun streamAgentTurn(
+        config: DirectApiConfig,
+        messages: List<JsonObject>,
+        tools: JsonArray,
+        toolChoice: String? = null,
+        maxOutputTokens: Int = 4_000,
+        temperature: Double = 0.3,
+        extraBody: JsonObject? = null,
+        onContentDelta: suspend (String) -> Unit = {},
+        onReasoningDelta: suspend (String) -> Unit = {},
+    ): DirectAgentTurn {
+        validateConfig(config)
+        val protocol = if (config.protocol == DirectApiConfig.PROTOCOL_RESPONSES) {
+            DirectApiConfig.PROTOCOL_RESPONSES
+        } else {
+            DirectApiConfig.PROTOCOL_CHAT_COMPLETIONS
+        }
+        val path = if (protocol == DirectApiConfig.PROTOCOL_RESPONSES) {
+            "responses"
+        } else {
+            "chat/completions"
+        }
+        val payload = if (protocol == DirectApiConfig.PROTOCOL_RESPONSES) {
+            responsesAgentPayload(
+                config, messages, tools, toolChoice, maxOutputTokens, temperature, extraBody,
+                stream = true,
+            )
+        } else {
+            chatAgentPayload(
+                config, messages, tools, toolChoice, maxOutputTokens, temperature, extraBody,
+                stream = true,
+            )
+        }
+        val body = json.encodeToString(payload)
+        var lastError: Throwable? = null
+        for (endpoint in endpointCandidates(config.baseUrl, path)) {
+            try {
+                return executeAgentStream(
+                    endpoint = endpoint,
+                    apiKey = config.apiKey,
+                    body = body,
+                    protocol = protocol,
+                    onContentDelta = onContentDelta,
+                    onReasoningDelta = onReasoningDelta,
+                )
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                lastError = error
+                if (error !is DirectApiHttpException || error.statusCode !in PATH_FALLBACK_STATUS_CODES) {
+                    break
+                }
+            }
+        }
+        throw lastError ?: IOException("API 地址没有提供 $path 接口")
+    }
+
     private suspend fun completeResolved(
         config: DirectApiConfig,
         systemPrompt: String,
@@ -394,6 +468,7 @@ class DirectApiClient(
         maxOutputTokens: Int,
         temperature: Double,
         extraBody: JsonObject?,
+        stream: Boolean = false,
     ): JsonObject = buildJsonObject {
         put("model", config.model.trim())
         put("messages", JsonArray(messages))
@@ -401,7 +476,7 @@ class DirectApiClient(
         toolChoice?.let { put("tool_choice", it) }
         put("temperature", temperature)
         put("max_tokens", maxOutputTokens)
-        put("stream", false)
+        put("stream", stream)
         extraBody?.forEach { (key, value) -> put(key, value) }
     }
 
@@ -413,6 +488,7 @@ class DirectApiClient(
         maxOutputTokens: Int,
         temperature: Double,
         extraBody: JsonObject?,
+        stream: Boolean = false,
     ): JsonObject {
         val system = messages.firstOrNull { it.string("role") == "system" }?.string("content").orEmpty()
         val input = buildJsonArray {
@@ -467,7 +543,7 @@ class DirectApiClient(
             toolChoice?.let { put("tool_choice", it) }
             put("temperature", temperature)
             put("max_output_tokens", maxOutputTokens)
-            put("stream", false)
+            put("stream", stream)
             extraBody?.forEach { (key, value) -> put(key, value) }
         }
     }
@@ -580,6 +656,207 @@ class DirectApiClient(
             name = name,
             arguments = arguments,
         )
+    }
+
+    private suspend fun executeAgentStream(
+        endpoint: HttpUrl,
+        apiKey: String,
+        body: String,
+        protocol: String,
+        onContentDelta: suspend (String) -> Unit,
+        onReasoningDelta: suspend (String) -> Unit,
+    ): DirectAgentTurn = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url(endpoint)
+            .header("Accept", "text/event-stream")
+            .header("Authorization", "Bearer ${apiKey.trim()}")
+            .post(body.toRequestBody(JSON_MEDIA_TYPE))
+            .build()
+        val call = client.newCall(request)
+        val cancellationHandle = currentCoroutineContext()[Job]?.invokeOnCompletion { cause ->
+            if (cause is CancellationException) call.cancel()
+        }
+        try {
+            call.execute().use { response ->
+                if (!response.isSuccessful) {
+                    val raw = response.body?.string().orEmpty()
+                    ensureSuccess(RawResponse(response.code, raw))
+                }
+                val source = response.body?.source() ?: throw IOException("AI 流式响应为空")
+                val content = StringBuilder()
+                val reasoning = StringBuilder()
+                val calls = linkedMapOf<String, DirectAgentToolCallBuffer>()
+                var promptTokens: Int? = null
+                var terminalSeen = false
+                var terminalResponse: JsonObject? = null
+
+                while (true) {
+                    currentCoroutineContext().ensureActive()
+                    val line = source.readUtf8Line() ?: break
+                    if (!line.startsWith("data:")) continue
+                    val data = line.removePrefix("data:").trim()
+                    if (data.isEmpty()) continue
+                    if (data == "[DONE]") {
+                        // Responses API has a structured response.completed event.
+                        // Do not let a bare transport sentinel hide a truncated run.
+                        if (protocol != DirectApiConfig.PROTOCOL_RESPONSES) terminalSeen = true
+                        break
+                    }
+                    val root = runCatching { json.parseToJsonElement(data) as JsonObject }.getOrNull()
+                        ?: continue
+                    if (protocol == DirectApiConfig.PROTOCOL_RESPONSES) {
+                        val type = root.string("type")
+                        val responseRoot = root["response"] as? JsonObject
+                        val error = (root["error"] as? JsonObject)?.string("message")
+                            ?: (responseRoot?.get("error") as? JsonObject)?.string("message")
+                        if (!error.isNullOrBlank()) throw DirectApiHttpException(502, error)
+
+                        when {
+                            type in RESPONSE_TEXT_DELTA_TYPES -> {
+                                val delta = root.string("delta")
+                                if (delta.isNotEmpty()) {
+                                    content.append(delta)
+                                    onContentDelta(delta)
+                                }
+                            }
+                            type in RESPONSE_REASONING_DELTA_TYPES -> {
+                                val delta = root.string("delta").ifBlank { root.string("text") }
+                                if (delta.isNotEmpty()) {
+                                    reasoning.append(delta)
+                                    onReasoningDelta(delta)
+                                }
+                            }
+                        }
+
+                        val item = root["item"] as? JsonObject
+                        if (item?.string("type") == "function_call") {
+                            mergeResponseFunctionCall(calls, item, replaceArguments = type.endsWith(".done"))
+                        }
+                        if (type.contains("function_call_arguments")) {
+                            val key = root.string("item_id")
+                                .ifBlank { root.string("call_id") }
+                                .ifBlank { root.string("output_index") }
+                            val buffer = calls.getOrPut(key.ifBlank { "call-${calls.size}" }) {
+                                DirectAgentToolCallBuffer()
+                            }
+                            val arguments = root.string("arguments")
+                                .ifBlank { root.string("delta") }
+                            if (type.endsWith(".done")) buffer.replaceArguments(arguments)
+                            else buffer.arguments.append(arguments)
+                        }
+
+                        if (type in RESPONSE_TERMINAL_TYPES) {
+                            terminalSeen = true
+                            terminalResponse = responseRoot
+                            if (type != "response.completed") {
+                                val status = responseRoot?.string("status").orEmpty().ifBlank { type }
+                                throw IOException("模型流式响应未完成：$status")
+                            }
+                        }
+                        promptTokens = responseRoot?.let { promptTokens(it, "input_tokens") } ?: promptTokens
+                    } else {
+                        val choice = (root["choices"] as? JsonArray)?.firstOrNull() as? JsonObject
+                            ?: continue
+                        val delta = choice["delta"] as? JsonObject ?: JsonObject(emptyMap())
+                        val contentDelta = when (val value = delta["content"]) {
+                            is JsonPrimitive -> value.contentOrNull.orEmpty()
+                            is JsonArray -> value.mapNotNull { part ->
+                                ((part as? JsonObject)?.get("text") as? JsonPrimitive)?.contentOrNull
+                            }.joinToString("")
+                            else -> ""
+                        }
+                        if (contentDelta.isNotEmpty()) {
+                            content.append(contentDelta)
+                            onContentDelta(contentDelta)
+                        }
+                        val reasoningDelta = listOf("reasoning_content", "reasoning", "reasoning_text")
+                            .firstNotNullOfOrNull { key ->
+                                (delta[key] as? JsonPrimitive)?.contentOrNull?.takeIf(String::isNotEmpty)
+                            }.orEmpty()
+                        if (reasoningDelta.isNotEmpty()) {
+                            reasoning.append(reasoningDelta)
+                            onReasoningDelta(reasoningDelta)
+                        }
+                        (delta["tool_calls"] as? JsonArray).orEmpty().forEachIndexed { position, raw ->
+                            val streamed = raw as? JsonObject ?: return@forEachIndexed
+                            val index = (streamed["index"] as? JsonPrimitive)?.intOrNull ?: position
+                            val buffer = calls.getOrPut(index.toString()) { DirectAgentToolCallBuffer() }
+                            streamed.string("id").takeIf(String::isNotBlank)?.let { buffer.id = it }
+                            val function = streamed["function"] as? JsonObject
+                            function?.string("name")?.takeIf(String::isNotBlank)?.let {
+                                buffer.name += it
+                            }
+                            function?.string("arguments")?.takeIf(String::isNotEmpty)?.let {
+                                buffer.arguments.append(it)
+                            }
+                        }
+                        promptTokens = promptTokens(root, "prompt_tokens") ?: promptTokens
+                        if (choice.string("finish_reason").isNotBlank()) terminalSeen = true
+                    }
+                }
+
+                if (!terminalSeen) throw IOException("AI 流式连接提前结束，未收到完成事件")
+                val parsedTerminal = terminalResponse?.let(::parseResponsesAgentTurn)
+                val finalContent = content.toString().ifBlank { parsedTerminal?.content.orEmpty() }
+                val finalReasoning = reasoning.toString().ifBlank { parsedTerminal?.reasoningContent.orEmpty() }
+                val finalCalls = calls.values.distinct().mapNotNull { buffer ->
+                    parseFunctionCall(buffer.id, buffer.name, buffer.arguments.toString())
+                }.ifEmpty { parsedTerminal?.toolCalls.orEmpty() }
+                canonicalAgentTurn(
+                    content = finalContent,
+                    reasoning = finalReasoning,
+                    calls = finalCalls,
+                    promptTokens = promptTokens ?: parsedTerminal?.promptTokens,
+                )
+            }
+        } finally {
+            cancellationHandle?.dispose()
+        }
+    }
+
+    private fun mergeResponseFunctionCall(
+        calls: MutableMap<String, DirectAgentToolCallBuffer>,
+        item: JsonObject,
+        replaceArguments: Boolean,
+    ) {
+        val id = item.string("call_id").ifBlank { item.string("id") }
+        val itemId = item.string("id")
+        val key = id.ifBlank { itemId }.ifBlank { "call-${calls.size}" }
+        val buffer = calls[id] ?: calls[itemId] ?: calls.getOrPut(key) { DirectAgentToolCallBuffer() }
+        if (id.isNotBlank()) calls[id] = buffer
+        if (itemId.isNotBlank()) calls[itemId] = buffer
+        if (id.isNotBlank()) buffer.id = id
+        item.string("name").takeIf(String::isNotBlank)?.let { buffer.name = it }
+        val arguments = item.string("arguments")
+        if (replaceArguments) buffer.replaceArguments(arguments)
+        else if (arguments.isNotBlank()) buffer.arguments.append(arguments)
+    }
+
+    private fun canonicalAgentTurn(
+        content: String,
+        reasoning: String,
+        calls: List<DirectAgentToolCall>,
+        promptTokens: Int?,
+    ): DirectAgentTurn {
+        val toolCalls = buildJsonArray {
+            calls.forEach { call ->
+                add(buildJsonObject {
+                    put("id", call.id)
+                    put("type", "function")
+                    put("function", buildJsonObject {
+                        put("name", call.name)
+                        put("arguments", json.encodeToString(call.arguments))
+                    })
+                })
+            }
+        }
+        val canonical = buildJsonObject {
+            put("role", "assistant")
+            put("content", content)
+            if (reasoning.isNotBlank()) put("reasoning_content", reasoning)
+            if (calls.isNotEmpty()) put("tool_calls", toolCalls)
+        }
+        return DirectAgentTurn(content.trim(), reasoning, calls, canonical, promptTokens)
     }
 
     private fun JsonObject.string(name: String): String =
@@ -713,32 +990,40 @@ class DirectApiClient(
             .header("Authorization", "Bearer ${apiKey.trim()}")
             .post(body.toRequestBody(JSON_MEDIA_TYPE))
             .build()
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                val raw = response.body?.string().orEmpty()
-                ensureSuccess(RawResponse(response.code, raw))
-            }
-            val source = response.body?.source() ?: throw IOException("AI 流式响应为空")
-            var finishReason = ""
-            var terminalSeen = false
-            while (true) {
-                currentCoroutineContext().ensureActive()
-                val line = source.readUtf8Line() ?: break
-                if (!line.startsWith("data:")) continue
-                val data = line.removePrefix("data:").trim()
-                if (data.isEmpty()) continue
-                if (data == "[DONE]") {
-                    terminalSeen = true
-                    break
+        val call = client.newCall(request)
+        val cancellationHandle = currentCoroutineContext()[Job]?.invokeOnCompletion { cause ->
+            if (cause is CancellationException) call.cancel()
+        }
+        try {
+            call.execute().use { response ->
+                if (!response.isSuccessful) {
+                    val raw = response.body?.string().orEmpty()
+                    ensureSuccess(RawResponse(response.code, raw))
                 }
-                val root = runCatching { json.parseToJsonElement(data) as JsonObject }.getOrNull() ?: continue
-                val event = parseDirectStreamEvent(root, protocol)
-                event.error?.let { throw DirectApiHttpException(502, it) }
-                if (event.delta.isNotEmpty()) onDelta(event.delta)
-                if (event.finishReason.isNotBlank()) finishReason = event.finishReason
-                terminalSeen = terminalSeen || event.terminal
+                val source = response.body?.source() ?: throw IOException("AI 流式响应为空")
+                var finishReason = ""
+                var terminalSeen = false
+                while (true) {
+                    currentCoroutineContext().ensureActive()
+                    val line = source.readUtf8Line() ?: break
+                    if (!line.startsWith("data:")) continue
+                    val data = line.removePrefix("data:").trim()
+                    if (data.isEmpty()) continue
+                    if (data == "[DONE]") {
+                        if (protocol != DirectApiConfig.PROTOCOL_RESPONSES) terminalSeen = true
+                        break
+                    }
+                    val root = runCatching { json.parseToJsonElement(data) as JsonObject }.getOrNull() ?: continue
+                    val event = parseDirectStreamEvent(root, protocol)
+                    event.error?.let { throw DirectApiHttpException(502, it) }
+                    if (event.delta.isNotEmpty()) onDelta(event.delta)
+                    if (event.finishReason.isNotBlank()) finishReason = event.finishReason
+                    terminalSeen = terminalSeen || event.terminal
+                }
+                DirectStreamSegment(finishReason.ifBlank { "stop" }, terminalSeen)
             }
-            DirectStreamSegment(finishReason.ifBlank { "stop" }, terminalSeen)
+        } finally {
+            cancellationHandle?.dispose()
         }
     }
 
@@ -979,6 +1264,22 @@ class DirectApiClient(
 
     companion object {
         private const val STREAM_RESUME_ANCHOR_CHARS = 64
+        private val RESPONSE_TEXT_DELTA_TYPES = setOf(
+            "response.output_text.delta",
+            "output_text.delta",
+        )
+        private val RESPONSE_REASONING_DELTA_TYPES = setOf(
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+            "response.reasoning.delta",
+            "reasoning_summary_text.delta",
+            "reasoning_text.delta",
+        )
+        private val RESPONSE_TERMINAL_TYPES = setOf(
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+        )
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val TRANSIENT_STATUS_CODES = setOf(500, 502, 503, 504)
         private val PATH_FALLBACK_STATUS_CODES = setOf(404, 405)

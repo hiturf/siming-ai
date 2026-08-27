@@ -79,16 +79,17 @@ class MobileCreationConversationAgentTest {
         withServer(object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
                 val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+                assertTrue(body.getValue("stream").jsonPrimitive.content.toBoolean())
                 return when (requests.getAndIncrement()) {
                     0 -> {
                         assertEquals("required", body.getValue("tool_choice").jsonPrimitive.content)
-                        jsonResponse(
+                        chatStreamResponse(
                             """{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-categories","type":"function","function":{"name":"set_tool_categories","arguments":"{\"enabled_categories\":[\"creation_data\"]}"}}]}}],"usage":{"prompt_tokens":88}}""",
                         )
                     }
                     1 -> {
                         assertEquals("auto", body.getValue("tool_choice").jsonPrimitive.content)
-                        jsonResponse(
+                        chatStreamResponse(
                             """{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-read","type":"function","function":{"name":"get_creation_snapshot","arguments":"{}"}}]}}],"usage":{"prompt_tokens":100}}""",
                         )
                     }
@@ -105,7 +106,7 @@ class MobileCreationConversationAgentTest {
                         assertFalse("agent_conversation_id" in visibleDraft)
                         assertFalse("execution_route" in visibleDraft)
                         assertFalse("execution_host" in visibleDraft)
-                        jsonResponse(
+                        chatStreamResponse(
                             """{"choices":[{"message":{"role":"assistant","content":"已读取当前立项资料，没有修改数据。"}}],"usage":{"prompt_tokens":144}}""",
                         )
                     }
@@ -139,7 +140,8 @@ class MobileCreationConversationAgentTest {
             override fun dispatch(request: RecordedRequest): MockResponse {
                 val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
                 assertEquals("required", body.getValue("tool_choice").jsonPrimitive.content)
-                return jsonResponse(
+                assertTrue(body.getValue("stream").jsonPrimitive.content.toBoolean())
+                return chatStreamResponse(
                     """{"choices":[{"message":{"role":"assistant","content":"我已经读取并保存了设定。"}}]}""",
                 )
             }
@@ -163,17 +165,18 @@ class MobileCreationConversationAgentTest {
         withServer(object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
                 val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+                assertTrue(body.getValue("stream").jsonPrimitive.content.toBoolean())
                 return when (requests.getAndIncrement()) {
-                    0 -> jsonResponse(
+                    0 -> chatStreamResponse(
                         """{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-categories","type":"function","function":{"name":"set_tool_categories","arguments":"{\"enabled_categories\":[\"creation_data\"]}"}}]}}]}""",
                     )
-                    1 -> jsonResponse(
+                    1 -> chatStreamResponse(
                         """{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-write-one","type":"function","function":{"name":"patch_creation_session","arguments":"{\"changes\":{\"genre\":\"玄幻\"}}"}},{"id":"call-write-two","type":"function","function":{"name":"patch_creation_session","arguments":"{\"changes\":{\"target_chapters\":1000}}"}}]}}]}""",
                     )
                     else -> {
                         assertTrue(body.getValue("tools").jsonArray.isEmpty())
                         assertFalse("tool_choice" in body)
-                        jsonResponse(
+                        chatStreamResponse(
                             """{"choices":[{"message":{"role":"assistant","content":"本轮只记录了题材。下一步想补充什么？"}}]}""",
                         )
                     }
@@ -251,10 +254,26 @@ class MobileCreationConversationAgentTest {
         return candidates.first(File::isFile).readText(Charsets.UTF_8)
     }
 
-    private fun jsonResponse(body: String) = MockResponse()
-        .setResponseCode(200)
-        .setHeader("Content-Type", "application/json")
-        .setBody(body)
+    private fun chatStreamResponse(body: String): MockResponse {
+        val root = Json.parseToJsonElement(body).jsonObject
+        val message = root.getValue("choices").jsonArray.first().jsonObject.getValue("message").jsonObject
+        val finishReason = if ((message["tool_calls"] as? JsonArray).orEmpty().isNotEmpty()) {
+            "tool_calls"
+        } else {
+            "stop"
+        }
+        val event = buildJsonObject {
+            put("choices", JsonArray(listOf(buildJsonObject {
+                put("delta", message)
+                put("finish_reason", finishReason)
+            })))
+            root["usage"]?.let { put("usage", it) }
+        }
+        return MockResponse()
+            .setResponseCode(200)
+            .setHeader("Content-Type", "text/event-stream")
+            .setBody("data: $event\n\ndata: [DONE]\n\n")
+    }
 
     private fun withServer(dispatcher: Dispatcher, block: (MockWebServer) -> Unit) {
         MockWebServer().use { server ->

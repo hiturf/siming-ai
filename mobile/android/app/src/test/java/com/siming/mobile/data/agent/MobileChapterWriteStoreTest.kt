@@ -40,7 +40,7 @@ class MobileChapterWriteStoreTest {
     }
 
     @Test
-    fun `draft journal has no formal chapter commit state`() = runTest {
+    fun `draft journal marks explicit author save without losing audit record`() = runTest {
         val directory = createTempDirectory("siming-mobile-write-").toFile()
         try {
             val manifest = manifest()
@@ -62,9 +62,12 @@ class MobileChapterWriteStoreTest {
             assertNotNull(recovered)
             assertEquals(MobileChapterWriteState.GENERATED, recovered.state)
             assertEquals(
-                setOf("generating", "generated", "cancelled", "failed"),
+                setOf("generating", "generated", "cancelled", "failed", "saved"),
                 MobileChapterWriteState.ALL,
             )
+            assertEquals(runId, store.latestGenerated("p1")?.id)
+            assertEquals(MobileChapterWriteState.SAVED, store.markSaved(runId)?.state)
+            assertEquals(null, store.latestGenerated("p1"))
             assertEquals(runId, mobileChapterWriteRunId("p1", "deepseek-chat", manifest))
             assertNotEquals(runId, mobileChapterWriteRunId("p2", "deepseek-chat", manifest))
         } finally {

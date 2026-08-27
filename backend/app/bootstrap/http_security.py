@@ -123,6 +123,7 @@ REMOTE_ANDROID_AUTHORING_PATHS: dict[str, frozenset[str]] = {
     "/api/v1/import/project-file": frozenset({"POST"}),
     "/api/v1/projects/{project_id}": frozenset({"GET", "PUT"}),
     "/api/v1/projects/{project_id}/chapters": frozenset({"GET", "POST"}),
+    "/api/v1/projects/{project_id}/chapter-drafts/pending": frozenset({"GET"}),
     "/api/v1/projects/{project_id}/chapters/{chapter_id}": frozenset(
         {"GET", "PUT", "DELETE"}
     ),
@@ -172,6 +173,13 @@ REMOTE_ANDROID_AUTHORING_PATHS: dict[str, frozenset[str]] = {
     "/api/v1/projects/{project_id}/ai/workspace-assistant/stream": frozenset(
         {"POST", "HEAD"}
     ),
+    "/api/v1/projects/{project_id}/ai/assistant/conversations": frozenset({"GET"}),
+    "/api/v1/projects/{project_id}/ai/assistant/conversations/{conversation_id}": frozenset(
+        {"GET"}
+    ),
+    "/api/v1/projects/{project_id}/ai/assistant/runs": frozenset({"GET"}),
+    "/api/v1/projects/{project_id}/ai/assistant/runs/{run_id}": frozenset({"GET"}),
+    "/api/v1/projects/{project_id}/ai/assistant/runs/{run_id}/cancel": frozenset({"POST"}),
 }
 REMOTE_ANDROID_AUTHORING_ROUTES = tuple(
     (template, compile_path(template)[0], methods)

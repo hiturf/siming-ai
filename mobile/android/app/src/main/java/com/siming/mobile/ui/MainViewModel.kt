@@ -9,6 +9,9 @@ import com.siming.mobile.data.AssistantModelRoute
 import com.siming.mobile.data.MobileCatalogingProgress
 import com.siming.mobile.data.MobileExportFile
 import com.siming.mobile.data.MobileNovelImportFile
+import com.siming.mobile.data.MobilePendingChapterDraft
+import com.siming.mobile.data.MobileAssistantConversation
+import com.siming.mobile.data.MobileAssistantMessage
 import com.siming.mobile.data.creation.CreationExecutionRoute
 import com.siming.mobile.data.creation.CreationAgentProgressEvent
 import com.siming.mobile.data.creation.CreationStartInput
@@ -48,6 +51,13 @@ data class MobileUiState(
     val assistantReasoning: String = "",
     val assistantActivity: String = "",
     val assistantRunning: Boolean = false,
+    val assistantConversationId: String? = null,
+    val assistantRunId: String? = null,
+    val assistantOperationId: String? = null,
+    val assistantConversations: List<MobileAssistantConversation> = emptyList(),
+    val assistantMessages: List<MobileAssistantMessage> = emptyList(),
+    val assistantToolLog: List<String> = emptyList(),
+    val pendingChapterDraft: MobilePendingChapterDraft? = null,
     val directApi: DirectApiSummary? = null,
     val discoveredModels: List<String> = emptyList(),
     val activeCreationId: String? = null,
@@ -73,6 +83,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = SimingRepository(application)
     private val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
     private var assistantJob: Job? = null
+    private var assistantCancelRequested = false
     private var catalogingJob: Job? = null
 
     val connection = repository.connection.stateIn(
@@ -752,18 +763,44 @@ private fun updateCatalogingProgress(
     ) {
         if (prompt.isBlank() || assistantJob?.isActive == true) return
         assistantJob = viewModelScope.launch {
+            assistantCancelRequested = false
             uiState.value = uiState.value.copy(
                 assistantRunning = true,
                 assistantOutput = "",
                 assistantReasoning = "",
                 assistantActivity = "正在加载与 PC 同源的工作区流程…",
+                assistantRunId = null,
+                assistantOperationId = null,
+                assistantToolLog = emptyList(),
                 error = null,
             )
             try {
-                val route = repository.runAssistant(projectId, prompt, modelRoute) { event ->
+                val route = repository.runAssistant(
+                    projectId = projectId,
+                    prompt = prompt,
+                    modelRoute = modelRoute,
+                    conversationId = uiState.value.assistantConversationId,
+                    history = uiState.value.assistantMessages.takeLast(12).map { message ->
+                        buildJsonObject {
+                            put("role", message.role)
+                            put("content", message.content)
+                        }
+                    },
+                ) { event ->
                     val update = parseAssistantEvent(event)
                     val current = uiState.value
-                    uiState.value = uiState.value.copy(
+                    val nextDraft = when {
+                        update.draftData != null -> {
+                            val parsed = MobilePendingChapterDraft.fromJson(projectId, update.draftData)
+                            if (parsed != null && update.draftDelta != null) {
+                                val previous = current.pendingChapterDraft
+                                    ?.takeIf { it.draftId == parsed.draftId }
+                                parsed.copy(content = previous?.content.orEmpty() + update.draftDelta)
+                            } else parsed ?: current.pendingChapterDraft
+                        }
+                        else -> current.pendingChapterDraft
+                    }
+                    uiState.value = current.copy(
                         assistantOutput = when {
                             update.output == null -> current.assistantOutput
                             update.replaceOutput -> update.output
@@ -775,7 +812,19 @@ private fun updateCatalogingProgress(
                             else -> current.assistantReasoning + update.reasoning
                         },
                         assistantActivity = update.activity ?: current.assistantActivity,
+                        assistantConversationId = update.conversationId ?: current.assistantConversationId,
+                        assistantRunId = update.runId ?: current.assistantRunId,
+                        assistantOperationId = update.operationId ?: current.assistantOperationId,
+                        assistantToolLog = update.toolLog?.let {
+                            (current.assistantToolLog + it).takeLast(100)
+                        } ?: current.assistantToolLog,
+                        pendingChapterDraft = nextDraft,
                     )
+                    val runId = uiState.value.assistantRunId
+                    if (assistantCancelRequested && !runId.isNullOrBlank()) {
+                        repository.cancelAssistantRun(projectId, runId)
+                        throw CancellationException("用户取消手机工作区任务")
+                    }
                 }
                 uiState.value = uiState.value.copy(
                     assistantRunning = false,
@@ -786,57 +835,158 @@ private fun updateCatalogingProgress(
                         AssistantRoute.GatewayMobileKey ->
                             "AI 任务已使用手机 Key 执行；提示词、工具和落库流程与 PC 一致"
                         AssistantRoute.DirectApi ->
-                            "手机独立工作区任务已完成，本地产生的修改已写入手机副本"
+                            if (uiState.value.pendingChapterDraft != null) {
+                                "章节草稿已交给正文编辑器，等待你明确保存"
+                            } else {
+                                "手机独立工作区任务已完成，本地产生的修改已写入手机副本"
+                            }
                     },
                 )
+                refreshAssistantConversations(projectId, selectCurrent = true)
             } catch (_: CancellationException) {
                 uiState.value = uiState.value.copy(
                     assistantRunning = false,
                     assistantActivity = "",
+                    pendingChapterDraft = uiState.value.pendingChapterDraft?.copy(status = "cancelled"),
                     notice = "任务已取消；未提交的章节不会写入，已生成草稿可在下次相同请求中恢复",
                 )
             } catch (error: Exception) {
                 uiState.value = uiState.value.copy(
                     assistantRunning = false,
                     assistantActivity = "",
+                    pendingChapterDraft = uiState.value.pendingChapterDraft?.copy(status = "error"),
                 )
                 showError(error)
             } finally {
+                assistantCancelRequested = false
                 assistantJob = null
             }
         }
     }
 
-    fun cancelAssistant() {
+    fun cancelAssistant(projectId: String) {
         val job = assistantJob ?: return
         if (!job.isActive) return
-        uiState.value = uiState.value.copy(assistantActivity = "正在取消；不会写入未提交的章节…")
-        job.cancel(CancellationException("用户取消手机工作区任务"))
+        assistantCancelRequested = true
+        val runId = uiState.value.assistantRunId
+        uiState.value = uiState.value.copy(
+            assistantActivity = if (runId.isNullOrBlank()) {
+                "正在等待服务器登记任务并安全取消…"
+            } else {
+                "正在向服务器取消任务；不会写入未提交的章节…"
+            },
+        )
+        if (!runId.isNullOrBlank()) {
+            viewModelScope.launch {
+                runCatching { repository.cancelAssistantRun(projectId, runId) }
+                    .onSuccess {
+                        job.cancel(CancellationException("用户取消手机工作区任务"))
+                    }
+                    .onFailure { error ->
+                        assistantCancelRequested = false
+                        uiState.value = uiState.value.copy(
+                            assistantActivity = "取消请求未确认，服务器任务仍在跟踪中…",
+                        )
+                        showError(error)
+                    }
+            }
+        } else if (connection.value == null) {
+            job.cancel(CancellationException("用户取消手机工作区任务"))
+        }
     }
 
-    fun saveAssistantAsChapter(projectId: String, onSaved: () -> Unit = {}) {
-        val content = uiState.value.assistantOutput.trim()
-        if (content.isBlank()) return
+    fun restorePendingChapterDraft(projectId: String) {
+        if (uiState.value.pendingChapterDraft?.projectId == projectId) return
         viewModelScope.launch {
             try {
-                val stamp = Instant.now().toString().take(16).replace('T', ' ')
-                saveRecordInternal(
-                    projectId,
-                    "chapter",
-                    null,
-                    mapOf(
-                        "title" to "AI 生成 $stamp",
-                        "content" to content,
-                        "word_count" to content.count { !it.isWhitespace() },
-                        "current_version" to 1,
-                    ),
-                )
-                uiState.value = uiState.value.copy(notice = "AI 结果已保存为本机新章节")
-                onSaved()
+                val draft = repository.pendingChapterDraft(projectId)
+                if (draft != null) uiState.value = uiState.value.copy(pendingChapterDraft = draft)
             } catch (error: Exception) {
                 showError(error)
             }
         }
+    }
+
+    fun hidePendingChapterDraft() {
+        uiState.value = uiState.value.copy(pendingChapterDraft = null)
+    }
+
+    fun savePendingChapterDraft(
+        draft: MobilePendingChapterDraft,
+        title: String,
+        content: String,
+        catalogingMode: String,
+        onSaved: (String) -> Unit = {},
+    ) {
+        viewModelScope.launch {
+            uiState.value = uiState.value.copy(busy = true, activity = "正在保存章节草稿…", error = null)
+            try {
+                val chapterId = repository.savePendingChapterDraft(
+                    draft = draft,
+                    title = title,
+                    content = content,
+                    catalogingMode = catalogingMode,
+                )
+                uiState.value = uiState.value.copy(
+                    busy = false,
+                    activity = "",
+                    pendingChapterDraft = null,
+                    notice = if (catalogingMode == "save_and_catalog") {
+                        "章节已保存，建档任务已按你的选择启动"
+                    } else {
+                        "章节已保存；未自动建档"
+                    },
+                )
+                onSaved(chapterId)
+            } catch (error: Exception) {
+                uiState.value = uiState.value.copy(busy = false, activity = "")
+                showError(error)
+            }
+        }
+    }
+
+    fun refreshAssistantConversations(projectId: String, selectCurrent: Boolean = false) {
+        viewModelScope.launch {
+            runCatching { repository.assistantConversations(projectId) }
+                .onSuccess { conversations ->
+                    val current = uiState.value.assistantConversationId
+                    val selected = when {
+                        current != null && conversations.any { it.id == current } -> current
+                        selectCurrent -> conversations.firstOrNull()?.id
+                        else -> null
+                    }
+                    uiState.value = uiState.value.copy(
+                        assistantConversations = conversations,
+                        assistantConversationId = selected,
+                    )
+                    if (selected != null) loadAssistantConversation(projectId, selected)
+                }
+        }
+    }
+
+    fun loadAssistantConversation(projectId: String, conversationId: String) {
+        viewModelScope.launch {
+            runCatching { repository.assistantMessages(projectId, conversationId) }
+                .onSuccess { messages ->
+                    uiState.value = uiState.value.copy(
+                        assistantConversationId = conversationId,
+                        assistantMessages = messages,
+                        assistantOutput = messages.lastOrNull { it.role == "assistant" }?.content.orEmpty(),
+                        assistantToolLog = messages.lastOrNull { it.role == "assistant" }?.toolLogs.orEmpty(),
+                    )
+                }
+                .onFailure(::showError)
+        }
+    }
+
+    fun newAssistantConversation() {
+        uiState.value = uiState.value.copy(
+            assistantConversationId = null,
+            assistantMessages = emptyList(),
+            assistantOutput = "",
+            assistantReasoning = "",
+            assistantToolLog = emptyList(),
+        )
     }
 
     fun resolveConflict(conflict: LocalConflict, choice: String) = launchActivity("正在处理版本分岔…") {
@@ -946,12 +1096,43 @@ private fun updateCatalogingProgress(
                         ?.get("content")?.jsonPrimitive?.contentOrNull
                     ?: directContent.orEmpty()
                 val reasoning = data?.get("reasoning_content")?.jsonPrimitive?.contentOrNull
+                val draft = (data?.get("applied_actions") as? JsonArray)
+                    .orEmpty()
+                    .mapNotNull { it as? JsonObject }
+                    .firstOrNull { action ->
+                        action["tool"]?.jsonPrimitive?.contentOrNull == "chapter_writer" &&
+                            action["status"]?.jsonPrimitive?.contentOrNull == "ok"
+                    }
+                    ?.get("data") as? JsonObject
                 AssistantEventUpdate(
                     output = reply,
                     replaceOutput = true,
                     reasoning = reasoning,
                     replaceReasoning = reasoning != null,
                     activity = "",
+                    draftData = draft,
+                )
+            }
+            "chapter_draft" -> AssistantEventUpdate(
+                activity = detail ?: "章节草稿已生成，等待作者确认",
+                draftData = event["data"] as? JsonObject,
+            )
+            "chapter_draft_delta" -> AssistantEventUpdate(
+                activity = "章节正在正文编辑器中实时生成…",
+                draftData = event["data"] as? JsonObject,
+                draftDelta = delta,
+            )
+            "conversation" -> {
+                val conversation = event["conversation"] as? JsonObject
+                AssistantEventUpdate(conversationId = conversation?.get("id")?.jsonPrimitive?.contentOrNull)
+            }
+            "run" -> {
+                val run = event["run"] as? JsonObject
+                AssistantEventUpdate(
+                    runId = run?.get("run_id")?.jsonPrimitive?.contentOrNull
+                        ?: run?.get("id")?.jsonPrimitive?.contentOrNull,
+                    operationId = run?.get("operation_id")?.jsonPrimitive?.contentOrNull,
+                    activity = "服务端任务已登记，正在执行…",
                 )
             }
             "done" -> AssistantEventUpdate(activity = "")
@@ -960,9 +1141,13 @@ private fun updateCatalogingProgress(
                 replaceOutput = true,
                 activity = "",
             )
-            "tool_call" -> AssistantEventUpdate(activity = "模型准备调用：${tool ?: "工作区工具"}")
+            "tool_call" -> AssistantEventUpdate(
+                activity = "模型准备调用：${tool ?: "工作区工具"}",
+                toolLog = "准备调用：${tool ?: "工作区工具"}",
+            )
             "tool", "search_result", "write_result" -> AssistantEventUpdate(
                 activity = detail ?: message ?: tool?.let { "$it 已执行" } ?: "工作区工具已执行",
+                toolLog = detail ?: message ?: tool?.let { "$it 已执行" },
             )
             "search_start", "write_start" -> AssistantEventUpdate(
                 activity = message ?: tool?.let { "正在执行：$it" } ?: "正在执行工作区工具…",
@@ -985,6 +1170,12 @@ private data class AssistantEventUpdate(
     val reasoning: String? = null,
     val replaceReasoning: Boolean = false,
     val activity: String? = null,
+    val conversationId: String? = null,
+    val runId: String? = null,
+    val operationId: String? = null,
+    val toolLog: String? = null,
+    val draftData: JsonObject? = null,
+    val draftDelta: String? = null,
 )
 
 fun ReplicaEntity.payload(): JsonObject? = payloadJson?.let {

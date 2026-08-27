@@ -4,7 +4,7 @@
 
 PC 是小说数据、领域副作用和上下文治理的唯一权威实现。Android 在线模式应尽量作为薄客户端；离线模式只允许可验证回放的修订；手机独立 Agent 的降级能力必须显式记录。
 
-当前共登记 **25** 项能力：**9** 项已对齐、**16** 项部分对齐、**0** 项待实现。
+当前共登记 **26** 项能力：**9** 项已对齐、**17** 项部分对齐、**0** 项待实现。
 
 ## 总览
 
@@ -13,6 +13,7 @@ PC 是小说数据、领域副作用和上下文治理的唯一权威实现。An
 | `assistant.workspace` | workspace assistant stream / MobileWorkspaceAgent | 调用 PC 权威接口 | 明确阻止 | 明确降级实现 | 部分对齐 |
 | `authoring.chapter` | /api/v1/projects/{project_id}/chapters | 调用 PC 权威接口 | 修订队列回放 | 修订队列回放 | 已对齐 |
 | `authoring.character` | /api/v1/projects/{project_id}/characters | 调用 PC 权威接口 | 修订队列回放 | 修订队列回放 | 已对齐 |
+| `authoring.document_import` | /api/v1/import/project-file | 调用 PC 权威接口 | 明确降级实现 | 明确降级实现 | 部分对齐 |
 | `authoring.export` | /api/v1/projects/{project_id}/export | 调用 PC 权威接口 | 明确降级实现 | 明确降级实现 | 部分对齐 |
 | `authoring.outline` | /api/v1/projects/{project_id}/outline | 调用 PC 权威接口 | 修订队列回放 | 修订队列回放 | 已对齐 |
 | `authoring.project` | /api/v1/projects/{project_id} | 调用 PC 权威接口 | 修订队列回放 | 修订队列回放 | 已对齐 |
@@ -47,9 +48,9 @@ PC 是小说数据、领域副作用和上下文治理的唯一权威实现。An
 - **PC：** PC 权威实现
 - **Android 在线：** 调用 PC 权威接口
 - **Android 离线：** 明确阻止：没有 Gateway 且未配置手机直连模型时不启动 Agent。
-- **Android 独立 Agent：** 明确降级实现：提示词、工具 schema、宽粒度类别控制器与版本化上下文策略均由 PC 源生成；章节写作运行、草稿和完整 ContextManifest 已具备本地持久恢复，但通用 Agent 对话转录仍未进入 PC 的数据库级运行审计，检索仍是确定性词法降级。
+- **Android 独立 Agent：** 明确降级实现：提示词、工具 schema、宽粒度类别控制器与版本化上下文策略均由 PC 源生成；模型正文、推理和函数参数使用供应商 SSE 真流式解析，章节草稿、完整 ContextManifest、通用会话转录与工具日志均可跨重启恢复。独立运行仍不进入 PC 的数据库级 AgentRun 审计，检索仍是确定性词法降级。
 - **已知缺口：**
-  - 手机独立 Agent 的章节写作已经支持跨重启恢复；非写章工具的完整对话转录仍未进入 PC AgentRun 审计账本。
+  - 手机独立 Agent 的章节草稿、通用对话和工具日志已支持跨重启恢复，但独立运行不会伪装成 PC 数据库中的 AgentRun 审计记录。
 
 ### `authoring.chapter` — 章节创建、读取、更新和删除
 
@@ -72,6 +73,20 @@ PC 是小说数据、领域副作用和上下文治理的唯一权威实现。An
 - **Android 在线：** 调用 PC 权威接口
 - **Android 离线：** 修订队列回放
 - **Android 独立 Agent：** 修订队列回放：本地写入统一投影为 PC Character 公共契约。
+
+### `authoring.document_import` — 小说 TXT / DOCX 批量导入与章节拆分
+
+- **权威入口：** `/api/v1/import/project-file`（`pc_http`）
+- **状态：** 部分对齐
+- **副作用：** content_sync
+- **幂等策略：** `client_serialization`；必须防重
+- **幂等限制：** Android 一次只提交一个导入文件；服务端当前未接收独立 request key。
+- **PC：** PC 权威实现
+- **Android 在线：** 调用 PC 权威接口
+- **Android 离线：** 明确降级实现：离线只解析 TXT；DOCX 必须连接 PC Gateway，避免在 Android 复制第二套 Word 解析和批量建档实现。
+- **Android 独立 Agent：** 明确降级实现：手机独立模式可本地导入 TXT；DOCX 连接 Gateway 后复用 PC 权威导入服务。
+- **已知缺口：**
+  - 离线和手机独立模式不解析 DOCX；连接 PC 后 Android 已可选择并上传 DOCX 到同一权威导入入口。
 
 ### `authoring.export` — 小说 TXT / Word / PDF 导出与本机保存
 

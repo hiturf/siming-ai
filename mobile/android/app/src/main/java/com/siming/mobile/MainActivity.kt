@@ -85,7 +85,7 @@ private var importCallback: ((MobileNovelImportFile) -> Unit)? = null
         MobileNovelImportFile(name, bytes)
     }
 
-    private val textPicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+    private val importPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val callback = importCallback
         importCallback = null
         if (uri == null || callback == null) return@registerForActivityResult
@@ -115,7 +115,12 @@ private var importCallback: ((MobileNovelImportFile) -> Unit)? = null
                     },
                     onPickText = { callback ->
                         importCallback = callback
-                        textPicker.launch("text/*")
+                        importPicker.launch(
+                            arrayOf(
+                                "text/plain",
+                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            ),
+                        )
                     },
                     onSaveExport = ::saveExport,
                 )

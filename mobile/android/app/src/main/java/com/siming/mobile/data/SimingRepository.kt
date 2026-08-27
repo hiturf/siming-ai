@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.room.withTransaction
 import com.siming.mobile.BuildConfig
 import com.siming.mobile.data.agent.MobileWorkspaceAgent
+import com.siming.mobile.data.agent.MobileAssistantConversationStore
 import com.siming.mobile.data.creation.CreationExecutionRoute
 import com.siming.mobile.data.creation.CreationAgentProgressEvent
 import com.siming.mobile.data.creation.CreationStartInput
@@ -68,6 +69,7 @@ class SimingRepository(context: Context) {
     private val directApiStore = SecureApiConfigStore(appContext)
     private val api = GatewayApi(tokenStore)
     private val directApi = DirectApiClient(allowCleartextForTests = BuildConfig.DEBUG)
+    private val mobileAssistantConversationStore = MobileAssistantConversationStore(appContext)
     private val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
     private val mobileWorkspaceAgent by lazy {
         MobileWorkspaceAgent(
@@ -266,14 +268,16 @@ class SimingRepository(context: Context) {
         file: MobileNovelImportFile,
         onProgress: suspend (String) -> Unit = {},
     ): MobileNovelImportResult {
-        require(file.bytes.isNotEmpty()) { "TXT 文件内容为空" }
+        val extension = file.filename.substringAfterLast('.', "").lowercase()
+        require(extension in setOf("txt", "docx")) { "仅支持导入 TXT 或 DOCX 文件" }
+        require(file.bytes.isNotEmpty()) { "导入文件内容为空" }
         require(file.bytes.size <= MAX_NOVEL_IMPORT_BYTES) {
             "单个导入文件不能超过 20 MiB"
         }
 
         val connection = dao.connection()
         if (connection != null && prepareCanonicalWrite()) {
-            onProgress("正在将原始 TXT 一次性上传到 Gateway…")
+            onProgress("正在将原始 ${extension.uppercase()} 一次性上传到 Gateway…")
             val remote = try {
                 api.importNovelProject(connection, file.filename, file.bytes)
             } catch (error: GatewayHttpException) {
@@ -299,6 +303,7 @@ class SimingRepository(context: Context) {
                 )
             }
         }
+        require(extension == "txt") { "DOCX 导入需要连接 PC Gateway；离线模式不会复制第二套 Word 解析器" }
         return importNovelOffline(file, onProgress)
     }
 
@@ -1248,6 +1253,8 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
         projectId: String,
         prompt: String,
         modelRoute: AssistantModelRoute,
+        conversationId: String? = null,
+        history: List<JsonObject> = emptyList(),
         onEvent: suspend (String) -> Unit,
     ): AssistantRoute {
         val connection = dao.connection()
@@ -1257,18 +1264,38 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
             } else {
                 null
             }
-            api.streamAssistant(
-                connection,
-                projectId,
-                WorkspaceAssistantRequest(
-                    message = prompt,
-                    modelRoute = if (directConfig == null) "pc" else "mobile",
-                    mobileProvider = directConfig?.let {
-                        MobileProviderEncryption.seal(it, connection, projectId)
-                    },
-                ),
-                onEvent,
-            )
+            var runId: String? = null
+            val trackingEvent: suspend (String) -> Unit = { raw ->
+                runCatching { json.parseToJsonElement(raw) as? JsonObject }.getOrNull()?.let { event ->
+                    if (event.string("type") == "run") {
+                        val run = event["run"] as? JsonObject
+                        runId = run?.let { value ->
+                            value.string("run_id").ifBlank { value.string("id") }
+                        }
+                    }
+                }
+                onEvent(raw)
+            }
+            try {
+                api.streamAssistant(
+                    connection,
+                    projectId,
+                    WorkspaceAssistantRequest(
+                        message = prompt,
+                        conversationId = conversationId,
+                        history = history,
+                        modelRoute = if (directConfig == null) "pc" else "mobile",
+                        mobileProvider = directConfig?.let {
+                            MobileProviderEncryption.seal(it, connection, projectId)
+                        },
+                    ),
+                    trackingEvent,
+                )
+            } catch (error: IOException) {
+                val recoverableRunId = runId
+                if (recoverableRunId.isNullOrBlank()) throw error
+                recoverAssistantRun(connection, projectId, recoverableRunId, trackingEvent, error)
+            }
             syncNow()
             return if (directConfig == null) AssistantRoute.GatewayPc else AssistantRoute.GatewayMobileKey
         }
@@ -1277,10 +1304,203 @@ suspend fun exportProject(projectId: String, format: String): MobileExportFile {
             resolvedDirectConfig(DirectApiConfig.TASK_ASSISTANT)
         }
         if (directConfig != null) {
-            mobileWorkspaceAgent.run(projectId, prompt, directConfig, onEvent)
+            val turnContext = mobileAssistantConversationStore.beginTurn(
+                projectId = projectId,
+                conversationId = conversationId,
+                prompt = prompt,
+            )
+            onEvent(buildJsonObject {
+                put("type", "conversation")
+                put("conversation", buildJsonObject { put("id", turnContext.conversationId) })
+            }.toString())
+            val output = StringBuilder()
+            val toolLogs = mutableListOf<String>()
+            var draftProduced = false
+            val trackedEvent: suspend (String) -> Unit = { raw ->
+                runCatching { json.parseToJsonElement(raw) as? JsonObject }.getOrNull()?.let { event ->
+                    when (event.string("type")) {
+                        "content_delta" -> output.append(event.string("delta"))
+                        "tool" -> event.string("detail").takeIf(String::isNotBlank)?.let(toolLogs::add)
+                        "chapter_draft" -> draftProduced = true
+                        else -> Unit
+                    }
+                }
+                onEvent(raw)
+            }
+            try {
+                mobileWorkspaceAgent.run(
+                    projectId = projectId,
+                    prompt = prompt,
+                    config = directConfig,
+                    history = turnContext.history.takeLast(12).map { message ->
+                        buildJsonObject {
+                            put("role", message.role)
+                            put("content", message.content)
+                        }
+                    },
+                    onEvent = trackedEvent,
+                )
+                mobileAssistantConversationStore.finishTurn(
+                    projectId = projectId,
+                    conversationId = turnContext.conversationId,
+                    content = output.toString().trim().ifBlank {
+                        if (draftProduced) "章节草稿已交给正文编辑器，尚未保存。" else "本轮任务已完成。"
+                    },
+                    status = "completed",
+                    toolLogs = toolLogs,
+                )
+            } catch (error: Exception) {
+                mobileAssistantConversationStore.finishTurn(
+                    projectId = projectId,
+                    conversationId = turnContext.conversationId,
+                    content = output.toString().trim().ifBlank {
+                        if (error is CancellationException) "任务已取消。" else "任务未完成：${error.message.orEmpty()}"
+                    },
+                    status = if (error is CancellationException) "aborted" else "error",
+                    toolLogs = toolLogs,
+                )
+                throw error
+            }
             return AssistantRoute.DirectApi
         }
         error("请先配置手机直连 API，或连接自己的 Gateway")
+    }
+
+    suspend fun pendingChapterDraft(projectId: String): MobilePendingChapterDraft? {
+        val connection = dao.connection()
+        val value = if (connection != null) {
+            api.pendingChapterDraft(connection, projectId)
+        } else {
+            mobileWorkspaceAgent.pendingChapterDraft(projectId)
+        } ?: return null
+        return MobilePendingChapterDraft.fromJson(projectId, value)
+    }
+
+    suspend fun savePendingChapterDraft(
+        draft: MobilePendingChapterDraft,
+        title: String,
+        content: String,
+        catalogingMode: String,
+    ): String {
+        require(title.isNotBlank()) { "章节标题不能为空" }
+        require(catalogingMode in setOf("save_only", "save_and_catalog")) { "未知的章节保存方式" }
+        val connection = dao.connection()
+        if (connection != null) {
+            val payload = buildJsonObject {
+                put("title", title.trim())
+                put("content", content)
+                draft.outlineNodeId?.let { put("outline_node_id", it) }
+                draft.contextManifestId?.let { put("context_manifest_id", it) }
+                put("draft_id", draft.draftId)
+                put("cataloging_mode", catalogingMode)
+            }
+            val response = api.saveGeneratedChapter(connection, draft.projectId, payload)
+            val chapterId = response.requiredId()
+            saveCanonicalReplica(draft.projectId, "chapter", chapterId, response)
+            SyncScheduler.enqueue(appContext)
+            return chapterId
+        }
+        require(catalogingMode == "save_only") { "手机独立模式需先仅保存；连接 PC Gateway 后才能启动建档" }
+        val chapterId = UUID.randomUUID().toString()
+        val payload = buildJsonObject {
+            put("id", chapterId)
+            put("project_id", draft.projectId)
+            put("title", title.trim())
+            put("content", content)
+            put("word_count", content.count { !it.isWhitespace() })
+            put("current_version", 1)
+            draft.outlineNodeId?.let { put("outline_node_id", it) }
+            draft.contextManifestId?.let { put("context_manifest_id", it) }
+        }
+        saveEntity(draft.projectId, "chapter", chapterId, payload)
+        mobileWorkspaceAgent.markChapterDraftSaved(draft.draftId)
+        return chapterId
+    }
+
+    suspend fun cancelAssistantRun(projectId: String, runId: String) {
+        val connection = requireConnection()
+        api.cancelAssistantRun(connection, projectId, runId)
+    }
+
+    suspend fun assistantConversations(projectId: String): List<MobileAssistantConversation> {
+        val connection = dao.connection()
+            ?: return mobileAssistantConversationStore.conversations(projectId)
+        val root = api.assistantConversations(connection, projectId)
+        return (root["items"] as? JsonArray).orEmpty().mapNotNull { raw ->
+            val item = raw as? JsonObject ?: return@mapNotNull null
+            item.string("id").takeIf(String::isNotBlank)?.let { id ->
+                MobileAssistantConversation(
+                    id = id,
+                    title = item.string("title").ifBlank { "新对话" },
+                    messageCount = (item["message_count"] as? JsonPrimitive)?.intOrNull ?: 0,
+                    updatedAt = item.string("updated_at"),
+                )
+            }
+        }
+    }
+
+    suspend fun assistantMessages(
+        projectId: String,
+        conversationId: String,
+    ): List<MobileAssistantMessage> {
+        val connection = dao.connection()
+            ?: return mobileAssistantConversationStore.messages(projectId, conversationId)
+        val root = api.assistantConversation(connection, projectId, conversationId)
+        return (root["messages"] as? JsonArray).orEmpty().mapNotNull { raw ->
+            val item = raw as? JsonObject ?: return@mapNotNull null
+            val role = item.string("role")
+            if (role !in setOf("user", "assistant")) return@mapNotNull null
+            MobileAssistantMessage(
+                id = item.string("id").ifBlank { UUID.randomUUID().toString() },
+                role = role,
+                content = item.string("content"),
+                status = item.string("status").ifBlank { "completed" },
+                createdAt = item.string("created_at"),
+                toolLogs = ((item["payload"] as? JsonObject)?.get("tool_logs") as? JsonArray)
+                    .orEmpty()
+                    .mapNotNull logs@{ rawLog ->
+                        val log = rawLog as? JsonObject ?: return@logs null
+                        log.string("detail").ifBlank { log.string("tool") }.takeIf(String::isNotBlank)
+                    },
+            )
+        }
+    }
+
+    private suspend fun recoverAssistantRun(
+        connection: GatewayConnection,
+        projectId: String,
+        runId: String,
+        onEvent: suspend (String) -> Unit,
+        streamError: IOException,
+    ) {
+        repeat(180) {
+            val detail = api.assistantRun(connection, projectId, runId)
+            val run = detail["run"] as? JsonObject ?: throw streamError
+            val status = run.string("status")
+            onEvent(buildJsonObject {
+                put("type", "status")
+                put("message", "连接已恢复，正在核对持久化任务：${status.ifBlank { "running" }}")
+            }.toString())
+            when (status) {
+                "completed", "success" -> {
+                    val assistantMessage = detail["assistant_message"] as? JsonObject
+                    val payload = assistantMessage?.get("payload") as? JsonObject
+                        ?: buildJsonObject {
+                            put("reply", assistantMessage?.string("content").orEmpty())
+                            put("run", run)
+                        }
+                    onEvent(buildJsonObject {
+                        put("type", "complete")
+                        put("data", payload)
+                    }.toString())
+                    return
+                }
+                "cancelled", "aborted" -> throw CancellationException("作品助手任务已取消")
+                "error", "failed" -> throw IOException(run.string("error").ifBlank { "作品助手任务执行失败" })
+            }
+            kotlinx.coroutines.delay(1_000)
+        }
+        throw IOException("AI 流中断后仍未取得终态；运行 ID：$runId", streamError)
     }
 
     suspend fun refreshCreationDrafts(): Int {

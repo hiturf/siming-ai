@@ -43,21 +43,45 @@ internal class MobileWorkspaceAgent(
     private val json = Json { ignoreUnknownKeys = true }
     private val contextManifests = LinkedHashMap<String, MobileContextManifest>()
 
+    suspend fun pendingChapterDraft(projectId: String): JsonObject? {
+        val run = chapterWriteStore.latestGenerated(projectId) ?: return null
+        return buildJsonObject {
+            put("draft_id", run.id)
+            put("project_id", run.projectId)
+            put("content_ref", run.id)
+            put("title", run.title)
+            put("outline_node_id", run.manifest.request.outlineNodeId)
+            put("context_manifest_id", run.manifest.id)
+            put("draft_status", "pending")
+            put("content", run.content)
+            put("word_count", countWords(run.content))
+            put("execution_route", "android_standalone")
+            put("next_actions", buildJsonArray {
+                add(JsonPrimitive("save_only"))
+                add(JsonPrimitive("save_and_catalog"))
+            })
+        }
+    }
+
+    suspend fun markChapterDraftSaved(draftId: String) {
+        chapterWriteStore.markSaved(draftId)
+    }
+
     suspend fun run(
         projectId: String,
         prompt: String,
         config: DirectApiConfig,
+        history: List<JsonObject> = emptyList(),
         onEvent: suspend (String) -> Unit,
     ) {
         val initialRecords = records(projectId)
         val project = initialRecords.firstOrNull { it.entity.entityType == "project" }?.payload
             ?: error("当前作品副本不存在，无法启动手机独立工作区")
-        val messages = mutableListOf(
-            message("system", contract.workspaceSystem()),
-            message(
-                "user",
-                contract.initialUserMessage(project, prompt),
-            ),
+        val messages = mutableListOf(message("system", contract.workspaceSystem()))
+        messages += history.filter { value -> value.string("role") in setOf("user", "assistant") }
+        messages += message(
+            "user",
+            contract.initialUserMessage(project, prompt),
         )
         onEvent(event("status", "已加载 PC 提示词契约 ${contract.sourceHash.take(12)}，开始执行"))
 
@@ -66,15 +90,25 @@ internal class MobileWorkspaceAgent(
         var categorySelected = false
         while (iteration < MAX_ITERATIONS) {
             val scopedTools = contract.toolSchemas(activeCategories)
-            val turn = directApi.agentTurn(
+            var streamedContent = false
+            var streamedReasoning = false
+            val turn = directApi.streamAgentTurn(
                 config = config,
                 messages = messages,
                 tools = scopedTools,
                 toolChoice = if (categorySelected) "auto" else "required",
                 maxOutputTokens = 6_000,
                 temperature = 0.3,
+                onContentDelta = { delta ->
+                    streamedContent = true
+                    onEvent(event(type = "content_delta", delta = delta))
+                },
+                onReasoningDelta = { delta ->
+                    streamedReasoning = true
+                    onEvent(event(type = "reasoning_delta", delta = delta))
+                },
             )
-            if (turn.reasoningContent.isNotBlank()) {
+            if (!streamedReasoning && turn.reasoningContent.isNotBlank()) {
                 onEvent(event(type = "reasoning_delta", delta = turn.reasoningContent))
             }
             if (turn.toolCalls.isEmpty()) {
@@ -83,7 +117,7 @@ internal class MobileWorkspaceAgent(
                 }
                 val content = turn.content.trim()
                 require(content.isNotBlank()) { "模型既没有调用 PC 工具，也没有返回最终内容" }
-                onEvent(event("content_delta", delta = content))
+                if (!streamedContent) onEvent(event("content_delta", delta = content))
                 onEvent(event("done", "任务完成"))
                 return
             }
@@ -148,7 +182,13 @@ internal class MobileWorkspaceAgent(
                     put("content", modelToolResult(result).toString())
                 }
                 if (call.name == "chapter_writer" && result.string("status") == "ok") {
-                    onEvent(event("content_delta", delta = "章节草稿已生成，尚未保存。请在正文编辑器确认后选择保存和建档方式。"))
+                    onEvent(
+                        event(
+                            type = "chapter_draft",
+                            detail = result.string("detail"),
+                            data = result["data"],
+                        ),
+                    )
                     onEvent(event("done", "章节草稿已生成，本轮已停止"))
                     return
                 }
@@ -575,7 +615,28 @@ internal class MobileWorkspaceAgent(
                 initialContent = checkpointContent,
                 maxResumeAttempts = 8,
                 onCheckpoint = { nextContent ->
+                    val previousContent = checkpointContent
                     checkpointContent = nextContent
+                    val delta = if (nextContent.startsWith(previousContent)) {
+                        nextContent.removePrefix(previousContent)
+                    } else {
+                        nextContent
+                    }
+                    if (delta.isNotEmpty()) {
+                        onEvent(
+                            event(
+                                type = "chapter_draft_delta",
+                                delta = delta,
+                                data = buildJsonObject {
+                                    put("draft_id", runId)
+                                    put("title", checkpointRun.title)
+                                    put("outline_node_id", request.outlineNodeId)
+                                    put("draft_status", MobileChapterWriteState.GENERATING)
+                                    put("execution_route", "android_standalone")
+                                },
+                            ),
+                        )
+                    }
                     if (
                         nextContent.length - persistedChars >= 512 ||
                         nextContent.endsWith("\n\n")
@@ -656,6 +717,10 @@ internal class MobileWorkspaceAgent(
         val data = buildJsonObject {
             put("draft_id", run.id)
             put("content_ref", run.id)
+            put("project_id", run.projectId)
+            put("title", run.title.ifBlank { outlineTitle }.ifBlank { "AI 生成章节" })
+            put("outline_node_id", request.outlineNodeId)
+            put("context_manifest_id", run.manifest.id)
             put("content", run.content)
             put("word_count", countWords(run.content))
             put("model", run.model)
@@ -1206,11 +1271,17 @@ internal class MobileWorkspaceAgent(
         }
     }
 
-    private fun event(type: String, detail: String = "", delta: String = ""): String =
+    private fun event(
+        type: String,
+        detail: String = "",
+        delta: String = "",
+        data: JsonElement? = null,
+    ): String =
         buildJsonObject {
             put("type", type)
             if (detail.isNotBlank()) put("detail", detail)
             if (delta.isNotBlank()) put("delta", delta)
+            data?.let { put("data", it) }
         }.toString()
 
     private fun message(role: String, content: String): JsonObject = buildJsonObject {

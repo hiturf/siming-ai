@@ -53,6 +53,9 @@ internal object PcApiPaths {
     fun chapterSnapshots(projectId: String, chapterId: String): String =
         "${authoringItem(projectId, "chapter", chapterId)}/snapshots"
 
+    fun pendingChapterDraft(projectId: String): String =
+        "${project(projectId)}/chapter-drafts/pending"
+
     fun chapterSnapshotDiff(projectId: String, chapterId: String): String =
         "${chapterSnapshots(projectId, chapterId)}/diff"
 
@@ -101,6 +104,21 @@ internal object PcApiPaths {
 
     fun assistantStream(projectId: String): String =
         "${project(projectId)}/ai/workspace-assistant/stream"
+
+    fun assistantConversations(projectId: String): String =
+        "${project(projectId)}/ai/assistant/conversations"
+
+    fun assistantConversation(projectId: String, conversationId: String): String =
+        "${assistantConversations(projectId)}/${segment(conversationId)}"
+
+    fun assistantRuns(projectId: String): String =
+        "${project(projectId)}/ai/assistant/runs"
+
+    fun assistantRun(projectId: String, runId: String): String =
+        "${assistantRuns(projectId)}/${segment(runId)}"
+
+    fun assistantRunCancel(projectId: String, runId: String): String =
+        "${assistantRun(projectId, runId)}/cancel"
 
     fun novelCreationSession(sessionId: String): String =
         "$NOVEL_CREATION_SESSIONS/${segment(sessionId)}"

@@ -3,16 +3,19 @@
 import json
 import os
 import unittest
+from io import BytesIO
 from unittest.mock import AsyncMock, patch
 
 os.environ["DATABASE_URL"] = "sqlite:///./test_novel_agent.db"
 
 from fastapi.testclient import TestClient
+from docx import Document as DocxDocument
 
 from app.core.utils import count_words
 from app.database.models import Chapter, Project
 from app.database.session import Base, SessionLocal, engine
 from app.main import app
+from app.services.import_service import _parse_raw_file
 
 API_PREFIX = "/api/v1"
 
@@ -183,6 +186,21 @@ class ImporterTestCase(unittest.TestCase):
             self.assertEqual([chapter.sort_order for chapter in chapters], [1000, 2000])
         finally:
             db.close()
+
+    def test_atomic_project_file_import_accepts_android_docx_payload(self):
+        document = DocxDocument()
+        document.add_paragraph("第一章 风起")
+        document.add_paragraph("这里是第一章正文。" * 10)
+        document.add_paragraph("第二章 云涌")
+        document.add_paragraph("这里是第二章正文。" * 10)
+        buffer = BytesIO()
+        document.save(buffer)
+
+        data = _parse_raw_file("手机导入.docx", buffer.getvalue())
+        self.assertEqual(data["encoding"], "DOCX")
+        self.assertEqual(data["format"], "docx")
+        self.assertIn("第一章 风起", data["text"])
+        self.assertIn("第二章 云涌", data["text"])
 
     def test_import_preview_ignores_sentence_like_chapter_prefixes_in_body(self):
         project_id = self.create_project("Body Prefix Project")

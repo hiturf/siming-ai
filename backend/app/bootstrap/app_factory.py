@@ -68,6 +68,7 @@ def _register_routers(app: FastAPI) -> None:
     from ..routers import (
         ai_writer,
         application_updates,
+        assistant_runs,
         cataloging,
         chapters,
         characters,
@@ -99,6 +100,7 @@ def _register_routers(app: FastAPI) -> None:
         outline,
         chapters,
         ai_writer,
+        assistant_runs,
         stats,
         export,
         deconstruct,

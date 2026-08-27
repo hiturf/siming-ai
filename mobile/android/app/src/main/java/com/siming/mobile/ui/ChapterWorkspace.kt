@@ -37,6 +37,7 @@ import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -46,6 +47,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -60,6 +62,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.siming.mobile.data.local.ReplicaEntity
+import com.siming.mobile.data.MobilePendingChapterDraft
 
 @Composable
 internal fun ChapterWorkspace(
@@ -135,6 +138,134 @@ internal fun ChapterWorkspace(
                     )
                 }
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun PendingChapterDraftEditorScreen(
+    draft: MobilePendingChapterDraft,
+    online: Boolean,
+    busy: Boolean,
+    viewModel: MainViewModel,
+    onBack: () -> Unit,
+    onSaved: (String) -> Unit,
+) {
+    var title by rememberSaveable(draft.draftId) { mutableStateOf(draft.title) }
+    var content by rememberSaveable(draft.draftId) { mutableStateOf(draft.content) }
+    var lastGeneratedContent by rememberSaveable(draft.draftId) { mutableStateOf(draft.content) }
+
+    LaunchedEffect(draft.content, draft.status) {
+        if (draft.generating || content == lastGeneratedContent) {
+            content = draft.content
+        }
+        lastGeneratedContent = draft.content
+        if (title.isBlank() && draft.title.isNotBlank()) title = draft.title
+    }
+
+    Scaffold(
+        containerColor = SimingPaper,
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(if (draft.generating) "AI 正在写作" else "确认 AI 章节草稿")
+                        Text(
+                            if (draft.executionRoute == "android_standalone") "手机独立草稿" else "PC 工作流草稿",
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                },
+                navigationIcon = {
+                    IconButton(onClick = {
+                        if (draft.generating) viewModel.cancelAssistant(draft.projectId)
+                        onBack()
+                    }) {
+                        Icon(Icons.AutoMirrored.Outlined.ArrowBack, "返回")
+                    }
+                },
+            )
+        },
+        bottomBar = {
+            Surface(color = SimingPaperWarm, tonalElevation = 3.dp) {
+                if (draft.generating) {
+                    OutlinedButton(
+                        onClick = { viewModel.cancelAssistant(draft.projectId) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .navigationBarsPadding()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                    ) {
+                        Text("停止生成并保留检查点")
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .navigationBarsPadding()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        OutlinedButton(
+                            enabled = !busy && title.isNotBlank(),
+                            onClick = {
+                                viewModel.savePendingChapterDraft(
+                                    draft, title, content, "save_only", onSaved,
+                                )
+                            },
+                            modifier = Modifier.weight(1f),
+                        ) { Text("仅保存") }
+                        Button(
+                            enabled = online && !busy && title.isNotBlank(),
+                            onClick = {
+                                viewModel.savePendingChapterDraft(
+                                    draft, title, content, "save_and_catalog", onSaved,
+                                )
+                            },
+                            modifier = Modifier.weight(1.25f),
+                        ) { Text("保存并建档") }
+                    }
+                }
+            }
+        },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .imePadding()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            if (draft.generating || busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+            OutlinedTextField(
+                value = title,
+                onValueChange = { title = it },
+                enabled = !draft.generating && !busy,
+                placeholder = { Text("章节标题") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = content,
+                onValueChange = { content = it },
+                enabled = !draft.generating && !busy,
+                placeholder = { Text(if (draft.generating) "模型正文会在这里实时出现…" else "检查并修改正文…") },
+                minLines = 16,
+                maxLines = Int.MAX_VALUE,
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                textStyle = MaterialTheme.typography.bodyLarge.copy(lineHeight = 28.sp),
+            )
+            Text(
+                when {
+                    draft.generating -> "${content.count { !it.isWhitespace() }} 字 · 正在流式生成，尚未保存"
+                    online -> "${content.count { !it.isWhitespace() }} 字 · 请选择仅保存，或保存并建档"
+                    else -> "${content.count { !it.isWhitespace() }} 字 · 独立模式可仅保存；连接 PC 后可建档"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }

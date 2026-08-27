@@ -7,13 +7,15 @@ on:
       - "backend/app/modules/gateway/**"
       - "backend/app/routers/gateway.py"
       - ".github/workflows/mobile-ci.yml"
+      - ".github/workflows/android-release-refresh.yml"
   push:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - "mobile/**"
       - "backend/app/modules/gateway/**"
       - "backend/app/routers/gateway.py"
       - ".github/workflows/mobile-ci.yml"
+      - ".github/workflows/android-release-refresh.yml"
 
 jobs:
   android:
