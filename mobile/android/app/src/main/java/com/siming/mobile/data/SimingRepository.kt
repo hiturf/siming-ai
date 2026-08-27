@@ -269,7 +269,7 @@ class SimingRepository(context: Context) {
         onProgress: suspend (String) -> Unit = {},
     ): MobileNovelImportResult {
         val extension = file.filename.substringAfterLast('.', "").lowercase()
-        require(extension in setOf("txt", "docx")) { "仅支持导入 TXT 或 DOCX 文件" }
+        require(extension in NovelFileDecoder.supportedExtensions) { "仅支持导入 TXT 或 DOCX 文件" }
         require(file.bytes.isNotEmpty()) { "导入文件内容为空" }
         require(file.bytes.size <= MAX_NOVEL_IMPORT_BYTES) {
             "单个导入文件不能超过 20 MiB"
@@ -303,7 +303,6 @@ class SimingRepository(context: Context) {
                 )
             }
         }
-        require(extension == "txt") { "DOCX 导入需要连接 PC Gateway；离线模式不会复制第二套 Word 解析器" }
         return importNovelOffline(file, onProgress)
     }
 
@@ -311,9 +310,10 @@ class SimingRepository(context: Context) {
         file: MobileNovelImportFile,
         onProgress: suspend (String) -> Unit,
     ): MobileNovelImportResult {
-        onProgress("正在本机识别 TXT 编码…")
+        val extension = file.filename.substringAfterLast('.', "").uppercase()
+        onProgress("正在本机解析 $extension 正文…")
         val decoded = withContext(Dispatchers.Default) {
-            TxtImportDecoder.decode(file.bytes)
+            NovelFileDecoder.decode(file.filename, file.bytes)
         }
         onProgress("正在本机识别章节边界…")
         val chapters = withContext(Dispatchers.Default) {

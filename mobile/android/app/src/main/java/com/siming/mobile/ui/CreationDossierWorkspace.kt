@@ -166,7 +166,7 @@ internal fun CreationDossierWorkspace(
                         Text("与 PC 使用同一份 V3 建档资料", fontWeight = FontWeight.Bold)
                     }
                     Text(
-                        "这里的创意、世界观、角色、地点、卷纲、开篇细纲和最终审阅，字段结构与确认规则都和 PC 一致。手机独立模式只把执行位置换成本机，不会另造一套数据。",
+                        "这里的创作约束、创意、世界观、角色、地点、卷纲、开篇细纲和最终审阅，字段结构与确认规则都和 PC 一致。手机独立模式只把执行位置换成本机，不会另造一套数据。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -272,30 +272,32 @@ internal fun CreationDossierWorkspace(
                 verticalArrangement = Arrangement.spacedBy(9.dp),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Button(
-                    onClick = {
-                        onGenerate(
-                            selectedStage,
-                            if (stageData.isEmpty()) "generate" else "regenerate",
-                            "",
-                        )
-                    },
-                    enabled = !running && CreationWorkbenchContract.stageCanGenerate(session, selectedStage),
-                ) {
-                    Icon(if (stageData.isEmpty()) Icons.Outlined.AutoAwesome else Icons.Outlined.Refresh, null)
-                    Spacer(Modifier.width(7.dp))
-                    Text(if (stageData.isEmpty()) "生成$stageLabel" else "重新生成")
-                }
-                OutlinedButton(
-                    onClick = {
-                        refineInstruction = ""
-                        refineOpen = true
-                    },
-                    enabled = !running && stageData.isNotEmpty(),
-                ) {
-                    Icon(Icons.Outlined.Edit, null)
-                    Spacer(Modifier.width(7.dp))
-                    Text("按要求调整")
+                if (selectedStage != "constraints") {
+                    Button(
+                        onClick = {
+                            onGenerate(
+                                selectedStage,
+                                if (stageData.isEmpty()) "generate" else "regenerate",
+                                "",
+                            )
+                        },
+                        enabled = !running && CreationWorkbenchContract.stageCanGenerate(session, selectedStage),
+                    ) {
+                        Icon(if (stageData.isEmpty()) Icons.Outlined.AutoAwesome else Icons.Outlined.Refresh, null)
+                        Spacer(Modifier.width(7.dp))
+                        Text(if (stageData.isEmpty()) "生成$stageLabel" else "重新生成")
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            refineInstruction = ""
+                            refineOpen = true
+                        },
+                        enabled = !running && stageData.isNotEmpty(),
+                    ) {
+                        Icon(Icons.Outlined.Edit, null)
+                        Spacer(Modifier.width(7.dp))
+                        Text("按要求调整")
+                    }
                 }
                 OutlinedButton(
                     onClick = {
@@ -307,6 +309,16 @@ internal fun CreationDossierWorkspace(
                 ) {
                     Text("完整编辑")
                 }
+            }
+        }
+
+        if (selectedStage == "constraints") {
+            item {
+                Text(
+                    "创作约束是作者控制的事实。可在这里直接编辑，或回到对话中说明调整要求；修改后受影响的下游资料会与 PC 一样标记为需要重新校验。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
 

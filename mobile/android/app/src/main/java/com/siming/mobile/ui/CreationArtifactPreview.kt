@@ -179,6 +179,18 @@ private fun ObjectPreviewCard(
 
 
 private fun fieldLabel(key: String): String = mapOf(
+    "brief" to "创作核心",
+    "genre" to "作品类型",
+    "target_audience" to "目标读者",
+    "platform" to "发布平台",
+    "target_words" to "目标字数",
+    "target_chapters" to "目标章节数",
+    "world_tone" to "世界基调",
+    "story_structure" to "故事结构",
+    "pacing" to "叙事节奏",
+    "special_requirements" to "必须遵守",
+    "avoid" to "必须避免",
+    "author_overrides" to "作者覆盖项",
     "options" to "创意方案",
     "title" to "标题",
     "subtitle" to "差异化定位",

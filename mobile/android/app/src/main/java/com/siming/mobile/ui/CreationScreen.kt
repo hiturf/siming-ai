@@ -61,6 +61,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.siming.mobile.data.creation.CreationExecutionRoute
 import com.siming.mobile.data.creation.CreationStartInput
+import com.siming.mobile.data.creation.CreationWorkbenchContract
 import com.siming.mobile.data.creation.PcCreationPreset
 import com.siming.mobile.data.creation.PcCreationPromptContract
 import com.siming.mobile.data.local.GatewayConnection
@@ -86,9 +87,7 @@ internal fun CreationScreen(
         PcCreationPromptContract(context.applicationContext)
     }
     val stages = remember(pcContract) {
-        pcContract.stageOrder
-            .filterNot { it == "constraints" }
-            .map { it to pcContract.stageLabels.getValue(it) }
+        CreationWorkbenchContract.visibleStages(pcContract.stageOrder, pcContract.stageLabels)
     }
     val drafts by viewModel.creationDrafts.collectAsStateWithLifecycle()
     val ui by viewModel.uiState

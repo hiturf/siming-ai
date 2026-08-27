@@ -117,8 +117,14 @@ private var importCallback: ((MobileNovelImportFile) -> Unit)? = null
                         importCallback = callback
                         importPicker.launch(
                             arrayOf(
-                                "text/plain",
+                                "text/*",
                                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                "application/docx",
+                                "application/x-docx",
+                                "application/msword",
+                                "application/zip",
+                                "application/x-zip-compressed",
+                                "application/octet-stream",
                             ),
                         )
                     },

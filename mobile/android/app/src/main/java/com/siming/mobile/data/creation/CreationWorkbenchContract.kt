@@ -17,6 +17,14 @@ internal object CreationWorkbenchContract {
         "macro_outline",
     )
 
+    /** Keep Android's visible dossier in the PC contract's authoritative order. */
+    fun visibleStages(
+        stageOrder: List<String>,
+        stageLabels: Map<String, String>,
+    ): List<Pair<String, String>> = stageOrder.map { stage ->
+        stage to requireNotNull(stageLabels[stage]) { "立项阶段缺少显示名称：$stage" }
+    }
+
     fun recommendedStage(session: JsonObject, visibleOrder: List<String>): String {
         val current = session.stringValue("current_stage")
         if (current in visibleOrder && session.stageStatus(current) != "confirmed") return current

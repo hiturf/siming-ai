@@ -1,9 +1,11 @@
 """Regression tests for imported chapter persistence."""
 
+import base64
 import json
 import os
 import unittest
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 os.environ["DATABASE_URL"] = "sqlite:///./test_novel_agent.db"
@@ -153,6 +155,17 @@ class ImporterTestCase(unittest.TestCase):
         data = response.json()["data"]
         self.assertEqual(data["encoding"], "UTF-16LE")
         self.assertEqual(data["text"], text)
+
+    def test_shared_android_encoding_fixtures_match_pc_decoder(self):
+        fixture_path = Path(__file__).resolve().parents[2] / "contracts" / "novel-import-encoding-fixtures.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+        for case in fixture["cases"]:
+            with self.subTest(case=case["name"]):
+                data = _parse_raw_file(case["filename"], base64.b64decode(case["base64"]))
+                self.assertEqual(data["encoding"], case["expected_encoding"])
+                self.assertEqual(data["text"], case["text"])
+                self.assertNotIn("\ufffd", data["text"])
 
     def test_atomic_project_file_import_creates_project_and_all_chapters(self):
         text = (

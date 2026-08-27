@@ -1,10 +1,20 @@
 package com.siming.mobile.data
 
+import java.io.ByteArrayInputStream
+import java.io.FilterInputStream
+import java.io.IOException
+import java.io.InputStream
+import java.io.StringReader
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
+import java.util.zip.ZipInputStream
+import javax.xml.parsers.SAXParserFactory
 import kotlin.math.max
+import org.xml.sax.Attributes
+import org.xml.sax.InputSource
+import org.xml.sax.helpers.DefaultHandler
 
 const val MAX_NOVEL_IMPORT_BYTES: Int = 20 * 1024 * 1024
 const val MAX_NOVEL_IMPORT_CHAPTERS: Int = 2_000
@@ -32,6 +42,19 @@ internal data class NovelChapterDraft(
     val content: String,
     val wordCount: Int,
 )
+
+internal object NovelFileDecoder {
+    val supportedExtensions: Set<String> = setOf("txt", "docx")
+
+    fun decode(filename: String, raw: ByteArray): DecodedNovelText {
+        val extension = filename.substringAfterLast('.', "").lowercase()
+        require(extension in supportedExtensions) { "仅支持导入 TXT 或 DOCX 文件" }
+        return when (extension) {
+            "docx" -> DocxImportDecoder.decode(raw)
+            else -> TxtImportDecoder.decode(raw)
+        }
+    }
+}
 
 internal object TxtImportDecoder {
     private val gb18030: Charset = Charset.forName("GB18030")
@@ -124,18 +147,19 @@ internal object TxtImportDecoder {
 
     private fun quality(text: String): Double {
         if (text.isEmpty()) return -10.0
-        val sample = text.take(20_000)
         var printable = 0
         var cjk = 0
         var bad = 0
-        for (char in sample) {
-            val code = char.code
+        var index = 0
+        var codePointCount = 0
+        while (index < text.length && codePointCount < 20_000) {
+            val code = Character.codePointAt(text, index)
             when {
-                char == '\uFFFD' || char == '\u0000' -> bad += 8
-                (code < 32 && char !in charArrayOf('\n', '\r', '\t')) ||
+                code == 0xfffd || code == 0 -> bad += 8
+                (code < 32 && !isAllowedTextControl(code)) ||
                     code in 0x7f..0x9f -> bad += 4
-                char.isISOControl() -> bad += 2
-                else -> printable += 1
+                isPythonPrintable(code) || isAllowedTextControl(code) -> printable += 1
+                else -> bad += 2
             }
             if (
                 code in 0x3400..0x4dbf ||
@@ -144,9 +168,31 @@ internal object TxtImportDecoder {
             ) {
                 cjk += 1
             }
+            index += Character.charCount(code)
+            codePointCount += 1
         }
-        val size = sample.length.toDouble()
+        val size = codePointCount.toDouble()
         return printable / size + minOf(cjk / size, 0.25) * 0.20 - bad / size
+    }
+
+    private fun isAllowedTextControl(codePoint: Int): Boolean =
+        codePoint == '\n'.code || codePoint == '\r'.code || codePoint == '\t'.code
+
+    /** Mirrors Python str.isprintable(), which the PC decoder uses for candidate scoring. */
+    private fun isPythonPrintable(codePoint: Int): Boolean {
+        if (codePoint == ' '.code) return true
+        return when (Character.getType(codePoint)) {
+            Character.UNASSIGNED.toInt(),
+            Character.CONTROL.toInt(),
+            Character.FORMAT.toInt(),
+            Character.PRIVATE_USE.toInt(),
+            Character.SURROGATE.toInt(),
+            Character.SPACE_SEPARATOR.toInt(),
+            Character.LINE_SEPARATOR.toInt(),
+            Character.PARAGRAPH_SEPARATOR.toInt(),
+            -> false
+            else -> true
+        }
     }
 
     private fun simplifiedChineseBonus(text: String): Double {
@@ -166,6 +212,161 @@ internal object TxtImportDecoder {
         val encoding: String,
         val score: Double,
     )
+}
+
+/** Lightweight DOCX text extraction matching python-docx's document paragraphs. */
+internal object DocxImportDecoder {
+    private const val DOCUMENT_ENTRY = "word/document.xml"
+    private const val WORD_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    private const val MAX_ARCHIVE_ENTRIES = 4_096
+    private const val MAX_DOCUMENT_XML_BYTES = 128L * 1024L * 1024L
+    private const val MAX_TEXT_CHARS = 40_000_000
+
+    fun decode(raw: ByteArray): DecodedNovelText {
+        require(raw.isNotEmpty()) { "DOCX 文件内容为空" }
+        try {
+            ZipInputStream(ByteArrayInputStream(raw)).use { archive ->
+                var entryCount = 0
+                while (true) {
+                    val entry = archive.nextEntry ?: break
+                    entryCount += 1
+                    require(entryCount <= MAX_ARCHIVE_ENTRIES) { "DOCX 内部文件过多，无法安全导入" }
+                    if (!entry.isDirectory && entry.name.replace('\\', '/') == DOCUMENT_ENTRY) {
+                        val text = parseDocumentXml(SizeLimitedInputStream(archive, MAX_DOCUMENT_XML_BYTES))
+                        require(text.isNotBlank()) { "DOCX 文件内容为空或无法解析" }
+                        return DecodedNovelText(text, "DOCX")
+                    }
+                    archive.closeEntry()
+                }
+            }
+        } catch (error: IllegalArgumentException) {
+            throw error
+        } catch (error: Exception) {
+            throw IllegalArgumentException("DOCX 文件损坏或无法解析", error)
+        }
+        throw IllegalArgumentException("DOCX 文件损坏或缺少正文")
+    }
+
+    private fun parseDocumentXml(input: InputStream): String {
+        val factory = SAXParserFactory.newInstance().apply {
+            isNamespaceAware = true
+            isValidating = false
+        }
+        listOf(
+            "http://apache.org/xml/features/disallow-doctype-decl" to true,
+            "http://xml.org/sax/features/external-general-entities" to false,
+            "http://xml.org/sax/features/external-parameter-entities" to false,
+            "http://apache.org/xml/features/nonvalidating/load-external-dtd" to false,
+        ).forEach { (feature, value) ->
+            runCatching { factory.setFeature(feature, value) }
+        }
+        val handler = DocumentParagraphHandler()
+        val reader = factory.newSAXParser().xmlReader.apply {
+            contentHandler = handler
+            entityResolver = handler
+        }
+        reader.parse(InputSource(input))
+        return handler.documentText()
+    }
+
+    private class DocumentParagraphHandler : DefaultHandler() {
+        private val paragraphs = mutableListOf<String>()
+        private var depth = 0
+        private var bodyDepth = -1
+        private var paragraphDepth = -1
+        private var paragraph: StringBuilder? = null
+        private var readingText = false
+        private var textChars = 0
+
+        override fun startElement(uri: String, localName: String, qName: String, attributes: Attributes) {
+            depth += 1
+            if (uri == WORD_NAMESPACE && localName == "body") {
+                bodyDepth = depth
+                return
+            }
+            if (uri == WORD_NAMESPACE && localName == "p" && depth == bodyDepth + 1) {
+                paragraphDepth = depth
+                paragraph = StringBuilder()
+                return
+            }
+            if (paragraphDepth < 0 || uri != WORD_NAMESPACE) return
+            when (localName) {
+                "t" -> readingText = true
+                "tab" -> append('\t')
+                "br", "cr" -> append('\n')
+                "noBreakHyphen" -> append('\u2011')
+                "softHyphen" -> append('\u00ad')
+            }
+        }
+
+        override fun characters(ch: CharArray, start: Int, length: Int) {
+            if (readingText && paragraphDepth >= 0) append(ch, start, length)
+        }
+
+        override fun endElement(uri: String, localName: String, qName: String) {
+            if (uri == WORD_NAMESPACE && localName == "t") readingText = false
+            if (uri == WORD_NAMESPACE && localName == "p" && depth == paragraphDepth) {
+                paragraph?.toString()?.takeIf { it.isNotBlank() }?.let(paragraphs::add)
+                paragraph = null
+                paragraphDepth = -1
+                readingText = false
+            }
+            if (uri == WORD_NAMESPACE && localName == "body" && depth == bodyDepth) bodyDepth = -1
+            depth -= 1
+        }
+
+        override fun resolveEntity(publicId: String?, systemId: String?): InputSource =
+            InputSource(StringReader(""))
+
+        fun documentText(): String = paragraphs.joinToString("\n\n")
+
+        private fun append(value: Char) {
+            val target = paragraph ?: return
+            accountText(1)
+            target.append(value)
+        }
+
+        private fun append(value: CharArray, start: Int, length: Int) {
+            val target = paragraph ?: return
+            accountText(length)
+            target.append(value, start, length)
+        }
+
+        private fun accountText(length: Int) {
+            textChars += length
+            require(textChars <= MAX_TEXT_CHARS) { "DOCX 正文过大，无法安全导入" }
+        }
+    }
+
+    private class SizeLimitedInputStream(
+        source: InputStream,
+        private val limit: Long,
+    ) : FilterInputStream(source) {
+        private var consumed = 0L
+
+        override fun read(): Int {
+            val value = super.read()
+            if (value >= 0) account(1L)
+            return value
+        }
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            val count = super.read(buffer, offset, length)
+            if (count > 0) account(count.toLong())
+            return count
+        }
+
+        override fun skip(count: Long): Long {
+            val skipped = super.skip(count)
+            if (skipped > 0) account(skipped)
+            return skipped
+        }
+
+        private fun account(count: Long) {
+            consumed += count
+            if (consumed > limit) throw IOException("DOCX 正文 XML 超过安全上限")
+        }
+    }
 }
 
 internal object NovelImportSplitter {
@@ -195,7 +396,7 @@ internal object NovelImportSplitter {
     }
 
     fun split(content: String): List<NovelChapterDraft> {
-        require(content.isNotBlank()) { "TXT 文件内容为空" }
+        require(content.isNotBlank()) { "导入文件内容为空" }
         val matches = marker.findAll(content)
             .filter { isLikelyChapterTitle(it.value) }
             .toList()

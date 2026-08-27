@@ -444,24 +444,28 @@
           ]
         },
         "android_offline": {
-          "support": "degraded",
+          "support": "local_cache",
           "source_refs": [
             {
               "path": "mobile/android/app/src/main/java/com/siming/mobile/data/NovelImport.kt",
-              "contains": "internal object TxtImportDecoder"
+              "contains": "internal object NovelFileDecoder"
+            },
+            {
+              "path": "mobile/android/app/src/main/java/com/siming/mobile/data/SimingRepository.kt",
+              "contains": "NovelFileDecoder.decode(file.filename, file.bytes)"
             }
           ],
-          "limitations": "离线只解析 TXT；DOCX 必须连接 PC Gateway，避免在 Android 复制第二套 Word 解析和批量建档实现。"
+          "notes": "本机直接解析 TXT / DOCX，TXT 与 PC 共用多编码回归样本且严格拒绝替换字符；作品和章节在同一本地事务中写入后进入 outbox。"
         },
         "android_standalone": {
-          "support": "degraded",
+          "support": "local_cache",
           "source_refs": [
             {
               "path": "mobile/android/app/src/main/java/com/siming/mobile/data/SimingRepository.kt",
-              "contains": "require(extension == \"txt\")"
+              "contains": "suspend fun importNovel("
             }
           ],
-          "limitations": "手机独立模式可本地导入 TXT；DOCX 连接 Gateway 后复用 PC 权威导入服务。"
+          "notes": "手机独立模式可直接导入与 PC 相同的 TXT / DOCX，不要求 PC 正在运行。"
         }
       },
       "side_effects": [
@@ -475,15 +479,19 @@
       "tests": [
         {
           "path": "mobile/android/app/src/test/java/com/siming/mobile/data/NovelImportTest.kt",
-          "contains": "class NovelImportTest"
+          "contains": "sharedPcEncodingFixturesDecodeIdenticallyWithoutReplacementCharacters"
+        },
+        {
+          "path": "mobile/android/app/src/test/java/com/siming/mobile/data/NovelImportTest.kt",
+          "contains": "decodesDocxDocumentParagraphsAndIgnoresTableCellParagraphsLikePc"
         },
         {
           "path": "backend/tests/test_importer.py",
-          "contains": "docx"
+          "contains": "test_shared_android_encoding_fixtures_match_pc_decoder"
         }
       ],
       "known_gaps": [
-        "离线和手机独立模式不解析 DOCX；连接 PC 后 Android 已可选择并上传 DOCX 到同一权威导入入口。"
+        "离线和手机独立导入先在本地事务中建档，再经 outbox 回放，不会生成 PC 单次导入接口的服务端操作审计记录；TXT / DOCX 输入格式和 TXT 编码结果已对齐。"
       ]
     },
     {
@@ -1473,7 +1481,7 @@
               "contains": "suspend fun generateCreationStage("
             }
           ],
-          "limitations": "使用与 PC 构建时导出的 V3 PromptSpec、阶段结构、标准化、依赖失效和最终建档门槛；新增结构化建档页后，创意选择、阶段生成/编辑/确认、最终审阅和正式建档体验与 PC 对齐。手机独立执行仍没有 PC 服务端 durable Operation/AgentRun 审计记录。"
+          "limitations": "使用与 PC 构建时导出的 V3 PromptSpec、八个完整阶段（包含创作约束）、标准化、依赖失效和最终建档门槛；结构化建档页中的创意选择、阶段生成/编辑/确认、最终审阅和正式建档体验与 PC 对齐。手机独立执行仍没有 PC 服务端 durable Operation/AgentRun 审计记录。"
         }
       },
       "side_effects": [
@@ -1497,6 +1505,14 @@
         {
           "path": "mobile/android/app/src/test/java/com/siming/mobile/data/creation/CreationWorkbenchContractTest.kt",
           "contains": "fun archiveReadinessMatchesPcFinalizationGate()"
+        },
+        {
+          "path": "mobile/android/app/src/test/java/com/siming/mobile/data/creation/CreationWorkbenchContractTest.kt",
+          "contains": "visibleStagesPreservePcOrderIncludingCreationConstraints"
+        },
+        {
+          "path": "mobile/android/app/src/test/java/com/siming/mobile/data/creation/MobileCreationAgentTest.kt",
+          "contains": "editingCreationConstraintsKeepsPcFormProjectionAndStalesDownstreamArtifacts"
         }
       ],
       "known_gaps": [
