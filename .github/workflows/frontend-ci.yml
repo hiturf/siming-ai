@@ -7,7 +7,7 @@ on:
       - ".jscpd.json"
       - ".github/workflows/frontend-ci.yml"
   push:
-    branches: [main, "codex/3.0-architecture"]
+    branches: [main, develop, "codex/3.0-architecture"]
     paths:
       - "frontend/**"
       - ".jscpd.json"

@@ -472,6 +472,11 @@ function GuiAssistantChat() {
   useEffect(() => {
     const resumedImportId = new URLSearchParams(location.search).get('import') || ''
     if (resumedImportId) {
+      // A creation-session deep link is adopted asynchronously from the
+      // durable session list. Wait for that context before restoring its
+      // import, otherwise the session transition clears the import that just
+      // loaded and the deep link silently opens the ordinary conversation.
+      if (requestedCreationSession && systemSessionId !== requestedCreationSession) return
       void apiClient.get<ApiResponse<MaterialImportSummary>>(`/novel-creation/imports/${resumedImportId}`)
         .then((response) => {
           const importRun = response.data.data
@@ -482,7 +487,7 @@ function GuiAssistantChat() {
         })
         .catch(() => message.error('无法恢复资料导入状态，请从任务中心重试'))
     }
-  }, [location.search])
+  }, [location.search, requestedCreationSession, systemSessionId])
 
   const openArtifactEditor = useCallback(async (artifact: CreationArtifactSummary, sessionIdOverride?: string) => {
     const targetSessionId = sessionIdOverride || systemSessionId || activeCreationRun?.session_id

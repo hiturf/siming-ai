@@ -302,7 +302,10 @@ async function mockUiApi(page: Page, assistantScenario: 'running' | 'recovery' =
     const requestUrl = new URL(route.request().url())
     const path = requestUrl.pathname
     if (path === '/api/v1/novel-creation/presets') return fulfill(route, { code: 0, data: creationPresets })
-    if (path === '/api/v1/novel-creation/sessions') return fulfill(route, { code: 0, data: { sessions: [] } })
+    if (path === '/api/v1/novel-creation/sessions') return fulfill(route, {
+      code: 0,
+      data: { sessions: Object.values(creationSessions) },
+    })
     if (path === '/api/v1/projects') return fulfill(route, { code: 0, data: { items: [project], total: 1 } })
     if (
       path === '/api/v1/ai/assistant/conversations'
@@ -657,7 +660,7 @@ test('keeps the workspace global-model control usable in the compact assistant p
   await page.goto('/project/p1', { waitUntil: 'networkidle' })
   await page.getByRole('button', { name: '展开项目助手' }).click()
 
-  await expect(page.getByRole('combobox', { name: '全局模型' })).toBeVisible()
+  await expect(page.getByRole('combobox', { name: '项目助手模型' })).toBeVisible()
   await expect(page.locator('.workspace-assistant-model-select .ant-select-selection-item')).toContainText('opencode')
   await expect(page.getByRole('button', { name: '管理模型' })).toBeVisible()
   await expectViewportSafe(page)
