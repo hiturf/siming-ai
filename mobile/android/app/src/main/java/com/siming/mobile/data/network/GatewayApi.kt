@@ -8,6 +8,9 @@ import java.io.IOException
 import java.time.Instant
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -169,6 +172,66 @@ class GatewayApi(private val tokenStore: SecureTokenStore) {
             path = path,
             method = if (create) "POST" else "PUT",
             payload = payload,
+        )
+    }
+
+    suspend fun pendingChapterDraft(
+        connection: GatewayConnection,
+        projectId: String,
+    ): JsonObject? {
+        val response = request<ApiEnvelope<JsonElement>>(
+            connection.baseUrl,
+            PcApiPaths.pendingChapterDraft(projectId),
+        )
+        return response.data as? JsonObject
+    }
+
+    suspend fun saveGeneratedChapter(
+        connection: GatewayConnection,
+        projectId: String,
+        payload: JsonObject,
+    ): JsonObject = canonicalWrite(
+        connection = connection,
+        path = PcApiPaths.authoringCollection(projectId, "chapter"),
+        method = "POST",
+        payload = payload,
+    )
+
+    suspend fun assistantConversations(
+        connection: GatewayConnection,
+        projectId: String,
+    ): JsonObject = request<ApiEnvelope<JsonObject>>(
+        connection.baseUrl,
+        PcApiPaths.assistantConversations(projectId),
+    ).data
+
+    suspend fun assistantConversation(
+        connection: GatewayConnection,
+        projectId: String,
+        conversationId: String,
+    ): JsonObject = request<ApiEnvelope<JsonObject>>(
+        connection.baseUrl,
+        PcApiPaths.assistantConversation(projectId, conversationId),
+    ).data
+
+    suspend fun assistantRun(
+        connection: GatewayConnection,
+        projectId: String,
+        runId: String,
+    ): JsonObject = request<ApiEnvelope<JsonObject>>(
+        connection.baseUrl,
+        PcApiPaths.assistantRun(projectId, runId),
+    ).data
+
+    suspend fun cancelAssistantRun(
+        connection: GatewayConnection,
+        projectId: String,
+        runId: String,
+    ) {
+        request<ApiEnvelope<JsonElement>>(
+            connection.baseUrl,
+            PcApiPaths.assistantRunCancel(projectId, runId),
+            "POST",
         )
     }
 
@@ -740,22 +803,47 @@ suspend fun downloadProjectExport(
                 .header("Accept", "text/event-stream")
                 .post(json.encodeToString(requestBody).toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            client.newCall(request).execute().use { response ->
-                if (response.code == 401 && attempt == 0) {
-                    response.body?.close()
-                    token = refresh(connection.baseUrl, token)
-                    return@use
-                }
-                if (!response.isSuccessful) throw errorFrom(response.code, response.body?.string())
-                val source = response.body?.source() ?: throw IOException("AI 响应为空")
-                while (!source.exhausted()) {
-                    val line = source.readUtf8Line() ?: break
-                    if (line.startsWith("data:")) {
-                        val data = line.removePrefix("data:").trim()
-                        if (data.isNotEmpty() && data != "[DONE]") onEvent(data)
+            val call = client.newCall(request)
+            val cancellationHandle = currentCoroutineContext()[Job]?.invokeOnCompletion { cause ->
+                if (cause is CancellationException) call.cancel()
+            }
+            try {
+                call.execute().use { response ->
+                    if (response.code == 401 && attempt == 0) {
+                        response.body?.close()
+                        token = refresh(connection.baseUrl, token)
+                        return@use
                     }
+                    if (!response.isSuccessful) throw errorFrom(response.code, response.body?.string())
+                    val source = response.body?.source() ?: throw IOException("AI 响应为空")
+                    var terminalSeen = false
+                    var streamError: String? = null
+                    while (!source.exhausted()) {
+                        val line = source.readUtf8Line() ?: break
+                        if (line.startsWith("data:")) {
+                            val data = line.removePrefix("data:").trim()
+                            if (data.isEmpty()) continue
+                            if (data == "[DONE]") break
+                            val event = runCatching { json.parseToJsonElement(data) as? JsonObject }.getOrNull()
+                            when ((event?.get("type") as? JsonPrimitive)?.contentOrNull) {
+                                "complete" -> terminalSeen = true
+                                "error", "permission_required" -> {
+                                    streamError = (event["message"] as? JsonPrimitive)?.contentOrNull
+                                        ?: (event["detail"] as? JsonPrimitive)?.contentOrNull
+                                        ?: "AI 任务执行失败"
+                                }
+                            }
+                            onEvent(data)
+                        }
+                    }
+                    streamError?.let { throw GatewayHttpException(502, it) }
+                    if (!terminalSeen) {
+                        throw IOException("AI 流式连接提前结束，正在根据持久化运行记录恢复")
+                    }
+                    return@withContext
                 }
-                return@withContext
+            } finally {
+                cancellationHandle?.dispose()
             }
         }
         throw GatewayHttpException(401, "设备授权已失效，请重新连接 Gateway")

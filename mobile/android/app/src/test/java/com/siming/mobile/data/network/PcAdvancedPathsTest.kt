@@ -28,6 +28,30 @@ class PcAdvancedPathsTest {
             "/api/v1/projects/project-1/chapters/chapter-1/restore/snapshot-1",
             PcApiPaths.chapterRestore(project, chapter, snapshot),
         )
+        assertEquals(
+            "/api/v1/projects/project-1/chapter-drafts/pending",
+            PcApiPaths.pendingChapterDraft(project),
+        )
+    }
+
+    @Test
+    fun `assistant lifecycle uses canonical PC routes`() {
+        assertEquals(
+            "/api/v1/projects/project-1/ai/assistant/conversations",
+            PcApiPaths.assistantConversations("project-1"),
+        )
+        assertEquals(
+            "/api/v1/projects/project-1/ai/assistant/conversations/conversation-1",
+            PcApiPaths.assistantConversation("project-1", "conversation-1"),
+        )
+        assertEquals(
+            "/api/v1/projects/project-1/ai/assistant/runs/run-1",
+            PcApiPaths.assistantRun("project-1", "run-1"),
+        )
+        assertEquals(
+            "/api/v1/projects/project-1/ai/assistant/runs/run-1/cancel",
+            PcApiPaths.assistantRunCancel("project-1", "run-1"),
+        )
     }
 
     @Test

@@ -657,6 +657,30 @@ def test_gateway_http_boundary_pairs_locally_and_denies_unauthorized_remote_clie
             )
             assert enabled_assistant.status_code == 405
 
+            private_conversations = remote_client.get(
+                f"/api/v1/projects/{private_project_id}/ai/assistant/conversations",
+                headers={"authorization": f"Bearer {access_token}"},
+            )
+            assert private_conversations.status_code == 404
+            enabled_conversations = remote_client.get(
+                f"/api/v1/projects/{enabled_project_id}/ai/assistant/conversations",
+                headers={"authorization": f"Bearer {access_token}"},
+            )
+            assert enabled_conversations.status_code == 200
+            assert enabled_conversations.json()["data"]["items"] == []
+            enabled_runs = remote_client.get(
+                f"/api/v1/projects/{enabled_project_id}/ai/assistant/runs",
+                headers={"authorization": f"Bearer {access_token}"},
+            )
+            assert enabled_runs.status_code == 200
+            assert enabled_runs.json()["data"]["items"] == []
+            pending_draft = remote_client.get(
+                f"/api/v1/projects/{enabled_project_id}/chapter-drafts/pending",
+                headers={"authorization": f"Bearer {access_token}"},
+            )
+            assert pending_draft.status_code == 200
+            assert pending_draft.json()["data"] is None
+
             oversized = remote_client.post(
                 "/api/v1/sync/push",
                 headers={

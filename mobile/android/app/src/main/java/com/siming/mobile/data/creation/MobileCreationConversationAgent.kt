@@ -84,6 +84,17 @@ internal class MobileCreationConversationAgent(
         var categorySelected = false
         var successfulWriteCount = 0
         var failedWriteCount = 0
+        val streamedReply = StringBuilder()
+        suspend fun emitReplyDelta(delta: String) {
+            if (delta.isEmpty()) return
+            streamedReply.append(delta)
+            onProgress(CreationAgentProgressEvent(
+                type = "reply_delta",
+                message = "",
+                status = "running",
+                data = buildJsonObject { put("delta", delta) },
+            ))
+        }
         while (iteration < contract.maxIterations && finalReply.isBlank()) {
             onProgress(CreationAgentProgressEvent(
                 type = "model_step_started",
@@ -97,7 +108,7 @@ internal class MobileCreationConversationAgent(
             } else {
                 contract.toolSchemas(activeCategories)
             }
-            val turn = directApi.agentTurn(
+            val turn = directApi.streamAgentTurn(
                 config = config,
                 messages = messages,
                 tools = scopedTools,
@@ -109,6 +120,7 @@ internal class MobileCreationConversationAgent(
                 maxOutputTokens = 6_000,
                 temperature = 0.25,
                 extraBody = extraBody,
+                onContentDelta = ::emitReplyDelta,
             )
             promptMetrics += promptMetric(
                 iteration = iteration + 1,
@@ -269,13 +281,14 @@ internal class MobileCreationConversationAgent(
                 "请根据以上真实工具结果，用两到四句中文说明本轮实际写入/读取了什么，然后提出一个基于当前数据缺口的后续问题。不要声称失败的写入已保存。",
             )
             val summaryTurn = runCatching {
-                directApi.agentTurn(
+                directApi.streamAgentTurn(
                     config = config,
                     messages = summaryMessages,
                     tools = JsonArray(emptyList()),
                     maxOutputTokens = 1_200,
                     temperature = 0.2,
                     extraBody = extraBody,
+                    onContentDelta = ::emitReplyDelta,
                 )
             }.getOrNull()
             promptMetrics += promptMetric(
@@ -301,13 +314,8 @@ internal class MobileCreationConversationAgent(
                 "本轮已完成：${writes.joinToString("；")}。接下来你最想补充哪一部分？"
             } else truthfulNoWrite(toolResults)
         }
-        finalReply.chunked(240).forEach { delta ->
-            onProgress(CreationAgentProgressEvent(
-                type = "reply_delta",
-                message = "",
-                status = "ok",
-                data = buildJsonObject { put("delta", delta) },
-            ))
+        if (!streamedReply.toString().endsWith(finalReply)) {
+            emitReplyDelta(finalReply)
         }
         val modelMessages = buildJsonArray {
             add(userMessage)

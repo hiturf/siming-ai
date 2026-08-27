@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -24,7 +26,7 @@ import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.PhoneAndroid
-import androidx.compose.material.icons.outlined.Save
+import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.StopCircle
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
@@ -142,7 +144,41 @@ internal fun AssistantWorkspace(projectId: String, viewModel: MainViewModel) {
                 }
             }
 
-            if (submittedPrompt.isBlank() && ui.assistantOutput.isBlank() && !ui.assistantRunning) {
+            if (canUseAi) {
+                item {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                        item {
+                            AssistChip(
+                                onClick = {
+                                    submittedPrompt = ""
+                                    viewModel.newAssistantConversation()
+                                },
+                                label = { Text("新对话") },
+                                leadingIcon = { Icon(Icons.Outlined.Add, null, Modifier.size(16.dp)) },
+                            )
+                        }
+                        items(ui.assistantConversations, key = { it.id }) { conversation ->
+                            AssistChip(
+                                onClick = {
+                                    submittedPrompt = ""
+                                    viewModel.loadAssistantConversation(projectId, conversation.id)
+                                },
+                                label = { Text(conversation.title, maxLines = 1) },
+                                colors = AssistChipDefaults.assistChipColors(
+                                    containerColor = if (conversation.id == ui.assistantConversationId) {
+                                        MaterialTheme.colorScheme.primaryContainer
+                                    } else Color.White,
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (
+                submittedPrompt.isBlank() && ui.assistantOutput.isBlank() &&
+                ui.assistantMessages.isEmpty() && !ui.assistantRunning
+            ) {
                 item { AssistantBubble("想从哪里开始？你可以直接描述任务，也可以先选一个常用动作。") }
                 item {
                     Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
@@ -162,7 +198,17 @@ internal fun AssistantWorkspace(projectId: String, viewModel: MainViewModel) {
                 }
             }
 
-            if (submittedPrompt.isNotBlank()) {
+            ui.assistantMessages.forEach { message ->
+                item(key = message.id) {
+                    if (message.role == "user") UserBubble(message.content)
+                    else AssistantBubble(message.content)
+                }
+            }
+
+            if (
+                submittedPrompt.isNotBlank() &&
+                ui.assistantMessages.lastOrNull { it.role == "user" }?.content != submittedPrompt
+            ) {
                 item { UserBubble(submittedPrompt) }
             }
 
@@ -184,18 +230,31 @@ internal fun AssistantWorkspace(projectId: String, viewModel: MainViewModel) {
                 }
             }
 
-            if (ui.assistantOutput.isNotBlank()) {
+            if (ui.assistantToolLog.isNotEmpty()) {
                 item {
-                    Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
-                        AssistantBubble(ui.assistantOutput)
-                        if (standaloneMobile && !ui.assistantRunning) {
-                            OutlinedButton(onClick = { viewModel.saveAssistantAsChapter(projectId) }) {
-                                Icon(Icons.Outlined.Save, null, Modifier.size(17.dp))
-                                Spacer(Modifier.width(6.dp))
-                                Text("保存为本机新章节")
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = SimingPaperWarm),
+                        modifier = Modifier.fillMaxWidth(0.92f),
+                    ) {
+                        Column(
+                            Modifier.padding(horizontal = 13.dp, vertical = 10.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text("工具执行记录", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                            ui.assistantToolLog.takeLast(8).forEach { entry ->
+                                Text("• $entry", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
                     }
+                }
+            }
+
+            if (
+                ui.assistantOutput.isNotBlank() &&
+                (ui.assistantRunning || ui.assistantMessages.lastOrNull { it.role == "assistant" }?.content != ui.assistantOutput)
+            ) {
+                item {
+                    AssistantBubble(ui.assistantOutput)
                 }
             }
         }
@@ -236,7 +295,7 @@ internal fun AssistantWorkspace(projectId: String, viewModel: MainViewModel) {
                         modifier = Modifier.weight(1f),
                     )
                     if (ui.assistantRunning) {
-                        IconButton(onClick = viewModel::cancelAssistant, modifier = Modifier.size(50.dp)) {
+                        IconButton(onClick = { viewModel.cancelAssistant(projectId) }, modifier = Modifier.size(50.dp)) {
                             Icon(Icons.Outlined.StopCircle, "停止", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(28.dp))
                         }
                     } else {

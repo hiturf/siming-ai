@@ -115,6 +115,8 @@ PR 描述至少包含：
 - [ ] 安装冒烟确认安装目录内存在 `Siming.exe`、`.siming-installed` 与卸载器，且覆盖安装不会遗留已删除运行时文件。
 - [ ] Gateway 发布同一版本的 `<version>`、`<major.minor>`、`latest` 三组标签，并包含 amd64/arm64、SBOM 与 provenance。
 
+既有版本若经维护者明确授权只刷新 Android 安装包，`vX.Y.Z` tag 仍保持不可移动。必须从已通过 CI 的 `main` 提交手动运行 `Android Release Refresh`，确认 Android `versionName` 与目标 tag 一致，并保留 Artifact 中的源提交 provenance；发布时只覆盖 `Siming.apk` 与 `Siming-apk-sha256.txt`，Windows 两项资产及其摘要不得变化。覆盖后必须重新下载四项资产，复核 APK 签名、版本、SHA-256，并比对 Windows 资产 ID/大小/摘要与操作前基线。
+
 ### 发布后
 
 - [ ] 从官方 Release 实际下载四项资产并重新核对 SHA-256。

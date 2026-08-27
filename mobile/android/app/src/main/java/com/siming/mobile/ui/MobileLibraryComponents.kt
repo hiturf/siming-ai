@@ -82,7 +82,7 @@ internal fun LibraryActionPanel(
             LibrarySmallAction(
                 icon = Icons.Outlined.FileOpen,
                 title = "导入小说",
-                detail = "TXT 建档",
+                detail = "TXT / DOCX 建档",
                 modifier = Modifier.weight(1f),
                 onClick = onImportNovel,
             )

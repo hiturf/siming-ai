@@ -74,6 +74,29 @@ internal class MobileChapterWriteStore(
         ),
     )
 
+    suspend fun latestGenerated(projectId: String): MobileChapterWriteRun? = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            directory.listFiles { item -> item.isFile && item.extension == "json" }
+                .orEmpty()
+                .asSequence()
+                .sortedByDescending(File::lastModified)
+                .mapNotNull { target ->
+                    runCatching {
+                        val root = json.parseToJsonElement(target.readText(Charsets.UTF_8)) as JsonObject
+                        MobileChapterWriteRun.fromJson(root)
+                    }.getOrNull()
+                }
+                .firstOrNull { run ->
+                    run.projectId == projectId && run.state == MobileChapterWriteState.GENERATED
+                }
+        }
+    }
+
+    suspend fun markSaved(runId: String): MobileChapterWriteRun? {
+        val run = load(runId) ?: return null
+        return transition(run, MobileChapterWriteState.SAVED)
+    }
+
     private fun file(runId: String): File {
         require(runId.matches(RUN_ID_PATTERN)) { "无效的手机写章运行 ID" }
         return File(directory, "$runId.json")
@@ -158,7 +181,8 @@ internal object MobileChapterWriteState {
     const val GENERATED = "generated"
     const val CANCELLED = "cancelled"
     const val FAILED = "failed"
-    val ALL = setOf(GENERATING, GENERATED, CANCELLED, FAILED)
+    const val SAVED = "saved"
+    val ALL = setOf(GENERATING, GENERATED, CANCELLED, FAILED, SAVED)
 }
 
 internal fun mobileChapterWriteRunId(

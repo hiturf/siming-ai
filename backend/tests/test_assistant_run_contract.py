@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from types import SimpleNamespace
 
 from app.main import app
+from app.routers import assistant_runs
 from app.schemas.ai_writer import WorkspaceAssistantRunResponse
 from app.services.workspace.run_log import run_payload
 
@@ -58,3 +60,25 @@ def test_run_queries_publish_typed_openapi_responses() -> None:
         run_schema["properties"]
     )
 
+
+def test_project_scoped_run_cancel_uses_the_registered_operation(monkeypatch) -> None:
+    run = _run()
+
+    class Workspace:
+        def run(self, project_id: str, run_id: str):
+            assert (project_id, run_id) == (run.project_id, run.id)
+            return run
+
+    class Operations:
+        async def action(self, operation_id: str, action: str):
+            assert (operation_id, action) == (run.operation_id, "cancel")
+            return "ok", {"id": operation_id, "status": "cancelled"}
+
+    monkeypatch.setattr(assistant_runs, "assistant_workspace", lambda _db: Workspace())
+    monkeypatch.setattr(assistant_runs, "get_operation_service", Operations)
+
+    response = asyncio.run(assistant_runs.cancel_assistant_run(run.project_id, run.id, object()))
+
+    assert response.data["run_id"] == run.id
+    assert response.data["operation_id"] == run.operation_id
+    assert response.data["operation"]["status"] == "cancelled"

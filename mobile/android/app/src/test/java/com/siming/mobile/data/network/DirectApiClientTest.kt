@@ -1,5 +1,6 @@
 package com.siming.mobile.data.network
 
+import java.io.IOException
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -327,6 +328,86 @@ class DirectApiClientTest {
         assertEquals("先核对章节列表", turn.reasoningContent)
         assertEquals("list_chapters", turn.toolCalls.single().name)
         assertEquals("call-2", turn.toolCalls.single().id)
+    }
+
+    @Test
+    fun `chat agent stream emits real deltas and buffers tool arguments until terminal`() = withServer(
+        object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+                assertTrue(body.getValue("stream").jsonPrimitive.content.toBoolean())
+                return sseResponse(
+                    """{"choices":[{"delta":{"reasoning_content":"先读取"},"finish_reason":null}]}""",
+                    """{"choices":[{"delta":{"content":"正在处理"},"finish_reason":null}]}""",
+                    """{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-live","function":{"name":"get_project_","arguments":"{\"id\":"}}]},"finish_reason":null}]}""",
+                    """{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"info","arguments":"\"project-1\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":29}}""",
+                )
+            }
+        },
+    ) { server ->
+        val content = mutableListOf<String>()
+        val reasoning = mutableListOf<String>()
+        val turn = runBlocking {
+            testClient().streamAgentTurn(
+                config(server, DirectApiConfig.PROTOCOL_CHAT_COMPLETIONS),
+                messages = listOf(buildJsonObject { put("role", "user"); put("content", "读取") }),
+                tools = singleTool("get_project_info"),
+                onContentDelta = { content += it },
+                onReasoningDelta = { reasoning += it },
+            )
+        }
+        assertEquals(listOf("正在处理"), content)
+        assertEquals(listOf("先读取"), reasoning)
+        assertEquals("get_project_info", turn.toolCalls.single().name)
+        assertEquals("project-1", turn.toolCalls.single().arguments["id"]?.jsonPrimitive?.content)
+        assertEquals(29, turn.promptTokens)
+    }
+
+    @Test
+    fun `responses agent stream emits text and reconstructs function call`() = withServer(
+        pathDispatcher(
+            "/responses" to sseResponse(
+                """{"type":"response.reasoning_summary_text.delta","delta":"核对上下文"}""",
+                """{"type":"response.output_text.delta","delta":"准备读取"}""",
+                """{"type":"response.output_item.added","item":{"type":"function_call","id":"item-1","call_id":"call-r","name":"list_chapters","arguments":""}}""",
+                """{"type":"response.function_call_arguments.delta","item_id":"item-1","delta":"{}"}""",
+                """{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":41}}}""",
+            ),
+        ),
+    ) { server ->
+        val content = mutableListOf<String>()
+        val turn = runBlocking {
+            testClient().streamAgentTurn(
+                config(server, DirectApiConfig.PROTOCOL_RESPONSES),
+                messages = listOf(buildJsonObject { put("role", "user"); put("content", "列出章节") }),
+                tools = singleTool("list_chapters"),
+                onContentDelta = { content += it },
+            )
+        }
+        assertEquals(listOf("准备读取"), content)
+        assertEquals("核对上下文", turn.reasoningContent)
+        assertEquals("list_chapters", turn.toolCalls.single().name)
+        assertEquals("call-r", turn.toolCalls.single().id)
+        assertEquals(41, turn.promptTokens)
+    }
+
+    @Test
+    fun `responses agent stream rejects done sentinel without completed event`() = withServer(
+        pathDispatcher(
+            "/responses" to sseResponse(
+                """{"type":"response.output_text.delta","delta":"未完成内容"}""",
+            ),
+        ),
+    ) { server ->
+        assertFailsWith<IOException> {
+            runBlocking {
+                testClient().streamAgentTurn(
+                    config(server, DirectApiConfig.PROTOCOL_RESPONSES),
+                    messages = listOf(buildJsonObject { put("role", "user"); put("content", "继续") }),
+                    tools = JsonArray(emptyList()),
+                )
+            }
+        }
     }
 
     @Test

@@ -383,7 +383,7 @@ private fun LibraryScreen(
                     EmptyPanel(
                         icon = Icons.AutoMirrored.Outlined.LibraryBooks,
                         title = "这里还没有作品",
-                        detail = "可以从零立项，也可以导入 TXT；司命是开源免费的，不需要把正文交给官方服务器。",
+                        detail = "可以从零立项，也可以导入 TXT；连接 PC Gateway 后还可直接导入 DOCX。",
                     )
                 }
             } else {
@@ -527,6 +527,31 @@ private fun ProjectScreen(
     val outlineRecords by viewModel.entities(project.projectId, "outline").collectAsStateWithLifecycle(initialValue = emptyList())
     val connection by viewModel.connection.collectAsStateWithLifecycle()
     val ui by viewModel.uiState
+
+    LaunchedEffect(project.projectId, connection?.deviceId) {
+        viewModel.restorePendingChapterDraft(project.projectId)
+        viewModel.refreshAssistantConversations(project.projectId)
+    }
+
+    val pendingChapterDraft = ui.pendingChapterDraft
+        ?.takeIf { it.projectId == project.projectId }
+    if (pendingChapterDraft != null) {
+        PendingChapterDraftEditorScreen(
+            draft = pendingChapterDraft,
+            online = connection != null,
+            busy = ui.busy,
+            viewModel = viewModel,
+            onBack = {
+                viewModel.hidePendingChapterDraft()
+                section = "assistant"
+            },
+            onSaved = {
+                viewModel.hidePendingChapterDraft()
+                section = "chapter"
+            },
+        )
+        return
+    }
 
     if (creatingChapter || chapterEditor != null) {
         val activeChapter = chapterEditor
