@@ -217,7 +217,7 @@ class MobileCreationConversationAgentTest {
                             """{"id":"call-write-$index","type":"function","function":{"name":"patch_creation_session","arguments":"{\"changes\":{\"genre\":\"类型$index\"}}"}}"""
                         }
                         chatStreamResponse(
-                            """{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[$calls}}]}""",
+                            """{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[$calls]}}]}""",
                         )
                     }
                     else -> {

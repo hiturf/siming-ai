@@ -472,8 +472,10 @@ class MobileConversationContextTest {
         assertTrue(accepted.accepted)
 
         val resultBatch = MobileNativeToolBudgetContract.admitExactAssistantTransaction(
-            assistantPayload = nativeAssistantPayload(listOf("search_chapters", "search_outline")),
-            orderedToolNames = listOf("search_chapters", "search_outline"),
+            assistantPayload = nativeAssistantPayload(
+                listOf("search_chapters", "search_outline", "search_characters"),
+            ),
+            orderedToolNames = listOf("search_chapters", "search_outline", "search_characters"),
         )
         assertFalse(resultBatch.accepted)
         assertEquals(

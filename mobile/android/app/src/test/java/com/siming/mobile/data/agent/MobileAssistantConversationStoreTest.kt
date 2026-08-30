@@ -127,13 +127,16 @@ class MobileAssistantConversationStoreTest {
             )
             store.recordDeliveredToolTransaction("project-1", turn, delivered)
 
-            val deliveredAfterRestart = assertNotNull(
-                MobileAssistantConversationStore(directory).snapshot("project-1", turn.conversationId),
+            val deliveredBeforeConsumption = assertNotNull(
+                store.snapshot("project-1", turn.conversationId),
             ).toolRuntimeState(turn.turnId)
-            assertEquals(listOf("transaction-1"), deliveredAfterRestart?.deliveredTransactions?.map { it.transactionId })
+            assertEquals(
+                listOf("transaction-1"),
+                deliveredBeforeConsumption?.deliveredTransactions?.map { it.transactionId },
+            )
             assertEquals(
                 "{ \"project_id\": \"project-1\" }",
-                deliveredAfterRestart?.deliveredTransactions?.single()?.calls?.single()?.argumentsJson,
+                deliveredBeforeConsumption?.deliveredTransactions?.single()?.calls?.single()?.argumentsJson,
             )
 
             store.markDeliveredToolTransactionsConsumed("project-1", turn)
@@ -222,15 +225,16 @@ class MobileAssistantConversationStoreTest {
     @Test
     fun `newer user message prevents stale turn from being closed`() = runBlocking {
         withTemporaryDirectory { directory ->
-            val store = MobileAssistantConversationStore(directory)
-            val old = store.beginTurn("project-1", null, "旧任务")
-            val newest = store.beginTurn("project-1", old.conversationId, "新任务")
+            val original = MobileAssistantConversationStore(directory)
+            val old = original.beginTurn("project-1", null, "旧任务")
+            val restarted = MobileAssistantConversationStore(directory)
+            val newest = restarted.beginTurn("project-1", old.conversationId, "新任务")
 
             val error = assertFailsWith<MobileConversationContextException> {
-                store.finishTurn("project-1", old, "旧任务完成", "completed", emptyList())
+                original.finishTurn("project-1", old, "旧任务完成", "completed", emptyList())
             }
             assertEquals(MobileConversationContextErrorCode.SOURCE_CHANGED, error.code)
-            val snapshot = assertNotNull(store.snapshot("project-1", newest.conversationId))
+            val snapshot = assertNotNull(restarted.snapshot("project-1", newest.conversationId))
             val history = snapshot.historicalTurns(newest).flatMap(MobileConversationTurn::messages)
             assertEquals(listOf("user", "assistant"), history.map { it.role })
             assertEquals("aborted", history.last().status)
@@ -627,9 +631,11 @@ class MobileAssistantConversationStoreTest {
             val first = assertNotNull(store.snapshot("project-1", "conversation-1"))
             val second = assertNotNull(MobileAssistantConversationStore(directory).snapshot("project-1", "conversation-1"))
 
-            assertEquals(listOf(1L, 2L, 3L), first.messages.map { it.sequenceNo })
+            assertEquals(listOf(1L, 2L, 3L, 4L), first.messages.map { it.sequenceNo })
             assertEquals(first.messages.map { it.turnId }, second.messages.map { it.turnId })
             assertEquals(2, first.turns.size)
+            assertEquals("继续", first.messages[2].content)
+            assertEquals("aborted", first.messages[3].status)
             val migratedRoot = Json.parseToJsonElement(legacy.readText()) as JsonObject
             assertEquals(2, migratedRoot["schema_version"]?.toString()?.toInt())
         }
