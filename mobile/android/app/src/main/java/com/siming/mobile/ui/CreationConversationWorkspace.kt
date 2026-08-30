@@ -403,7 +403,7 @@ private fun CreationConversationContextCard(
                 when (state.status) {
                     "compressing", "pending" -> "正在整理较早立项对话"
                     "failed" -> "立项对话上下文整理失败"
-                    else -> "立项对话上下文",
+                    else -> "立项对话上下文"
                 },
                 fontWeight = FontWeight.Bold,
             )
