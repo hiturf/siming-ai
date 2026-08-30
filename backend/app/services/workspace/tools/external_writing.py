@@ -52,6 +52,7 @@ def _external_writing_context_result(
     db: Session,
     project: Any,
     target_outline: Any,
+    target_chapter: Any | None,
     manifest: Any,
     manifest_payload: dict[str, Any],
     args: dict[str, Any],
@@ -90,7 +91,15 @@ def _external_writing_context_result(
         "detail": detail,
         "data": {
             "project": {"id": project.id, "title": project.title},
-            "target": {"outline_node_id": target_outline.id, "title": target_outline.title},
+            "target": {
+                "outline_node_id": target_outline.id,
+                "title": target_outline.title,
+                "draft_kind": "revision" if target_chapter else "new",
+                "target_chapter_id": target_chapter.id if target_chapter else None,
+                "base_chapter_version": (
+                    int(target_chapter.current_version or 1) if target_chapter else None
+                ),
+            },
             "requirements": str(args.get("requirements") or "").strip(),
             "prompt_pack": prompt_pack,
             "context_manifest_id": manifest.id,
@@ -105,7 +114,7 @@ def _external_writing_context_result(
             "task_context": safe_task_context if selection_ready else "",
             "warnings": list(dict.fromkeys(warnings)),
             "workflow_boundaries": {
-                "current_task": "base_chapter_writing",
+                "current_task": "chapter_revision" if target_chapter else "base_chapter_writing",
                 "de_ai_revision": "separate_user_action",
                 "quality_review": "separate_user_action",
             },
@@ -163,17 +172,26 @@ async def prepare_external_writing_context(
         Chapter.outline_node_id == outline_node_id,
     ).first()
     if existing_chapter:
+        target_chapter_id = str(args.get("target_chapter_id") or "").strip()
+        if not target_chapter_id or target_chapter_id != str(existing_chapter.id):
+            return {
+                "tool": "prepare_external_writing_context",
+                "status": "skipped",
+                "detail": (
+                    "The selected outline already has formal prose. To prepare a reviewable "
+                    "revision, explicitly pass its existing_chapter_id as target_chapter_id."
+                ),
+                "data": {
+                    "outline_node_id": outline_node_id,
+                    "existing_chapter_id": existing_chapter.id,
+                },
+            }
+    elif str(args.get("target_chapter_id") or "").strip():
         return {
             "tool": "prepare_external_writing_context",
             "status": "skipped",
-            "detail": (
-                "The selected outline already has a formal chapter. Chapter writing only "
-                "creates independent new-chapter drafts and never overwrites saved prose."
-            ),
-            "data": {
-                "outline_node_id": outline_node_id,
-                "existing_chapter_id": existing_chapter.id,
-            },
+            "detail": "target_chapter_id does not match the formal chapter linked to this outline.",
+            "data": {"outline_node_id": outline_node_id},
         }
 
     orchestrator = ContextOrchestrator(db)
@@ -225,6 +243,7 @@ async def prepare_external_writing_context(
         db,
         project,
         target_outline,
+        existing_chapter,
         manifest,
         manifest_payload,
         args,
@@ -283,6 +302,101 @@ def _external_draft_manifest_error(
     }
 
 
+def _resolve_external_draft_target(
+    db: Session,
+    project_id: str,
+    args: dict[str, Any],
+) -> tuple[str | None, str, str | None, int | None, dict[str, Any] | None]:
+    """Resolve new-vs-revision identity before the terminal save boundary."""
+    from app.database.models import Chapter, OutlineNode
+
+    outline_node_id = str(args.get("outline_node_id") or "").strip() or None
+    if not outline_node_id:
+        return None, "", None, None, {
+            "tool": "save_external_chapter_draft",
+            "status": "skipped",
+            "detail": "The Agent must select a real chapter-level outline ID before saving a draft.",
+            "data": None,
+        }
+    target_outline = (
+        db.query(OutlineNode)
+        .filter(
+            OutlineNode.project_id == project_id,
+            OutlineNode.id == outline_node_id,
+        )
+        .first()
+    )
+    if not target_outline or target_outline.node_type != "chapter":
+        return outline_node_id, "", None, None, {
+            "tool": "save_external_chapter_draft",
+            "status": "skipped",
+            "detail": "outline_node_id must identify a chapter node in the current project.",
+            "data": {"outline_node_id": outline_node_id},
+        }
+    existing_chapter = (
+        db.query(Chapter)
+        .filter(
+            Chapter.project_id == project_id,
+            Chapter.outline_node_id == outline_node_id,
+        )
+        .first()
+    )
+    target_chapter_id = str(args.get("target_chapter_id") or "").strip() or None
+    if existing_chapter and target_chapter_id != str(existing_chapter.id):
+        return outline_node_id, "", target_chapter_id, None, {
+            "tool": "save_external_chapter_draft",
+            "status": "skipped",
+            "detail": (
+                "The selected outline has formal prose. A revision candidate requires "
+                "the matching target_chapter_id and never overwrites it automatically."
+            ),
+            "data": {
+                "outline_node_id": outline_node_id,
+                "existing_chapter_id": existing_chapter.id,
+            },
+        }
+    if not existing_chapter and target_chapter_id:
+        return outline_node_id, "", target_chapter_id, None, {
+            "tool": "save_external_chapter_draft",
+            "status": "skipped",
+            "detail": (
+                "target_chapter_id does not match the formal chapter linked to this outline."
+            ),
+            "data": {"outline_node_id": outline_node_id},
+        }
+
+    requested_base_version = args.get("base_chapter_version")
+    if existing_chapter and requested_base_version is None:
+        return outline_node_id, "", target_chapter_id, None, {
+            "tool": "save_external_chapter_draft",
+            "status": "skipped",
+            "detail": (
+                "A revision must carry the base_chapter_version returned by "
+                "prepare_external_writing_context so later author edits cannot be overwritten."
+            ),
+            "data": {"target_chapter_id": target_chapter_id},
+        }
+    try:
+        base_chapter_version = int(requested_base_version) if existing_chapter else None
+    except (TypeError, ValueError):
+        return outline_node_id, "", target_chapter_id, None, {
+            "tool": "save_external_chapter_draft",
+            "status": "skipped",
+            "detail": (
+                "base_chapter_version must be the integer returned by "
+                "prepare_external_writing_context."
+            ),
+            "data": {"target_chapter_id": target_chapter_id},
+        }
+    return (
+        outline_node_id,
+        str(target_outline.title or "").strip(),
+        target_chapter_id,
+        base_chapter_version,
+        None,
+    )
+
+
 async def save_external_chapter_draft(
     db: Session,
     project_id: str,
@@ -293,7 +407,6 @@ async def save_external_chapter_draft(
     API-free: stores draft content server-side and returns draft_id/content_ref.
     Saving the draft is the terminal boundary for an AI chapter-writing turn.
     """
-    from app.database.models import Chapter, OutlineNode
     from app.services.cataloging.launcher import (
         cataloging_block_result,
         cataloging_required_block_result,
@@ -302,6 +415,7 @@ async def save_external_chapter_draft(
     )
     from app.services.workspace.generated_drafts import (
         ChapterDraftOutlineConflict,
+        ChapterDraftTargetConflict,
         PendingChapterDraftConflict,
         find_pending_chapter_draft,
         pending_draft_block_result,
@@ -318,45 +432,18 @@ async def save_external_chapter_draft(
             "data": None,
         }
 
-    outline_node_id = str(args.get("outline_node_id") or "").strip() or None
     context_manifest_id = str(args.get("context_manifest_id") or "").strip() or None
     source_agent = str(args.get("source_agent") or "external").strip()
-    if not outline_node_id:
-        return {
-            "tool": "save_external_chapter_draft",
-            "status": "skipped",
-            "detail": "The Agent must select a real chapter-level outline ID before saving a draft.",
-            "data": None,
-        }
-    target_outline = db.query(OutlineNode).filter(
-        OutlineNode.project_id == project_id,
-        OutlineNode.id == outline_node_id,
-    ).first()
-    if not target_outline or target_outline.node_type != "chapter":
-        return {
-            "tool": "save_external_chapter_draft",
-            "status": "skipped",
-            "detail": "outline_node_id must identify a chapter node in the current project.",
-            "data": {"outline_node_id": outline_node_id},
-        }
-    existing_chapter = db.query(Chapter).filter(
-        Chapter.project_id == project_id,
-        Chapter.outline_node_id == outline_node_id,
-    ).first()
-    if existing_chapter:
-        return {
-            "tool": "save_external_chapter_draft",
-            "status": "skipped",
-            "detail": (
-                "The selected outline already has a formal chapter. This tool cannot "
-                "create a rewrite draft or overwrite saved prose."
-            ),
-            "data": {
-                "outline_node_id": outline_node_id,
-                "existing_chapter_id": existing_chapter.id,
-            },
-        }
-    title = str(target_outline.title or "").strip()
+    (
+        outline_node_id,
+        title,
+        target_chapter_id,
+        base_chapter_version,
+        target_error,
+    ) = _resolve_external_draft_target(db, project_id, args)
+    if target_error:
+        return target_error
+    assert outline_node_id is not None
 
     pending_draft = find_pending_chapter_draft(db, project_id)
     if pending_draft:
@@ -391,6 +478,8 @@ async def save_external_chapter_draft(
             title=title,
             outline_node_id=outline_node_id,
             context_manifest_id=context_manifest_id,
+            target_chapter_id=target_chapter_id or None,
+            base_chapter_version=base_chapter_version,
             db=db,
         )
     except PendingChapterDraftConflict as conflict:
@@ -405,8 +494,22 @@ async def save_external_chapter_draft(
             ),
             "data": {
                 "outline_node_id": outline_node_id,
-                "existing_chapter_id": conflict.chapter.id,
+                "existing_chapter_id": getattr(
+                    conflict.chapter,
+                    "id",
+                    target_chapter_id or None,
+                ),
             },
+        }
+    except ChapterDraftTargetConflict as conflict:
+        return {
+            "tool": "save_external_chapter_draft",
+            "status": "skipped",
+            "detail": (
+                "The revision target changed before the candidate was stored; "
+                "no prose was overwritten."
+            ),
+            "data": {"target_chapter_id": conflict.target_chapter_id},
         }
 
     return apply_turn_directive({
@@ -421,6 +524,9 @@ async def save_external_chapter_draft(
             "context_manifest_id": context_manifest_id,
             "content": content,
             "draft_status": "pending",
+            "draft_kind": "revision" if target_chapter_id else "new",
+            "target_chapter_id": target_chapter_id or None,
+            "base_chapter_version": base_chapter_version,
             "next_actions": ["save_and_catalog", "save_only"],
             "word_count": count_words(content),
             "source_agent": source_agent,
