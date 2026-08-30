@@ -340,7 +340,10 @@ class MobileAssistantConversationStoreTest {
                 safetyMarginTokens = 1_000,
             )
             val recent = current.planRecentTurns(currentTurn, MobileUtf8ByteTokenCounter, budget)
-            assertEquals((21..25).map { "立项问题 $it" }, recent.exactTurns.map { it.messages.first().content })
+            assertEquals(
+                (21..25).map { "立项问题 $it" },
+                recent.recentExactTurns.map { it.messages.first().content },
+            )
         }
     }
 
