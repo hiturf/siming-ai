@@ -251,7 +251,14 @@ export default function ContextGovernancePage({ projectId }: { projectId: string
     {
       title: '模型',
       key: 'model',
-      render: (_: unknown, item: ContextManifest) => <Text ellipsis={{ tooltip: item.model || '未知模型' }} style={{ maxWidth: 180 }}>{item.model || '未知模型（1M 默认）'}</Text>,
+      render: (_: unknown, item: ContextManifest) => (
+        <Text
+          ellipsis={{ tooltip: item.model || '未知模型：1M 仅用于预览估算，Agent 会阻断执行' }}
+          style={{ maxWidth: 180 }}
+        >
+          {item.model || '未知模型（1M 未验证预览，Agent 会阻断）'}
+        </Text>
+      ),
     },
     {
       title: '操作',

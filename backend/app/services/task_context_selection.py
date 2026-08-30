@@ -22,6 +22,8 @@ from .task_context_sources import (
 MODEL_SELECTED_TASK_TYPES = frozenset({"writing", "outline_planning"})
 TASK_CONTEXT_SOFT_TARGET_TOKENS = 32_000
 TASK_CONTEXT_SEARCH_EXCERPT_CHARS = 600
+TASK_CONTEXT_SEARCH_PAGE_LIMIT = 10
+TASK_CONTEXT_SEARCH_MAX_CURSOR = 20
 TASK_CONTEXT_SEARCH_SOURCE_TYPES = frozenset(
     {
         "chapter",
@@ -264,9 +266,7 @@ class TaskContextSelector:
                 recency_score=source.recency_score,
                 structural_score=source.structural_score,
                 final_score=source.final_score,
-                selection_reason=(
-                    "Exact source selected by the Agent after retrieval review."
-                ),
+                selection_reason=("Exact source selected by the Agent after retrieval review."),
                 estimated_tokens=source.estimated_tokens,
                 evidence_submitted_at=now,
                 sort_order=next_order,
@@ -417,8 +417,10 @@ class TaskContextSelector:
         *,
         query: str,
         limit: int,
+        offset: int = 0,
         source_types: Sequence[str],
         hybrid_search: Callable[[Sequence[str]], list[Any]],
+        include_next_probe: bool = False,
     ) -> list[dict[str, Any]]:
         self.clear(manifest)
         requested = {str(value).strip() for value in source_types if str(value).strip()}
@@ -437,7 +439,10 @@ class TaskContextSelector:
         retrieval_types = [value for value in effective if value != "narrative_governance"]
         if retrieval_types:
             candidates.extend(hybrid_search(retrieval_types))
-        candidates = candidates[: max(1, min(limit, 20))]
+        page_size = max(1, min(limit, TASK_CONTEXT_SEARCH_PAGE_LIMIT))
+        page_offset = max(0, min(offset, TASK_CONTEXT_SEARCH_MAX_CURSOR))
+        fetch_size = page_size + int(include_next_probe)
+        candidates = candidates[page_offset : page_offset + fetch_size]
         existing = {
             (item.source_type, item.source_id, item.chunk_id, item.source_hash): item
             for item in manifest.items
@@ -484,10 +489,8 @@ class TaskContextSelector:
                     "source_id": item.source_id,
                     "chunk_id": item.chunk_id,
                     "source_hash": item.source_hash,
-                    "title": item.title,
-                    "excerpt": _clean_text(
-                        item.content_excerpt, TASK_CONTEXT_SEARCH_EXCERPT_CHARS
-                    ),
+                    "title": _clean_text(item.title, 100),
+                    "excerpt": _clean_text(item.content_excerpt, TASK_CONTEXT_SEARCH_EXCERPT_CHARS),
                     "estimated_chunk_tokens": item.estimated_tokens,
                     "scores": {
                         "lexical": item.lexical_score,
@@ -506,6 +509,8 @@ __all__ = [
     "MODEL_SELECTED_TASK_TYPES",
     "TASK_CONTEXT_SOFT_TARGET_TOKENS",
     "TASK_CONTEXT_SEARCH_EXCERPT_CHARS",
+    "TASK_CONTEXT_SEARCH_MAX_CURSOR",
+    "TASK_CONTEXT_SEARCH_PAGE_LIMIT",
     "TASK_CONTEXT_SEARCH_SOURCE_TYPES",
     "TaskContextSelector",
     "generation_items",

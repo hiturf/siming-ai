@@ -176,7 +176,6 @@ data class MobileProviderEnvelope(
 data class WorkspaceAssistantRequest(
     val message: String,
     @SerialName("conversation_id") val conversationId: String? = null,
-    val history: List<JsonObject> = emptyList(),
     @SerialName("model_route") val modelRoute: String = "pc",
     @SerialName("mobile_provider") val mobileProvider: MobileProviderEnvelope? = null,
 )

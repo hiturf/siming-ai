@@ -80,6 +80,8 @@ class OutlineDraftGenerationTestCase(unittest.TestCase):
             "content": "",
             "tool_calls": [
                 {
+                    "id": "call-outline-1",
+                    "type": "function",
                     "function": {
                         "name": "propose_outline_nodes",
                         "arguments": json.dumps(
@@ -176,6 +178,97 @@ class OutlineDraftGenerationTestCase(unittest.TestCase):
         self.assertEqual(result["status"], "needs_confirmation")
         self.assertEqual(self.db.query(OutlineDraft).count(), 0)
         completion.assert_not_awaited()
+
+    @patch(
+        "app.services.workspace.tools.outline_writer.LLMGateway.chat_completion",
+        new_callable=AsyncMock,
+    )
+    def test_internal_writer_rejects_unsupported_model_without_consuming_selection(
+        self,
+        completion: AsyncMock,
+    ) -> None:
+        manifest, token = self.planning_context()
+        manifest.provider = "codex_cli"
+        manifest.model = "test"
+        self.db.commit()
+
+        result = asyncio.run(
+            outline_writer(
+                self.db,
+                "p1",
+                {
+                    "context_manifest_id": manifest.id,
+                    "context_selection_token": token,
+                    "insert_after_id": "o1",
+                },
+            )
+        )
+
+        self.db.refresh(manifest)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["data"]["reason"], "tool_capability_unavailable")
+        self.assertIn("tool_capability_unavailable", result["detail"])
+        self.assertIsNone(manifest.consumed_at)
+        self.assertEqual(self.db.query(OutlineDraft).count(), 0)
+        completion.assert_not_awaited()
+
+    @patch(
+        "app.services.workspace.tools.outline_writer.store_outline_draft",
+    )
+    @patch(
+        "app.services.workspace.tools.outline_writer.LLMGateway.chat_completion",
+        new_callable=AsyncMock,
+    )
+    @patch(
+        "app.services.workspace.tools.outline_writer.LLMGateway.local_cli_extra_body",
+        return_value={},
+    )
+    def test_internal_writer_rejects_json_content_without_native_tool_call(
+        self,
+        _extra_body,
+        completion: AsyncMock,
+        store_draft,
+    ) -> None:
+        manifest, token = self.planning_context()
+        completion.return_value = {
+            "content": json.dumps(
+                {
+                    "nodes": [
+                        {
+                            "title": "Must not persist",
+                            "node_type": "chapter",
+                            "summary": "Looks valid but is ordinary assistant text.",
+                            "character_names": [],
+                            "status": "pending",
+                        }
+                    ],
+                    "design_notes": "Not a native tool call.",
+                }
+            ),
+            "tool_calls": [],
+        }
+
+        result = asyncio.run(
+            outline_writer(
+                self.db,
+                "p1",
+                {
+                    "context_manifest_id": manifest.id,
+                    "context_selection_token": token,
+                    "insert_after_id": "o1",
+                    "batch_count": 1,
+                    "requirements": "Plan the next chapter.",
+                },
+            )
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(
+            result["data"]["protocol_error"],
+            "required_native_tool_call_missing_or_ambiguous",
+        )
+        self.assertEqual(self.db.query(OutlineDraft).count(), 0)
+        store_draft.assert_not_called()
 
     def test_external_agent_saves_the_same_draft_type_and_stops(self) -> None:
         manifest, token = self.planning_context()

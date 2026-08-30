@@ -1,32 +1,31 @@
 """Persistence and presentation helpers for project-assistant turns."""
+
 from __future__ import annotations
 
 import json
-import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.architecture.uow import commit_session
 from app.core.utils import utc_isoformat
 from app.services.operation_runtime import record_operation_signal
+from app.services.workspace.assistant_public_projection import (
+    public_message_content,
+    public_message_payload,
+    public_tool_log,
+)
 from app.services.workspace.run_log import mark_assistant_run, run_payload
 
 
-def _compact_workspace_detail(value: object, limit: int = 180) -> str:
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
-    if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + "..."
-
-
 def _workspace_result_summary(result: dict) -> str:
-    tool = str(result.get("tool") or "tool")
-    status = str(result.get("status") or "ok")
-    detail = _compact_workspace_detail(result.get("detail") or "")
+    projected = public_tool_log(result)
+    tool = str(projected["tool"])
+    status = str(projected["status"])
+    detail = str(projected["detail"])
     prefix = f"{tool}（{status}）"
     return f"{prefix}：{detail}" if detail else prefix
 
@@ -63,21 +62,30 @@ def _build_workspace_final_reply(
     if searched_context:
         lines = ["本轮已读取相关资料，但模型没有给出最终文字回复。", "", "已读取："]
         for item in searched_context[:5]:
-            tool = str(item.get("tool") or "search")
-            detail = _compact_workspace_detail(item.get("detail") or "")
+            projected = public_tool_log(item)
+            tool = str(projected["tool"])
+            detail = str(projected["detail"])
             data = item.get("data")
             count = len(data) if isinstance(data, list) else 0
             suffix = detail or (f"{count} 条结果" if count else "有结果")
             lines.append(f"- {tool}：{suffix}")
         if len(searched_context) > 5:
             lines.append(f"- 另有 {len(searched_context) - 5} 条检索上下文已省略")
-        lines.extend([
-            "",
-            "请重试一次；如果连续出现，建议在系统设置里测试当前模型/CLI 的流式输出和工具调用能力。",
-        ])
+        lines.extend(
+            [
+                "",
+                (
+                    "请重试一次；如果连续出现，建议在系统设置里测试"
+                    "当前模型/CLI 的流式输出和工具调用能力。"
+                ),
+            ]
+        )
         return "\n".join(lines)
 
-    return "我没有收到模型的文字回复，也没有执行任何工具。请重试一次，或在系统设置里测试当前模型/CLI 是否支持项目助手的流式输出和工具调用。"
+    return (
+        "我没有收到模型的文字回复，也没有执行任何工具。请重试一次，"
+        "或在系统设置里测试当前模型/CLI 是否支持项目助手的流式输出和工具调用。"
+    )
 
 
 def _workspace_outcome(
@@ -100,7 +108,7 @@ def _workspace_outcome(
 
 def _assistant_conversation_to_dict(
     conversation: Any,
-    message_count: Optional[int] = None,
+    message_count: int | None = None,
 ) -> dict:
     return {
         "id": conversation.id,
@@ -115,17 +123,29 @@ def _assistant_conversation_to_dict(
 
 
 def _assistant_message_to_dict(message: Any) -> dict:
-    payload = None
+    raw_payload = None
     if message.payload_json:
         try:
-            payload = json.loads(message.payload_json)
+            raw_payload = json.loads(message.payload_json)
         except Exception:
-            payload = None
+            raw_payload = None
+    payload = public_message_payload(raw_payload)
+    if payload is not None and str(message.status or "").lower() in {
+        "error",
+        "aborted",
+        "cancelled",
+        "interrupted",
+    }:
+        # Legacy/pre-release rows may have copied a raw provider diagnostic to
+        # ``payload.reply`` even though their durable message status is an
+        # error.  The stable public error projection is authoritative here.
+        payload.pop("reply", None)
     return {
         "id": message.id,
         "conversation_id": message.conversation_id,
+        "sequence_no": message.sequence_no,
         "role": message.role,
-        "content": message.content,
+        "content": public_message_content(message, payload),
         "payload": payload,
         "status": message.status,
         "created_at": utc_isoformat(message.created_at),
@@ -135,8 +155,6 @@ def _assistant_message_to_dict(message: Any) -> dict:
 
 @dataclass
 class WorkspaceTurnTelemetry:
-    reasoning_parts: list[str] = field(default_factory=list)
-    last_reasoning_iteration: int = 0
     last_operation_report_at: float = 0.0
 
     def report_model_activity(
@@ -160,17 +178,6 @@ class WorkspaceTurnTelemetry:
             message=message,
         )
 
-    def record_reasoning_delta(self, text: str, iteration: int) -> str:
-        """Keep the persisted transcript byte-for-byte aligned with SSE deltas."""
-        delta = str(text or "")
-        if not delta:
-            return ""
-        prefix = "\n\n" if self.reasoning_parts and self.last_reasoning_iteration != iteration else ""
-        visible_delta = f"{prefix}{delta}"
-        self.reasoning_parts.append(visible_delta)
-        self.last_reasoning_iteration = iteration
-        return visible_delta
-
 
 def finalize_workspace_assistant_turn(
     db: Session,
@@ -184,12 +191,17 @@ def finalize_workspace_assistant_turn(
     searched_context: list[dict],
     final_model: str,
     final_usage: Any,
-    reasoning_content: str,
 ) -> dict[str, Any]:
-    failed_logs = [
-        log for log in tool_logs
-        if str(log.get("status") or "").lower() == "error"
-    ]
+    existing_payload: dict[str, Any] = {}
+    if assistant_message.payload_json:
+        try:
+            decoded_payload = json.loads(assistant_message.payload_json)
+            if isinstance(decoded_payload, dict):
+                existing_payload = decoded_payload
+        except Exception:
+            existing_payload = {}
+    reference_context_audit = existing_payload.get("reference_context_audit")
+    failed_logs = [log for log in tool_logs if str(log.get("status") or "").lower() == "error"]
     final_reply_for_save = _build_workspace_final_reply(
         final_reply,
         applied_actions=applied_actions,
@@ -198,8 +210,9 @@ def finalize_workspace_assistant_turn(
     )
     if failed_logs:
         failed_text = "；".join(
-            f"{log.get('tool')}: {log.get('detail') or '执行失败'}"
+            f"{projected['tool']}: {projected['detail']}"
             for log in failed_logs[:3]
+            if (projected := public_tool_log(log))
         )
         final_reply_for_save = (
             f"{final_reply_for_save}\n\n注意：本轮有工具执行失败，相关数据可能未保存：{failed_text}"
@@ -211,9 +224,8 @@ def finalize_workspace_assistant_turn(
         searched_context=searched_context,
         failed_logs=failed_logs,
     )
-    response_payload: dict[str, Any] = {
+    private_result: dict[str, Any] = {
         "reply": final_reply_for_save,
-        "reasoning_content": reasoning_content,
         "outcome": outcome,
         "actions": [],
         "applied_actions": applied_actions,
@@ -223,8 +235,16 @@ def finalize_workspace_assistant_turn(
         "model": final_model,
         "usage": final_usage,
     }
+    if isinstance(reference_context_audit, dict):
+        private_result["reference_context_audit"] = reference_context_audit
     if assistant_run:
-        response_payload["run"] = run_payload(assistant_run)
+        private_result["run"] = run_payload(assistant_run)
+    response_payload = public_message_payload(private_result) or {
+        "reply": final_reply_for_save,
+        "tool_logs": [],
+        "applied_actions": [],
+        "actions": [],
+    }
     assistant_message.content = response_payload["reply"]
     assistant_message.payload_json = json.dumps(response_payload, ensure_ascii=False)
     assistant_message.status = "completed"

@@ -63,6 +63,7 @@ from ..modules.context.application.runtime import (
 from ..modules.context.application.runtime import (
     active_context_manifest as active_context_manifest,
 )
+from ..modules.model_runtime.application.request_capacity import active_request_capacity
 from ..modules.model_runtime.application.runtime import resolve_model_identity
 from .character_archive import character_archive_text
 from .context_manifest_runtime import (
@@ -98,6 +99,8 @@ from .task_context_baseline import (
 )
 from .task_context_selection import (
     MODEL_SELECTED_TASK_TYPES,
+    TASK_CONTEXT_SEARCH_MAX_CURSOR,
+    TASK_CONTEXT_SEARCH_PAGE_LIMIT,
     TaskContextSelector,
 )
 from .task_context_selection import (
@@ -580,6 +583,14 @@ class ContextOrchestrator:
                 provider, model_name = resolve_model_identity(raw)
             except Exception:
                 provider = "unknown"
+        request_capacity = active_request_capacity(provider, model_name)
+        if request_capacity is not None:
+            return ResolvedModelContextProfile(
+                provider=provider, model_name=model_name,
+                context_window_tokens=request_capacity.context_window_tokens,
+                max_output_tokens=request_capacity.max_output_tokens,
+                safety_margin_tokens=request_capacity.safety_margin_tokens, known=True,
+            )
         profile = (
             self.db.query(ModelContextProfile)
             .filter(
@@ -1651,16 +1662,21 @@ class ContextOrchestrator:
         manifest: ContextManifest,
         *,
         query: str,
-        limit: int = 12,
+        limit: int = TASK_CONTEXT_SEARCH_PAGE_LIMIT,
+        offset: int = 0,
         source_types: Sequence[str] = (),
+        include_next_probe: bool = False,
     ) -> list[dict[str, Any]]:
         if not manifest.project_id:
             return []
+        page_limit = max(1, min(limit, TASK_CONTEXT_SEARCH_PAGE_LIMIT))
+        page_offset = max(0, min(offset, TASK_CONTEXT_SEARCH_MAX_CURSOR))
         if manifest.task_type in MODEL_SELECTED_TASK_TYPES:
             return TaskContextSelector(self.db).search(
                 manifest,
                 query=query,
-                limit=limit,
+                limit=page_limit,
+                offset=page_offset,
                 source_types=source_types,
                 hybrid_search=lambda effective_types: self._hybrid_candidates(
                     manifest.project_id,
@@ -1668,6 +1684,7 @@ class ContextOrchestrator:
                     {},
                     source_types=effective_types,
                 ),
+                include_next_probe=include_next_probe,
             )
         results = self._hybrid_candidates(
             manifest.project_id,
@@ -1678,8 +1695,8 @@ class ContextOrchestrator:
         return persist_search_candidates(
             self.db,
             manifest,
-            results,
-            limit=limit,
+            results[page_offset:],
+            limit=page_limit + int(include_next_probe),
         )
 
     # ------------------------------------------------------------------
@@ -1712,7 +1729,7 @@ class ContextOrchestrator:
             self._write_hnsw_sidecar(project_id)
             return {"available": True, "indexed": 0, "reason": "Already current."}
         vectors = LocalSemanticRuntime.embed([f"passage: {chunk.content}" for chunk in pending])
-        for chunk, vector in zip(pending, vectors):
+        for chunk, vector in zip(pending, vectors, strict=False):
             row = current_by_chunk.get(chunk.id)
             if row is None:
                 row = RagChunkEmbedding(

@@ -626,7 +626,7 @@ def test_android_creation_apply_immediately_enables_the_formal_project_for_sync(
     }
     with (
         patch(
-            "app.routers.novel_creation.finalize_creation_session",
+            "app.routers.novel_creation_aux_routes.finalize_creation_session",
             new=AsyncMock(return_value=tool_result),
         ),
         patch(

@@ -64,9 +64,12 @@ class SqlAlchemyContextGovernance:
             ],
             "fallback": {
                 "context_window_tokens": DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS,
+                "capacity_assurance": "unverified",
+                "sendable_for_hard_budget": False,
                 "reason": (
-                    "Models without an exact profile use the platform 1M context default; "
-                    "the configured or built-in model output limit still applies."
+                    "The platform 1M value is an unverified preview estimate only. "
+                    "Agent requests that require a hard capacity guarantee need an enabled "
+                    "provider/model profile."
                 ),
             },
             "semantic": ContextOrchestrator(session).semantic_status(),

@@ -268,6 +268,7 @@ export function MessageList({
           messages.map((item, index) => (
             <div
               key={`${item.role}-${item.id || index}`}
+              data-message-id={item.id || undefined}
               className={`workspace-assistant-message workspace-assistant-${item.role}`}
             >
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>

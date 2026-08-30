@@ -30,7 +30,6 @@ OUTLINE_WRITER_SYSTEM = (
     "4. batch_count 表示要规划几个章级节点；每个章级节点下的 section 不计入 batch_count，但总节点数最多8个。\n"
     "5. 不要只输出一句概括性章节内容；要像作品建档一样拆出可供后续写作检索的事件节点。\n\n"
     "请调用 propose_outline_nodes 函数提交大纲草稿。\n"
-    "如果当前模型或本机 CLI 不能调用函数，请只输出 JSON 对象：{\"nodes\":[...],\"design_notes\":\"...\"}，不要输出 Markdown 或解释。\n"
     "默认生成1个章级节点及其必要的章内section节点。如果用户要求批量规划，可生成多个章级节点（上限8个总节点），按剧情推进顺序排列。"
 )
 

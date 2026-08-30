@@ -407,6 +407,10 @@ internal data class MobileContextValidation(
 internal data class MobileContextSearch(
     val manifest: MobileContextManifest,
     val items: List<MobileContextManifestItem>,
+    val cursor: Int,
+    val limit: Int,
+    val nextCursor: Int?,
+    val hasMore: Boolean,
 )
 
 internal data class MobileContextSelection(
@@ -523,10 +527,15 @@ internal class MobileContextManifestEngine(
         inputs: MobileContextInputs,
         query: String,
         sourceTypes: Set<String> = emptySet(),
-        limit: Int = 12,
+        limit: Int = 10,
+        cursor: Int = 0,
     ): MobileContextSearch {
-        val candidates = queryCandidates(inputs, query, sourceTypes)
-            .take(limit.coerceIn(1, 20))
+        val pageLimit = limit.coerceIn(1, 10)
+        val pageCursor = cursor.coerceIn(0, 20)
+        val allCandidates = queryCandidates(inputs, query, sourceTypes)
+        val candidates = allCandidates
+            .drop(pageCursor)
+            .take(pageLimit)
         val retained = existing.items.filter { it.category != "agent_selected" }
         val merged = (retained + candidates)
             .distinctBy { listOf(it.category, it.sourceType, it.sourceId.orEmpty(), it.sourceHash).joinToString("\u001f") }
@@ -544,7 +553,17 @@ internal class MobileContextManifestEngine(
             selectionToken = null,
             selectionFingerprint = fingerprint(merged.filter { it.category != "agent_search" }),
         )
-        return MobileContextSearch(cleared, candidates)
+        val nextCursor = (pageCursor + candidates.size).takeIf { next ->
+            candidates.size == pageLimit && next <= 20 && next < allCandidates.size
+        }
+        return MobileContextSearch(
+            manifest = cleared,
+            items = candidates,
+            cursor = pageCursor,
+            limit = pageLimit,
+            nextCursor = nextCursor,
+            hasMore = nextCursor != null,
+        )
     }
 
     fun select(

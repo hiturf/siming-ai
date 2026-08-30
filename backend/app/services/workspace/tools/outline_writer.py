@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import json as _json
 from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.ai.capabilities import (
+    TOOL_CAPABILITY_UNAVAILABLE,
+    TOOL_CAPABILITY_UNAVAILABLE_MESSAGE,
+)
 from app.architecture.uow import commit_session
 
-from ....core.json_repair import parse_json_object
 from ....database.models import Project
 from ....modules.model_runtime.application.execution import model_executor as LLMGateway
 from ....prompts.outline_writer_prompts import build_outline_writer_messages
@@ -24,6 +26,10 @@ from ..outline_drafts import (
     store_outline_draft,
 )
 from ..turn_control import AssistantTurnDirective, apply_turn_directive
+from .native_structured_output import (
+    NativeStructuredOutputError,
+    required_tool_arguments,
+)
 
 OUTLINE_PROPOSAL_TOOL = {
     "type": "function",
@@ -72,77 +78,6 @@ OUTLINE_PROPOSAL_TOOL = {
 }
 
 
-def _parse_jsonish_object(value: Any) -> dict[str, Any] | None:
-    if isinstance(value, dict):
-        return value
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = _json.loads(value)
-        if isinstance(parsed, dict):
-            return parsed
-    except (_json.JSONDecodeError, TypeError, ValueError):
-        pass
-    return parse_json_object(value)
-
-
-def _normalize_outline_payload(value: Any) -> dict[str, Any] | None:
-    parsed = _parse_jsonish_object(value)
-    if not isinstance(parsed, dict):
-        return None
-    if isinstance(parsed.get("nodes"), list):
-        return parsed
-    if isinstance(parsed.get("node"), dict):
-        return {**parsed, "nodes": [parsed["node"]]}
-    for key in (
-        "arguments",
-        "args",
-        "input",
-        "parameters",
-        "payload",
-        "function",
-        "data",
-        "action",
-        "propose_outline_nodes",
-    ):
-        candidate = _normalize_outline_payload(parsed.get(key))
-        if candidate:
-            if not candidate.get("design_notes") and parsed.get("design_notes"):
-                candidate = {**candidate, "design_notes": parsed.get("design_notes")}
-            return candidate
-    for key in ("actions", "tool_calls"):
-        values = parsed.get(key)
-        if isinstance(values, list):
-            for value in values:
-                candidate = _normalize_outline_payload(value)
-                if candidate:
-                    return candidate
-    return None
-
-
-def _outline_payload_from_result(
-    result: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str]:
-    candidates: list[Any] = []
-    for call in result.get("tool_calls") or []:
-        if isinstance(call, dict):
-            function = call.get("function")
-            if isinstance(function, dict):
-                candidates.append(function.get("arguments", ""))
-            candidates.append(call)
-    candidates.append(result.get("content", ""))
-    raw_for_error = ""
-    for raw in candidates:
-        if raw_for_error == "":
-            raw_for_error = (
-                raw if isinstance(raw, str) else _json.dumps(raw, ensure_ascii=False)
-            )
-        parsed = _normalize_outline_payload(raw)
-        if parsed:
-            return parsed, raw_for_error
-    return None, raw_for_error
-
-
 def _normalize_generated_nodes(
     nodes: list[Any],
     requirements: str,
@@ -174,6 +109,48 @@ def _result(
     }
 
 
+async def _generate_outline(
+    *,
+    messages: list[dict[str, Any]],
+    model: str | None,
+    max_tokens: int,
+    gateway_extra: dict[str, Any],
+) -> dict[str, Any]:
+    return await LLMGateway.chat_completion(
+        messages=messages,
+        model=model,
+        temperature=0.7,
+        max_tokens=max_tokens,
+        timeout=180,
+        retry=1,
+        extra_body=gateway_extra,
+        tools=[OUTLINE_PROPOSAL_TOOL],
+        tool_choice="required",
+    )
+
+
+def _native_model_binding(
+    args: dict[str, Any],
+    manifest: Any,
+) -> tuple[str | None, dict[str, Any] | None]:
+    model_override = str(args.get("model") or "").strip()
+    manifest_model = str(manifest.model or "").strip()
+    manifest_provider = str(manifest.provider or "").strip()
+    model = model_override or (
+        f"{manifest_provider}:{manifest_model}"
+        if manifest_provider and manifest_model
+        else manifest_model
+    )
+    bound_model = model or None
+    if LLMGateway.supports_tool_calling(bound_model):
+        return bound_model, None
+    return bound_model, _result(
+        "error",
+        TOOL_CAPABILITY_UNAVAILABLE_MESSAGE,
+        {"reason": TOOL_CAPABILITY_UNAVAILABLE},
+    )
+
+
 async def outline_writer(
     db: Session,
     project_id: str,
@@ -202,10 +179,7 @@ async def outline_writer(
     orchestrator = ContextOrchestrator(db)
     manifest = orchestrator.get_manifest(manifest_id, project_id)
     if manifest is None:
-        return _result(
-            "needs_confirmation",
-            "The requested context manifest was not found.",
-        )
+        return _result("needs_confirmation", "The requested context manifest was not found.")
     usable, detail = orchestrator.validate_task_selection(
         manifest,
         token=selection_token,
@@ -229,6 +203,9 @@ async def outline_writer(
                 ),
             },
         )
+    model, capability_error = _native_model_binding(args, manifest)
+    if capability_error is not None:
+        return capability_error
     if not orchestrator.mark_consumed(manifest):
         return _result(
             "needs_confirmation",
@@ -238,10 +215,8 @@ async def outline_writer(
     commit_session(db)
 
     messages = build_outline_writer_messages(
-        task_context=render_generation_context(manifest),
-        batch_count=batch_count,
+        task_context=render_generation_context(manifest), batch_count=batch_count
     )
-    model = str(args.get("model") or manifest.model or "") or None
     max_tokens = max(1, int(manifest.output_reserve_tokens or 1))
     gateway_extra = LLMGateway.local_cli_extra_body(
         model,
@@ -255,26 +230,31 @@ async def outline_writer(
     )
     commit_session(db)
     try:
-        result = await LLMGateway.chat_completion(
+        result = await _generate_outline(
             messages=messages,
             model=model,
-            temperature=0.7,
             max_tokens=max_tokens,
-            timeout=180,
-            retry=1,
-            extra_body=gateway_extra,
-            tools=[OUTLINE_PROPOSAL_TOOL],
-            tool_choice="required",
+            gateway_extra=gateway_extra,
         )
     except Exception as exc:
         return _result("error", f"大纲生成失败: {exc}")
 
-    parsed, raw_for_error = _outline_payload_from_result(result)
-    if not isinstance(parsed, dict) or not parsed.get("nodes"):
+    try:
+        parsed, raw_for_error = required_tool_arguments(
+            result,
+            expected_name="propose_outline_nodes",
+        )
+    except NativeStructuredOutputError as exc:
         return _result(
             "error",
             "大纲生成结果解析失败",
-            {"raw": str(raw_for_error)[:500]},
+            {"protocol_error": exc.reason},
+        )
+    if not parsed.get("nodes"):
+        return _result(
+            "error",
+            "大纲生成结果解析失败",
+            {"raw": raw_for_error[:500]},
         )
     raw_nodes = parsed.get("nodes", [])
     if (

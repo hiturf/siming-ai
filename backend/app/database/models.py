@@ -6,14 +6,20 @@ MCP, CLI, migration, and plugin integrations may keep importing this module.
 
 from __future__ import annotations
 
-from app.database.schema_models import SchemaMetadata
+from app.database.schema_models import (
+    DataIntegrityQuarantine,
+    DataIntegrityQuarantineBatch,
+    SchemaMetadata,
+)
 from app.database.session import Base
 from app.modules.assistant.infrastructure.models import (
     AssistantConversation,
+    AssistantConversationReplica,
     AssistantMemory,
     AssistantMessage,
     AssistantRun,
     AssistantRunStep,
+    AssistantTranscriptImportReceipt,
     ChapterDraft,
     OutlineDraft,
     RagChunk,
@@ -143,7 +149,9 @@ __all__ = [
     "TrainingDataset",
     "TrainingJob",
     "AssistantConversation",
+    "AssistantConversationReplica",
     "AssistantMessage",
+    "AssistantTranscriptImportReceipt",
     "SystemAssistantConversation",
     "SystemAssistantMessage",
     "AssistantRun",
@@ -190,6 +198,8 @@ __all__ = [
     "ExternalAgentGlobalSettings",
     "Base",
     "SchemaMetadata",
+    "DataIntegrityQuarantine",
+    "DataIntegrityQuarantineBatch",
     "ContextManifest",
     "ContextManifestItem",
     "ContextRebuildJob",

@@ -145,11 +145,13 @@ def sample_cli_process_tree(pid: int) -> dict[str, Any]:
             alive += 1
             cpu = process.cpu_times()
             cpu_seconds += float(cpu.user) + float(cpu.system)
-            io = process.io_counters()
-            read_bytes += int(getattr(io, "read_bytes", 0) or 0)
-            write_bytes += int(getattr(io, "write_bytes", 0) or 0)
+            io_reader = getattr(process, "io_counters", None)
+            if callable(io_reader):
+                io = io_reader()
+                read_bytes += int(getattr(io, "read_bytes", 0) or 0)
+                write_bytes += int(getattr(io, "write_bytes", 0) or 0)
             rss_bytes += int(process.memory_info().rss or 0)
-        except (psutil.Error, OSError):
+        except (psutil.Error, OSError, AttributeError, NotImplementedError):
             continue
     return {
         "alive": alive > 0,
@@ -376,6 +378,20 @@ class _CLIMonitor:
             ) from timeout_error
 
         metrics = sample_cli_process_tree(self.process.pid)
+        if not metrics.get("alive") and self.process.returncode is None:
+            # Some sandboxed/container runtimes expose subprocess PIDs to
+            # asyncio but not to psutil.  A failed psutil sample is therefore
+            # not proof that the child vanished.  Keep monitoring the
+            # authoritative asyncio lifecycle and mark this sample as
+            # inconclusive instead of killing a healthy CLI.
+            await asyncio.sleep(0)
+            if self.process.returncode is None:
+                metrics = {
+                    **metrics,
+                    "alive": True,
+                    "metrics_available": False,
+                    "lifecycle_status": "metrics_unavailable",
+                }
         try:
             external_activity = (
                 self.external_activity_probe()
@@ -401,23 +417,9 @@ class _CLIMonitor:
         self.last_metrics = metrics
         idle = now - self.last_meaningful_activity
         output_idle = now - self.last_output_activity
-        if not metrics.get("alive") and self.process.returncode is None:
-            try:
-                await asyncio.wait_for(
-                    self.process.wait(),
-                    timeout=max(0.2, self.poll_seconds),
-                )
-            except TimeoutError as exc:
-                self.report(
-                    "disconnected",
-                    {**metrics, "lifecycle_status": "interrupted"},
-                    "CLI 进程已经意外中断",
-                )
-                await terminate_cli_process_tree(self.process)
-                raise CLIInterruptedError(
-                    "本机 CLI 进程已经意外中断，最近检查点已保留"
-                ) from exc
-        elif idle >= self.stalled_after and metrics.get("metrics_available"):
+        if idle >= self.stalled_after and (
+            metrics.get("metrics_available") or self.active_readers == 0
+        ):
             self.report("stalled", metrics, "CLI 进程已确认长时间没有任何活动")
             out_text, err_text = self.decoded_output()
             await terminate_cli_process_tree(self.process)
@@ -444,7 +446,7 @@ class _CLIMonitor:
             self.report(
                 "terminal",
                 {"reason": reason},
-                "章节草稿已生成，正在停止本次 CLI",
+                "终止型草稿已生成，正在停止本次 CLI",
             )
             await terminate_cli_process_tree(self.process)
             raise CLITurnTerminal(reason, stdout=out_text, stderr=err_text)

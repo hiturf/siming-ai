@@ -50,7 +50,7 @@ def test_creation_session_pack_injects_bound_session_and_rejects_cross_session_a
     ))
 
     assert allowed.is_error is False
-    assert allowed.content[0]["text"].startswith('{"status": "ok"')
+    assert json.loads(allowed.content[0]["text"])["status"] == "ok"
     assert denied.is_error is True
     assert _payload(denied)["status"] == "denied"
     assert "scope mismatch" in _payload(denied)["detail"]

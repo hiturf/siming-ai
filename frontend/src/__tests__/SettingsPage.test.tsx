@@ -76,6 +76,7 @@ function mockCustomModelConfig() {
 describe('SettingsPage startup and update controls', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    window.history.replaceState({}, '', '/settings')
     mockInitialLoads()
     api.put.mockImplementation((_url: string, payload: object) => Promise.resolve({
       data: { data: { ...launcherSettings, ...payload } },
@@ -99,6 +100,15 @@ describe('SettingsPage startup and update controls', () => {
         { key: 'github', label: 'GitHub 全部版本', url: 'https://github.test/releases', description: '完整历史版本' },
       ],
     } } })
+  })
+
+  it('opens the advanced context panel from the model-capacity remediation link', async () => {
+    window.history.replaceState({}, '', '/settings?section=context-governance')
+    renderSettings()
+
+    const advanced = await screen.findByRole('button', { name: /高级设置：上下文与技术参数/ })
+    expect(advanced).toHaveAttribute('aria-expanded', 'true')
+    expect(document.getElementById('context-governance-settings')).toBeInTheDocument()
   })
 
   it('does not check or download updates during initial load', async () => {

@@ -16,6 +16,7 @@ from .context_orchestrator import (
 )
 from .task_context_selection import (
     TASK_CONTEXT_SEARCH_EXCERPT_CHARS,
+    TASK_CONTEXT_SEARCH_PAGE_LIMIT,
     TASK_CONTEXT_SEARCH_SOURCE_TYPES,
     TASK_CONTEXT_SOFT_TARGET_TOKENS,
 )
@@ -93,7 +94,7 @@ def portable_context_policy(task_type: str = "writing") -> dict[str, Any]:
             "mode": "model_retrieval_then_exact_selection",
             "hard_source_count_limit": None,
             "search_excerpt_chars": TASK_CONTEXT_SEARCH_EXCERPT_CHARS,
-            "search_page_limit": 20,
+            "search_page_limit": TASK_CONTEXT_SEARCH_PAGE_LIMIT,
             "search_source_types": sorted(TASK_CONTEXT_SEARCH_SOURCE_TYPES),
             "exact_source_content_limit_chars": None,
             "ordering": ["tier", "required_first", "score_desc", "title"],

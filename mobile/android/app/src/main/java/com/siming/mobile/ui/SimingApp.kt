@@ -205,6 +205,7 @@ fun SimingApp(
             onBack = { selectedProjectId = null },
             snackbar = snackbar,
             onSaveExport = onSaveExport,
+            onConfigureDirectApi = { showDirectApiSetup = true },
         )
         return
     }
@@ -520,6 +521,7 @@ private fun ProjectScreen(
     onBack: () -> Unit,
     snackbar: SnackbarHostState,
     onSaveExport: (MobileExportFile) -> Unit,
+    onConfigureDirectApi: () -> Unit,
 ) {
     var section by rememberSaveable(project.projectId) { mutableStateOf("chapter") }
     var lastReferenceSection by rememberSaveable(project.projectId) { mutableStateOf("outline") }
@@ -740,7 +742,11 @@ if (editor != null) {
                     onOpen = { chapterEditor = it },
                     onManageOrder = { showChapterOrder = true },
                 )
-                "assistant" -> AssistantScreen(project.projectId, viewModel)
+                "assistant" -> AssistantScreen(
+                    projectId = project.projectId,
+                    viewModel = viewModel,
+                    onConfigureDirectApi = onConfigureDirectApi,
+                )
                 "tools" -> ProjectToolsPanel(
                     project = project,
                     online = connection != null,
@@ -1330,8 +1336,12 @@ private fun RecordEditorScreen(
 }
 
 @Composable
-private fun AssistantScreen(projectId: String, viewModel: MainViewModel) {
-    AssistantWorkspace(projectId, viewModel)
+private fun AssistantScreen(
+    projectId: String,
+    viewModel: MainViewModel,
+    onConfigureDirectApi: () -> Unit,
+) {
+    AssistantWorkspace(projectId, viewModel, onConfigureDirectApi)
 }
 
 @Composable
@@ -1675,6 +1685,15 @@ private fun DirectApiSetupScreen(
     var protocol by rememberSaveable(existing?.baseUrl) {
         mutableStateOf(existing?.protocol ?: DirectApiConfig.PROTOCOL_AUTO)
     }
+    var contextWindowTokens by rememberSaveable(existing?.baseUrl) {
+        mutableStateOf(existing?.contextWindowTokens?.toString().orEmpty())
+    }
+    var maxOutputTokens by rememberSaveable(existing?.baseUrl) {
+        mutableStateOf((existing?.maxOutputTokens ?: DirectApiConfig.DEFAULT_AGENT_OUTPUT_TOKENS).toString())
+    }
+    var safetyMarginTokens by rememberSaveable(existing?.baseUrl) {
+        mutableStateOf((existing?.safetyMarginTokens ?: DirectApiConfig.DEFAULT_SAFETY_MARGIN_TOKENS).toString())
+    }
     val taskModels = remember(existing?.baseUrl) {
         mutableStateMapOf<String, String>().apply {
             putAll(existing?.taskModels.orEmpty())
@@ -1827,6 +1846,40 @@ private fun DirectApiSetupScreen(
                 enabled = !ui.busy,
                 modifier = Modifier.fillMaxWidth(),
             )
+            Text("项目助手容量档案", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text(
+                "容量必须来自模型服务商文档或你的部署配置；司命不会根据模型名猜测。UTF-8 保守计数只会低估可用空间，不会把未知容量伪装成安全。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedTextField(
+                value = contextWindowTokens,
+                onValueChange = { contextWindowTokens = it.filter(Char::isDigit).take(9) },
+                label = { Text("上下文窗口（tokens）") },
+                placeholder = { Text("例如 128000") },
+                supportingText = { Text("必填；留空时手机直连 Agent 会明确停止，不裁剪历史继续执行") },
+                singleLine = true,
+                enabled = !ui.busy,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = maxOutputTokens,
+                    onValueChange = { maxOutputTokens = it.filter(Char::isDigit).take(8) },
+                    label = { Text("输出预留") },
+                    singleLine = true,
+                    enabled = !ui.busy,
+                    modifier = Modifier.weight(1f),
+                )
+                OutlinedTextField(
+                    value = safetyMarginTokens,
+                    onValueChange = { safetyMarginTokens = it.filter(Char::isDigit).take(8) },
+                    label = { Text("安全余量") },
+                    singleLine = true,
+                    enabled = !ui.busy,
+                    modifier = Modifier.weight(1f),
+                )
+            }
             OutlinedButton(
                 onClick = { viewModel.discoverDirectModels(baseUrl, apiKey) },
                 enabled = baseUrl.isNotBlank() && (apiKey.isNotBlank() || existing != null) && !ui.busy,
@@ -1892,11 +1945,20 @@ private fun DirectApiSetupScreen(
                         protocol,
                         modelChoices,
                         taskModels.toMap(),
+                        contextWindowTokens.toIntOrNull() ?: 0,
+                        maxOutputTokens.toIntOrNull() ?: 0,
+                        safetyMarginTokens.toIntOrNull() ?: -1,
                         onConfigured,
                     )
                 },
                 enabled = baseUrl.isNotBlank() &&
-                    (apiKey.isNotBlank() || existing != null) && !ui.busy,
+                    (apiKey.isNotBlank() || existing != null) &&
+                    (contextWindowTokens.toIntOrNull() ?: 0) > 0 &&
+                    (maxOutputTokens.toIntOrNull() ?: 0) > 0 &&
+                    (safetyMarginTokens.toIntOrNull() ?: -1) >= 0 &&
+                    ((maxOutputTokens.toIntOrNull() ?: 0) + (safetyMarginTokens.toIntOrNull() ?: 0) <
+                        (contextWindowTokens.toIntOrNull() ?: 0)) &&
+                    !ui.busy,
                 modifier = Modifier.fillMaxWidth().height(50.dp),
             ) {
                 if (ui.busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)

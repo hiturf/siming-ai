@@ -432,7 +432,21 @@ class LocalCLICatalogingAgentTestCase(unittest.TestCase):
                 default_model="custom-cli",
             )
 
-            with patch("app.services.cataloging.local_cli_agent.SessionLocal", self.Session):
+            stable_metrics = {
+                "alive": True,
+                "process_count": 1,
+                "cpu_seconds": 0.0,
+                "read_bytes": 0,
+                "write_bytes": 0,
+                "rss_bytes": 1,
+                "metrics_available": True,
+            }
+            with patch(
+                "app.services.cataloging.local_cli_agent.SessionLocal", self.Session
+            ), patch(
+                "app.ai.local_cli_monitor.sample_cli_process_tree",
+                return_value=stable_metrics,
+            ):
                 with self.assertRaisesRegex(RuntimeError, "确认卡住"):
                     asyncio.run(_run_cli_turn(
                         job=job,

@@ -8,15 +8,26 @@ from app.architecture.tool_definition import ToolDef
 TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ToolDef(
         name="search_context",
-        description="全文检索项目中所有已索引的内容（章节、大纲、角色、世界观、记忆等）。返回相关度排序的结果列表。适用于跨类型模糊搜索。",
+        description="分页全文检索项目索引，每页只返回短候选、真实ID和哈希。返回 next_cursor 时可继续下一页；原文用对应读取工具按范围获取。",
         input_schema={
-            "query": {"type": "string", "description": "搜索关键词，支持中英文"},
+            "query": {"type": "string", "maxLength": 200, "description": "搜索关键词，支持中英文"},
             "source_types": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "限定搜索范围：chapter|chapter_summary|outline|character|character_timeline|worldbuilding|assistant_memory",
             },
-            "limit": {"type": "integer", "description": "返回条数上限，默认20，最大50"},
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3,
+                "description": "本页条数，默认/最大3",
+            },
+            "cursor": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 40,
+                "description": "上一页返回的 next_cursor",
+            },
         },
         required=["query"],
         tool_type="read",
@@ -106,13 +117,32 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         input_schema={
             "context_manifest_id": {"type": "string", "description": "Baseline manifest ID"},
             "run_id": {"type": "string", "description": "Agent run bound to a baseline manifest"},
-            "query": {"type": "string", "description": "Task-specific retrieval query"},
+            "query": {
+                "type": "string",
+                "maxLength": 500,
+                "description": "Task-specific retrieval query",
+            },
             "source_types": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "可选范围：chapter|chapter_summary|outline|character|character_timeline|worldbuilding|assistant_memory|narrative_governance",
             },
-            "limit": {"type": "integer", "description": "Maximum candidates on this search page; default 12, model-selected generation max 20"},
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "default": 10,
+                "description": (
+                    "Maximum short candidates on this search page; default/max 10."
+                ),
+            },
+            "cursor": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 20,
+                "default": 0,
+                "description": "Use the previous page's next_cursor for more candidates.",
+            },
         },
         required=["query"],
         tool_type="read",

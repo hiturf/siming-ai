@@ -111,6 +111,11 @@ def main() -> None:
         help="Process-scoped model-selected tool category state for one managed Agent turn.",
     )
     parser.add_argument(
+        "--direct-mcp-lease-token",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging to stderr.",
@@ -156,6 +161,7 @@ def main() -> None:
             permission_pack=args.permission_pack,
             creation_session_id=args.creation_session_id,
             tool_category_state_file=args.tool_category_state_file,
+            direct_mcp_lease_token=args.direct_mcp_lease_token,
         )
     finally:
         db.close()

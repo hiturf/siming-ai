@@ -76,6 +76,7 @@ def prepare_direct_mcp_launch(
     project_id: str = "",
     creation_session_id: str = "",
     tool_category_state_file: str = "",
+    direct_mcp_lease_token: str = "",
 ) -> tuple[Any, dict[str, str]]:
     """Inject exactly one authorized Siming MCP into a known Agent CLI."""
     provider = adapter._provider
@@ -86,6 +87,7 @@ def prepare_direct_mcp_launch(
         project_id=project_id,
         creation_session_id=creation_session_id,
         tool_category_state_file=tool_category_state_file,
+        direct_mcp_lease_token=direct_mcp_lease_token,
     )
     server_config = _mcp_server_config(server)
     args = list(launch.args)
@@ -251,6 +253,7 @@ def prepare_opencode_launch(
     mcp_project_id: str = "",
     mcp_creation_session_id: str = "",
     mcp_tool_category_state_file: str = "",
+    mcp_direct_mcp_lease_token: str = "",
 ) -> tuple[Any, str, dict[str, str]]:
     launch, prompt_file = adapter._opencode_family_launch(
         prompt=prompt,
@@ -268,6 +271,7 @@ def prepare_opencode_launch(
             project_id=mcp_project_id,
             creation_session_id=mcp_creation_session_id,
             tool_category_state_file=mcp_tool_category_state_file,
+            direct_mcp_lease_token=mcp_direct_mcp_lease_token,
         )
         prefix = {
             "opencode_cli": "OPENCODE",

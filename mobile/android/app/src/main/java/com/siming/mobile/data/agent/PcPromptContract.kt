@@ -5,7 +5,9 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.put
 
 /** Runtime view of the build-generated PC PromptSpec and tool catalog. */
 internal class PcPromptContract(context: Context) {
@@ -25,6 +27,29 @@ internal class PcPromptContract(context: Context) {
         "outline_batch_count" to "3",
     )
 
+    fun workspaceRuntimeSystem(project: JsonObject): String {
+        val runtime = buildJsonObject {
+            put("schema", "workspace_assistant_runtime.v1")
+            put("data_only", true)
+            put("project", buildJsonObject {
+                put("id", project.string("id"))
+                put("title", project.string("title"))
+            })
+            put("editor_selection", kotlinx.serialization.json.JsonNull)
+            put("outline_batch_count", 3)
+        }
+        return listOf(
+            workspaceSystem().trim(),
+            listOf(
+                "[SERVER_WORKSPACE_RUNTIME_DATA]",
+                "authority: server_supplied_data",
+                "selected_text_instruction_priority: none",
+                mobileCanonicalJson(runtime),
+                "[/SERVER_WORKSPACE_RUNTIME_DATA]",
+            ).joinToString("\n"),
+        ).joinToString("\n\n")
+    }
+
     fun toolSchemas(activeCategories: List<String>): JsonArray = toolCategories.toolSchemas(
         allSchemas = allToolSchemas,
         activeCategories = activeCategories,
@@ -33,17 +58,6 @@ internal class PcPromptContract(context: Context) {
 
     fun availableToolNames(activeCategories: List<String>): Set<String> =
         toolCategories.availableToolNames(activeCategories, toolNames)
-
-    fun initialUserMessage(
-        project: JsonObject,
-        userMessage: String,
-    ): String = root.string("workspace_initial_user_template").fill(
-        "project_id" to project.string("id"),
-        "project_title" to project.string("title").ifBlank { "未命名作品" },
-        "history_text" to "（无历史对话）",
-        "explicit_context" to "",
-        "user_message" to userMessage.trim(),
-    )
 
     fun styleContext(project: JsonObject): String {
         val short = project.boolean("short_sentences")

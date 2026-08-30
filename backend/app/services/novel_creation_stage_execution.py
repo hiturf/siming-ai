@@ -211,7 +211,7 @@ def _prepare_stage_manifest(
         return orchestrator, manifest
     interview = working_draft.get("interview")
     answers = (
-        (interview.get("history") or [])[-6:]
+        list(interview.get("history") or [])
         if isinstance(interview, dict) and isinstance(interview.get("history"), list)
         else []
     )

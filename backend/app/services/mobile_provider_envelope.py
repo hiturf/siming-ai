@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.orm import Session
 
@@ -37,7 +37,16 @@ class _MobileProviderCredentials(BaseModel):
     api_key: str = Field(min_length=1, max_length=16_384)
     model: str = Field(min_length=1, max_length=300)
     protocol: str = Field(pattern="^(responses|chat_completions)$")
+    context_window_tokens: int = Field(gt=0, le=10_000_000)
+    max_output_tokens: int = Field(gt=0, le=2_000_000)
+    safety_margin_tokens: int = Field(ge=0, le=2_000_000)
     issued_at: int
+
+    @model_validator(mode="after")
+    def validate_capacity(self) -> _MobileProviderCredentials:
+        if self.max_output_tokens + self.safety_margin_tokens >= self.context_window_tokens:
+            raise ValueError("手机模型容量必须为输入保留正数空间")
+        return self
 
 
 def _decode(value: str, *, expected: int | None = None, maximum: int = 64 * 1024) -> bytes:
@@ -132,6 +141,9 @@ def decrypt_mobile_provider(
         base_url=_validated_base_url(credentials.base_url),
         api_protocol=credentials.protocol,
         provider_type="ephemeral_mobile",
+        context_window_tokens=credentials.context_window_tokens,
+        max_output_tokens=credentials.max_output_tokens,
+        safety_margin_tokens=credentials.safety_margin_tokens,
     )
 
 
