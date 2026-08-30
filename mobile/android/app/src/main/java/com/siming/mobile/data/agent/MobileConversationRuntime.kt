@@ -590,8 +590,5 @@ internal class MobileDirectCheckpointGenerator(
     }
 }
 
-private fun JsonObject.stringValue(name: String): String =
-    (get(name) as? JsonPrimitive)?.contentOrNull.orEmpty()
-
 private fun JsonObject.objectValue(name: String): JsonObject =
     get(name) as? JsonObject ?: error("$name 必须是对象")

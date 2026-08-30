@@ -1584,7 +1584,8 @@ private fun updateCatalogingProgress(
                     val activity = when (status) {
                         "pending", "compressing" -> "正在整理较早上下文；当前任务尚未执行"
                         "ready" -> context.detail.ifBlank { "较早上下文已整理，正在继续当前任务" }
-                        "failed" -> context.errorDetail.ifBlank { "较早上下文整理失败；当前任务尚未执行" }
+                        "failed" -> context.errorDetail.orEmpty()
+                            .ifBlank { "较早上下文整理失败；当前任务尚未执行" }
                         "syncing_transcript" -> context.detail.ifBlank { "正在同步手机完整会话…" }
                         "transcript_synced" -> context.detail.ifBlank { "手机完整会话已同步" }
                         else -> context.detail.takeIf(String::isNotBlank)
