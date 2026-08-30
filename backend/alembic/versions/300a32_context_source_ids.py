@@ -1,7 +1,7 @@
 """Widen durable checkpoint source IDs for canonical Creation turn IDs.
 
-Revision ID: 300a31_context_source_ids
-Revises: 300a30_transcript_integrity
+Revision ID: 300a32_context_source_ids
+Revises: 300a31_transcript_integrity
 """
 
 from __future__ import annotations
@@ -10,8 +10,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "300a31_context_source_ids"
-down_revision = "300a30_transcript_integrity"
+revision = "300a32_context_source_ids"
+down_revision = "300a31_transcript_integrity"
 branch_labels = None
 depends_on = None
 
@@ -45,7 +45,7 @@ def _source_id_length() -> int | None:
 
 
 def _sqlite_source_table(*, source_id_length: int) -> sa.Table:
-    """Describe the known 300a27 table without reflecting its incomplete FK graph."""
+    """Describe the known 300a28 table without reflecting its incomplete FK graph."""
 
     metadata = sa.MetaData()
     sa.Table(

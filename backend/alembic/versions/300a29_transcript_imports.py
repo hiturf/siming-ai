@@ -1,7 +1,7 @@
 """Add explicit, device-scoped assistant transcript imports.
 
-Revision ID: 300a28_transcript_imports
-Revises: 300a27_conversation_context
+Revision ID: 300a29_transcript_imports
+Revises: 300a28_conversation_context
 """
 
 from __future__ import annotations
@@ -10,8 +10,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "300a28_transcript_imports"
-down_revision = "300a27_conversation_context"
+revision = "300a29_transcript_imports"
+down_revision = "300a28_conversation_context"
 branch_labels = None
 depends_on = None
 

@@ -12,8 +12,8 @@ from sqlalchemy.exc import IntegrityError
 from alembic import command
 from app.database.bootstrap import alembic_config
 
-_HEAD = "300a29_direct_mcp_integrity"
-_PARENT = "300a28_transcript_imports"
+_HEAD = "300a30_direct_mcp_integrity"
+_PARENT = "300a29_transcript_imports"
 
 
 def _column_names(engine, table: str) -> set[str]:

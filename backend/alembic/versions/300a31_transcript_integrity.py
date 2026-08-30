@@ -1,7 +1,7 @@
 """Quarantine invalid transcript ownership rows before enforcing SQLite FKs.
 
-Revision ID: 300a30_transcript_integrity
-Revises: 300a29_direct_mcp_integrity
+Revision ID: 300a31_transcript_integrity
+Revises: 300a30_direct_mcp_integrity
 """
 
 from __future__ import annotations
@@ -16,8 +16,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "300a30_transcript_integrity"
-down_revision = "300a29_direct_mcp_integrity"
+revision = "300a31_transcript_integrity"
+down_revision = "300a30_direct_mcp_integrity"
 branch_labels = None
 depends_on = None
 

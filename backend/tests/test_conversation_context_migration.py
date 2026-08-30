@@ -16,10 +16,10 @@ def _load_migration() -> ModuleType:
         Path(__file__).resolve().parents[1]
         / "alembic"
         / "versions"
-        / "300a27_conversation_context.py"
+        / "300a28_conversation_context.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "migration_300a27_conversation_context",
+        "migration_300a28_conversation_context",
         path,
     )
     assert spec and spec.loader

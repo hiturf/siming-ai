@@ -6,7 +6,7 @@
 >
 > 工作分支：`feat/agent-conversation-compaction`
 >
-> 目标版本：v3.3.9
+> 目标版本：v3.3.10（原定 v3.3.9 已由并行合并的章节修订版本占用）
 >
 > 覆盖范围：项目工作台 Agent、新书立项 Agent、PC/Gateway、Android 独立运行
 >

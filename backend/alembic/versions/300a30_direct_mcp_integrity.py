@@ -1,7 +1,7 @@
 """Add durable Direct-MCP lease and call identities.
 
-Revision ID: 300a29_direct_mcp_integrity
-Revises: 300a28_transcript_imports
+Revision ID: 300a30_direct_mcp_integrity
+Revises: 300a29_transcript_imports
 """
 
 from __future__ import annotations
@@ -10,8 +10,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "300a29_direct_mcp_integrity"
-down_revision = "300a28_transcript_imports"
+revision = "300a30_direct_mcp_integrity"
+down_revision = "300a29_transcript_imports"
 branch_labels = None
 depends_on = None
 

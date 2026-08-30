@@ -17,8 +17,8 @@ from app.modules.assistant.infrastructure.models import (
     ConversationContextCheckpointSource,
 )
 
-_HEAD = "300a31_context_source_ids"
-_PARENT = "300a30_transcript_integrity"
+_HEAD = "300a32_context_source_ids"
+_PARENT = "300a31_transcript_integrity"
 
 
 def _source_id_length(engine) -> int | None:

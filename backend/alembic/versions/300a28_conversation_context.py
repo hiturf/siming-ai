@@ -1,7 +1,7 @@
 """Persist ordered Agent messages and conversation context checkpoints.
 
-Revision ID: 300a27_conversation_context
-Revises: 300a26_outline_drafts
+Revision ID: 300a28_conversation_context
+Revises: 300a27_chapter_revision_drafts
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "300a27_conversation_context"
-down_revision = "300a26_outline_drafts"
+revision = "300a28_conversation_context"
+down_revision = "300a27_chapter_revision_drafts"
 branch_labels = None
 depends_on = None
 

@@ -50,7 +50,7 @@ def test_upgrade_quarantines_orphans_and_preserves_namespace_for_reimport(tmp_pa
     database_path = tmp_path / "legacy-orphans.db"
     url = f"sqlite:///{database_path.as_posix()}"
     config = alembic_config(url)
-    command.upgrade(config, "300a29_direct_mcp_integrity")
+    command.upgrade(config, "300a30_direct_mcp_integrity")
 
     legacy_engine = create_engine(url)
     try:
@@ -95,7 +95,7 @@ def test_upgrade_quarantines_orphans_and_preserves_namespace_for_reimport(tmp_pa
     finally:
         legacy_engine.dispose()
 
-    command.upgrade(config, "300a30_transcript_integrity")
+    command.upgrade(config, "300a31_transcript_integrity")
 
     managed_engine = create_session_engine(url)
     try:
@@ -129,7 +129,7 @@ def test_upgrade_quarantines_orphans_and_preserves_namespace_for_reimport(tmp_pa
             assert receipt_payload["replica_id"] == "orphan-replica"
             assert receipt_payload["created_at"] == "2025-01-02 03:04:05.000000"
 
-            batch = db.get(DataIntegrityQuarantineBatch, "300a30_transcript_integrity")
+            batch = db.get(DataIntegrityQuarantineBatch, "300a31_transcript_integrity")
             assert batch is not None
             assert batch.quarantined_receipt_count == 1
             assert batch.quarantined_replica_count == 1
@@ -177,7 +177,7 @@ def test_alembic_rejects_supplied_sqlite_transaction_when_foreign_keys_cannot_en
 ) -> None:
     database_path = tmp_path / "active-transaction.db"
     url = f"sqlite:///{database_path.as_posix()}"
-    command.upgrade(alembic_config(url), "300a29_direct_mcp_integrity")
+    command.upgrade(alembic_config(url), "300a30_direct_mcp_integrity")
     engine = create_engine(url)
     try:
         with engine.connect() as connection:
@@ -194,7 +194,7 @@ def test_alembic_rejects_supplied_sqlite_transaction_when_foreign_keys_cannot_en
                 RuntimeError,
                 match="SQLite migration connection has foreign keys disabled",
             ):
-                command.upgrade(config, "300a30_transcript_integrity")
+                command.upgrade(config, "300a31_transcript_integrity")
             transaction.rollback()
     finally:
         engine.dispose()
@@ -204,7 +204,7 @@ def test_upgrade_rejects_nonunique_quarantine_table_drift(tmp_path) -> None:
     database_path = tmp_path / "quarantine-drift.db"
     url = f"sqlite:///{database_path.as_posix()}"
     config = alembic_config(url)
-    command.upgrade(config, "300a29_direct_mcp_integrity")
+    command.upgrade(config, "300a30_direct_mcp_integrity")
     engine = create_engine(url)
     try:
         with engine.begin() as connection:
@@ -238,9 +238,9 @@ def test_upgrade_rejects_nonunique_quarantine_table_drift(tmp_path) -> None:
             RuntimeError,
             match="uq_data_integrity_quarantine_source must be UNIQUE",
         ):
-            command.upgrade(config, "300a30_transcript_integrity")
+            command.upgrade(config, "300a31_transcript_integrity")
         with engine.connect() as connection:
             revision = connection.execute(text("SELECT version_num FROM alembic_version"))
-            assert revision.scalar_one() == "300a29_direct_mcp_integrity"
+            assert revision.scalar_one() == "300a30_direct_mcp_integrity"
     finally:
         engine.dispose()
