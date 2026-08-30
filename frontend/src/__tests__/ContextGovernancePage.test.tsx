@@ -77,6 +77,24 @@ describe('ContextGovernancePage', () => {
     expect(screen.getByText('320 / 8500 tokens')).toBeInTheDocument()
   })
 
+  it('labels the unknown-model 1M value as an unverified preview that cannot run', async () => {
+    const unknownModelManifest = { ...manifest, model: '' }
+    api.get.mockImplementation((url: string) => {
+      if (url.includes('context-governance-status')) {
+        return Promise.resolve({ data: { data: { generation_allowed: false, reason: 'Model capacity is unverified', semantic: { available: false, reason: '' } } } })
+      }
+      if (url.endsWith('/context-manifests')) {
+        return Promise.resolve({ data: { data: { items: [unknownModelManifest] } } })
+      }
+      return Promise.resolve({ data: { data: unknownModelManifest } })
+    })
+
+    render(<ContextGovernancePage projectId="p1" />)
+
+    expect(await screen.findByText('未知模型（1M 未验证预览，Agent 会阻断）')).toBeInTheDocument()
+    expect(screen.queryByText('未知模型（1M 默认）')).not.toBeInTheDocument()
+  })
+
   it('opens the persisted source audit trail', async () => {
     mockLoad()
     render(<ContextGovernancePage projectId="p1" />)

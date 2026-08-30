@@ -1817,6 +1817,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/novel-creation/sessions/{session_id}/conversations/{conversation_id}/checkpoints": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Creation Conversation Checkpoints */
+        get: operations["list_creation_conversation_checkpoints_api_v1_novel_creation_sessions__session_id__conversations__conversation_id__checkpoints_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/novel-creation/sessions/{session_id}/conversations/{conversation_id}/checkpoints/{checkpoint_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Creation Conversation Checkpoint */
+        get: operations["get_creation_conversation_checkpoint_api_v1_novel_creation_sessions__session_id__conversations__conversation_id__checkpoints__checkpoint_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/novel-creation/sessions/{session_id}/conversations/{conversation_id}/context-state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Creation Conversation Context State */
+        get: operations["get_creation_conversation_context_state_api_v1_novel_creation_sessions__session_id__conversations__conversation_id__context_state_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/novel-creation/sessions/{session_id}/dependency-graph": {
         parameters: {
             query?: never;
@@ -2489,6 +2540,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/projects/{project_id}/ai/assistant/conversations/transcript-import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import Assistant Conversation Transcript
+         * @description Import complete closed turns and return the canonical server revision.
+         */
+        post: operations["import_assistant_conversation_transcript_api_v1_projects__project_id__ai_assistant_conversations_transcript_import_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/projects/{project_id}/ai/assistant/conversations/{conversation_id}": {
         parameters: {
             query?: never;
@@ -2508,6 +2579,110 @@ export interface paths {
          * @description Delete an assistant conversation.
          */
         delete: operations["delete_assistant_conversation_api_v1_projects__project_id__ai_assistant_conversations__conversation_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_id}/ai/assistant/conversations/{conversation_id}/checkpoints": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Conversation Checkpoints
+         * @description List derived attempts newest first; full navigation stays in detail.
+         */
+        get: operations["list_conversation_checkpoints_api_v1_projects__project_id__ai_assistant_conversations__conversation_id__checkpoints_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_id}/ai/assistant/conversations/{conversation_id}/checkpoints/rebuild": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rebuild Conversation Checkpoint
+         * @description Return 409: rebuilding is only safe inside a new model request.
+         */
+        post: operations["rebuild_conversation_checkpoint_api_v1_projects__project_id__ai_assistant_conversations__conversation_id__checkpoints_rebuild_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_id}/ai/assistant/conversations/{conversation_id}/checkpoints/{checkpoint_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Conversation Checkpoint
+         * @description Return one safe, auditable checkpoint view.
+         */
+        get: operations["get_conversation_checkpoint_api_v1_projects__project_id__ai_assistant_conversations__conversation_id__checkpoints__checkpoint_id__get"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete Conversation Checkpoint
+         * @description Return 409: checkpoint audit records are not deletable by this API.
+         */
+        delete: operations["delete_conversation_checkpoint_api_v1_projects__project_id__ai_assistant_conversations__conversation_id__checkpoints__checkpoint_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_id}/ai/assistant/conversations/{conversation_id}/checkpoints/{checkpoint_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel Conversation Checkpoint
+         * @description Cancel an in-flight derived attempt without changing the transcript.
+         */
+        post: operations["cancel_conversation_checkpoint_api_v1_projects__project_id__ai_assistant_conversations__conversation_id__checkpoints__checkpoint_id__cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_id}/ai/assistant/conversations/{conversation_id}/context-state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Conversation Context State
+         * @description Return the active checkpoint/budget state without reading client history.
+         */
+        get: operations["get_conversation_context_state_api_v1_projects__project_id__ai_assistant_conversations__conversation_id__context_state_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -2664,7 +2839,7 @@ export interface paths {
         put?: never;
         /**
          * Retry Assistant Run Step
-         * @description Retry a failed workspace assistant run step (preserves original).
+         * @description Retry a failed workspace assistant run step.
          */
         post: operations["retry_assistant_run_step_api_v1_projects__project_id__ai_assistant_runs__run_id__steps__step_id__retry_post"];
         delete?: never;
@@ -2684,7 +2859,7 @@ export interface paths {
         put?: never;
         /**
          * Workspace Assistant Stream
-         * @description Conversational assistant with multi-turn agentic loop — search → reason → act.
+         * @description Validate the request and delegate one detached assistant turn.
          */
         post: operations["workspace_assistant_stream_api_v1_projects__project_id__ai_workspace_assistant_stream_post"];
         delete?: never;
@@ -5298,6 +5473,48 @@ export interface components {
              */
             tool_mode?: string | null;
         };
+        /** ApiResponse[ConversationCheckpointDetailResponse] */
+        ApiResponse_ConversationCheckpointDetailResponse_: {
+            /**
+             * Code
+             * @default 0
+             */
+            code: number;
+            data?: components["schemas"]["ConversationCheckpointDetailResponse"] | null;
+            /**
+             * Message
+             * @default success
+             */
+            message: string;
+        };
+        /** ApiResponse[ConversationCheckpointListResponse] */
+        ApiResponse_ConversationCheckpointListResponse_: {
+            /**
+             * Code
+             * @default 0
+             */
+            code: number;
+            data?: components["schemas"]["ConversationCheckpointListResponse"] | null;
+            /**
+             * Message
+             * @default success
+             */
+            message: string;
+        };
+        /** ApiResponse[ConversationContextStateResponse] */
+        ApiResponse_ConversationContextStateResponse_: {
+            /**
+             * Code
+             * @default 0
+             */
+            code: number;
+            data?: components["schemas"]["ConversationContextStateResponse"] | null;
+            /**
+             * Message
+             * @default success
+             */
+            message: string;
+        };
         /** ApiResponse[GatewayAdminSessionStatusView] */
         ApiResponse_GatewayAdminSessionStatusView_: {
             /**
@@ -5621,6 +5838,20 @@ export interface components {
              */
             message: string;
         };
+        /** ApiResponse[TranscriptImportResponse] */
+        ApiResponse_TranscriptImportResponse_: {
+            /**
+             * Code
+             * @default 0
+             */
+            code: number;
+            data?: components["schemas"]["TranscriptImportResponse"] | null;
+            /**
+             * Message
+             * @default success
+             */
+            message: string;
+        };
         /** ApiResponse[WorkspaceAssistantRunDetailResponse] */
         ApiResponse_WorkspaceAssistantRunDetailResponse_: {
             /**
@@ -5725,10 +5956,6 @@ export interface components {
              * @default
              */
             creation_session_id: string;
-            /** History */
-            history?: {
-                [key: string]: unknown;
-            }[];
             /** Model */
             model?: string | null;
             /**
@@ -5816,11 +6043,6 @@ export interface components {
             creation_session_id: string;
             /** File */
             file: string;
-            /**
-             * History
-             * @default []
-             */
-            history: string;
             /** Model */
             model?: string | null;
             /**
@@ -6404,12 +6626,209 @@ export interface components {
         /** ContextSearchRequest */
         ContextSearchRequest: {
             /**
+             * Cursor
+             * @default 0
+             */
+            cursor: number;
+            /**
              * Limit
-             * @default 12
+             * @default 10
              */
             limit: number;
             /** Query */
             query: string;
+        };
+        /** ConversationCheckpointDetailResponse */
+        ConversationCheckpointDetailResponse: {
+            /** Active Checkpoint Id */
+            active_checkpoint_id?: string | null;
+            /** Active History Tokens */
+            active_history_tokens: number;
+            /** Author Quotes */
+            author_quotes?: {
+                [key: string]: unknown;
+            }[];
+            /**
+             * Capacity Assurance
+             * @enum {string}
+             */
+            capacity_assurance: "exact" | "conservative" | "unverified";
+            /** Checkpoint Tokens */
+            checkpoint_tokens?: number | null;
+            /** Completed At */
+            completed_at?: string | null;
+            /** Created At */
+            created_at?: string | null;
+            /** Error Code */
+            error_code?: string | null;
+            /** Error Detail */
+            error_detail?: string | null;
+            /** Execution Ledger */
+            execution_ledger?: {
+                [key: string]: unknown;
+            }[];
+            /** Id */
+            id: string;
+            /** Latest Checkpoint Id */
+            latest_checkpoint_id?: string | null;
+            /** Model */
+            model?: string | null;
+            model_binding?: components["schemas"]["ConversationModelBindingResponse"] | null;
+            /** Original History Tokens */
+            original_history_tokens?: number | null;
+            /** Original Tokens */
+            original_tokens?: number | null;
+            /** Policy Version */
+            policy_version: number;
+            /** Project Refs */
+            project_refs?: {
+                [key: string]: unknown;
+            }[];
+            /** Provider */
+            provider?: string | null;
+            /** Recent Exact Turn Count */
+            recent_exact_turn_count: number;
+            /** Retryable */
+            retryable: boolean;
+            /** Schema */
+            schema?: string | null;
+            /** Schema Version */
+            schema_version: string;
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "workspace" | "creation";
+            /** Semantic Navigation */
+            semantic_navigation?: {
+                [key: string]: unknown;
+            };
+            /** Source Message Count */
+            source_message_count: number;
+            source_range: components["schemas"]["ConversationCheckpointSourceRangeResponse"];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "compressing" | "ready" | "failed" | "cancelled" | "superseded";
+            /** Trigger */
+            trigger: string;
+            /** Updated At */
+            updated_at?: string | null;
+            /** Warnings */
+            warnings?: string[];
+        };
+        /** ConversationCheckpointListResponse */
+        ConversationCheckpointListResponse: {
+            /** Items */
+            items: components["schemas"]["ConversationCheckpointSummaryResponse"][];
+            /** Total */
+            total: number;
+        };
+        /** ConversationCheckpointSourceRangeResponse */
+        ConversationCheckpointSourceRangeResponse: {
+            /** First Sequence */
+            first_sequence: number;
+            /** Last Sequence */
+            last_sequence: number;
+            /** Message Count */
+            message_count: number;
+            /** Source Hash */
+            source_hash: string;
+        };
+        /** ConversationCheckpointSummaryResponse */
+        ConversationCheckpointSummaryResponse: {
+            /** Checkpoint Tokens */
+            checkpoint_tokens?: number | null;
+            /** Completed At */
+            completed_at?: string | null;
+            /** Created At */
+            created_at?: string | null;
+            /** Error Code */
+            error_code?: string | null;
+            /** Error Detail */
+            error_detail?: string | null;
+            /** Id */
+            id: string;
+            model_binding?: components["schemas"]["ConversationModelBindingResponse"] | null;
+            /** Original History Tokens */
+            original_history_tokens?: number | null;
+            /** Policy Version */
+            policy_version: number;
+            /** Retryable */
+            retryable: boolean;
+            /** Schema Version */
+            schema_version: string;
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "workspace" | "creation";
+            /** Source Message Count */
+            source_message_count: number;
+            source_range: components["schemas"]["ConversationCheckpointSourceRangeResponse"];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "compressing" | "ready" | "failed" | "cancelled" | "superseded";
+            /** Updated At */
+            updated_at?: string | null;
+            /** Warnings */
+            warnings?: string[];
+        };
+        /** ConversationContextStateResponse */
+        ConversationContextStateResponse: {
+            /** Active Checkpoint Id */
+            active_checkpoint_id?: string | null;
+            /** Active History Tokens */
+            active_history_tokens: number;
+            /**
+             * Capacity Assurance
+             * @enum {string}
+             */
+            capacity_assurance: "exact" | "conservative" | "unverified";
+            /** Error Code */
+            error_code?: string | null;
+            /** Error Detail */
+            error_detail?: string | null;
+            /** Latest Checkpoint Id */
+            latest_checkpoint_id?: string | null;
+            /** Model */
+            model?: string | null;
+            model_binding?: components["schemas"]["ConversationModelBindingResponse"] | null;
+            /** Original History Tokens */
+            original_history_tokens: number;
+            /** Policy Version */
+            policy_version: number;
+            /** Provider */
+            provider?: string | null;
+            /** Recent Exact Turn Count */
+            recent_exact_turn_count: number;
+            /** Retryable */
+            retryable: boolean;
+            /** Source Message Count */
+            source_message_count: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ready" | "compressing" | "failed";
+            /** Trigger */
+            trigger: string;
+            /** Updated At */
+            updated_at?: string | null;
+            /** Warnings */
+            warnings?: string[];
+        };
+        /** ConversationModelBindingResponse */
+        ConversationModelBindingResponse: {
+            /** Display Name */
+            display_name?: string | null;
+            /** Model */
+            model?: string | null;
+            /** Provider */
+            provider?: string | null;
         };
         /** CreationAgentRequest */
         CreationAgentRequest: {
@@ -6443,6 +6862,7 @@ export interface components {
              * @enum {string}
              */
             model_route: "pc" | "mobile";
+            reference_context?: components["schemas"]["ReferenceContext"] | null;
             /** Session Id */
             session_id: string;
         };
@@ -8383,6 +8803,30 @@ export interface components {
             /** Model Key */
             model_key: string;
         };
+        /**
+         * ReferenceContext
+         * @description Untrusted reference data that can never replace the latest user intent.
+         */
+        ReferenceContext: {
+            /** Content */
+            content: string;
+            /** Content Sha256 */
+            content_sha256?: string | null;
+            /**
+             * Coverage
+             * @enum {string}
+             */
+            coverage: "full" | "distributed" | "excerpt";
+            /** Source Chars */
+            source_chars: number;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "long_text" | "attachment" | "routed_data";
+            /** Source Name */
+            source_name: string;
+        };
         /** RefreshTokenRequest */
         RefreshTokenRequest: {
             /** Refresh Token */
@@ -8965,6 +9409,55 @@ export interface components {
             /** Project Id */
             project_id?: string | null;
         };
+        /** TranscriptImportRequest */
+        TranscriptImportRequest: {
+            /** Client Conversation Id */
+            client_conversation_id?: string | null;
+            /** Idempotency Key */
+            idempotency_key: string;
+            /** Messages */
+            messages: components["schemas"]["TranscriptMessageInput"][];
+            /** Server Conversation Id */
+            server_conversation_id?: string | null;
+            /** Title */
+            title?: string | null;
+            /** Transcript Revision */
+            transcript_revision: number;
+        };
+        /** TranscriptImportResponse */
+        TranscriptImportResponse: {
+            /** Applied Revision */
+            applied_revision: number;
+            /** Conversation Id */
+            conversation_id: string;
+            /** Idempotent */
+            idempotent: boolean;
+            /** Imported Message Count */
+            imported_message_count: number;
+            /** Transcript Revision */
+            transcript_revision: number;
+        };
+        /** TranscriptMessageInput */
+        TranscriptMessageInput: {
+            /** Content */
+            content: string;
+            /** Id */
+            id: string;
+            /** Message Hash */
+            message_hash: string;
+            /**
+             * Role
+             * @enum {string}
+             */
+            role: "user" | "assistant";
+            /** Sequence No */
+            sequence_no: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "completed" | "error" | "aborted" | "cancelled";
+        };
         /** ValidationError */
         ValidationError: {
             /** Context */
@@ -8990,10 +9483,11 @@ export interface components {
             canonical_conversation_id?: string | null;
             /** Conversation Id */
             conversation_id?: string | null;
-            /** History */
-            history?: {
-                [key: string]: unknown;
-            }[];
+            /**
+             * Creation Session Id
+             * @description Typed source-session reference; never used as workspace conversation history
+             */
+            creation_session_id?: string | null;
             /**
              * Local Cli Read Paths
              * @description Absolute files/directories explicitly confirmed by the user for this turn
@@ -9026,6 +9520,13 @@ export interface components {
              * @default 3
              */
             outline_batch_count: number;
+            /** @description Typed data-only reference material for the current exact author message */
+            reference_context?: components["schemas"]["ReferenceContext"] | null;
+            /**
+             * Scope
+             * @description Deprecated project-scope marker retained for typed client compatibility
+             */
+            scope?: "project" | null;
             /**
              * Selected Text
              * @description User-selected text in the editor
@@ -9086,6 +9587,8 @@ export interface components {
             current_iteration: number;
             /** Error */
             error?: string | null;
+            /** Error Code */
+            error_code?: string | null;
             /** Id */
             id: string;
             /** Model */
@@ -9134,10 +9637,28 @@ export interface components {
             iteration: number;
             /** Request */
             request?: unknown;
+            /**
+             * Request Bytes
+             * @default 0
+             */
+            request_bytes: number;
+            /** Request Sha256 */
+            request_sha256?: string | null;
             /** Resolved Step Id */
             resolved_step_id?: string | null;
+            /** Resource Refs */
+            resource_refs?: {
+                [key: string]: unknown;
+            }[];
             /** Result */
             result?: unknown;
+            /**
+             * Result Bytes
+             * @default 0
+             */
+            result_bytes: number;
+            /** Result Sha256 */
+            result_sha256?: string | null;
             /** Retry Block Reason */
             retry_block_reason?: string | null;
             /** Retry Of Step Id */
@@ -12820,6 +13341,106 @@ export interface operations {
             };
         };
     };
+    list_creation_conversation_checkpoints_api_v1_novel_creation_sessions__session_id__conversations__conversation_id__checkpoints_get: {
+        parameters: {
+            query?: {
+                offset?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiResponse_ConversationCheckpointListResponse_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_creation_conversation_checkpoint_api_v1_novel_creation_sessions__session_id__conversations__conversation_id__checkpoints__checkpoint_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+                conversation_id: string;
+                checkpoint_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiResponse_ConversationCheckpointDetailResponse_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_creation_conversation_context_state_api_v1_novel_creation_sessions__session_id__conversations__conversation_id__context_state_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiResponse_ConversationContextStateResponse_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_creation_dependency_graph_api_v1_novel_creation_sessions__session_id__dependency_graph_get: {
         parameters: {
             query?: never;
@@ -14282,6 +14903,41 @@ export interface operations {
             };
         };
     };
+    import_assistant_conversation_transcript_api_v1_projects__project_id__ai_assistant_conversations_transcript_import_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TranscriptImportRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiResponse_TranscriptImportResponse_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_assistant_conversation_api_v1_projects__project_id__ai_assistant_conversations__conversation_id__get: {
         parameters: {
             query?: never;
@@ -14333,6 +14989,204 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_conversation_checkpoints_api_v1_projects__project_id__ai_assistant_conversations__conversation_id__checkpoints_get: {
+        parameters: {
+            query?: {
+                offset?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                project_id: string;
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiResponse_ConversationCheckpointListResponse_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    rebuild_conversation_checkpoint_api_v1_projects__project_id__ai_assistant_conversations__conversation_id__checkpoints_rebuild_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_conversation_checkpoint_api_v1_projects__project_id__ai_assistant_conversations__conversation_id__checkpoints__checkpoint_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                conversation_id: string;
+                checkpoint_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiResponse_ConversationCheckpointDetailResponse_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_conversation_checkpoint_api_v1_projects__project_id__ai_assistant_conversations__conversation_id__checkpoints__checkpoint_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                conversation_id: string;
+                checkpoint_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_conversation_checkpoint_api_v1_projects__project_id__ai_assistant_conversations__conversation_id__checkpoints__checkpoint_id__cancel_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                conversation_id: string;
+                checkpoint_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiResponse_ConversationContextStateResponse_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_conversation_context_state_api_v1_projects__project_id__ai_assistant_conversations__conversation_id__context_state_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiResponse_ConversationContextStateResponse_"];
                 };
             };
             /** @description Validation Error */

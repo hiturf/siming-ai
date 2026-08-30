@@ -15,9 +15,9 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
 
 from app.database.bootstrap import SCHEMA_EPOCH, bootstrap_database
-from app.database.models import AssistantRun, AssistantRunStep
+from app.database.models import AssistantRun, AssistantRunStep, Project
 
-HEAD_REVISION = "300a26_outline_drafts"
+HEAD_REVISION = "300a31_context_source_ids"
 
 
 def _database_url(path: Path) -> str:
@@ -50,6 +50,10 @@ def test_fresh_database_is_initialized_and_versioned():
                 "content_sync_jobs",
                 "gateway_devices",
                 "sync_changes",
+                "assistant_conversation_replicas",
+                "assistant_transcript_import_receipts",
+                "data_integrity_quarantine",
+                "data_integrity_quarantine_batches",
             } <= tables
             assert "sort_order" in {
                 column["name"] for column in inspect(engine).get_columns("chapters")
@@ -145,6 +149,23 @@ def test_stamped_300a23_database_repairs_missing_character_change_log_version():
             initialized = bootstrap_database(engine, database_url=url)
             assert initialized.schema_revision == HEAD_REVISION
             with engine.begin() as connection:
+                connection.execute(text(
+                    "INSERT INTO projects (id, title, created_at, updated_at) "
+                    "VALUES ('project-1', 'Legacy', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ))
+                connection.execute(text(
+                    "INSERT INTO chapters "
+                    "(id, project_id, title, content, cataloging_required, sort_order, "
+                    "created_at, updated_at) VALUES "
+                    "('chapter-1', 'project-1', 'Chapter', '', 0, 1, "
+                    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ))
+                connection.execute(text(
+                    "INSERT INTO characters "
+                    "(id, project_id, name, created_at, updated_at) VALUES "
+                    "('character-1', 'project-1', 'Character', "
+                    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ))
                 connection.execute(text(
                     "INSERT INTO character_change_logs "
                     "(id, character_id, chapter_id, chapter_version, change_type, "
@@ -263,6 +284,7 @@ def test_legacy_truncated_run_step_json_is_repaired_before_retry():
 
             Session = sessionmaker(bind=engine)
             with Session() as db:
+                db.add(Project(id="project-1", title="Project"))
                 run = AssistantRun(project_id="project-1", status="error", phase="tool")
                 db.add(run)
                 db.flush()

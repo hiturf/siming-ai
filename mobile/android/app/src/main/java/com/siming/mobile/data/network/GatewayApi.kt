@@ -277,6 +277,25 @@ class GatewayApi(private val tokenStore: SecureTokenStore) {
         PcApiPaths.assistantConversation(projectId, conversationId),
     ).data
 
+    suspend fun assistantContextState(
+        connection: GatewayConnection,
+        projectId: String,
+        conversationId: String,
+    ): JsonObject = request<ApiEnvelope<JsonObject>>(
+        connection.baseUrl,
+        PcApiPaths.assistantContextState(projectId, conversationId),
+    ).data
+
+    suspend fun assistantCheckpoint(
+        connection: GatewayConnection,
+        projectId: String,
+        conversationId: String,
+        checkpointId: String,
+    ): JsonObject = request<ApiEnvelope<JsonObject>>(
+        connection.baseUrl,
+        PcApiPaths.assistantCheckpoint(projectId, conversationId, checkpointId),
+    ).data
+
     suspend fun assistantRun(
         connection: GatewayConnection,
         projectId: String,
@@ -711,6 +730,25 @@ suspend fun createProjectExport(
         PcApiPaths.novelCreationSession(sessionId),
     ).data
 
+    suspend fun novelCreationContextState(
+        connection: GatewayConnection,
+        sessionId: String,
+        conversationId: String,
+    ): JsonObject = request<ApiEnvelope<JsonObject>>(
+        connection.baseUrl,
+        PcApiPaths.novelCreationContextState(sessionId, conversationId),
+    ).data
+
+    suspend fun novelCreationCheckpoint(
+        connection: GatewayConnection,
+        sessionId: String,
+        conversationId: String,
+        checkpointId: String,
+    ): JsonObject = request<ApiEnvelope<JsonObject>>(
+        connection.baseUrl,
+        PcApiPaths.novelCreationCheckpoint(sessionId, conversationId, checkpointId),
+    ).data
+
     suspend fun novelCreationAgentTurn(
         connection: GatewayConnection,
         payload: JsonObject,
@@ -995,6 +1033,22 @@ suspend fun downloadProjectExport(
         }
         throw GatewayHttpException(401, "设备授权已失效，请重新连接 Gateway")
     }
+
+    /**
+     * Imports one contiguous batch of closed standalone turns into the
+     * canonical server conversation. The caller owns cursor advancement and
+     * must persist the returned receipt before constructing the next batch.
+     */
+    suspend fun importAssistantTranscript(
+        connection: GatewayConnection,
+        projectId: String,
+        requestBody: JsonObject,
+    ): JsonObject = request<ApiEnvelope<JsonObject>>(
+        connection.baseUrl,
+        PcApiPaths.assistantTranscriptImport(projectId),
+        "POST",
+        requestBody.toString(),
+    ).data
 
     private suspend fun validAccessToken(baseUrl: String): String {
         val current = tokenStore.read() ?: throw GatewayHttpException(401, "设备尚未配对")

@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.architecture.uow import commit_session
 
 from .registry import registry
-
+from .tool_result_projection import sanitize_diagnostic_tool_result
 
 # Project-facing model generation/review tools share one prepared context
 # contract. Pure rule checks and read-only retrieval are intentionally absent.
@@ -44,13 +44,15 @@ async def execute_workspace_action(
         return {"tool": tool, "status": "skipped", "detail": "未知工具"}
     task_type = _GOVERNED_TASKS.get(tool)
     if not task_type:
-        return await handler(db, project_id, args)
+        result = await handler(db, project_id, args)
+        return sanitize_diagnostic_tool_result(tool, result)
 
     if tool in {"chapter_writer", "outline_writer"}:
         # Both authoring generators validate an explicit, model-finalized manifest and its
         # one-step selection token. Never recreate a default manifest here:
         # doing so would bypass the Agent retrieval/review workflow.
-        return await handler(db, project_id, args)
+        result = await handler(db, project_id, args)
+        return sanitize_diagnostic_tool_result(tool, result)
 
     from ..context_orchestrator import ContextOrchestrator, activate_context_manifest
 
@@ -64,7 +66,11 @@ async def execute_workspace_action(
             model=str(args.get("model") or "") or None,
             execution_route="workspace_internal",
             arguments=args,
-            pinned_chunk_ids=args.get("pinned_chunk_ids") if isinstance(args.get("pinned_chunk_ids"), list) else (),
+            pinned_chunk_ids=(
+                args.get("pinned_chunk_ids")
+                if isinstance(args.get("pinned_chunk_ids"), list)
+                else ()
+            ),
         )
     usable, detail = orchestrator.validate(manifest)
     if not usable:
@@ -73,7 +79,11 @@ async def execute_workspace_action(
         commit_session(db)
         return {
             "tool": tool,
-            "status": manifest.status if manifest.status in {"needs_confirmation", "blocked_rebuild", "stale"} else "needs_confirmation",
+            "status": (
+                manifest.status
+                if manifest.status in {"needs_confirmation", "blocked_rebuild", "stale"}
+                else "needs_confirmation"
+            ),
             "detail": detail,
             "data": {
                 "context_manifest_id": manifest.id,
@@ -86,6 +96,7 @@ async def execute_workspace_action(
         # await a remote model for minutes, so close this transaction first.
         commit_session(db)
         result = await handler(db, project_id, governed_args)
+    result = sanitize_diagnostic_tool_result(tool, result)
     if result.get("status") == "ok":
         orchestrator.mark_consumed(manifest)
         commit_session(db)

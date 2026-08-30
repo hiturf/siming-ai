@@ -20,7 +20,7 @@ interface ModelProfile {
 interface ProfileFormValues {
   provider: string
   model_name: string
-  context_window_tokens: number
+  context_window_tokens?: number
   max_output_tokens?: number
   safety_margin_tokens: number
   enabled: boolean
@@ -57,7 +57,7 @@ export default function ContextGovernanceSettingsPanel() {
 
   const showCreate = () => {
     setEditing(null)
-    form.setFieldsValue({ context_window_tokens: 1_000_000, safety_margin_tokens: 512, enabled: true, provider: '', model_name: '' })
+    form.setFieldsValue({ context_window_tokens: undefined, safety_margin_tokens: 512, enabled: true, provider: '', model_name: '' })
     setOpen(true)
   }
 
@@ -89,7 +89,7 @@ export default function ContextGovernanceSettingsPanel() {
         <Text type="secondary" style={{ fontSize: 12 }}>{semantic?.model || 'multilingual-e5-small'}{semantic?.reason ? ` · ${semantic.reason}` : ''}</Text>
       </div>
       <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
-        未配置档案的远程模型按 1M 上下文窗口编排；单次输出仍受模型能力表或模型设置中的最大输出限制。若服务商限制更低，请在这里填写精确档案。
+        未配置档案时，1M 只是预览估算，不作为安全容量。请按服务商公布的当前模型规格填写确切窗口和最大输出；否则长对话 Agent 会在执行前明确报告容量未知。
       </Text>
       <Table
         rowKey="id"

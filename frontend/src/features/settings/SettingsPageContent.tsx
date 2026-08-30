@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import {
   Card,
@@ -166,6 +166,8 @@ interface SettingsPageProps {
 }
 
 function SettingsPage({ embedded = false }: SettingsPageProps = {}) {
+  const contextGovernanceRequested = typeof window !== 'undefined'
+    && new URLSearchParams(window.location.search).get('section') === 'context-governance'
   const queryClient = useQueryClient()
   const modelConfigsQuery = useSharedModelConfigs()
   const { setGlobalModel: persistGlobalModel } = useGlobalModelActions()
@@ -234,13 +236,22 @@ function SettingsPage({ embedded = false }: SettingsPageProps = {}) {
       setLauncherSettings(res.data.data)
       setLaunchMode(res.data.data.launch_mode)
       setUpdateChannel(res.data.data.update_channel || 'stable')
-      if (res.data.data.gateway_headless && !embedded) setSettingsSection('gateway')
+      if (res.data.data.gateway_headless && !embedded && !contextGovernanceRequested) setSettingsSection('gateway')
     } catch (err: any) {
       message.error(err.message || '获取启动方式失败')
     } finally {
       setLauncherLoading(false)
     }
-  }, [embedded])
+  }, [contextGovernanceRequested, embedded])
+
+  useEffect(() => {
+    if (!contextGovernanceRequested) return
+    setSettingsSection('ai')
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById('context-governance-settings')?.scrollIntoView?.({ block: 'start' })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [contextGovernanceRequested])
 
   const scanCliIntegrations = async () => {
     setCliScanLoading(true)
@@ -1256,14 +1267,17 @@ function SettingsPage({ embedded = false }: SettingsPageProps = {}) {
         </Card>
       )}
 
-      <Collapse
-        className="settings-card"
-        items={[{
-          key: 'advanced-ai',
-          label: '高级设置：上下文与技术参数',
-          children: <ContextGovernanceSettingsPanel />,
-        }]}
-      />
+      <div id="context-governance-settings">
+        <Collapse
+          className="settings-card"
+          defaultActiveKey={contextGovernanceRequested ? ['advanced-ai'] : []}
+          items={[{
+            key: 'advanced-ai',
+            label: '高级设置：上下文与技术参数',
+            children: <ContextGovernanceSettingsPanel />,
+          }]}
+        />
+      </div>
       </>}
 
       <Modal

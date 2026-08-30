@@ -33,7 +33,6 @@ from app.prompts.character_writer_prompts import build_character_writer_messages
 from app.prompts.outline_writer_prompts import build_outline_writer_messages  # noqa: E402
 from app.prompts.style_prompts import build_style_context  # noqa: E402
 from app.prompts.worldbuilding_writer_prompts import build_worldbuilding_writer_messages  # noqa: E402
-from app.prompts.workspace_assistant import build_workspace_assistant_initial_user_message  # noqa: E402
 from app.services.agent.prompt_builder import compose_chapter_writer_messages  # noqa: E402
 from app.prompts.packs.chapter_quality import PACK as CHAPTER_QUALITY_PACK  # noqa: E402
 from app.services.workspace.registry import registry  # noqa: E402
@@ -329,14 +328,6 @@ def build_contract() -> dict:
         "assistant.workspace.quality",
         outline_batch_count="{{outline_batch_count}}",
     )
-    initial_user = build_workspace_assistant_initial_user_message(
-        project_id="{{project_id}}",
-        project_title="{{project_title}}",
-        history_text="{{history_text}}",
-        explicit_context=["{{explicit_context}}"],
-        outline_batch_count=3,
-        user_message="{{user_message}}",
-    )
     chapter_messages = compose_chapter_writer_messages(
         pack=CHAPTER_QUALITY_PACK,
         style_context="{{style_context}}",
@@ -350,9 +341,9 @@ def build_contract() -> dict:
     contract = {
         "schema_version": 3,
         "source_versions": {
-            "workspace": "assistant.workspace.quality@3.1.0",
+            "workspace": "assistant.workspace.quality@3.2.0",
             "chapter_quality": "assistant.chapter.quality@3.1.0",
-            "novel_creation": "creation.novel.stage@3.0.0",
+            "novel_creation": "creation.novel.stage@3.1.0",
         },
         "tool_names": sorted({*tool_names, TOOL_CATEGORY_CONTROLLER}),
         "tool_schemas": [
@@ -361,7 +352,10 @@ def build_contract() -> dict:
         ],
         "tool_categories": tool_category_contract(),
         "workspace_system_template": workspace_system,
-        "workspace_initial_user_template": initial_user,
+        "workspace_current_user_contract": {
+            "source": "conversation_context_frame.current_user_message",
+            "content": "verbatim",
+        },
         "chapter": {
             "quality_system_template": chapter_messages[0]["content"],
             "user_template": chapter_messages[1]["content"],

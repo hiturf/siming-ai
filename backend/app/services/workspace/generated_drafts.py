@@ -17,13 +17,13 @@ from uuid import uuid4
 
 from sqlalchemy.exc import IntegrityError
 
-from app.architecture.uow import commit_session
+from app.architecture.uow import commit_session, session_commits_deferred
 
 from ...core.utils import count_words
 
 MAX_CHAPTER_DRAFTS = 64
 
-_CHAPTER_DRAFTS: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_CHAPTER_DRAFTS: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
 
 class PendingChapterDraftConflict(RuntimeError):
@@ -69,8 +69,13 @@ def _cache_chapter_draft(
         _CHAPTER_DRAFTS.popitem(last=False)
 
 
-def _set_chapter_draft_superseded(draft: Any) -> None:
+def _set_chapter_draft_superseded(draft: Any, *, db: Any) -> None:
     draft.status = "superseded"
+    if session_commits_deferred(db):
+        # A cache miss is safe across either commit or rollback; retaining a
+        # pre-transaction "pending" entry after commit is not.
+        _CHAPTER_DRAFTS.pop(str(draft.id), None)
+        return
     cached = _CHAPTER_DRAFTS.get(str(draft.id))
     if cached:
         cached["status"] = "superseded"
@@ -184,17 +189,18 @@ def store_chapter_draft(
                 raise ChapterDraftOutlineConflict(concurrent_chapter) from None
         raise
 
-    _cache_chapter_draft(
-        draft_id=draft_id,
-        project_id=project_id,
-        title=title or "",
-        outline_node_id=outline_node_id,
-        context_manifest_id=context_manifest_id,
-        saved_chapter_id=None,
-        status="pending",
-        content=content,
-        created_at=row.created_at or created_at,
-    )
+    if not session_commits_deferred(db):
+        _cache_chapter_draft(
+            draft_id=draft_id,
+            project_id=project_id,
+            title=title or "",
+            outline_node_id=outline_node_id,
+            context_manifest_id=context_manifest_id,
+            saved_chapter_id=None,
+            status="pending",
+            content=content,
+            created_at=row.created_at or created_at,
+        )
 
     return draft_id
 
@@ -237,7 +243,12 @@ def get_chapter_draft(project_id: str, draft_id: str | None, *, db: Any = None) 
     return None
 
 
-def get_chapter_draft_meta(project_id: str, draft_id: str | None, *, db: Any = None) -> dict[str, Any] | None:
+def get_chapter_draft_meta(
+    project_id: str,
+    draft_id: str | None,
+    *,
+    db: Any = None,
+) -> dict[str, Any] | None:
     if not draft_id:
         return None
     entry = _CHAPTER_DRAFTS.get(str(draft_id))
@@ -360,19 +371,6 @@ def find_pending_chapter_draft(
     )
 
 
-def pending_chapter_draft_ids(db: Any, project_id: str) -> set[str]:
-    from ...database.models import ChapterDraft
-
-    release_stale_pending_chapter_drafts(db, project_id)
-    return {
-        str(row[0])
-        for row in db.query(ChapterDraft.id).filter(
-            ChapterDraft.project_id == project_id,
-            ChapterDraft.status == "pending",
-        ).all()
-    }
-
-
 def latest_pending_chapter_draft(db: Any, project_id: str) -> Any | None:
     from ...database.models import ChapterDraft
 
@@ -386,26 +384,6 @@ def latest_pending_chapter_draft(db: Any, project_id: str) -> Any | None:
         .order_by(ChapterDraft.updated_at.desc(), ChapterDraft.created_at.desc())
         .first()
     )
-
-
-def find_new_pending_chapter_draft(
-    db: Any,
-    project_id: str,
-    excluded_ids: set[str],
-) -> Any | None:
-    from ...database.models import ChapterDraft
-
-    release_stale_pending_chapter_drafts(db, project_id)
-    query = db.query(ChapterDraft).filter(
-        ChapterDraft.project_id == project_id,
-        ChapterDraft.status == "pending",
-    )
-    if excluded_ids:
-        query = query.filter(ChapterDraft.id.notin_(excluded_ids))
-    return query.order_by(
-        ChapterDraft.created_at.desc(),
-        ChapterDraft.id.desc(),
-    ).first()
 
 
 def find_chapter_draft(db: Any, project_id: str, draft_id: str) -> Any | None:
@@ -445,7 +423,7 @@ def release_stale_pending_chapter_drafts(db: Any, project_id: str) -> int:
     if not stale:
         return 0
     for draft in stale:
-        _set_chapter_draft_superseded(draft)
+        _set_chapter_draft_superseded(draft, db=db)
     commit_session(db)
     return len(stale)
 
@@ -470,7 +448,7 @@ def ensure_generated_draft_outline_is_unused(
     ).first()
     if existing:
         if draft is not None and draft.status == "pending":
-            _set_chapter_draft_superseded(draft)
+            _set_chapter_draft_superseded(draft, db=db)
             commit_session(db)
         raise ValidationError(
             "该大纲已在草稿生成期间关联正式章节；"
@@ -523,7 +501,13 @@ def update_chapter_draft(
     row.content = content
     cached = _CHAPTER_DRAFTS.get(draft_id)
     if cached:
-        cached.update({"title": title, "outline_node_id": outline_node_id or "", "content": content})
+        cached.update(
+            {
+                "title": title,
+                "outline_node_id": outline_node_id or "",
+                "content": content,
+            }
+        )
     return row
 
 

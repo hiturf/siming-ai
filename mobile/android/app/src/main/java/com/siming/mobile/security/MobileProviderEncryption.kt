@@ -12,6 +12,7 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
@@ -35,20 +36,7 @@ object MobileProviderEncryption {
         val associatedData =
             "siming-mobile-provider-v1:${connection.deviceId}:$projectId".toByteArray(Charsets.UTF_8)
         val plaintext = Json.encodeToString(
-            buildJsonObject {
-                put("base_url", config.baseUrl.trim().trimEnd('/'))
-                put("api_key", config.apiKey.trim())
-                put("model", config.model.trim())
-                put(
-                    "protocol",
-                    if (config.protocol == DirectApiConfig.PROTOCOL_RESPONSES) {
-                        DirectApiConfig.PROTOCOL_RESPONSES
-                    } else {
-                        DirectApiConfig.PROTOCOL_CHAT_COMPLETIONS
-                    },
-                )
-                put("issued_at", System.currentTimeMillis())
-            },
+            providerPlaintext(config, issuedAt = System.currentTimeMillis()),
         ).toByteArray(Charsets.UTF_8)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
@@ -59,6 +47,33 @@ object MobileProviderEncryption {
             nonce = encode(nonce),
             ciphertext = encode(ciphertext),
         )
+    }
+
+    /** Request-scoped provider and capacity profile; this object is encrypted as one envelope. */
+    internal fun providerPlaintext(
+        config: DirectApiConfig,
+        issuedAt: Long,
+    ): JsonObject {
+        val contextWindow = requireNotNull(config.contextWindowTokens) {
+            "手机模型线路尚未配置上下文窗口，未创建 Gateway 凭据密文"
+        }
+        return buildJsonObject {
+            put("base_url", config.baseUrl.trim().trimEnd('/'))
+            put("api_key", config.apiKey.trim())
+            put("model", config.model.trim())
+            put(
+                "protocol",
+                if (config.protocol == DirectApiConfig.PROTOCOL_RESPONSES) {
+                    DirectApiConfig.PROTOCOL_RESPONSES
+                } else {
+                    DirectApiConfig.PROTOCOL_CHAT_COMPLETIONS
+                },
+            )
+            put("context_window_tokens", contextWindow)
+            put("max_output_tokens", config.maxOutputTokens)
+            put("safety_margin_tokens", config.safetyMarginTokens)
+            put("issued_at", issuedAt)
+        }
     }
 
     private fun hkdfSha256(input: ByteArray, info: ByteArray, length: Int): ByteArray {

@@ -1,4 +1,4 @@
-from app.routers.ai_writer import _assistant_history_text, _workspace_outcome
+from app.routers.ai_writer import _workspace_outcome
 
 
 def test_workspace_outcome_marks_empty_response():
@@ -45,12 +45,3 @@ def test_workspace_outcome_marks_partial_success_when_a_write_succeeded_before_f
     )
 
     assert outcome == "partial_success"
-
-def test_workspace_history_labels_assistant_without_completion_state():
-    history = _assistant_history_text([
-        {"role": "user", "content": "你好"},
-        {"role": "assistant", "content": "我在。"},
-    ])
-
-    assert "助手：" in history
-    assert "助手（已完成）" not in history

@@ -28,9 +28,9 @@ def test_android_prompt_contract_has_no_pc_source_drift():
     assert committed == generated
     assert committed["source_sha256"]
     assert committed["source_versions"] == {
-        "workspace": "assistant.workspace.quality@3.1.0",
+        "workspace": "assistant.workspace.quality@3.2.0",
         "chapter_quality": "assistant.chapter.quality@3.1.0",
-        "novel_creation": "creation.novel.stage@3.0.0",
+        "novel_creation": "creation.novel.stage@3.1.0",
     }
 
 

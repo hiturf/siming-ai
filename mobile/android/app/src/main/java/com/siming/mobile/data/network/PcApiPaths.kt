@@ -124,8 +124,17 @@ internal object PcApiPaths {
     fun assistantConversations(projectId: String): String =
         "${project(projectId)}/ai/assistant/conversations"
 
+    fun assistantTranscriptImport(projectId: String): String =
+        "${assistantConversations(projectId)}/transcript-import"
+
     fun assistantConversation(projectId: String, conversationId: String): String =
         "${assistantConversations(projectId)}/${segment(conversationId)}"
+
+    fun assistantContextState(projectId: String, conversationId: String): String =
+        "${assistantConversation(projectId, conversationId)}/context-state"
+
+    fun assistantCheckpoint(projectId: String, conversationId: String, checkpointId: String): String =
+        "${assistantConversation(projectId, conversationId)}/checkpoints/${segment(checkpointId)}"
 
     fun assistantRuns(projectId: String): String =
         "${project(projectId)}/ai/assistant/runs"
@@ -138,6 +147,19 @@ internal object PcApiPaths {
 
     fun novelCreationSession(sessionId: String): String =
         "$NOVEL_CREATION_SESSIONS/${segment(sessionId)}"
+
+    fun novelCreationConversation(sessionId: String, conversationId: String): String =
+        "${novelCreationSession(sessionId)}/conversations/${segment(conversationId)}"
+
+    fun novelCreationContextState(sessionId: String, conversationId: String): String =
+        "${novelCreationConversation(sessionId, conversationId)}/context-state"
+
+    fun novelCreationCheckpoint(
+        sessionId: String,
+        conversationId: String,
+        checkpointId: String,
+    ): String =
+        "${novelCreationConversation(sessionId, conversationId)}/checkpoints/${segment(checkpointId)}"
 
     fun novelCreationRuns(sessionId: String): String =
         "${novelCreationSession(sessionId)}/runs"

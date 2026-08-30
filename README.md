@@ -23,7 +23,7 @@ Siming is a free and open-source, local-first AI workspace for planning, writing
 
 *新书立项工作台：先形成一套故事方向，再通过对话持续调整角色、世界观、卷纲和前 3 章细纲。图中内容均为虚构演示数据。*
 
-> **当前源码版本 3.3.8** 修复了大纲节点一次关联多个角色时无法保存，以及新建大纲/角色保存失败没有明确提示的问题；同时收紧 AI 草稿、Android 离线写入和建档记录的持久化一致性。完整变化见 [3.3.8 发布说明](docs/release-notes-3.3.8.md)。
+> **当前源码版本 3.3.9** 为项目工作台与新书立项 Agent 引入可追溯的对话 checkpoint、动态模型上下文预算和严格的原生工具事务保护，并同步 PC、Gateway 与 Android 的失败语义。3.3.8 的大纲保存与持久化修复因未单独打 tag，也首次随本版本安装包分发。完整变化见 [3.3.9 发布说明](docs/release-notes-3.3.9.md)。
 
 ## 它解决什么问题
 

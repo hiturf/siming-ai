@@ -896,34 +896,12 @@ class LocalCLIAdapter(BaseAdapter):
         return value if value > 0 else float(DEFAULT_LOCAL_CLI_TIMEOUT)
 
     @staticmethod
-    def _chapter_draft_terminal_probe(runtime_body: dict[str, Any]) -> Callable[[], Any] | None:
-        project_id = str(runtime_body.get("local_cli_terminal_draft_project_id") or "").strip()
-        if not project_id:
-            return None
-        excluded_ids = {
-            str(item)
-            for item in (runtime_body.get("local_cli_terminal_draft_excluded_ids") or [])
-            if str(item).strip()
-        }
+    def _terminal_draft_probe(runtime_body: dict[str, Any]) -> Callable[[], Any] | None:
+        from ..services.workspace.terminal_draft_detection import (
+            local_cli_terminal_draft_probe,
+        )
 
-        def _probe() -> str | None:
-            from ..database.models import ChapterDraft
-            from ..database.session import SessionLocal
-
-            session = SessionLocal()
-            try:
-                query = session.query(ChapterDraft.id).filter(
-                    ChapterDraft.project_id == project_id,
-                    ChapterDraft.status == "pending",
-                )
-                if excluded_ids:
-                    query = query.filter(ChapterDraft.id.notin_(excluded_ids))
-                row = query.order_by(ChapterDraft.created_at.desc(), ChapterDraft.id.desc()).first()
-                return f"chapter_draft:{row[0]}" if row else None
-            finally:
-                session.close()
-
-        return _probe
+        return local_cli_terminal_draft_probe(runtime_body)
 
     @staticmethod
     def _creation_revision_activity_probe(
@@ -1096,6 +1074,9 @@ class LocalCLIAdapter(BaseAdapter):
                     mcp_tool_category_state_file=str(
                         runtime_body.get("local_cli_mcp_tool_category_state_file") or ""
                     ),
+                    mcp_direct_mcp_lease_token=str(
+                        runtime_body.get("local_cli_mcp_lease_token") or ""
+                    ),
                 )
             elif self._provider == "codex_cli":
                 launch = self._launch(prompt, model)
@@ -1154,6 +1135,9 @@ class LocalCLIAdapter(BaseAdapter):
                     tool_category_state_file=str(
                         runtime_body.get("local_cli_mcp_tool_category_state_file") or ""
                     ),
+                    direct_mcp_lease_token=str(
+                        runtime_body.get("local_cli_mcp_lease_token") or ""
+                    ),
                 )
         except ValueError as exc:
             _unlink_if_exists(prompt_file)
@@ -1211,7 +1195,7 @@ class LocalCLIAdapter(BaseAdapter):
                 timeout_seconds=context.request_timeout,
                 operation_id=context.operation_id,
                 external_activity_probe=self._creation_revision_activity_probe(runtime_body),
-                terminal_probe=self._chapter_draft_terminal_probe(runtime_body),
+                terminal_probe=self._terminal_draft_probe(runtime_body),
                 quiet_seconds=self._activity_window(
                     runtime_body,
                     "local_cli_quiet_seconds",
@@ -1361,9 +1345,12 @@ class LocalCLIAdapter(BaseAdapter):
 
     @staticmethod
     def _isolated_retry_attempts(extra_body: dict | None) -> int:
-        if not bool((extra_body or {}).get("local_cli_isolated")):
+        body = extra_body or {}
+        if bool(body.get("local_cli_mcp_authorized")):
             return 1
-        raw = (extra_body or {}).get("local_cli_retry_attempts", DEFAULT_ISOLATED_CLI_ATTEMPTS)
+        if not bool(body.get("local_cli_isolated")):
+            return 1
+        raw = body.get("local_cli_retry_attempts", DEFAULT_ISOLATED_CLI_ATTEMPTS)
         try:
             attempts = int(raw)
         except (TypeError, ValueError):

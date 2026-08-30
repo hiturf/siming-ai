@@ -93,23 +93,60 @@ class MobileContextManifestTest {
             expanded,
             "commonproof",
             setOf("worldbuilding"),
-            limit = 20,
+            limit = 99,
         )
         val second = engine.search(
             first.manifest,
             expanded,
-            "supplementproof",
+            "commonproof",
             setOf("worldbuilding"),
-            limit = 20,
+            limit = 10,
+            cursor = 10,
         )
-        val selectedIds = second.manifest.items
+        val third = engine.search(
+            second.manifest,
+            expanded,
+            "commonproof",
+            setOf("worldbuilding"),
+            limit = 10,
+            cursor = 20,
+        )
+        val selectedIds = third.manifest.items
             .filter { it.category == "agent_search" && it.sourceId.orEmpty().startsWith("proof-") }
             .map { it.itemId }
 
-        val selection = engine.select(second.manifest, expanded, selectedIds)
+        val selection = engine.select(third.manifest, expanded, selectedIds)
 
+        assertEquals(10, first.limit)
+        assertEquals(10, first.nextCursor)
+        assertTrue(first.hasMore)
+        assertEquals(20, second.nextCursor)
+        assertEquals(20, third.cursor)
+        assertFalse(third.hasMore)
         assertTrue(selection.ready)
         assertEquals(25, selection.accepted.size)
+
+        val exactTwenty = base.copy(
+            primaryRecords = base.primaryRecords + extras.take(20),
+            rawRecords = base.rawRecords + extras.take(20),
+        )
+        val twentyFirst = engine.search(
+            engine.prepare(exactTwenty),
+            exactTwenty,
+            "commonproof",
+            setOf("worldbuilding"),
+            limit = 10,
+        )
+        val twentySecond = engine.search(
+            twentyFirst.manifest,
+            exactTwenty,
+            "commonproof",
+            setOf("worldbuilding"),
+            limit = 10,
+            cursor = 10,
+        )
+        assertFalse(twentySecond.hasMore)
+        assertEquals(null, twentySecond.nextCursor)
     }
 
     @Test

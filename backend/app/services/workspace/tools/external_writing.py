@@ -30,7 +30,7 @@ def _load_external_writing_prompt_pack(
         db.query(PublicPromptPack)
         .filter(
             PublicPromptPack.pack_id == "chapter_writing_quality",
-            PublicPromptPack.enabled == True,
+            PublicPromptPack.enabled,
         )
         .first()
     )
@@ -72,17 +72,28 @@ def _external_writing_context_result(
         f"{TASK_CONTEXT_SOFT_TARGET_TOKENS} is a non-blocking soft target"
     )
     if status == "needs_confirmation":
-        detail += ". Required context is missing; author confirmation is required before generation."
+        detail += (
+            ". Required context is missing; author confirmation is required "
+            "before generation."
+        )
     elif not selection_ready:
         detail += ". The Agent must now search and finalize exact evidence before drafting."
     next_tools = [
-        {"tool": "search_task_context", "description": "Ask focused model-chosen queries and inspect compact candidates."},
-        {"tool": "submit_context_evidence", "description": "Finalize only the exact sources needed for this chapter."},
+        {
+            "tool": "search_task_context",
+            "description": "Ask focused model-chosen queries and inspect compact candidates.",
+        },
+        {
+            "tool": "submit_context_evidence",
+            "description": "Finalize only the exact sources needed for this chapter.",
+        },
     ]
     if selection_ready:
         next_tools.append({
             "tool": "save_external_chapter_draft",
-            "description": "Use the returned selection token, save one unsaved draft, and end the turn.",
+            "description": (
+                "Use the returned selection token, save one unsaved draft, and end the turn."
+            ),
         })
     return {
         "tool": "prepare_external_writing_context",
@@ -140,7 +151,10 @@ async def prepare_external_writing_context(
         return {
             "tool": "prepare_external_writing_context",
             "status": "skipped",
-            "detail": "The Agent must select a real chapter-level outline ID before preparing writing context.",
+            "detail": (
+                "The Agent must select a real chapter-level outline ID before "
+                "preparing writing context."
+            ),
             "data": None,
         }
     target_outline = (
@@ -325,7 +339,9 @@ async def save_external_chapter_draft(
         return {
             "tool": "save_external_chapter_draft",
             "status": "skipped",
-            "detail": "The Agent must select a real chapter-level outline ID before saving a draft.",
+            "detail": (
+                "The Agent must select a real chapter-level outline ID before saving a draft."
+            ),
             "data": None,
         }
     target_outline = db.query(OutlineNode).filter(
@@ -555,7 +571,7 @@ async def get_external_chapter_draft(
             "data": None,
         }
 
-    draft_content = get_chapter_draft(project_id, draft_id)
+    draft_content = get_chapter_draft(project_id, draft_id, db=db)
     if not draft_content:
         return {
             "tool": "get_external_chapter_draft",
@@ -642,13 +658,36 @@ async def record_external_quality_review(
                     "plot_tension": ("plot_tension", "plot", "情节张力", "情节推进"),
                     "emotional_tension": ("emotional_tension", "emotion", "情绪张力"),
                     "pacing_density": ("pacing_density", "pacing", "节奏", "节奏控制"),
-                    "character_consistency": ("character_consistency", "character", "角色一致性", "角色塑造"),
+                    "character_consistency": (
+                        "character_consistency",
+                        "character",
+                        "角色一致性",
+                        "角色塑造",
+                    ),
                     "viewpoint_consistency": ("viewpoint_consistency", "viewpoint", "视角一致性"),
-                    "world_consistency": ("world_consistency", "world", "设定一致性", "世界观一致性"),
+                    "world_consistency": (
+                        "world_consistency",
+                        "world",
+                        "设定一致性",
+                        "世界观一致性",
+                    ),
                 }
-                metric = {"chapter_id": chapter_id, "passed": bool(passed), "warnings": list(issues or []), "evidence": "；".join(str(item) for item in suggestions[:10]), "source": "external_agent"}
+                metric = {
+                    "chapter_id": chapter_id,
+                    "passed": bool(passed),
+                    "warnings": list(issues or []),
+                    "evidence": "；".join(str(item) for item in suggestions[:10]),
+                    "source": "external_agent",
+                }
                 for target, names in aliases.items():
-                    value = next((scores[name] for name in names if isinstance(scores.get(name), (int, float))), None)
+                    value = next(
+                        (
+                            scores[name]
+                            for name in names
+                            if isinstance(scores.get(name), (int, float))
+                        ),
+                        None,
+                    )
                     if value is not None:
                         metric[target] = float(value) * 10 if float(value) <= 10 else float(value)
                 quality_row = record_quality_metric(db, project_id, metric)
@@ -660,13 +699,16 @@ async def record_external_quality_review(
             draft_content = get_chapter_draft(project_id, draft_id)
             if draft_content:
                 review["draft_id"] = draft_id
-                review["draft_content_length"] = len(draft_content) if isinstance(draft_content, str) else 0
+                review["draft_content_length"] = (
+                    len(draft_content) if isinstance(draft_content, str) else 0
+                )
         except Exception:
             pass  # Draft lookup is optional
 
     return {
         "tool": "record_external_quality_review",
         "status": "ok",
-        "detail": f"Review recorded: {'PASS' if passed else 'FAIL'}" + (f" (total: {review.get('total_score', '?')})" if scores else ""),
+        "detail": f"Review recorded: {'PASS' if passed else 'FAIL'}"
+        + (f" (total: {review.get('total_score', '?')})" if scores else ""),
         "data": review,
     }

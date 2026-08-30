@@ -44,6 +44,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         required=["outline_node_id", "context_manifest_id", "context_selection_token"],
         tool_type="generator",
         estimated_cost="high",
+        ends_agent_turn=True,
         handler_name="chapter_writer",
     ),
     ToolDef(
@@ -82,6 +83,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         required=["context_manifest_id", "context_selection_token"],
         tool_type="generator",
         estimated_cost="high",
+        ends_agent_turn=True,
         handler_name="outline_writer",
     ),
     ToolDef(
@@ -214,7 +216,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         description="Read one durable creation Operation by operation ID or stage run ID, including progress and events.",
         input_schema={
             "operation_id": {"type": "string", "description": "Operation ID"},
-            "run_id": {"type": "string", "description": "Creation stage run ID when operation_id is unknown"},
+            "run_id": {
+                "type": "string",
+                "description": "Creation stage run ID when operation_id is unknown",
+            },
         },
         tool_type="read",
         estimated_cost="free",
@@ -225,8 +230,14 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         description="Atomically patch session-level form, interview, model, or selected-concept fields with revision protection.",
         input_schema={
             "session_id": {"type": "string", "description": "Creation session ID"},
-            "expected_revision": {"type": "integer", "description": "Required current session revision"},
-            "changes": {"type": "object", "description": "Validated session-level fields to update"},
+            "expected_revision": {
+                "type": "integer",
+                "description": "Required current session revision",
+            },
+            "changes": {
+                "type": "object",
+                "description": "Validated session-level fields to update",
+            },
         },
         required=["session_id", "expected_revision", "changes"],
         tool_type="write",
@@ -292,8 +303,14 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         input_schema={
             "session_id": {"type": "string", "description": "Creation session ID"},
             "artifact": {"type": "string", "description": "Creation artifact identifier"},
-            "expected_revision": {"type": "integer", "description": "Required current session revision"},
-            "changes": {"type": "array", "description": "Validated set|replace|append|remove|resize operations"},
+            "expected_revision": {
+                "type": "integer",
+                "description": "Required current session revision",
+            },
+            "changes": {
+                "type": "array",
+                "description": "Validated set|replace|append|remove|resize operations",
+            },
         },
         required=["session_id", "artifact", "expected_revision", "changes"],
         tool_type="write",
@@ -308,7 +325,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         input_schema={
             "session_id": {"type": "string", "description": "Creation session ID"},
             "artifact": {"type": "string", "description": "Creation artifact identifier"},
-            "expected_revision": {"type": "integer", "description": "Required current session revision"},
+            "expected_revision": {
+                "type": "integer",
+                "description": "Required current session revision",
+            },
             "paths": {"type": "array", "description": "JSON Pointer paths to lock"},
         },
         required=["session_id", "artifact", "expected_revision", "paths"],
@@ -324,7 +344,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         input_schema={
             "session_id": {"type": "string", "description": "Creation session ID"},
             "artifact": {"type": "string", "description": "Creation artifact identifier"},
-            "expected_revision": {"type": "integer", "description": "Required current session revision"},
+            "expected_revision": {
+                "type": "integer",
+                "description": "Required current session revision",
+            },
             "paths": {"type": "array", "description": "JSON Pointer paths to unlock"},
         },
         required=["session_id", "artifact", "expected_revision", "paths"],
@@ -340,7 +363,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         input_schema={
             "session_id": {"type": "string", "description": "Creation session ID"},
             "artifact": {"type": "string", "description": "Creation artifact identifier"},
-            "expected_revision": {"type": "integer", "description": "Required current session revision"},
+            "expected_revision": {
+                "type": "integer",
+                "description": "Required current session revision",
+            },
         },
         required=["session_id", "artifact", "expected_revision"],
         tool_type="write",
@@ -357,7 +383,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             "artifact": {"type": "string", "description": "Optional artifact filter"},
             "entity_type": {"type": "string", "description": "Optional entity type filter"},
             "include_deleted": {"type": "boolean", "description": "Include soft-deleted entities"},
-            "query": {"type": "string", "description": "Model-chosen name, relation, or fact query"},
+            "query": {
+                "type": "string",
+                "description": "Model-chosen name, relation, or fact query",
+            },
             "offset": {"type": "integer", "description": "Zero-based result offset"},
             "limit": {"type": "integer", "description": "Page size, 1 to 50; default 20"},
         },
@@ -380,8 +409,14 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         description="Atomically patch one creation entity while preserving the rest of its artifact and marking dependents stale.",
         input_schema={
             "entity_id": {"type": "string", "description": "Creation entity ID"},
-            "expected_revision": {"type": "integer", "description": "Required current session revision"},
-            "changes": {"type": "array", "description": "Entity-relative JSON Pointer patch operations"},
+            "expected_revision": {
+                "type": "integer",
+                "description": "Required current session revision",
+            },
+            "changes": {
+                "type": "array",
+                "description": "Entity-relative JSON Pointer patch operations",
+            },
         },
         required=["entity_id", "expected_revision", "changes"],
         tool_type="write",
@@ -395,7 +430,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         description="Soft-delete one creation entity and valid dependent relations; version history remains restorable.",
         input_schema={
             "entity_id": {"type": "string", "description": "Creation entity ID"},
-            "expected_revision": {"type": "integer", "description": "Required current session revision"},
+            "expected_revision": {
+                "type": "integer",
+                "description": "Required current session revision",
+            },
         },
         required=["entity_id", "expected_revision"],
         tool_type="write",
@@ -422,7 +460,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         description="Compare one artifact version with its parent or another version using deterministic JSON Pointer changes.",
         input_schema={
             "version_id": {"type": "string", "description": "Artifact version ID"},
-            "against_version_id": {"type": "string", "description": "Optional comparison version ID"},
+            "against_version_id": {
+                "type": "string",
+                "description": "Optional comparison version ID",
+            },
         },
         required=["version_id"],
         tool_type="read",
@@ -434,7 +475,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         description="Restore a validated historical artifact snapshot without deleting newer history.",
         input_schema={
             "version_id": {"type": "string", "description": "Artifact version ID"},
-            "expected_revision": {"type": "integer", "description": "Required current session revision"},
+            "expected_revision": {
+                "type": "integer",
+                "description": "Required current session revision",
+            },
         },
         required=["version_id", "expected_revision"],
         tool_type="write",
@@ -453,7 +497,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         input_schema={
             "session_id": {"type": "string", "description": "Creation session ID"},
             "artifact": {"type": "string", "description": "Artifact identifier"},
-            "expected_revision": {"type": "integer", "description": "Required current session revision"},
+            "expected_revision": {
+                "type": "integer",
+                "description": "Required current session revision",
+            },
         },
         required=["session_id", "artifact", "expected_revision"],
         tool_type="write",
@@ -471,7 +518,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         input_schema={
             "session_id": {"type": "string", "description": "Creation session ID"},
             "artifact": {"type": "string", "description": "Artifact identifier"},
-            "expected_revision": {"type": "integer", "description": "Required current session revision"},
+            "expected_revision": {
+                "type": "integer",
+                "description": "Required current session revision",
+            },
             "model": {
                 "type": "string",
                 "description": "Optional model identity; omitted uses the active default model",
@@ -480,7 +530,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
                 "type": "boolean",
                 "description": "Use model generation when a model is available",
             },
-            "entity_type": {"type": "string", "description": "Optional entity type for isolated new-entity generation"},
+            "entity_type": {
+                "type": "string",
+                "description": "Optional entity type for isolated new-entity generation",
+            },
             "instruction": {"type": "string", "description": "Optional generation direction"},
             "context_entity_ids": {
                 "type": "array",
@@ -509,8 +562,14 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         input_schema={
             "session_id": {"type": "string", "description": "Creation session ID"},
             "artifact": {"type": "string", "description": "Artifact identifier"},
-            "expected_revision": {"type": "integer", "description": "Required current session revision"},
-            "instruction": {"type": "string", "description": "Required localized refinement instruction"},
+            "expected_revision": {
+                "type": "integer",
+                "description": "Required current session revision",
+            },
+            "instruction": {
+                "type": "string",
+                "description": "Required localized refinement instruction",
+            },
             "model": {
                 "type": "string",
                 "description": "Optional model identity; omitted uses the active default model",
@@ -519,7 +578,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
                 "type": "boolean",
                 "description": "Use model generation when a model is available",
             },
-            "entity_id": {"type": "string", "description": "Optional existing entity ID for isolated refinement"},
+            "entity_id": {
+                "type": "string",
+                "description": "Optional existing entity ID for isolated refinement",
+            },
             "context_entity_ids": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -547,7 +609,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         input_schema={
             "session_id": {"type": "string", "description": "Creation session ID"},
             "artifact": {"type": "string", "description": "Artifact identifier"},
-            "expected_revision": {"type": "integer", "description": "Required current session revision"},
+            "expected_revision": {
+                "type": "integer",
+                "description": "Required current session revision",
+            },
             "instruction": {"type": "string", "description": "Optional replacement direction"},
             "model": {
                 "type": "string",
@@ -557,7 +622,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
                 "type": "boolean",
                 "description": "Use model generation when a model is available",
             },
-            "entity_id": {"type": "string", "description": "Optional existing entity ID for isolated regeneration"},
+            "entity_id": {
+                "type": "string",
+                "description": "Optional existing entity ID for isolated regeneration",
+            },
             "context_entity_ids": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -580,7 +648,9 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         ToolDef(
             name=name,
             description=description,
-            input_schema={"operation_id": {"type": "string", "description": "Durable creation Operation ID"}},
+            input_schema={
+                "operation_id": {"type": "string", "description": "Durable creation Operation ID"}
+            },
             required=["operation_id"],
             tool_type="write",
             writes_project_data=False,
@@ -589,10 +659,19 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             handler_name=name,
         )
         for name, description in (
-            ("cancel_creation_operation", "Cancel a running creation operation and prevent unfinished data from being written."),
+            (
+                "cancel_creation_operation",
+                "Cancel a running creation operation and prevent unfinished data from being written.",
+            ),
             ("pause_creation_operation", "Pause a creation operation at its supported checkpoint."),
-            ("resume_creation_operation", "Resume a paused creation operation from its retained checkpoint."),
-            ("retry_creation_operation", "Retry the current failed unit of a creation operation without replaying completed units."),
+            (
+                "resume_creation_operation",
+                "Resume a paused creation operation from its retained checkpoint.",
+            ),
+            (
+                "retry_creation_operation",
+                "Retry the current failed unit of a creation operation without replaying completed units.",
+            ),
         )
     ),
     ToolDef(
@@ -621,8 +700,14 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         input_schema={
             "session_id": {"type": "string", "description": "Creation session ID"},
             "file_path": {"type": "string", "description": "Local source file path"},
-            "model": {"type": "string", "description": "Optional model used for evidence-only extraction"},
-            "source_message_id": {"type": "string", "description": "Optional originating assistant conversation message"},
+            "model": {
+                "type": "string",
+                "description": "Optional model used for evidence-only extraction",
+            },
+            "source_message_id": {
+                "type": "string",
+                "description": "Optional originating assistant conversation message",
+            },
         },
         required=["session_id", "file_path"],
         tool_type="write",
@@ -648,9 +733,18 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         description="Atomically apply selected import candidates with revision, confirmation, and lock protection.",
         input_schema={
             "import_id": {"type": "string", "description": "Durable material import run ID"},
-            "selected_artifacts": {"type": "array", "description": "world_style|characters|locations|macro_outline|opening_outline"},
-            "strategy": {"type": "string", "description": "merge|overwrite_unconfirmed|skip_conflicts"},
-            "expected_revision": {"type": "integer", "description": "Required current creation session revision"},
+            "selected_artifacts": {
+                "type": "array",
+                "description": "world_style|characters|locations|macro_outline|opening_outline",
+            },
+            "strategy": {
+                "type": "string",
+                "description": "merge|overwrite_unconfirmed|skip_conflicts",
+            },
+            "expected_revision": {
+                "type": "integer",
+                "description": "Required current creation session revision",
+            },
         },
         required=["import_id", "selected_artifacts", "expected_revision"],
         tool_type="write",
@@ -661,15 +755,27 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="list_imported_files",
-        description="List all imported files in the working directory. Returns file names, paths, sizes, and modification times.",
-        input_schema={},
+        description="List imported files in bounded pages. Continue with next_cursor when has_more is true.",
+        input_schema={
+            "cursor": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Cursor returned by the previous page",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3,
+                "description": "Files in this page (default/max 3)",
+            },
+        },
         tool_type="read",
         estimated_cost="free",
         handler_name="list_imported_files",
     ),
     ToolDef(
         name="read_imported_file",
-        description="Read the content of a specific imported file from the working directory.",
+        description="Read one explicit character range from an imported text file. Continue with next_offset_chars when has_more is true.",
         input_schema={
             "filename": {
                 "type": "string",
@@ -677,7 +783,14 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             },
             "max_size": {
                 "type": "integer",
-                "description": "Max characters to read (default 50000)",
+                "minimum": 1,
+                "maximum": 4000,
+                "description": "Characters in this range (default/max 4000)",
+            },
+            "offset_chars": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Character offset for this range (default 0)",
             },
         },
         required=["filename"],

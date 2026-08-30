@@ -33,6 +33,7 @@ import kotlinx.serialization.json.put
 internal class MobileWorkspaceAgent(
     context: Context,
     private val directApi: DirectApiClient,
+    private val conversationStore: MobileAssistantConversationStore,
     private val loadSnapshot: suspend (String) -> List<ReplicaEntity>,
     private val saveEntity: suspend (String, String, String, JsonObject) -> String,
 ) {
@@ -40,6 +41,10 @@ internal class MobileWorkspaceAgent(
     private val contextPolicies = PcContextManifestPolicy(context.applicationContext)
     private val chapterWriteStore = MobileChapterWriteStore(context.applicationContext)
     private val outlineDraftStore = MobileOutlineDraftStore(context.applicationContext)
+    private val conversationContextRuntime = MobileDirectConversationContextRuntime(
+        directApi = directApi,
+        conversationStore = conversationStore,
+    )
     private val json = Json { ignoreUnknownKeys = true }
     private val contextManifests = LinkedHashMap<String, MobileContextManifest>()
 
@@ -97,33 +102,54 @@ internal class MobileWorkspaceAgent(
         projectId: String,
         prompt: String,
         config: DirectApiConfig,
-        history: List<JsonObject> = emptyList(),
+        conversation: MobileConversationSnapshot,
+        turnContext: MobileAssistantTurnContext,
         onEvent: suspend (String) -> Unit,
     ) {
         val initialRecords = records(projectId)
         val project = initialRecords.firstOrNull { it.entity.entityType == "project" }?.payload
             ?: error("当前作品副本不存在，无法启动手机独立工作区")
-        val messages = mutableListOf(message("system", contract.workspaceSystem()))
-        messages += history.filter { value -> value.string("role") in setOf("user", "assistant") }
-        messages += message(
-            "user",
-            contract.initialUserMessage(project, prompt),
-        )
         onEvent(event("status", "已加载 PC 提示词契约 ${contract.sourceHash.take(12)}，开始执行"))
 
+        var currentConversation = conversation
+        val initialRuntime = conversation.toolRuntimeState(turnContext.turnId)
+        val deliveredTransactions = initialRuntime?.deliveredTransactions.orEmpty().toMutableList()
+        val executionLedger = initialRuntime?.executionLedger.orEmpty().toMutableList()
         var iteration = 0
         var activeCategories = emptyList<String>()
         var categorySelected = false
         while (iteration < MAX_ITERATIONS) {
             val scopedTools = contract.toolSchemas(activeCategories)
+            val requestToolChoice = if (categorySelected) "auto" else "required"
+            val prepared = prepareConversationRequest(
+                projectId = projectId,
+                prompt = prompt,
+                project = project,
+                config = config,
+                conversation = currentConversation,
+                turnContext = turnContext,
+                scopedTools = scopedTools,
+                toolChoice = requestToolChoice,
+                currentTurnLedger = executionLedger,
+                pendingTransactions = deliveredTransactions,
+                onEvent = onEvent,
+            )
+            currentConversation = prepared.conversation
+            MobileToolProtocolValidator.validate(
+                messages = prepared.rendered.messages,
+                supportsNativeToolCalling = true,
+                toolsOffered = scopedTools.isNotEmpty(),
+                currentUserMessageId = prepared.rendered.currentUserMessageId,
+                checkpointMessageId = prepared.rendered.checkpointMessageId,
+            )
             var streamedContent = false
             var streamedReasoning = false
             val turn = directApi.streamAgentTurn(
                 config = config,
-                messages = messages,
+                messages = providerMessages(prepared.rendered.messages),
                 tools = scopedTools,
-                toolChoice = if (categorySelected) "auto" else "required",
-                maxOutputTokens = 6_000,
+                toolChoice = requestToolChoice,
+                maxOutputTokens = config.maxOutputTokens,
                 temperature = 0.3,
                 onContentDelta = { delta ->
                     streamedContent = true
@@ -134,6 +160,18 @@ internal class MobileWorkspaceAgent(
                     onEvent(event(type = "reasoning_delta", delta = delta))
                 },
             )
+            if (deliveredTransactions.isNotEmpty()) {
+                val consumed = conversationStore.markDeliveredToolTransactionsConsumed(
+                    projectId = projectId,
+                    turnContext = turnContext,
+                )
+                deliveredTransactions.clear()
+                deliveredTransactions += consumed.deliveredTransactions
+                executionLedger.clear()
+                executionLedger += consumed.executionLedger
+                currentConversation = conversationStore.snapshot(projectId, turnContext.conversationId)
+                    ?: error("工具事务消费状态保存后会话丢失")
+            }
             if (!streamedReasoning && turn.reasoningContent.isNotBlank()) {
                 onEvent(event(type = "reasoning_delta", delta = turn.reasoningContent))
             }
@@ -148,9 +186,72 @@ internal class MobileWorkspaceAgent(
                 return
             }
 
+            val offeredToolNames = scopedToolNames(scopedTools)
+            val callIds = turn.toolCalls.map(DirectAgentToolCall::id)
+            if (callIds.any(String::isBlank) || callIds.distinct().size != callIds.size) {
+                throw MobileConversationContextException(
+                    MobileConversationContextErrorCode.PROTOCOL_INVALID,
+                    "原生工具调用 ID 为空或重复，整批未执行",
+                )
+            }
+            val calledToolNames = turn.toolCalls.map(DirectAgentToolCall::name)
+            val undeclared = calledToolNames.filterNot(offeredToolNames::contains)
+            if (undeclared.isNotEmpty()) {
+                throw MobileConversationContextException(
+                    MobileConversationContextErrorCode.PROTOCOL_INVALID,
+                    "模型调用了本步骤未声明的原生工具，整批未执行：${undeclared.joinToString()}",
+                )
+            }
+
             val categoryCall = turn.toolCalls.firstOrNull { it.name == contract.toolCategories.controller }
+            if (categoryCall != null && turn.toolCalls.size != 1) {
+                throw MobileConversationContextException(
+                    MobileConversationContextErrorCode.PROTOCOL_INVALID,
+                    "set_tool_categories 必须是模型步骤中唯一的原生调用，整批未执行",
+                )
+            }
+            if (categoryCall == null && !categorySelected) {
+                throw MobileConversationContextException(
+                    MobileConversationContextErrorCode.PROTOCOL_INVALID,
+                    "模型没有调用本步骤唯一开放的 set_tool_categories，整批未执行",
+                )
+            }
+            val draftCalls = turn.toolCalls.filter { it.name in TERMINAL_DRAFT_TOOLS }
+            if (draftCalls.isNotEmpty() && turn.toolCalls.size != 1) {
+                throw MobileConversationContextException(
+                    MobileConversationContextErrorCode.PROTOCOL_INVALID,
+                    "草稿生成工具必须是模型步骤中唯一的业务调用，整批未执行",
+                )
+            }
+            val batchAdmission = MobileNativeToolBudgetContract.admitExactAssistantTransaction(
+                assistantPayload = turn.assistantMessage,
+                orderedToolNames = calledToolNames,
+            )
+            if (!batchAdmission.accepted) {
+                val results = turn.toolCalls.map { call ->
+                    rejectedNativeBatchResult(call.name, batchAdmission)
+                }
+                val transaction = deliveredTransaction(turn, turn.toolCalls, results)
+                persistRejectedMobileNativeToolBatch(
+                    conversationStore = conversationStore,
+                    projectId = projectId,
+                    turnContext = turnContext,
+                    transaction = transaction,
+                    admission = batchAdmission,
+                    overCapacityDetail =
+                        "模型返回的原生 assistant 工具事务超过容量协议；逐调用拒绝已记录，整批业务处理器未执行",
+                ) { runtime ->
+                    deliveredTransactions.clear()
+                    deliveredTransactions += runtime.deliveredTransactions
+                    results.forEach { result ->
+                        onEvent(event(type = "tool", detail = result.string("detail")))
+                    }
+                }
+                iteration += 1
+                continue
+            }
+
             if (categoryCall != null) {
-                messages += assistantToolMessage(turn.content, turn.reasoningContent, listOf(categoryCall))
                 val selected = runCatching {
                     contract.toolCategories.normalize(
                         (categoryCall.arguments["enabled_categories"] as? JsonArray)
@@ -162,11 +263,18 @@ internal class MobileWorkspaceAgent(
                     onSuccess = { contract.toolCategories.selectionResult(it, contract.toolNames) },
                     onFailure = { errorResult(categoryCall.name, it.message ?: "工具类别参数无效") },
                 )
-                messages += buildJsonObject {
-                    put("role", "tool")
-                    put("tool_call_id", categoryCall.id)
-                    put("content", categoryResult.toString())
-                }
+                val transaction = deliveredTransaction(
+                    turn = turn,
+                    calls = listOf(categoryCall),
+                    results = listOf(categoryResult),
+                )
+                val runtime = conversationStore.recordDeliveredToolTransaction(
+                    projectId,
+                    turnContext,
+                    transaction,
+                )
+                deliveredTransactions.clear()
+                deliveredTransactions += runtime.deliveredTransactions
                 selected.getOrNull()?.let { categories ->
                     activeCategories = categories
                     categorySelected = true
@@ -181,11 +289,10 @@ internal class MobileWorkspaceAgent(
                 continue
             }
 
-            messages += turn.assistantMessage
             val availableTools = contract.availableToolNames(activeCategories)
-
+            val toolResults = mutableListOf<JsonObject>()
             for (call in turn.toolCalls) {
-                val result = if (call.name in availableTools) {
+                val rawResult = if (call.name in availableTools) {
                     try {
                         execute(projectId, call.name, call.arguments, config, onEvent)
                     } catch (error: CancellationException) {
@@ -196,29 +303,29 @@ internal class MobileWorkspaceAgent(
                 } else {
                     skipped(call.name, "手机提示词契约未开放该工具")
                 }
+                val result = modelVisibleToolResult(call.name, rawResult)
                 onEvent(
                     event(
                         type = "tool",
                         detail = result.string("detail").ifBlank { "已执行 ${call.name}" },
                     ),
                 )
-                messages += buildJsonObject {
-                    put("role", "tool")
-                    put("tool_call_id", call.id)
-                    put("content", modelToolResult(result).toString())
-                }
+                toolResults += result
                 if (call.name == "chapter_writer" && result.string("status") == "ok") {
+                    persistTerminalToolReceipt(projectId, turnContext, turn, call, result)
+                    val draftData = pendingChapterDraft(projectId) ?: rawResult["data"]
                     onEvent(
                         event(
                             type = "chapter_draft",
                             detail = result.string("detail"),
-                            data = result["data"],
+                            data = draftData,
                         ),
                     )
                     onEvent(event("done", "章节草稿已生成，本轮已停止"))
                     return
                 }
                 if (call.name == "chapter_writer" && result.string("status") == "blocked") {
+                    persistTerminalToolReceipt(projectId, turnContext, turn, call, result)
                     pendingChapterDraft(projectId)?.let { draft ->
                         onEvent(
                             event(
@@ -232,17 +339,20 @@ internal class MobileWorkspaceAgent(
                     return
                 }
                 if (call.name == "outline_writer" && result.string("status") == "ok") {
+                    persistTerminalToolReceipt(projectId, turnContext, turn, call, result)
+                    val draftData = pendingOutlineDraft(projectId) ?: rawResult["data"]
                     onEvent(
                         event(
                             type = "outline_draft",
                             detail = result.string("detail"),
-                            data = result["data"],
+                            data = draftData,
                         ),
                     )
                     onEvent(event("done", "大纲草稿已生成，本轮已停止"))
                     return
                 }
                 if (call.name == "outline_writer" && result.string("status") == "blocked") {
+                    persistTerminalToolReceipt(projectId, turnContext, turn, call, result)
                     pendingOutlineDraft(projectId)?.let { draft ->
                         onEvent(
                             event(
@@ -256,12 +366,274 @@ internal class MobileWorkspaceAgent(
                     return
                 }
             }
+            val transaction = deliveredTransaction(
+                turn = turn,
+                calls = turn.toolCalls,
+                results = toolResults,
+            )
+            val runtime = conversationStore.recordDeliveredToolTransaction(
+                projectId,
+                turnContext,
+                transaction,
+            )
+            deliveredTransactions.clear()
+            deliveredTransactions += runtime.deliveredTransactions
             iteration += 1
             if (iteration == MAX_ITERATIONS) {
                 error("手机独立工作区达到 $MAX_ITERATIONS 轮工具上限，任务已安全停止")
             }
         }
     }
+
+    private suspend fun prepareConversationRequest(
+        projectId: String,
+        prompt: String,
+        project: JsonObject,
+        config: DirectApiConfig,
+        conversation: MobileConversationSnapshot,
+        turnContext: MobileAssistantTurnContext,
+        scopedTools: JsonArray,
+        toolChoice: String?,
+        currentTurnLedger: List<MobileToolExecutionReceipt>,
+        pendingTransactions: List<MobileToolTransaction>,
+        onEvent: suspend (String) -> Unit,
+    ): MobilePreparedConversationRequest {
+        val prepared = conversationContextRuntime.prepare(
+            storageId = projectId,
+            currentUserPrompt = prompt,
+            config = config,
+            conversation = conversation,
+            turnContext = turnContext,
+            systemPrompt = contract.workspaceRuntimeSystem(project),
+            scopedTools = scopedTools,
+            taskType = DirectApiConfig.TASK_ASSISTANT,
+            maxOutputTokens = config.maxOutputTokens,
+            toolChoice = toolChoice,
+            temperature = 0.3,
+            currentTurnLedger = currentTurnLedger,
+            pendingTransactions = pendingTransactions,
+            onStatus = { status ->
+                onEvent(
+                    contextEvent(
+                        status = status.status,
+                        detail = status.detail,
+                        conversation = status.conversation,
+                        budget = status.budget,
+                        checkpointId = status.checkpointId,
+                        recentTurns = status.recentExactTurnCount,
+                    ),
+                )
+            },
+        )
+        return prepared
+    }
+
+    private fun deliveredTransaction(
+        turn: DirectAgentTurn,
+        calls: List<DirectAgentToolCall>,
+        results: List<JsonObject>,
+    ): MobileToolTransaction {
+        require(calls.size == results.size) { "工具调用与结果必须原子配对" }
+        return MobileToolTransaction(
+            transactionId = "tool-transaction-${UUID.randomUUID()}",
+            assistantMessageId = "tool-assistant-${UUID.randomUUID()}",
+            assistantContent = turn.assistantMessage.string("content"),
+            assistantReasoningContent = turn.assistantMessage.string("reasoning_content"),
+            assistantProviderState = (turn.assistantMessage["provider_state"] as? JsonArray)
+                .orEmpty()
+                .mapNotNull { it as? JsonObject },
+            state = MobileToolTransactionState.PENDING,
+            calls = calls.map { call ->
+                val exactCall = (turn.assistantMessage["tool_calls"] as? JsonArray)
+                    .orEmpty()
+                    .mapNotNull { it as? JsonObject }
+                    .firstOrNull { it.string("id").ifBlank { it.string("call_id") } == call.id }
+                    ?: throw MobileConversationContextException(
+                        MobileConversationContextErrorCode.PROTOCOL_INVALID,
+                        "原生 assistant payload 缺少工具调用 ${call.id}",
+                    )
+                val function = exactCall["function"] as? JsonObject
+                    ?: throw MobileConversationContextException(
+                        MobileConversationContextErrorCode.PROTOCOL_INVALID,
+                        "原生 assistant payload 缺少 function 对象",
+                    )
+                MobileToolCallRecord(
+                    id = call.id,
+                    name = call.name,
+                    argumentsJson = function.string("arguments"),
+                )
+            },
+            results = emptyList(),
+        ).let { transaction ->
+            calls.zip(results).fold(transaction) { current, (call, result) ->
+                current.addResult(
+                    MobileToolResultRecord(
+                        toolCallId = call.id,
+                        content = mobileCanonicalJson(result),
+                    ),
+                )
+            }.markDelivered()
+        }
+    }
+
+    /** Terminal draft batches are audited, receipted, and never replayed into another model call. */
+    private suspend fun persistTerminalToolReceipt(
+        projectId: String,
+        turnContext: MobileAssistantTurnContext,
+        turn: DirectAgentTurn,
+        call: DirectAgentToolCall,
+        result: JsonObject,
+    ) {
+        conversationStore.recordDeliveredToolTransaction(
+            projectId = projectId,
+            turnContext = turnContext,
+            transaction = deliveredTransaction(turn, listOf(call), listOf(result)),
+        )
+        conversationStore.markDeliveredToolTransactionsConsumed(projectId, turnContext)
+    }
+
+    private fun scopedToolNames(scopedTools: JsonArray): Set<String> = scopedTools.mapTo(linkedSetOf()) { schema ->
+        val function = (schema as? JsonObject)?.get("function") as? JsonObject
+            ?: throw MobileConversationContextException(
+                MobileConversationContextErrorCode.PROTOCOL_INVALID,
+                "工具 Schema 缺少 function 对象",
+            )
+        function.string("name").ifBlank {
+            throw MobileConversationContextException(
+                MobileConversationContextErrorCode.PROTOCOL_INVALID,
+                "工具 Schema 缺少 function.name",
+            )
+        }
+    }
+
+    private fun rejectedNativeBatchResult(
+        tool: String,
+        admission: MobileNativeToolBatchAdmission,
+    ): JsonObject {
+        val reason = requireNotNull(admission.reason)
+        val detail = if (reason == MobileNativeToolBudgetContract.NATIVE_ASSISTANT_TRANSACTION_OVER_CAPACITY) {
+            "当前原生工具 assistant 事务为 ${admission.declaredJsonBytes} 字节，超过协议上限 " +
+                "${admission.maxJsonBytes} 字节；整批未执行。请减少并行调用或缩小工具参数。"
+        } else if (admission.callCount > MobileNativeToolBudgetContract.MAX_NATIVE_TOOL_CALLS_PER_STEP) {
+            "当前步骤包含 ${admission.callCount} 个工具调用，超过协议上限 " +
+                "${MobileNativeToolBudgetContract.MAX_NATIVE_TOOL_CALLS_PER_STEP}；整批未执行。"
+        } else {
+            "当前工具批次的声明结果上限为 ${admission.declaredJsonBytes} 字节，超过单步 " +
+                "${admission.maxJsonBytes} 字节上限；整批未执行。请减少并行调用或使用分页。"
+        }
+        return buildJsonObject {
+            put("tool", tool)
+            put("status", "error")
+            put("detail", detail)
+            put("data", buildJsonObject {
+                put("reason", reason)
+                put("batch_call_count", admission.callCount)
+                put("max_batch_call_count", MobileNativeToolBudgetContract.MAX_NATIVE_TOOL_CALLS_PER_STEP)
+                put("declared_batch_json_bytes", admission.declaredJsonBytes)
+                put("max_batch_json_bytes", admission.maxJsonBytes)
+            })
+        }
+    }
+
+    private fun modelVisibleToolResult(tool: String, raw: JsonObject): JsonObject {
+        val projected = when {
+            tool in STATUS_ONLY_RESULT_TOOLS -> statusReceipt(tool, raw)
+            tool == "submit_context_evidence" -> contextSelectionReceipt(raw)
+            tool == "chapter_writer" -> artifactReferenceReceipt(tool, raw) { data ->
+                buildJsonObject {
+                    data.string("content").take(1_200).takeIf(String::isNotBlank)?.let { preview ->
+                        put("content_preview", preview)
+                    }
+                }
+            }
+            tool == "outline_writer" -> artifactReferenceReceipt(tool, raw) { data ->
+                val nodes = (data["nodes"] as? JsonArray).orEmpty().take(8)
+                buildJsonObject {
+                    put("nodes_preview", buildJsonArray {
+                        nodes.forEach { rawNode ->
+                            val node = rawNode as? JsonObject ?: return@forEach
+                            add(buildJsonObject {
+                                OUTLINE_PREVIEW_FIELDS.forEach { field ->
+                                    node[field]?.let { put(field, it) }
+                                }
+                            })
+                        }
+                    })
+                }
+            }
+            else -> raw
+        }
+        if (MobileNativeToolBudgetContract.actualResultFits(tool, projected)) return projected
+        return buildJsonObject {
+            put("tool", tool)
+            put("status", "error")
+            put("detail", "工具结果超过其声明的模型可见 JSON 上限；结果未进入下一模型步骤，请缩小范围或分页读取")
+            put("data", buildJsonObject {
+                put("error_code", MobileConversationContextErrorCode.TOOL_RESULT_OVER_CAPACITY)
+                put("retryable", true)
+                put("declared_max_json_bytes", MobileNativeToolBudgetContract.declaredResultJsonBytes(tool))
+            })
+        }
+    }
+
+    private fun statusReceipt(tool: String, raw: JsonObject): JsonObject = buildJsonObject {
+        put("tool", raw.string("tool").ifBlank { tool })
+        put("status", raw.string("status"))
+        put("detail", raw.string("detail"))
+        val data = raw["data"] as? JsonObject
+        put("data", buildJsonObject {
+            MODEL_RESULT_ID_FIELDS.forEach { field -> data?.get(field)?.let { put(field, it) } }
+        })
+    }
+
+    private fun contextSelectionReceipt(raw: JsonObject): JsonObject = buildJsonObject {
+        put("tool", raw.string("tool").ifBlank { "submit_context_evidence" })
+        put("status", raw.string("status"))
+        put("detail", raw.string("detail"))
+        val data = raw["data"] as? JsonObject
+        put("data", buildJsonObject {
+            CONTEXT_SELECTION_RECEIPT_FIELDS.forEach { field ->
+                data?.get(field)?.let { put(field, it) }
+            }
+        })
+    }
+
+    private fun artifactReferenceReceipt(
+        tool: String,
+        raw: JsonObject,
+        preview: (JsonObject) -> JsonObject,
+    ): JsonObject = buildJsonObject {
+        put("tool", raw.string("tool").ifBlank { tool })
+        put("status", raw.string("status"))
+        put("detail", raw.string("detail"))
+        val data = raw["data"] as? JsonObject ?: JsonObject(emptyMap())
+        put("data", buildJsonObject {
+            MODEL_RESULT_ID_FIELDS.forEach { field -> data[field]?.let { put(field, it) } }
+            preview(data).forEach { (field, value) -> put(field, value) }
+        })
+    }
+
+    private fun contextEvent(
+        status: String,
+        detail: String,
+        conversation: MobileConversationSnapshot,
+        budget: MobileRequestBudgetEnvelope? = null,
+        checkpointId: String? = conversation.activeCheckpoint?.id,
+        recentTurns: Int? = null,
+    ): String = buildJsonObject {
+        put("type", "conversation_context")
+        put(
+            "context_state",
+            mobileConversationContextStatePayload(
+                status = status,
+                detail = detail,
+                conversation = conversation,
+                budget = budget,
+                checkpointId = checkpointId,
+                recentExactTurnCount = recentTurns,
+            ),
+        )
+    }.toString()
 
     private suspend fun execute(
         projectId: String,
@@ -286,23 +658,23 @@ internal class MobileWorkspaceAgent(
         "chapter_writer" -> chapterWriter(
             projectId,
             args,
-            config.forTask(DirectApiConfig.TASK_WRITING),
+            mobileCapacityBoundTaskConfig(config, DirectApiConfig.TASK_WRITING),
             onEvent,
         )
         "character_writer" -> characterWriter(
             projectId,
             args,
-            config.forTask(DirectApiConfig.TASK_PLANNING),
+            mobileCapacityBoundTaskConfig(config, DirectApiConfig.TASK_PLANNING),
         )
         "outline_writer" -> outlineWriter(
             projectId,
             args,
-            config.forTask(DirectApiConfig.TASK_PLANNING),
+            mobileCapacityBoundTaskConfig(config, DirectApiConfig.TASK_PLANNING),
         )
         "worldbuilding_writer" -> worldbuildingWriter(
             projectId,
             args,
-            config.forTask(DirectApiConfig.TASK_PLANNING),
+            mobileCapacityBoundTaskConfig(config, DirectApiConfig.TASK_PLANNING),
         )
         "create_character" -> createCharacter(projectId, args)
         "update_character" -> updateCharacter(projectId, args)
@@ -549,22 +921,31 @@ internal class MobileWorkspaceAgent(
             inputs,
             query,
             sourceTypes,
-            args.int("limit").takeIf { it > 0 } ?: 12,
+            (args.int("limit").takeIf { it > 0 } ?: 10).coerceIn(1, 10),
+            args.int("cursor").coerceIn(0, 20),
         )
         cacheManifest(searched.manifest)
         val items = searched.items.map { item ->
             buildJsonObject {
                 item.toJson(includeContent = false).forEach { (key, value) -> put(key, value) }
+                put("title", item.title.take(100))
                 put("excerpt", item.content.take(policy.searchExcerptChars))
                 put("estimated_chunk_tokens", item.estimatedTokens)
             }
         }
         return ok(
             "search_task_context",
-            "本次模型查询返回 ${items.size} 个候选；这些资料尚未进入正文上下文",
+            "本次模型查询返回 ${items.size} 个候选；这些资料尚未进入任务上下文",
             buildJsonObject {
                 put("manifest_id", searched.manifest.id)
                 put("items", JsonArray(items))
+                put("page", buildJsonObject {
+                    put("cursor", searched.cursor)
+                    put("limit", searched.limit)
+                    if (searched.nextCursor == null) put("next_cursor", JsonNull)
+                    else put("next_cursor", searched.nextCursor)
+                    put("has_more", searched.hasMore)
+                })
             },
         )
     }
@@ -1397,7 +1778,8 @@ internal class MobileWorkspaceAgent(
     )
 
     private fun contextTaskConfig(config: DirectApiConfig, taskType: String): DirectApiConfig =
-        config.forTask(
+        mobileCapacityBoundTaskConfig(
+            config,
             if (taskType == "outline_planning") {
                 DirectApiConfig.TASK_PLANNING
             } else {
@@ -1496,30 +1878,6 @@ internal class MobileWorkspaceAgent(
         1 + countTree(node["children"] as? JsonArray ?: JsonArray(emptyList()))
     }
 
-    private fun outlineContext(all: List<LocalRecord>, targetId: String): String {
-        val outlines = all.filter { it.entity.entityType == "outline" }
-        if (outlines.isEmpty()) return "暂无大纲。"
-        val selected = if (targetId.isBlank()) outlines else outlines.filter {
-            it.entity.entityId == targetId || isDescendant(it, targetId, outlines)
-        }
-        if (selected.isEmpty()) return "暂无当前大纲节点。"
-        return selected.sortedBy { it.payload.int("sort_order") }.joinToString("\n") {
-            val p = it.payload
-            "- [${p.string("node_type").ifBlank { "chapter" }}] ${p.string("title")}（${p.string("status").ifBlank { "pending" }}）\n  ${p.string("summary").ifBlank { "暂无摘要" }}"
-        }
-    }
-
-    private fun isDescendant(node: LocalRecord, ancestorId: String, all: List<LocalRecord>): Boolean {
-        val parentById = all.associate { it.entity.entityId to it.payload.string("parent_id") }
-        var current = node.payload.string("parent_id")
-        val visited = mutableSetOf<String>()
-        while (current.isNotBlank() && visited.add(current)) {
-            if (current == ancestorId) return true
-            current = parentById[current].orEmpty()
-        }
-        return false
-    }
-
     private fun worldContext(all: List<LocalRecord>): String {
         val entries = all.filter { it.entity.entityType == "world" }
             .sortedWith(compareBy<LocalRecord> { it.payload.string("dimension") }.thenBy { it.payload.int("sort_order") })
@@ -1528,34 +1886,6 @@ internal class MobileWorkspaceAgent(
         return entries.joinToString("\n\n") {
             val p = it.payload
             "【${p.string("dimension").ifBlank { "culture" }}·${p.string("title")}】\n${p.string("content")}".take(2_500)
-        }
-    }
-
-    private fun characterContext(all: List<LocalRecord>, names: List<String>): String {
-        val candidates = all.filter { it.entity.entityType == "character" }
-            .filter { names.isEmpty() || it.payload.string("name") in names }
-            .take(16)
-        if (candidates.isEmpty()) return "未指定角色。"
-        return candidates.joinToString("\n\n") {
-            val p = it.payload
-            buildString {
-                append("【${p.string("name")}】\n")
-                append("  身份: ${p.string("role_type").ifBlank { "未设定" }}\n")
-                append("  性格: ${p.string("personality").ifBlank { "未设定" }.take(300)}\n")
-                append("  背景: ${p.string("background").ifBlank { "未设定" }.take(300)}\n")
-                append("  当前目标: ${p.string("current_goal").ifBlank { "未设定" }.take(200)}\n")
-                append("  当前冲突: ${p.string("active_conflict").ifBlank { "未设定" }.take(200)}")
-            }
-        }
-    }
-
-    private fun recentSummaries(all: List<LocalRecord>, limit: Int): String {
-        val chapters = orderedChapters(all).takeLast(limit)
-        if (chapters.isEmpty()) return "暂无前文摘要。"
-        return chapters.joinToString("\n") {
-            val p = it.payload
-            val summary = p.string("summary").ifBlank { p.string("content").take(500) }
-            "- ${p.string("title")}: $summary"
         }
     }
 
@@ -1572,43 +1902,11 @@ internal class MobileWorkspaceAgent(
         }
     }
 
-    private fun existingOutlineList(all: List<LocalRecord>): String {
-        val outlines = all.filter { it.entity.entityType == "outline" }
-        if (outlines.isEmpty()) return "暂无大纲。"
-        val byId = outlines.associateBy { it.entity.entityId }
-        return outlines.sortedBy { it.payload.int("sort_order") }.joinToString("\n") { node ->
-            var depth = 0
-            var parent = node.payload.string("parent_id")
-            val visited = mutableSetOf<String>()
-            while (parent.isNotBlank() && visited.add(parent)) {
-                depth += 1
-                parent = byId[parent]?.payload?.string("parent_id").orEmpty()
-            }
-            "${"  ".repeat(depth)}- [${node.payload.string("node_type")}] ${node.payload.string("title")} (${node.payload.string("status").ifBlank { "pending" }})"
-        }
-    }
-
     private fun structuredArguments(turn: DirectAgentTurn, tool: String, wrapper: String? = null): JsonObject? {
-        val call = turn.toolCalls.firstOrNull { it.name == tool } ?: turn.toolCalls.firstOrNull()
-        var parsed = call?.arguments ?: parseJsonObject(turn.content) ?: return null
+        val call = turn.toolCalls.firstOrNull { it.name == tool } ?: return null
+        var parsed = call.arguments
         if (wrapper != null) (parsed[wrapper] as? JsonObject)?.let { parsed = it }
         return parsed
-    }
-
-    private fun parseJsonObject(raw: String): JsonObject? {
-        val clean = raw.trim()
-            .removePrefix("```json")
-            .removePrefix("```")
-            .removeSuffix("```")
-            .trim()
-        val candidate = if (clean.startsWith("{") && clean.endsWith("}")) {
-            clean
-        } else {
-            val start = clean.indexOf('{')
-            val end = clean.lastIndexOf('}')
-            if (start < 0 || end <= start) return null else clean.substring(start, end + 1)
-        }
-        return runCatching { json.parseToJsonElement(candidate) as? JsonObject }.getOrNull()
     }
 
     private fun ok(tool: String, detail: String, data: JsonElement = JsonNull): JsonObject = result(tool, "ok", detail, data)
@@ -1623,25 +1921,6 @@ internal class MobileWorkspaceAgent(
         put("status", status)
         put("detail", detail)
         put("data", data)
-    }
-
-    /** Mirrors PC redact_tool_result_for_model for long chapter drafts. */
-    private fun modelToolResult(result: JsonObject): JsonObject {
-        if (result.string("tool") != "chapter_writer") return result
-        val data = result["data"] as? JsonObject ?: return result
-        val content = data.string("content")
-        if (content.isBlank()) return result
-        val compactData = buildJsonObject {
-            data.forEach { (key, value) -> if (key != "content") put(key, value) }
-            put("content_preview", content.take(500) + if (content.length > 500) "..." else "")
-            put(
-                "usage_note",
-                "草稿已持久化；这是本轮终点。正式保存、建档、去除 AI 味和质量评分均由作者在界面另行发起。",
-            )
-        }
-        return buildJsonObject {
-            result.forEach { (key, value) -> put(key, if (key == "data") compactData else value) }
-        }
     }
 
     private fun event(
@@ -1660,28 +1939,6 @@ internal class MobileWorkspaceAgent(
     private fun message(role: String, content: String): JsonObject = buildJsonObject {
         put("role", role)
         put("content", content)
-    }
-
-    private fun assistantToolMessage(
-        content: String,
-        reasoningContent: String,
-        calls: List<DirectAgentToolCall>,
-    ): JsonObject = buildJsonObject {
-        put("role", "assistant")
-        put("content", content)
-        if (reasoningContent.isNotBlank()) put("reasoning_content", reasoningContent)
-        put("tool_calls", buildJsonArray {
-            calls.forEach { call ->
-                add(buildJsonObject {
-                    put("id", call.id)
-                    put("type", "function")
-                    put("function", buildJsonObject {
-                        put("name", call.name)
-                        put("arguments", call.arguments.toString())
-                    })
-                })
-            }
-        })
     }
 
     private fun clean(source: JsonObject): JsonObject = buildJsonObject {
@@ -1734,6 +1991,54 @@ internal class MobileWorkspaceAgent(
     companion object {
         private const val MAX_ITERATIONS = 12
         private const val MAX_CONTEXT_MANIFESTS = 20
+        private val TERMINAL_DRAFT_TOOLS = setOf("chapter_writer", "outline_writer")
+        private val STATUS_ONLY_RESULT_TOOLS = setOf(
+            "update_project_info",
+            "create_character",
+            "update_character",
+            "create_outline_node",
+            "create_outline_nodes",
+            "update_outline_node",
+            "create_worldbuilding_entry",
+            "update_worldbuilding_entry",
+        )
+        private val MODEL_RESULT_ID_FIELDS = listOf(
+            "id",
+            "project_id",
+            "chapter_id",
+            "outline_node_id",
+            "character_id",
+            "worldbuilding_id",
+            "manifest_id",
+            "context_manifest_id",
+            "draft_id",
+            "content_ref",
+            "status",
+            "draft_status",
+            "saved_outline_node_ids",
+            "chapter_outline_node_ids",
+            "next_actions",
+            "title",
+            "word_count",
+            "model",
+            "parent_id",
+            "insert_after_id",
+            "design_notes",
+        )
+        private val OUTLINE_PREVIEW_FIELDS = listOf(
+            "id", "parent_id", "node_type", "title", "summary", "status",
+        )
+        private val CONTEXT_SELECTION_RECEIPT_FIELDS = listOf(
+            "manifest_id",
+            "accepted_count",
+            "selection_ready",
+            "context_selection_token",
+            "estimated_input_tokens",
+            "input_budget_tokens",
+            "soft_target_tokens",
+            "soft_target_exceeded",
+            "warnings",
+        )
         private val WORLD_DIMENSIONS = setOf("geography", "history", "factions", "power_system", "races", "culture")
         private val LOCATOR_FIELDS = setOf(
             "id", "project_id", "chapter_id", "chapter_title", "outline_node_id", "node_id",

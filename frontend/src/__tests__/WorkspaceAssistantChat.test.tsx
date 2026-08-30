@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Modal, message } from 'antd'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, useLocation } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { mockDelete, mockGet, mockPost } = vi.hoisted(() => ({
@@ -115,6 +115,10 @@ const completedRunDetail = {
 }
 
 function renderChat(onApplied = vi.fn()) {
+  const LocationProbe = () => {
+    const location = useLocation()
+    return <span data-testid="location-probe">{location.pathname}{location.search}</span>
+  }
   const view = render(
     <MemoryRouter>
       <WorkspaceAssistantChat
@@ -123,6 +127,7 @@ function renderChat(onApplied = vi.fn()) {
         modelOptions={[{ value: 'openai:test', label: 'OpenAI · test' }]}
         onApplied={onApplied}
       />
+      <LocationProbe />
     </MemoryRouter>,
   )
   return { ...view, onApplied }
@@ -762,5 +767,282 @@ describe('WorkspaceAssistantChat cancellation and recovery', () => {
     expect(screen.getByText('C:\\Novel Notes\\世界观.md')).toBeInTheDocument()
     expect(screen.getByText(/只能读取隔离副本/)).toBeInTheDocument()
     expect(screen.getByText(/本轮结束后快照自动删除/)).toBeInTheDocument()
+  })
+
+  it('does not claim a short within-capacity conversation was compacted', async () => {
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/projects/project-1/ai/assistant/conversations') {
+        return Promise.resolve({
+          data: { data: { items: [{ id: 'conversation-short', project_id: 'project-1', title: '短会话' }], total: 1 } },
+        })
+      }
+      if (url === '/projects/project-1/ai/assistant/conversations/conversation-short') {
+        return Promise.resolve({
+          data: {
+            data: {
+              conversation: { id: 'conversation-short', project_id: 'project-1', title: '短会话' },
+              messages: [],
+            },
+          },
+        })
+      }
+      if (url.endsWith('/context-state')) {
+        return Promise.resolve({
+          data: {
+            data: {
+              status: 'ready',
+              active_checkpoint_id: null,
+              latest_checkpoint_id: null,
+              trigger: 'within_capacity',
+              capacity_assurance: 'unverified',
+              warnings: [],
+            },
+          },
+        })
+      }
+      return Promise.reject(new Error(`unexpected GET ${url}`))
+    })
+
+    renderChat()
+
+    await screen.findByText('短会话')
+    await waitFor(() => expect(mockGet).toHaveBeenCalledWith(
+      '/projects/project-1/ai/assistant/conversations/conversation-short/context-state',
+    ))
+    expect(screen.queryByText('已整理较早上下文')).not.toBeInTheDocument()
+  })
+
+  it('shows a ready checkpoint outside the transcript and exposes verified details', async () => {
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/projects/project-1/ai/assistant/conversations') {
+        return Promise.resolve({
+          data: { data: { items: [{ id: 'conversation-context', project_id: 'project-1', title: '长期讨论' }], total: 1 } },
+        })
+      }
+      if (url === '/projects/project-1/ai/assistant/conversations/conversation-context') {
+        return Promise.resolve({
+          data: {
+            data: {
+              conversation: { id: 'conversation-context', project_id: 'project-1', title: '长期讨论' },
+              messages: [
+                {
+                  id: 'source-user-1', conversation_id: 'conversation-context', role: 'user',
+                  content: '不要修改主角姓名。', status: 'completed', payload: null,
+                },
+                {
+                  id: 'source-assistant-1', conversation_id: 'conversation-context', role: 'assistant',
+                  content: '已记录。', status: 'completed', payload: null,
+                },
+              ],
+            },
+          },
+        })
+      }
+      if (url.endsWith('/context-state')) {
+        return Promise.resolve({
+          data: {
+            data: {
+              status: 'ready',
+              policy_version: 1,
+              schema_version: 1,
+              active_checkpoint_id: 'checkpoint-1',
+              source_message_count: 30,
+              recent_exact_turn_count: 4,
+              original_history_tokens: 84000,
+              active_history_tokens: 19000,
+              trigger: 'projected_next_step_over_capacity',
+              capacity_assurance: 'exact',
+              model: 'openai:gpt-test',
+              warnings: [],
+            },
+          },
+        })
+      }
+      if (url.endsWith('/checkpoints/checkpoint-1')) {
+        return Promise.resolve({
+          data: {
+            data: {
+              id: 'checkpoint-1',
+              status: 'ready',
+              policy_version: 1,
+              schema: 'conversation_checkpoint.v1',
+              source_range: {
+                first_sequence: 1,
+                last_sequence: 30,
+                message_count: 30,
+                started_at: '2026-08-01T08:00:00Z',
+                ended_at: '2026-08-20T08:00:00Z',
+              },
+              recent_exact_turn_count: 4,
+              original_history_tokens: 84000,
+              active_history_tokens: 19000,
+              checkpoint_tokens: 6000,
+              trigger: 'projected_next_step_over_capacity',
+              capacity_assurance: 'exact',
+              model_binding: { provider: 'openai', model: 'gpt-test' },
+              author_quotes: [{
+                message_id: 'source-user-1',
+                exact_quote: '不要修改主角姓名。',
+                purpose: 'active_constraint',
+              }],
+              execution_ledger: [{
+                run_id: 'run-old',
+                step_id: 'step-old',
+                tool: 'create_outline_nodes',
+                status: 'ok',
+                detail: '已创建章级大纲',
+                resource_refs: [{ type: 'outline', id: 'outline-2', revision: 3 }],
+              }],
+              semantic_navigation: {
+                authority: 'non_authoritative_navigation',
+                current_objectives: ['继续规划下一章'],
+              },
+              warnings: [],
+            },
+          },
+        })
+      }
+      return Promise.reject(new Error(`unexpected GET ${url}`))
+    })
+
+    const user = userEvent.setup()
+    const view = renderChat()
+
+    expect(await screen.findByText('已整理较早上下文')).toBeInTheDocument()
+    expect(screen.getByText(/保留最近 4 轮原文/)).toBeInTheDocument()
+    const transcript = document.querySelector('.workspace-assistant-messages')
+    expect(transcript).not.toHaveTextContent('已整理较早上下文')
+
+    await user.click(screen.getByRole('button', { name: /查看/ }))
+    const detailDialog = await screen.findByRole('dialog', { name: '上下文整理详情' })
+    expect(within(detailDialog).getByText(/原始 84,000 tokens/)).toBeInTheDocument()
+    expect(within(detailDialog).getByText('不要修改主角姓名。', { exact: false })).toBeInTheDocument()
+    expect(within(detailDialog).getByText('create_outline_nodes')).toBeInTheDocument()
+    expect(within(detailDialog).getByText(/outline · outline-2 · r3/)).toBeInTheDocument()
+    expect(within(detailDialog).getByText('继续规划下一章')).toBeInTheDocument()
+    expect(within(detailDialog).getByText(/openai:gpt-test/)).toBeInTheDocument()
+    view.unmount()
+  })
+
+  it('keeps a failed checkpoint recoverable and guides retry through a new message', async () => {
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/projects/project-1/ai/assistant/conversations') {
+        return Promise.resolve({
+          data: { data: { items: [{ id: 'conversation-failed', project_id: 'project-1', title: '失败会话' }], total: 1 } },
+        })
+      }
+      if (url === '/projects/project-1/ai/assistant/conversations/conversation-failed') {
+        return Promise.resolve({
+          data: {
+            data: {
+              conversation: { id: 'conversation-failed', project_id: 'project-1', title: '失败会话' },
+              messages: [],
+            },
+          },
+        })
+      }
+      if (url.endsWith('/context-state')) {
+        return Promise.resolve({
+          data: {
+            data: {
+              status: 'failed',
+              latest_checkpoint_id: 'checkpoint-failed',
+              error_code: 'conversation_checkpoint_failed',
+              error_detail: '结构校验失败',
+              retryable: true,
+              warnings: [],
+            },
+          },
+        })
+      }
+      return Promise.reject(new Error(`unexpected GET ${url}`))
+    })
+    const user = userEvent.setup()
+    renderChat()
+
+    expect(await screen.findByText('较早上下文整理失败')).toBeInTheDocument()
+    expect(screen.getByText(/当前任务尚未执行，完整聊天仍然保留/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /发送新消息重试/ }))
+
+    expect(mockPost).not.toHaveBeenCalled()
+    expect(document.querySelector('.workspace-assistant-sr-status')).toHaveTextContent('请发送一条新消息')
+    await waitFor(() => expect(screen.getByPlaceholderText(/告诉AI你想写什么/)).toHaveFocus())
+  })
+
+  it('treats checkpoint SSE frames as UI state and no longer sends a fixed history slice', async () => {
+    const stream = createControlledResponse([
+      conversationEvent
+      + sse({
+        type: 'conversation_context',
+        context_state: {
+          status: 'compressing',
+          latest_checkpoint_id: 'checkpoint-stream',
+          source_message_count: 24,
+          recent_exact_turn_count: 3,
+          trigger: 'projected_next_step_over_capacity',
+          warnings: [],
+        },
+      })
+      + runEvent,
+    ])
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      stream.bindSignal(init?.signal)
+      return Promise.resolve(stream.response)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderChat()
+    await sendChapterRequest()
+
+    const requestBody = JSON.parse(String(fetchMock.mock.calls[0][1]?.body))
+    expect(requestBody).not.toHaveProperty('history')
+    expect(await screen.findByText('正在整理较早上下文')).toBeInTheDocument()
+    expect(document.querySelector('.workspace-assistant-messages')).not.toHaveTextContent('正在整理较早上下文')
+
+    await act(async () => {
+      stream.push(sse({
+        type: 'conversation_checkpoint',
+        checkpoint: {
+          id: 'checkpoint-stream',
+          status: 'ready',
+          source_range: { first_sequence: 1, last_sequence: 24, message_count: 24 },
+          recent_exact_turn_count: 3,
+          original_history_tokens: 60000,
+          active_history_tokens: 16000,
+          trigger: 'projected_next_step_over_capacity',
+          capacity_assurance: 'exact',
+          warnings: [],
+        },
+      }))
+    })
+
+    expect(await screen.findByText('已整理较早上下文')).toBeInTheDocument()
+    expect(screen.getByText(/保留最近 3 轮原文/)).toBeInTheDocument()
+    expect(document.querySelector('.workspace-assistant-messages')).not.toHaveTextContent('已整理较早上下文')
+  })
+
+  it('blocks on unknown model capacity and opens the exact governance settings panel', async () => {
+    const stream = createControlledResponse([
+      sse({
+        type: 'error',
+        code: 'conversation_capacity_unknown',
+        message: '模型上下文容量未知',
+        details: { remediation: 'configure_model_context_profile' },
+      }) + sse('[DONE]'),
+    ])
+    stream.close()
+    vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      stream.bindSignal(init?.signal)
+      return Promise.resolve(stream.response)
+    }))
+    const user = userEvent.setup()
+    renderChat()
+
+    await user.type(screen.getByPlaceholderText(/告诉AI你想写什么/), '继续写')
+    await user.click(screen.getByRole('button', { name: /发送/ }))
+
+    expect(await screen.findByText('需要配置当前模型的上下文容量')).toBeInTheDocument()
+    expect(screen.getByText(/避免用猜测的容量继续执行/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '配置上下文容量' }))
+    expect(screen.getByTestId('location-probe')).toHaveTextContent('/settings?section=context-governance')
   })
 })

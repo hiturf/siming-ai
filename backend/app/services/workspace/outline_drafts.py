@@ -97,33 +97,6 @@ def latest_pending_outline_draft(db: Any, project_id: str) -> Any | None:
     )
 
 
-def pending_outline_draft_ids(db: Any, project_id: str) -> set[str]:
-    from ...database.models import OutlineDraft
-
-    return {
-        str(row[0])
-        for row in db.query(OutlineDraft.id)
-        .filter(OutlineDraft.project_id == project_id, OutlineDraft.status == "pending")
-        .all()
-    }
-
-
-def find_new_pending_outline_draft(
-    db: Any,
-    project_id: str,
-    excluded_ids: set[str],
-) -> Any | None:
-    from ...database.models import OutlineDraft
-
-    query = db.query(OutlineDraft).filter(
-        OutlineDraft.project_id == project_id,
-        OutlineDraft.status == "pending",
-    )
-    if excluded_ids:
-        query = query.filter(OutlineDraft.id.notin_(excluded_ids))
-    return query.order_by(OutlineDraft.created_at.desc(), OutlineDraft.id.desc()).first()
-
-
 def outline_draft_result_data(draft: Any) -> dict[str, Any]:
     nodes = [dict(node) for node in (draft.nodes_json or []) if isinstance(node, dict)]
     saved_ids = [str(value) for value in (draft.saved_outline_node_ids or []) if str(value)]
@@ -531,10 +504,8 @@ __all__ = [
     "confirm_outline_draft",
     "discard_outline_draft",
     "find_outline_draft",
-    "find_new_pending_outline_draft",
     "latest_pending_outline_draft",
     "outline_draft_result_data",
-    "pending_outline_draft_ids",
     "pending_outline_draft_block_result",
     "store_outline_draft",
     "supersede_outline_draft",

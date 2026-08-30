@@ -5,6 +5,13 @@ import androidx.room.withTransaction
 import com.siming.mobile.BuildConfig
 import com.siming.mobile.data.agent.MobileWorkspaceAgent
 import com.siming.mobile.data.agent.MobileAssistantConversationStore
+import com.siming.mobile.data.agent.MobileAssistantTurnContext
+import com.siming.mobile.data.agent.MobileConversationContextErrorCode
+import com.siming.mobile.data.agent.MobileConversationContextException
+import com.siming.mobile.data.agent.MobileTranscriptImportReceipt
+import com.siming.mobile.data.agent.mobileCanonicalJson
+import com.siming.mobile.data.agent.mobileCapacityBoundTaskConfig
+import com.siming.mobile.data.agent.mobileConversationContextStatePayload
 import com.siming.mobile.data.agent.mobileOutlineTreeHash
 import com.siming.mobile.data.creation.CreationExecutionRoute
 import com.siming.mobile.data.creation.CreationAgentProgressEvent
@@ -65,6 +72,24 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 
+internal fun mobileAssistantContextFailureEvent(
+    error: MobileConversationContextException,
+    conversationId: String?,
+    model: String?,
+): JsonObject = buildJsonObject {
+    put("type", "conversation_context")
+    put("context_state", buildJsonObject {
+        put("status", "failed")
+        put("detail", "会话上下文校验失败；本轮未发送模型凭据或执行业务工具")
+        put("error_code", error.code)
+        put("error_detail", error.message)
+        put("provider", "android_direct_api")
+        model?.takeIf(String::isNotBlank)?.let { put("model", it) }
+        conversationId?.takeIf(String::isNotBlank)?.let { put("conversation_id", it) }
+        put("retryable", true)
+    })
+}
+
 @OptIn(ExperimentalSerializationApi::class)
 class SimingRepository(context: Context) {
     private val appContext = context.applicationContext
@@ -80,6 +105,7 @@ class SimingRepository(context: Context) {
         MobileWorkspaceAgent(
             context = appContext,
             directApi = directApi,
+            conversationStore = mobileAssistantConversationStore,
             loadSnapshot = dao::projectSnapshot,
             saveEntity = { projectId, entityType, entityId, payload ->
                 saveEntity(projectId, entityType, entityId, payload)
@@ -92,6 +118,7 @@ class SimingRepository(context: Context) {
             context = appContext,
             stageAgent = mobileCreationAgent,
             directApi = directApi,
+            conversationStore = mobileAssistantConversationStore,
             persistSession = ::saveCreationSession,
             finalizeSession = { session ->
                 saveCreationSession(session)
@@ -128,6 +155,9 @@ class SimingRepository(context: Context) {
         protocol: String,
         availableModels: List<String>,
         taskModels: Map<String, String>,
+        contextWindowTokens: Int,
+        maxOutputTokens: Int,
+        safetyMarginTokens: Int,
     ): DirectApiSummary {
         val existing = directApiStore.read()
         val normalizedDefault = model.trim()
@@ -156,6 +186,9 @@ class SimingRepository(context: Context) {
             protocol = protocol,
             availableModels = normalizedCatalog,
             taskModels = normalizedTasks,
+            contextWindowTokens = contextWindowTokens,
+            maxOutputTokens = maxOutputTokens,
+            safetyMarginTokens = safetyMarginTokens,
         )
         val probe = directApi.testAndResolve(config)
         val resolved = config.copy(protocol = probe.protocol)
@@ -1520,16 +1553,21 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
         prompt: String,
         modelRoute: AssistantModelRoute,
         conversationId: String? = null,
-        history: List<JsonObject> = emptyList(),
         onEvent: suspend (String) -> Unit,
     ): AssistantRoute {
         val connection = dao.connection()
         if (connection != null) {
             val directConfig = if (modelRoute == AssistantModelRoute.MobileKey) {
-                resolvedDirectConfig(DirectApiConfig.TASK_ASSISTANT)
+                resolvedAssistantDirectConfig(conversationId, onEvent)
             } else {
                 null
             }
+            val canonicalConversationId = syncStandaloneAssistantTranscript(
+                connection = connection,
+                projectId = projectId,
+                conversationId = conversationId,
+                onEvent = onEvent,
+            )
             var runId: String? = null
             val trackingEvent: suspend (String) -> Unit = { raw ->
                 runCatching { json.parseToJsonElement(raw) as? JsonObject }.getOrNull()?.let { event ->
@@ -1548,15 +1586,30 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
                     projectId,
                     WorkspaceAssistantRequest(
                         message = prompt,
-                        conversationId = conversationId,
-                        history = history,
+                        conversationId = canonicalConversationId,
                         modelRoute = if (directConfig == null) "pc" else "mobile",
                         mobileProvider = directConfig?.let {
-                            MobileProviderEncryption.seal(it, connection, projectId)
+                            MobileProviderEncryption.seal(
+                                requireMobileProviderCapacity(it),
+                                connection,
+                                projectId,
+                            )
                         },
                     ),
                     trackingEvent,
                 )
+            } catch (error: MobileConversationContextException) {
+                onEvent(buildJsonObject {
+                    put("type", "conversation_context")
+                    put("context_state", buildJsonObject {
+                        put("status", "failed")
+                        put("detail", "会话上下文校验失败；本轮未发送模型凭据或业务工具")
+                        put("error_code", error.code)
+                        put("error_detail", error.message)
+                        canonicalConversationId?.let { put("conversation_id", it) }
+                    })
+                }.toString())
+                throw error
             } catch (error: IOException) {
                 val recoverableRunId = runId
                 if (recoverableRunId.isNullOrBlank()) throw error
@@ -1567,7 +1620,7 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
         }
 
         val directConfig = directApiStore.read()?.let {
-            resolvedDirectConfig(DirectApiConfig.TASK_ASSISTANT)
+            resolvedAssistantDirectConfig(conversationId, onEvent)
         }
         if (directConfig != null) {
             val turnContext = mobileAssistantConversationStore.beginTurn(
@@ -1600,17 +1653,16 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
                     projectId = projectId,
                     prompt = prompt,
                     config = directConfig,
-                    history = turnContext.history.takeLast(12).map { message ->
-                        buildJsonObject {
-                            put("role", message.role)
-                            put("content", message.content)
-                        }
-                    },
+                    conversation = mobileAssistantConversationStore.snapshot(
+                        projectId,
+                        turnContext.conversationId,
+                    ) ?: error("手机独立会话在执行前丢失"),
+                    turnContext = turnContext,
                     onEvent = trackedEvent,
                 )
                 mobileAssistantConversationStore.finishTurn(
                     projectId = projectId,
-                    conversationId = turnContext.conversationId,
+                    turnContext = turnContext,
                     content = output.toString().trim().ifBlank {
                         when {
                             draftProduced -> "章节草稿已交给正文编辑器，尚未保存。"
@@ -1622,9 +1674,45 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
                     toolLogs = toolLogs,
                 )
             } catch (error: Exception) {
+                if (error is MobileConversationContextException) {
+                    val failedSnapshot = runCatching {
+                        mobileAssistantConversationStore.snapshot(
+                            projectId,
+                            turnContext.conversationId,
+                        )
+                    }.getOrNull()
+                    onEvent(buildJsonObject {
+                        put("type", "conversation_context")
+                        put(
+                            "context_state",
+                            failedSnapshot?.let { snapshot ->
+                                mobileConversationContextStatePayload(
+                                    status = "failed",
+                                    detail = "会话上下文校验失败；本轮未执行未确认的业务工具",
+                                    conversation = snapshot,
+                                    checkpointId = snapshot.checkpoints.lastOrNull()?.id,
+                                    provider = "android_direct_api",
+                                    model = directConfig.model,
+                                    errorCode = error.code,
+                                    errorDetail = error.message,
+                                    retryable = true,
+                                )
+                            } ?: buildJsonObject {
+                                put("status", "failed")
+                                put("detail", "会话上下文校验失败；本轮未执行未确认的业务工具")
+                                put("error_code", error.code)
+                                put("error_detail", error.message)
+                                put("conversation_id", turnContext.conversationId)
+                                put("provider", "android_direct_api")
+                                put("model", directConfig.model)
+                                put("retryable", true)
+                            },
+                        )
+                    }.toString())
+                }
                 mobileAssistantConversationStore.finishTurn(
                     projectId = projectId,
-                    conversationId = turnContext.conversationId,
+                    turnContext = turnContext,
                     content = output.toString().trim().ifBlank {
                         if (error is CancellationException) "任务已取消。" else "任务未完成：${error.message.orEmpty()}"
                     },
@@ -1636,6 +1724,92 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
             return AssistantRoute.DirectApi
         }
         error("请先配置手机直连 API，或连接自己的 Gateway")
+    }
+
+    /**
+     * Converts a standalone local conversation into the canonical Gateway
+     * transcript before continuing it online. Each response is durably recorded
+     * before the next <=100-turn batch is constructed. A conflict is terminal:
+     * the assistant request is never retried with an untyped history fallback.
+     */
+    private suspend fun syncStandaloneAssistantTranscript(
+        connection: GatewayConnection,
+        projectId: String,
+        conversationId: String?,
+        onEvent: suspend (String) -> Unit,
+    ): String? {
+        val localId = conversationId?.takeIf(String::isNotBlank) ?: return null
+        var snapshot = mobileAssistantConversationStore.prepareTranscriptSync(projectId, localId)
+            ?: return localId
+        onEvent(buildJsonObject {
+            put("type", "conversation_context")
+            put("context_state", buildJsonObject {
+                put("status", "syncing_transcript")
+                put("detail", "正在把手机完整会话同步到 Gateway…")
+                put("conversation_id", localId)
+                put("transcript_revision", snapshot.transcriptRevision)
+                put("confirmed_source_revision", snapshot.replicaState.confirmedSourceRevision)
+            })
+        }.toString())
+
+        var batches = 0
+        while (true) {
+            val request = snapshot.nextTranscriptImportRequest() ?: break
+            val before = snapshot.replicaState
+            val receipt = try {
+                MobileTranscriptImportReceipt.fromJson(
+                    api.importAssistantTranscript(connection, projectId, request.toJson()),
+                )
+            } catch (error: GatewayHttpException) {
+                if (error.status == 409) {
+                    throw GatewayHttpException(
+                        409,
+                        "手机会话与 Gateway 的 canonical transcript 冲突，未发送本轮消息：${error.message}",
+                    )
+                }
+                throw error
+            }
+            mobileAssistantConversationStore.recordTranscriptImportReceipt(
+                projectId = projectId,
+                conversationId = localId,
+                request = request,
+                receipt = receipt,
+                expectedReplicaRevision = before.revision,
+            )
+            snapshot = mobileAssistantConversationStore.snapshot(projectId, localId)
+                ?: error("transcript import receipt 已保存，但本地会话无法重新读取")
+            check(snapshot.replicaState.confirmedSourceRevision > before.confirmedSourceRevision) {
+                "Gateway transcript import 没有推进本地确认游标"
+            }
+            batches += 1
+            onEvent(buildJsonObject {
+                put("type", "conversation_context")
+                put("context_state", buildJsonObject {
+                    put("status", "syncing_transcript")
+                    put("detail", "已同步 $batches 批完整回合")
+                    put("conversation_id", localId)
+                    put("canonical_conversation_id", receipt.conversationId)
+                    put("confirmed_source_revision", snapshot.replicaState.confirmedSourceRevision)
+                    put("transcript_revision", snapshot.transcriptRevision)
+                })
+            }.toString())
+        }
+        val canonicalId = snapshot.replicaState.serverConversationId
+            ?: error("本地会话没有可确认的完整回合，无法建立 Gateway canonical transcript")
+        onEvent(buildJsonObject {
+            put("type", "conversation")
+            put("conversation", buildJsonObject { put("id", canonicalId) })
+        }.toString())
+        onEvent(buildJsonObject {
+            put("type", "conversation_context")
+            put("context_state", buildJsonObject {
+                put("status", "transcript_synced")
+                put("detail", "手机完整会话已同步，继续由 Gateway 管理上下文")
+                put("conversation_id", canonicalId)
+                put("confirmed_source_revision", snapshot.replicaState.confirmedSourceRevision)
+            })
+        }.toString())
+        return canonicalId
     }
 
     suspend fun pendingChapterDraft(projectId: String): MobilePendingChapterDraft? {
@@ -2025,6 +2199,53 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
         }
     }
 
+    suspend fun assistantContextState(
+        projectId: String,
+        conversationId: String,
+    ): JsonObject? {
+        val connection = dao.connection()
+        if (connection != null) return api.assistantContextState(connection, projectId, conversationId)
+        val snapshot = mobileAssistantConversationStore.snapshot(projectId, conversationId) ?: return null
+        val latest = snapshot.checkpoints.lastOrNull()
+        val status = when (latest?.status) {
+            "pending", "compressing" -> "compressing"
+            "failed", "cancelled" -> "failed"
+            "superseded" -> if (snapshot.activeCheckpoint == null) "failed" else "ready"
+            else -> "ready"
+        }
+        val selectedId = if (status == "ready") {
+            snapshot.activeCheckpoint?.id
+        } else {
+            latest?.id ?: snapshot.activeCheckpoint?.id
+        }
+        return mobileConversationContextStatePayload(
+            status = status,
+            detail = when (status) {
+                "compressing" -> "正在整理较早上下文；当前任务尚未执行"
+                "failed" -> "较早上下文整理失败；完整聊天记录仍保留"
+                else -> if (snapshot.activeCheckpoint == null) {
+                    "当前完整会话仍在模型容量内"
+                } else {
+                    "较早上下文已整理；完整聊天记录仍保留"
+                }
+            },
+            conversation = snapshot,
+            checkpointId = selectedId,
+            errorCode = latest?.errorCode,
+            errorDetail = latest?.errorDetail,
+            retryable = status == "failed",
+        )
+    }
+
+    suspend fun assistantCheckpointDetail(
+        projectId: String,
+        conversationId: String,
+        checkpointId: String,
+    ): JsonObject? {
+        val connection = dao.connection() ?: return null
+        return api.assistantCheckpoint(connection, projectId, conversationId, checkpointId)
+    }
+
     suspend fun assistantMessages(
         projectId: String,
         conversationId: String,
@@ -2096,7 +2317,8 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
             val sessionId = remote.string("id")
             val local = storedCreationSession(sessionId)
             val route = local?.let(::creationRoute) ?: CreationExecutionRoute.Pc
-            saveCreationSession(tagCreationRoute(remote, route, CREATION_HOST_GATEWAY))
+            val merged = local?.let { CreationAgentTurnRecords.mergeRemoteSession(remote, it) } ?: remote
+            saveCreationSession(tagCreationRoute(merged, route, CREATION_HOST_GATEWAY))
         }
         return sessions.size
     }
@@ -2139,20 +2361,79 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
 
     suspend fun getCreationSession(sessionId: String): JsonObject = loadCreationSession(sessionId)
 
+    /** Refreshes the Gateway-owned creation session and its auditable context detail. */
+    suspend fun refreshCreationConversationContext(sessionId: String): JsonObject {
+        val stored = loadCreationSession(sessionId)
+        if (creationHost(stored) != CREATION_HOST_GATEWAY) return stored
+        val connection = requireConnection()
+        val route = creationRoute(stored)
+        val conversationId = CreationAgentTurnRecords.gatewayConversationId(stored)
+        val fresh = tagCreationRoute(
+            api.getNovelCreationSession(connection, sessionId),
+            route,
+            CREATION_HOST_GATEWAY,
+        )
+        val merged = CreationAgentTurnRecords.withTurns(
+            fresh,
+            CreationAgentTurnRecords.turns(stored),
+            gatewayConversationId = conversationId,
+        )
+        val enriched = enrichGatewayCreationConversationContext(
+            session = merged,
+            connection = connection,
+            conversationId = conversationId,
+        )
+        saveCreationSession(enriched)
+        return enriched
+    }
+
     suspend fun runCreationAgentTurn(
         sessionId: String,
         message: String,
         onProgress: suspend (CreationAgentProgressEvent) -> Unit = {},
     ): JsonObject {
         require(message.isNotBlank()) { "请输入你想告诉 AI 的内容" }
-        val current = loadCreationSession(sessionId)
+        val loaded = loadCreationSession(sessionId)
+        val route = creationRoute(loaded)
+        val gatewayExecution = creationHost(loaded) == CREATION_HOST_GATEWAY
+        val standaloneExecution = route == CreationExecutionRoute.MobileKey && !gatewayExecution
+        // loadCreationSession has already projected a standalone canonical transcript.
+        // Only non-standalone audits recover themselves; the device transcript is the
+        // sole authority for whether a local turn completed or was interrupted.
+        val current = if (standaloneExecution) {
+            loaded
+        } else {
+            CreationAgentTurnRecords.recoverInterruptedTurns(loaded)
+        }
+        if (current != loaded) saveCreationSession(current)
         val turns = CreationAgentTurnRecords.turns(current)
-        val pendingTurn = CreationAgentTurnRecords.pending(message)
-        val pendingTurns = (turns + pendingTurn).takeLast(20)
+        val standaloneStorageId = if (standaloneExecution) creationConversationStorageId(sessionId) else null
+        var standaloneTurnContext: MobileAssistantTurnContext? = null
+        val pendingTurn = if (standaloneStorageId != null) {
+            val conversationId = standaloneStorageId
+            mobileAssistantConversationStore.ensureConversationArchive(
+                projectId = standaloneStorageId,
+                conversationId = conversationId,
+                conversationKind = "creation",
+                creationSessionId = sessionId,
+                title = current.string("display_title").ifBlank { "立项会话" },
+                archivedTurns = CreationAgentTurnRecords.archivedTurns(current),
+            )
+            val context = mobileAssistantConversationStore.beginTurn(
+                projectId = standaloneStorageId,
+                conversationId = conversationId,
+                prompt = message,
+                conversationKind = "creation",
+                creationSessionId = sessionId,
+            )
+            standaloneTurnContext = context
+            CreationAgentTurnRecords.pending(message, id = context.turnId)
+        } else {
+            CreationAgentTurnRecords.pending(message)
+        }
+        val pendingTurns = turns + pendingTurn
         val pendingSession = CreationAgentTurnRecords.withTurns(current, pendingTurns)
         saveCreationSession(pendingSession)
-        val route = creationRoute(current)
-        val gatewayExecution = creationHost(current) == CREATION_HOST_GATEWAY
         val clientTurnId = UUID.randomUUID().toString()
         val capturedProgress = mutableListOf<JsonElement>()
         val seenSequences = mutableSetOf<Long>()
@@ -2241,13 +2522,30 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
                                 ?: JsonArray(emptyList())
                         ),
                     )
-                    CreationAgentTurnRecords.withTurns(
+                    val completed = CreationAgentTurnRecords.withTurns(
                         fresh,
                         CreationAgentTurnRecords.replace(pendingTurns, completedTurn),
                         gatewayConversationId = result.string("conversation_id"),
                     )
+                    runCatching {
+                        enrichGatewayCreationConversationContext(
+                            session = completed,
+                            connection = connection,
+                            conversationId = result.string("conversation_id"),
+                        )
+                    }.getOrDefault(completed)
                 }
                 else -> {
+                    val storageId = checkNotNull(standaloneStorageId) {
+                        "手机独立立项缺少 canonical conversation storage id"
+                    }
+                    val turnContext = checkNotNull(standaloneTurnContext) {
+                        "手机独立立项缺少稳定 TurnContext"
+                    }
+                    val conversation = mobileAssistantConversationStore.snapshot(
+                        storageId,
+                        turnContext.conversationId,
+                    ) ?: error("手机独立立项 canonical conversation 不存在")
                     emitProgress(CreationAgentProgressEvent(
                         type = "turn_started",
                         message = "已接收请求，正在准备手机本地立项上下文…",
@@ -2255,9 +2553,18 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
                     val result = mobileCreationConversationAgent.run(
                         source = pendingSession,
                         message = message,
-                        turns = turns,
+                        storageId = storageId,
+                        conversation = conversation,
+                        turnContext = turnContext,
                         config = resolvedDirectConfig(DirectApiConfig.TASK_PLANNING),
                         onProgress = ::emitProgress,
+                    )
+                    mobileAssistantConversationStore.finishTurn(
+                        projectId = storageId,
+                        turnContext = turnContext,
+                        content = result.reply,
+                        status = result.status,
+                        toolLogs = result.toolResults.map(::mobileCanonicalJson),
                     )
                     emitProgress(CreationAgentProgressEvent(
                         type = "complete",
@@ -2287,7 +2594,21 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
             }
         } catch (error: CancellationException) {
             val latest = runCatching { loadCreationSession(sessionId) }.getOrDefault(pendingSession)
-            val cancelled = CreationAgentTurnRecords.fail(pendingTurn, "本轮已取消，未确认的操作不会进入后续上下文。")
+            val detail = "本轮已取消，未确认的操作不会进入后续上下文。"
+            val cancelled = CreationAgentTurnRecords.fail(pendingTurn, detail, status = "cancelled")
+            val context = standaloneTurnContext
+            val storageId = standaloneStorageId
+            if (context != null && storageId != null) {
+                runCatching {
+                    mobileAssistantConversationStore.finishTurn(
+                        projectId = storageId,
+                        turnContext = context,
+                        content = detail,
+                        status = "cancelled",
+                        toolLogs = emptyList(),
+                    )
+                }.exceptionOrNull()?.let(error::addSuppressed)
+            }
             saveCreationSession(CreationAgentTurnRecords.withTurns(
                 latest,
                 CreationAgentTurnRecords.replace(CreationAgentTurnRecords.turns(latest), cancelled),
@@ -2295,7 +2616,56 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
             throw error
         } catch (error: Exception) {
             val latest = runCatching { loadCreationSession(sessionId) }.getOrDefault(pendingSession)
-            val failed = CreationAgentTurnRecords.fail(pendingTurn, error.message ?: "本轮立项处理失败")
+            val detail = error.message ?: "本轮立项处理失败"
+            if (error is MobileConversationContextException) {
+                val failedContext = standaloneStorageId?.let { storageId ->
+                    runCatching {
+                        mobileAssistantConversationStore.snapshot(
+                            storageId,
+                            standaloneTurnContext?.conversationId ?: storageId,
+                        )
+                    }.getOrNull()?.let { snapshot ->
+                        mobileConversationContextStatePayload(
+                            status = "failed",
+                            detail = "立项上下文校验失败；未执行未确认的业务工具",
+                            conversation = snapshot,
+                            checkpointId = snapshot.checkpoints.lastOrNull()?.id,
+                            provider = "android_direct_api",
+                            model = runCatching {
+                                resolvedDirectConfig(DirectApiConfig.TASK_PLANNING).model
+                            }.getOrNull(),
+                            errorCode = error.code,
+                            errorDetail = detail,
+                            retryable = true,
+                        )
+                    }
+                }
+                emitProgress(CreationAgentProgressEvent(
+                    type = "conversation_context",
+                    message = "立项上下文校验失败；未执行未确认的业务工具",
+                    status = "failed",
+                    data = failedContext ?: buildJsonObject {
+                        put("status", "failed")
+                        put("error_code", error.code)
+                        put("error_detail", detail)
+                        put("retryable", true)
+                    },
+                ))
+            }
+            val failed = CreationAgentTurnRecords.fail(pendingTurn, detail)
+            val context = standaloneTurnContext
+            val storageId = standaloneStorageId
+            if (context != null && storageId != null) {
+                runCatching {
+                    mobileAssistantConversationStore.finishTurn(
+                        projectId = storageId,
+                        turnContext = context,
+                        content = detail,
+                        status = "error",
+                        toolLogs = emptyList(),
+                    )
+                }.exceptionOrNull()?.let(error::addSuppressed)
+            }
             saveCreationSession(CreationAgentTurnRecords.withTurns(
                 latest,
                 CreationAgentTurnRecords.replace(CreationAgentTurnRecords.turns(latest), failed),
@@ -2571,6 +2941,27 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
         put("locked_requirements", JsonArray(input.lockedRequirements.map(::JsonPrimitive)))
     }
 
+    private suspend fun enrichGatewayCreationConversationContext(
+        session: JsonObject,
+        connection: GatewayConnection,
+        conversationId: String,
+    ): JsonObject {
+        if (conversationId.isBlank()) return session
+        val sessionId = session.string("id")
+        require(sessionId.isNotBlank()) { "立项上下文缺少 session id" }
+        val state = api.novelCreationContextState(connection, sessionId, conversationId)
+        val checkpointId = when (state.string("status")) {
+            "ready" -> state.string("active_checkpoint_id")
+            else -> state.string("latest_checkpoint_id").ifBlank {
+                state.string("active_checkpoint_id")
+            }
+        }
+        val detail = checkpointId.takeIf(String::isNotBlank)?.let {
+            api.novelCreationCheckpoint(connection, sessionId, conversationId, it)
+        }
+        return CreationAgentTurnRecords.withConversationContext(session, state, detail)
+    }
+
     private suspend fun saveCreationSession(session: JsonObject) {
         val sessionId = session.string("id")
         require(sessionId.isNotBlank()) { "立项会话缺少 id" }
@@ -2596,8 +2987,18 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
     private suspend fun loadCreationSession(sessionId: String): JsonObject {
         val stored = storedCreationSession(sessionId) ?: error("立项草稿不存在或已删除")
         val migrated = CreationAgentTurnRecords.migrateLegacyHistory(stored)
-        if (migrated != stored) saveCreationSession(migrated)
-        return migrated
+        val standaloneExecution = creationRoute(migrated) == CreationExecutionRoute.MobileKey &&
+            creationHost(migrated) == CREATION_HOST_DEVICE
+        val recovered = if (standaloneExecution) {
+            val storageId = creationConversationStorageId(sessionId)
+            mobileAssistantConversationStore.snapshot(storageId, storageId)?.let { canonical ->
+                CreationAgentTurnRecords.reconcileWithCanonicalConversation(migrated, canonical)
+            } ?: CreationAgentTurnRecords.recoverInterruptedTurns(migrated)
+        } else {
+            migrated
+        }
+        if (recovered != stored) saveCreationSession(recovered)
+        return recovered
     }
 
     private suspend fun storedCreationSession(sessionId: String): JsonObject? {
@@ -2639,7 +3040,7 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
         sessionId: String,
     ): JsonObject {
         val envelope = MobileProviderEncryption.seal(
-            resolvedDirectConfig(DirectApiConfig.TASK_PLANNING),
+            requireMobileProviderCapacity(resolvedDirectConfig(DirectApiConfig.TASK_PLANNING)),
             connection,
             sessionId,
         )
@@ -2982,11 +3383,31 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
 
     private suspend fun resolvedDirectConfig(taskType: String): DirectApiConfig {
         val stored = directApiStore.read() ?: error("请先在设置中配置手机 API Key")
-        val selected = stored.forTask(taskType)
+        val selected = mobileCapacityBoundTaskConfig(stored, taskType)
         if (stored.protocol != DirectApiConfig.PROTOCOL_AUTO) return selected
         val resolved = stored.copy(protocol = directApi.testAndResolve(selected).protocol)
         directApiStore.save(resolved)
-        return resolved.forTask(taskType)
+        return mobileCapacityBoundTaskConfig(resolved, taskType)
+    }
+
+    private suspend fun resolvedAssistantDirectConfig(
+        conversationId: String?,
+        onEvent: suspend (String) -> Unit,
+    ): DirectApiConfig {
+        val selectedModel = directApiStore.read()
+            ?.modelForTask(DirectApiConfig.TASK_ASSISTANT)
+        return try {
+            resolvedDirectConfig(DirectApiConfig.TASK_ASSISTANT)
+        } catch (error: MobileConversationContextException) {
+            onEvent(
+                mobileAssistantContextFailureEvent(
+                    error = error,
+                    conversationId = conversationId,
+                    model = selectedModel,
+                ).toString(),
+            )
+            throw error
+        }
     }
 
     suspend fun disconnect(clearOfflineData: Boolean): Boolean {
@@ -3022,6 +3443,19 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
     private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
         .digest(value.toByteArray(Charsets.UTF_8))
         .joinToString("") { "%02x".format(it) }
+
+    private fun creationConversationStorageId(sessionId: String): String =
+        "creation-${sha256(sessionId).take(32)}"
+
+    private fun requireMobileProviderCapacity(config: DirectApiConfig): DirectApiConfig {
+        if (config.contextWindowTokens == null) {
+            throw MobileConversationContextException(
+                MobileConversationContextErrorCode.CAPACITY_UNKNOWN,
+                "手机模型线路尚未配置上下文窗口，未创建 Gateway 凭据密文",
+            )
+        }
+        return config
+    }
 
     companion object {
         private const val MAX_ENTITY_BYTES = 1024 * 1024

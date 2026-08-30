@@ -103,7 +103,7 @@
     ],
     "required_over_budget_status": "needs_confirmation",
     "search_excerpt_chars": 600,
-    "search_page_limit": 20,
+    "search_page_limit": 10,
     "search_source_types": [
       "assistant_memory",
       "chapter",
@@ -116,7 +116,7 @@
     ],
     "unknown_model_uses_defaults": true
   },
-  "source_sha256": "3b80bc355ac65111897f9b9ab6a5512e6accc919acfbd39fff75a799e83e9777",
+  "source_sha256": "5415380a7edf134471969e92020a7ffa7ef6a64d55f5941c298e52b29941de42",
   "task_policies": {
     "outline_planning": {
       "categories": {
@@ -231,7 +231,7 @@
         ],
         "required_over_budget_status": "needs_confirmation",
         "search_excerpt_chars": 600,
-        "search_page_limit": 20,
+        "search_page_limit": 10,
         "search_source_types": [
           "assistant_memory",
           "chapter",
@@ -360,7 +360,7 @@
         ],
         "required_over_budget_status": "needs_confirmation",
         "search_excerpt_chars": 600,
-        "search_page_limit": 20,
+        "search_page_limit": 10,
         "search_source_types": [
           "assistant_memory",
           "chapter",

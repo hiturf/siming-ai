@@ -9,6 +9,11 @@ from typing import Any, Generic, TypeVar
 from pydantic import BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 
+from .tool_result_policy import (
+    DEFAULT_MODEL_RESULT_CONTRACT,
+    ModelResultContract,
+)
+
 InputT = TypeVar("InputT", bound=BaseModel)
 OutputT = TypeVar("OutputT", bound=BaseModel)
 ToolCallable = Callable[[InputT], OutputT | Awaitable[OutputT]]
@@ -53,8 +58,12 @@ class ToolSpec(Generic[InputT, OutputT]):
     expose_to_mcp: bool = True
     estimated_cost: str = "free"
     writes_project_data: bool = False
+    ends_agent_turn: bool = False
     mcp_permission_pack: str = ""
+    direct_mcp_project_scoped: bool = False
+    direct_mcp_transactional: bool = False
     input_schema_override: dict[str, Any] | None = None
+    model_result_contract: ModelResultContract = DEFAULT_MODEL_RESULT_CONTRACT
 
     def validate_input(self, value: InputT | dict[str, Any]) -> InputT:
         if isinstance(value, self.input_model):
@@ -96,13 +105,18 @@ class ToolSpec(Generic[InputT, OutputT]):
             "permission_tags": sorted(self.permission_tags),
             "risk_level": self.risk_level,
             "writes_project_data": self.writes_project_data,
+            "ends_agent_turn": self.ends_agent_turn,
             "expose_to_internal_agent": self.expose_to_internal_agent,
             "expose_to_scheduler": self.expose_to_scheduler,
             "expose_to_mcp": self.expose_to_mcp,
             "mcp_permission_pack": self.mcp_permission_pack,
+            "direct_mcp_project_scoped": self.direct_mcp_project_scoped,
+            "direct_mcp_transactional": self.direct_mcp_transactional,
             "requires_confirmation": self.requires_confirmation,
             "estimated_cost": self.estimated_cost,
             "idempotent": self.idempotent,
+            "model_result_policy": self.model_result_contract.policy.value,
+            "model_result_max_json_bytes": self.model_result_contract.max_json_bytes,
         }
 
 
@@ -129,7 +143,11 @@ def project_typed_tool_spec(
         expose_to_mcp=source.expose_to_mcp,
         estimated_cost=source.estimated_cost,
         writes_project_data=source.writes_project_data,
+        ends_agent_turn=source.ends_agent_turn,
         mcp_permission_pack=source.mcp_permission_pack,
+        direct_mcp_project_scoped=source.direct_mcp_project_scoped,
+        direct_mcp_transactional=source.direct_mcp_transactional,
+        model_result_contract=source.model_result_contract,
     )
 
 

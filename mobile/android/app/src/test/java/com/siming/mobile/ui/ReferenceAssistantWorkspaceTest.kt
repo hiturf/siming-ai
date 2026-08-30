@@ -1,6 +1,12 @@
 package com.siming.mobile.ui
 
+import com.siming.mobile.data.mobileAssistantContextFailureEvent
+import com.siming.mobile.data.agent.MobileConversationContextErrorCode
+import com.siming.mobile.data.agent.MobileConversationContextException
+import com.siming.mobile.data.agent.mobileCapacityBoundTaskConfig
 import com.siming.mobile.data.local.ReplicaEntity
+import com.siming.mobile.data.network.DirectApiConfig
+import kotlinx.serialization.json.JsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -40,6 +46,58 @@ class ReferenceAssistantWorkspaceTest {
     fun `assistant quick actions only provide user messages without app routing`() {
         assertTrue(assistantQuickActions.any { it.label == "续写下一章" && "下一章" in it.prompt })
         assertTrue(assistantQuickActions.any { it.label == "检查世界观冲突" && "世界观" in it.prompt })
+    }
+
+    @Test
+    fun `unknown direct model capacity exposes the explicit configuration action`() {
+        assertTrue(
+            requiresDirectContextCapacityConfiguration(
+                MobileAssistantContextState(
+                    status = "failed",
+                    errorCode = "conversation_capacity_unknown",
+                ),
+            ),
+        )
+        assertFalse(
+            requiresDirectContextCapacityConfiguration(
+                MobileAssistantContextState(
+                    status = "failed",
+                    errorCode = "conversation_checkpoint_failed",
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `assistant task model override emits typed capacity event for configuration action`() {
+        val config = DirectApiConfig(
+            displayName = "test",
+            baseUrl = "https://example.test/v1",
+            apiKey = "secret",
+            model = "general-model",
+            taskModels = mapOf(DirectApiConfig.TASK_ASSISTANT to "assistant-model"),
+            contextWindowTokens = 128_000,
+        )
+        val failure = try {
+            mobileCapacityBoundTaskConfig(config, DirectApiConfig.TASK_ASSISTANT)
+            error("assistant task-model override should fail closed")
+        } catch (error: MobileConversationContextException) {
+            error
+        }
+
+        val event = mobileAssistantContextFailureEvent(
+            error = failure,
+            conversationId = "conversation-1",
+            model = config.modelForTask(DirectApiConfig.TASK_ASSISTANT),
+        )
+        assertEquals("conversation_context", event["type"]?.toString()?.trim('"'))
+        val contextState = mobileAssistantContextStateFromJson(
+            event["context_state"] as JsonObject,
+        )
+        assertEquals("failed", contextState.status)
+        assertEquals(MobileConversationContextErrorCode.CAPACITY_UNKNOWN, contextState.errorCode)
+        assertEquals("assistant-model", contextState.model)
+        assertTrue(requiresDirectContextCapacityConfiguration(contextState))
     }
 
     private fun replica(entityType: String, entityId: String, payload: String) = ReplicaEntity(

@@ -22,6 +22,8 @@ import {
   type WorkspacePersistedMessage,
   type WorkspaceRunLog,
   type WorkspaceToolLog,
+  type ConversationCheckpointDetail,
+  type ConversationContextState,
   type StepDetail,
   SCOPE_LABEL,
   assistantOutcomeToRunLog,
@@ -32,6 +34,8 @@ import {
   MessageList,
   Composer,
   StepDetailModal,
+  ConversationCheckpointNotice,
+  ModelContextCapacityAlert,
 } from './assistant'
 import { motionAwareScrollBehavior } from '../utils/motion'
 import { extractExplicitLocalPaths } from '../utils/localCliPathGrant'
@@ -44,6 +48,15 @@ import {
   type GeneratedOutlineDraftNode,
 } from '../contexts/AiPanelContext'
 import { createLatestRequestGate } from '../shared/latestRequest'
+import {
+  cancelConversationCheckpoint,
+  checkpointIdForState,
+  checkpointFromEvent,
+  contextStateFromEvent,
+  getConversationCheckpoint,
+  getConversationContextState,
+} from '../services/conversationContext'
+import { modelContextCapacityIssueFrom } from '../services/conversationContextErrors'
 import './WorkspaceAssistantChat.css'
 
 const { Text } = Typography
@@ -230,6 +243,7 @@ function WorkspaceAssistantChat({
   const historyListRequestGate = useRef(createLatestRequestGate<string>())
   const historyMessageRequestGate = useRef(createLatestRequestGate<string>())
   const historyTargetRef = useRef<string | null>(null)
+  const activeConversationIdRef = useRef<string | null>(null)
   const resumePersistedRunRef = useRef<(
     detail: WorkspaceAssistantRunDetail,
     conversationId: string,
@@ -241,6 +255,17 @@ function WorkspaceAssistantChat({
   const [canceling, setCanceling] = useState(false)
   const [cancelPending, setCancelPending] = useState(false)
   const [runtimeAnnouncement, setRuntimeAnnouncement] = useState('')
+  const [conversationContextState, setConversationContextState] = useState<ConversationContextState | null>(null)
+  const [conversationContextError, setConversationContextError] = useState<string | null>(null)
+  const [modelContextCapacityIssue, setModelContextCapacityIssue] = useState<ReturnType<typeof modelContextCapacityIssueFrom>>(null)
+  const [checkpointDetail, setCheckpointDetail] = useState<ConversationCheckpointDetail | null>(null)
+  const [checkpointModalOpen, setCheckpointModalOpen] = useState(false)
+  const [checkpointDetailLoading, setCheckpointDetailLoading] = useState(false)
+  const [checkpointActionLoading, setCheckpointActionLoading] = useState<'rebuild' | 'cancel' | null>(null)
+
+  useEffect(() => {
+    activeConversationIdRef.current = activeConversationId
+  }, [activeConversationId])
 
   const selectedProvider = String(defaultModel || '').split(':', 1)[0]
   const isLocalCliModel = selectedProvider.endsWith('_cli')
@@ -432,6 +457,32 @@ function WorkspaceAssistantChat({
     return detail
   }, [projectId])
 
+  const refreshConversationContextState = useCallback(async (
+    conversationId: string,
+    shouldApply: () => boolean = () => true,
+  ) => {
+    try {
+      const nextState = await getConversationContextState(projectId, conversationId)
+      if (!shouldApply()) return null
+      setConversationContextState(nextState)
+      setConversationContextError(null)
+      const expectedCheckpointId = checkpointIdForState(nextState)
+      setCheckpointDetail((current) => (
+        current && expectedCheckpointId && current.id === expectedCheckpointId ? current : null
+      ))
+      return nextState
+    } catch (error: any) {
+      if (!shouldApply()) return null
+      if (error?.response?.status === 404) {
+        setConversationContextState(null)
+        setConversationContextError(null)
+        return null
+      }
+      setConversationContextError(error?.message || '读取上下文整理状态失败')
+      return null
+    }
+  }, [projectId])
+
   const isCurrentExecution = (execution: ActiveAssistantExecution) => (
     mountedRef.current && activeExecutionRef.current?.token === execution.token
   )
@@ -510,11 +561,19 @@ function WorkspaceAssistantChat({
       && historyTargetRef.current === conversationId
     )
     setHistoryLoading(true)
+    activeConversationIdRef.current = conversationId
     setActiveConversationId(conversationId)
     setMessages([])
     setRunLogs([])
     setCurrentRun(null)
     setShowAllRunLogs(false)
+    setConversationContextState(null)
+    setConversationContextError(null)
+    setModelContextCapacityIssue(null)
+    setCheckpointDetail(null)
+    setCheckpointModalOpen(false)
+    setCheckpointDetailLoading(false)
+    setCheckpointActionLoading(null)
     try {
       const res = await apiClient.get<ApiResponse<{ conversation: WorkspaceAssistantConversation; messages: WorkspacePersistedMessage[] }>>(
         `/projects/${projectId}/ai/assistant/conversations/${conversationId}`,
@@ -525,6 +584,7 @@ function WorkspaceAssistantChat({
       // Re-sorting here can scramble older rows that share the same timestamp.
       const loadedMessages = (res.data.data.messages || []).map(toWorkspaceMessage)
       setMessages(loadedMessages)
+      void refreshConversationContextState(conversationId, ownsConversation)
       const lastRunMessage = [...loadedMessages]
         .reverse()
         .find((item) => item.role === 'assistant' && item.data?.run)
@@ -559,7 +619,7 @@ function WorkspaceAssistantChat({
     } finally {
       if (ownsConversation()) setHistoryLoading(false)
     }
-  }, [projectId, refreshRunLogs])
+  }, [projectId, refreshConversationContextState, refreshRunLogs])
 
   useEffect(() => {
     let mounted = true
@@ -567,10 +627,18 @@ function WorkspaceAssistantChat({
     historyMessageRequestGate.current.invalidate()
     historyTargetRef.current = null
     setHistoryLoading(false)
+    activeConversationIdRef.current = null
     setActiveConversationId(null)
     setMessages([])
     setRunLogs([])
     setCurrentRun(null)
+    setConversationContextState(null)
+    setConversationContextError(null)
+    setModelContextCapacityIssue(null)
+    setCheckpointDetail(null)
+    setCheckpointModalOpen(false)
+    setCheckpointDetailLoading(false)
+    setCheckpointActionLoading(null)
     fetchConversations().then((items) => {
       if (mounted && items[0]) {
         loadConversation(items[0].id)
@@ -591,12 +659,86 @@ function WorkspaceAssistantChat({
     historyMessageRequestGate.current.invalidate()
     historyTargetRef.current = null
     setHistoryLoading(false)
+    activeConversationIdRef.current = null
     setActiveConversationId(null)
     setMessages([])
     setInput('')
     setRunLogs([])
     setCurrentRun(null)
     setShowAllRunLogs(false)
+    setConversationContextState(null)
+    setConversationContextError(null)
+    setModelContextCapacityIssue(null)
+    setCheckpointDetail(null)
+    setCheckpointModalOpen(false)
+    setCheckpointDetailLoading(false)
+    setCheckpointActionLoading(null)
+  }
+
+  const openCheckpointDetails = async () => {
+    setCheckpointModalOpen(true)
+    const conversationId = activeConversationId
+    const checkpointId = checkpointIdForState(conversationContextState, checkpointDetail)
+    if (!conversationId || !checkpointId || checkpointDetail?.id === checkpointId) return
+    setCheckpointDetailLoading(true)
+    try {
+      const detail = await getConversationCheckpoint(projectId, conversationId, checkpointId)
+      if (activeConversationIdRef.current !== conversationId) return
+      setCheckpointDetail(detail)
+      setConversationContextError(null)
+    } catch (error: any) {
+      if (activeConversationIdRef.current === conversationId) {
+        message.error(error?.message || '读取 checkpoint 详情失败')
+      }
+    } finally {
+      if (activeConversationIdRef.current === conversationId) setCheckpointDetailLoading(false)
+    }
+  }
+
+  const guideCheckpointRetry = () => {
+    if (!activeConversationId || generating) return
+    const guidance = '请发送一条新消息；系统会结合最新任务按需重新整理较早上下文。'
+    setCheckpointModalOpen(false)
+    setRuntimeAnnouncement(guidance)
+    message.info(guidance)
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLTextAreaElement>('.workspace-assistant-composer textarea')?.focus()
+    })
+  }
+
+  const cancelCheckpoint = async () => {
+    const conversationId = activeConversationId
+    const checkpointId = checkpointIdForState(conversationContextState, checkpointDetail)
+    if (!conversationId || !checkpointId || checkpointActionLoading) return
+    setCheckpointActionLoading('cancel')
+    try {
+      const nextState = await cancelConversationCheckpoint(projectId, conversationId, checkpointId)
+      if (activeConversationIdRef.current !== conversationId) return
+      setConversationContextState(nextState)
+      setConversationContextError(null)
+      setRuntimeAnnouncement('上下文整理已取消，当前任务尚未执行')
+    } catch (error: any) {
+      if (activeConversationIdRef.current === conversationId) {
+        message.error(error?.message || '取消上下文整理失败')
+      }
+    } finally {
+      if (activeConversationIdRef.current === conversationId) setCheckpointActionLoading(null)
+    }
+  }
+
+  const jumpToCheckpointSourceMessage = (messageId: string) => {
+    setCheckpointModalOpen(false)
+    window.requestAnimationFrame(() => {
+      const target = [...(messagesRef.current?.querySelectorAll<HTMLElement>('[data-message-id]') || [])]
+        .find((element) => element.dataset.messageId === messageId)
+      if (!target) {
+        message.info('原消息不在当前已加载的会话中')
+        return
+      }
+      target.scrollIntoView?.({ block: 'center', behavior: motionAwareScrollBehavior() })
+      target.classList.add('workspace-assistant-message-source-highlight')
+      window.setTimeout(() => target.classList.remove('workspace-assistant-message-source-highlight'), 1800)
+    })
   }
 
   const deleteConversation = (conversationId: string) => {
@@ -991,6 +1133,7 @@ function WorkspaceAssistantChat({
     setCancelPending(false)
     setCanceling(false)
     setGenerating(true)
+    setModelContextCapacityIssue(null)
     setRuntimeAnnouncement('已恢复正在后台执行的任务，可继续等待或取消')
 
     void (async () => {
@@ -1056,6 +1199,7 @@ function WorkspaceAssistantChat({
     const grantedReadPaths = isOpenCodeCliModel ? proposedReadPaths : []
 
     setGenerating(true)
+    setModelContextCapacityIssue(null)
     cancelRequestedRef.current = false
     setRunLogs([{ key: `${Date.now()}-start`, tool: agentRuntimeTool, status: 'running', message: '正在提交给AI助手' }])
     setCurrentRun(null)
@@ -1087,10 +1231,6 @@ function WorkspaceAssistantChat({
     if (options?.text === undefined) setInput('')
 
     try {
-      const history = messages.slice(-8).map((item) => ({
-        role: item.role,
-        content: item.content,
-      }))
       const res = await fetch(`/api/v1/projects/${projectId}/ai/workspace-assistant/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1105,11 +1245,24 @@ function WorkspaceAssistantChat({
           max_tokens: undefined,
           local_cli_read_permission_grant: grantedReadPaths.length > 0 ? 'read_once' : 'none',
           local_cli_read_paths: grantedReadPaths,
-          history,
         }),
         signal: controller.signal,
       })
-      if (!res.ok || !res.body) throw new Error('请求失败')
+      if (!res.ok) {
+        const payload = await res.json().catch(() => null)
+        const capacityIssue = modelContextCapacityIssueFrom(payload)
+        if (capacityIssue) setModelContextCapacityIssue(capacityIssue)
+        const detail = payload && typeof payload === 'object' && 'detail' in payload
+          ? (payload as { detail?: unknown }).detail
+          : null
+        const detailMessage = typeof detail === 'string'
+          ? detail
+          : detail && typeof detail === 'object' && 'message' in detail
+            ? String((detail as { message?: unknown }).message || '')
+            : ''
+        throw new Error(detailMessage || `请求失败（HTTP ${res.status}）`)
+      }
+      if (!res.body) throw new Error('请求失败：响应没有事件流')
 
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
@@ -1138,6 +1291,7 @@ function WorkspaceAssistantChat({
           execution.conversationId = conversation.id
           execution.userMessageId = persistedUser.id
           execution.assistantMessageId = persistedAssistant.id
+          activeConversationIdRef.current = conversation.id
           setActiveConversationId(conversation.id)
           upsertConversation(conversation)
           setMessages((prev) => {
@@ -1153,6 +1307,48 @@ function WorkspaceAssistantChat({
               toWorkspaceMessage(persistedAssistant),
             ])
           })
+        } else if (event.type === 'conversation_context') {
+          const nextState = contextStateFromEvent(event)
+          if (!nextState) return
+          setConversationContextState(nextState)
+          setConversationContextError(null)
+          const expectedCheckpointId = checkpointIdForState(nextState)
+          setCheckpointDetail((current) => (
+            current && expectedCheckpointId && current.id === expectedCheckpointId ? current : null
+          ))
+          if (nextState.status === 'pending' || nextState.status === 'compressing') {
+            setRuntimeAnnouncement('正在整理较早上下文；当前任务尚未执行')
+          } else if (nextState.status === 'ready') {
+            setRuntimeAnnouncement('较早上下文已整理，正在继续当前任务')
+          } else if (nextState.status === 'failed') {
+            setRuntimeAnnouncement('较早上下文整理失败；当前任务尚未执行')
+          }
+        } else if (event.type === 'conversation_checkpoint') {
+          const nextState = contextStateFromEvent(event)
+          const nextCheckpoint = checkpointFromEvent(event)
+          if (nextCheckpoint) setCheckpointDetail(nextCheckpoint)
+          if (nextState) {
+            setConversationContextState(nextState)
+          } else if (nextCheckpoint) {
+            setConversationContextState((current) => ({
+              ...(current || { status: nextCheckpoint.status }),
+              ...nextCheckpoint,
+              status: nextCheckpoint.status,
+              active_checkpoint_id: nextCheckpoint.status === 'ready'
+                ? nextCheckpoint.id
+                : current?.active_checkpoint_id,
+              latest_checkpoint_id: nextCheckpoint.id,
+            }))
+          }
+          setConversationContextError(null)
+          const nextStatus = nextState?.status || nextCheckpoint?.status
+          if (nextStatus === 'ready') {
+            setRuntimeAnnouncement('较早上下文已整理，正在继续当前任务')
+          } else if (nextStatus === 'failed') {
+            setRuntimeAnnouncement('较早上下文整理失败；当前任务尚未执行')
+          } else if (nextStatus === 'cancelled') {
+            setRuntimeAnnouncement('较早上下文整理已取消；当前任务尚未执行')
+          }
         } else if (event.type === 'run') {
           const run = event.run as WorkspaceAssistantRun
           execution.run = run
@@ -1245,6 +1441,8 @@ function WorkspaceAssistantChat({
           void fetchConversations()
           Promise.resolve(onApplied?.()).catch(() => undefined)
         } else if (event.type === 'error') {
+          const capacityIssue = modelContextCapacityIssueFrom(event)
+          if (capacityIssue) setModelContextCapacityIssue(capacityIssue)
           throw new Error(event.message || 'AI助手执行失败')
         }
       }
@@ -1441,6 +1639,11 @@ function WorkspaceAssistantChat({
         />
       )}
 
+      <ModelContextCapacityAlert
+        issue={modelContextCapacityIssue}
+        onConfigure={() => navigate('/settings?section=context-governance')}
+      />
+
       {isLocalCliModel && !modelUnavailable && (
         <Alert
           className="workspace-assistant-cli-permission"
@@ -1482,6 +1685,24 @@ function WorkspaceAssistantChat({
           <Text type="secondary" style={{ fontSize: 12 }}>还没有历史对话。</Text>
         )}
       </div>
+
+      <ConversationCheckpointNotice
+        state={conversationContextState}
+        detail={checkpointDetail}
+        stateError={conversationContextError}
+        detailLoading={checkpointDetailLoading}
+        actionLoading={checkpointActionLoading}
+        modalOpen={checkpointModalOpen}
+        onOpen={() => { void openCheckpointDetails() }}
+        onClose={() => setCheckpointModalOpen(false)}
+        onRebuild={guideCheckpointRetry}
+        onCancel={() => { void cancelCheckpoint() }}
+        onNewConversation={() => {
+          setCheckpointModalOpen(false)
+          startNewConversation()
+        }}
+        onJumpToMessage={jumpToCheckpointSourceMessage}
+      />
 
       {runLogs.length > 0 && (
         <div className="workspace-assistant-run-log">
@@ -1599,7 +1820,6 @@ function WorkspaceAssistantChat({
         cancelPending={cancelPending || canceling}
         selectedText={selectedText}
         showSelectionTag={showSelectionTag}
-        messageCount={displayedMessages.length}
         onInputChange={setInput}
         onSend={sendMessage}
         onStop={stopGeneration}

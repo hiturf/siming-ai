@@ -247,12 +247,21 @@ describe('WriterPage manual writing actions', () => {
     )
 
     await screen.findByLabelText('当前草稿：第二章 迟到草稿')
+    await waitFor(() => {
+      expect(document.querySelector<HTMLTextAreaElement>('.writer-content-input textarea'))
+        .toHaveValue(pendingDraft.content)
+      expect(screen.getByRole('status')).toHaveTextContent('有未保存修改')
+    })
     fireEvent.click(screen.getByRole('button', { name: '保存并建档' }))
 
-    expect(await screen.findByText('保存失败', {}, { timeout: 5000 })).toBeInTheDocument()
     await waitFor(() => {
-      expect(screen.getAllByText(detail).length).toBeGreaterThan(0)
-    }, { timeout: 5000 })
+      expect(api.post).toHaveBeenCalledWith(
+        '/projects/project-1/chapters',
+        expect.objectContaining({ draft_id: pendingDraft.draft_id, content: pendingDraft.content }),
+      )
+      expect(screen.getByRole('status')).toHaveTextContent('保存失败')
+      expect(screen.getByRole('status')).toHaveTextContent(detail)
+    })
     expect(await screen.findByLabelText('当前草稿：第二章 迟到草稿')).toBeInTheDocument()
   })
 
