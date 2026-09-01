@@ -509,6 +509,89 @@ def test_full_roundtrip_cross_database_restores_author_data_and_rebuilds_indexes
         destination_engine.dispose()
 
 
+def test_full_package_accepts_stale_narrative_checkpoint_references(seeded, tmp_path: Path):
+    source_db, _factory, _content = seeded
+    checkpoint = source_db.query(NarrativeCheckpoint).one()
+    checkpoint.chapter_id = "missing-chapter"
+    checkpoint.chapter_snapshot_id = "missing-snapshot"
+    source_db.commit()
+
+    payload = _export_bytes(source_db, "source-project", "full")
+    source_path = _write_package(tmp_path / f"stale{PACKAGE_EXTENSION}", payload)
+    validated = ProjectPackageValidator(source_path).validate()
+
+    checkpoint_row = validated.rows["narrative_checkpoints"][0]
+    assert checkpoint_row["chapter_id"] is None
+    assert checkpoint_row["chapter_snapshot_id"] is None
+
+    destination_engine, destination_factory = _database(tmp_path / "destination.db")
+    destination = destination_factory()
+    try:
+        outcome = ProjectPackageImporter(
+            destination,
+            validated,
+            idempotency_key=uuid.uuid4(),
+            new_title="清理后导入",
+        ).restore()
+        destination.commit()
+        assert outcome.result["project_id"]
+    finally:
+        validated.cleanup()
+        destination.close()
+        Base.metadata.drop_all(bind=destination_engine)
+        destination_engine.dispose()
+
+
+def test_legacy_full_package_with_stale_narrative_checkpoint_references_imports_cleaned(
+    seeded,
+    tmp_path: Path,
+):
+    """旧备份包内已含指向包外的检查点引用，验证放行并导入后置空。"""
+    source_db, _factory, _content = seeded
+    payload = _export_bytes(source_db, "source-project", "full")
+    entries = _archive_entries(payload)
+    checkpoint_line = next(
+        line
+        for line in entries["data/narrative_checkpoints.jsonl"].decode("utf-8").splitlines()
+        if line.strip()
+    )
+    checkpoint_row = json.loads(checkpoint_line)
+    checkpoint_row["chapter_id"] = "missing-chapter"
+    checkpoint_row["chapter_snapshot_id"] = "missing-snapshot"
+    entries["data/narrative_checkpoints.jsonl"] = (
+        json.dumps(checkpoint_row, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    _update_manifest_entry(entries, "data/narrative_checkpoints.jsonl")
+    source_path = _write_package(
+        tmp_path / f"legacy-stale{PACKAGE_EXTENSION}", _repack(entries)
+    )
+
+    validated = ProjectPackageValidator(source_path).validate()
+    stale_row = validated.rows["narrative_checkpoints"][0]
+    assert stale_row["chapter_id"] == "missing-chapter"
+    assert stale_row["chapter_snapshot_id"] == "missing-snapshot"
+
+    destination_engine, destination_factory = _database(tmp_path / "destination.db")
+    destination = destination_factory()
+    try:
+        outcome = ProjectPackageImporter(
+            destination,
+            validated,
+            idempotency_key=uuid.uuid4(),
+            new_title="旧包导入",
+        ).restore()
+        destination.commit()
+        assert outcome.result["project_id"]
+        restored = destination.query(NarrativeCheckpoint).one()
+        assert restored.chapter_id is None
+        assert restored.chapter_snapshot_id is None
+    finally:
+        validated.cleanup()
+        destination.close()
+        Base.metadata.drop_all(bind=destination_engine)
+        destination_engine.dispose()
+
+
 def _api_app(factory) -> FastAPI:
     configure_application_services()
     app = FastAPI()
