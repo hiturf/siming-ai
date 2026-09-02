@@ -39,7 +39,7 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Apply product patch and synchronize the remaining Android contract test
+      - name: Apply product patch and synchronize contracts
         shell: bash
         run: |
           python - <<'PY'
@@ -62,10 +62,10 @@ jobs:
           )
           exec(compile(script, "one-shot-256k-capacity-fallback.py", "exec"), {"__name__": "__main__"})
 
-          path = Path(
+          test_path = Path(
               "mobile/android/app/src/test/java/com/siming/mobile/ui/ReferenceAssistantWorkspaceTest.kt"
           )
-          text = path.read_text(encoding="utf-8")
+          text = test_path.read_text(encoding="utf-8")
           for import_line in (
               "import com.siming.mobile.data.mobileAssistantContextFailureEvent\n",
               "import com.siming.mobile.data.agent.MobileConversationContextErrorCode\n",
@@ -73,7 +73,6 @@ jobs:
               "import kotlinx.serialization.json.JsonObject\n",
           ):
               text = text.replace(import_line, "")
-
           pattern = re.compile(
               r"    @Test\n"
               r"    fun `assistant task model override emits typed capacity event for configuration action`\(\) \{.*?"
@@ -104,7 +103,44 @@ jobs:
               raise SystemExit(
                   "ReferenceAssistantWorkspaceTest.kt: stale capacity test could not be replaced"
               )
-          path.write_text(text, encoding="utf-8")
+          test_path.write_text(text, encoding="utf-8")
+
+          orchestrator_path = Path("backend/app/services/context_orchestrator.py")
+          orchestrator = orchestrator_path.read_text(encoding="utf-8")
+          verbose_capacity = '''        fallback_window = (
+            DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
+            if provider == "local_llama_cpp"
+            else DEFAULT_CONTEXT_WINDOW_TOKENS
+        )
+        fallback_output = min(
+            output_limit(),
+            max(1, fallback_window // 4),
+            max(1, fallback_window - DEFAULT_SAFETY_MARGIN_TOKENS - 1),
+        )'''
+          compact_capacity = '''        fallback_window = DEFAULT_CONTEXT_WINDOW_TOKENS
+        if provider == "local_llama_cpp":
+            fallback_window = DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
+        fallback_output = min(
+            output_limit(), max(1, fallback_window // 4),
+            max(1, fallback_window - DEFAULT_SAFETY_MARGIN_TOKENS - 1),
+        )'''
+          if orchestrator.count(verbose_capacity) != 1:
+              raise SystemExit("context_orchestrator.py: capacity block did not match once")
+          orchestrator = orchestrator.replace(verbose_capacity, compact_capacity, 1)
+          verbose_warning = '''                warnings.append(
+                    "No exact model context profile is configured; "
+                    "the temporary 256K fallback was used. "
+                    "Configure the exact provider/model limit when available."
+                )'''
+          compact_warning = '''                warnings.append(
+                    "No exact model context profile is configured; the temporary 256K "
+                    "fallback was used. Configure the exact provider/model limit when available.")'''
+          if orchestrator.count(verbose_warning) != 1:
+              raise SystemExit("context_orchestrator.py: fallback warning did not match once")
+          orchestrator_path.write_text(
+              orchestrator.replace(verbose_warning, compact_warning, 1),
+              encoding="utf-8",
+          )
           PY
 
       - name: Install backend dependencies
@@ -113,9 +149,15 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-dev.txt
 
-      - name: Run focused backend tests
-        working-directory: backend
+      - name: Regenerate and validate Android context policy
         run: |
+          python scripts/export-mobile-context-policy.py
+          python scripts/export-mobile-context-policy.py --check
+
+      - name: Validate backend architecture and focused behavior
+        run: |
+          cd backend
+          python scripts/run_quality.py
           python -m pytest \
             tests/test_conversation_context_budget.py \
             tests/test_conversation_context_runtime.py \
