@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 
+from app.core.model_limits import DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS
 from app.services.mobile_context_policy import portable_context_policy
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -40,7 +41,7 @@ def test_portable_writing_policy_keeps_pc_contract_and_budget() -> None:
     policy = portable_context_policy("writing")
     assert policy["contract"]["required_categories"] == ["target_outline", "style"]
     assert policy["model_defaults"] == {
-        "context_window_tokens": 1_000_000,
+        "context_window_tokens": DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS,
         "safety_margin_tokens": 512,
         "minimum_output_reserve_tokens": 2_048,
         "output_ratio": 0.45,
