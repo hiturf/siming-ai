@@ -22,10 +22,9 @@ from ..schemas.chapter import (
     ChapterReorderRequest,
     ChapterUpdate,
 )
-from ..services.cataloging.chapter_rollback import chapter_suffix_ids
+from ..services.cataloging.chapter_rollback import cataloging_required_suffix_ids
 from ..services.cataloging.launcher import (
     CHAPTER_SAVE_SOURCE,
-    cancel_superseded_chapter_cataloging_jobs,
     create_and_queue_cataloging_job,
 )
 from ..services.chapter_quality import preview_chapter_quality
@@ -61,7 +60,10 @@ def _bind_draft_manifest(values: dict, draft) -> None:
 
 
 def _save_message(data: dict) -> str:
-    if data.get("cataloging_impact") == "style_only" and data.get("chapter_text_changed"):
+    if (
+        data.get("cataloging_impact") == "style_only"
+        and data.get("chapter_text_changed")
+    ):
         return "章节已保存；本次标记为仅润色，原建档状态已保留"
     launch = data.get("cataloging_job")
     if isinstance(launch, dict):
@@ -125,23 +127,6 @@ def _start_chapter_cataloging(
     return data
 
 
-def _required_suffix(
-    workspace: ChapterWorkspace,
-    project_id: str,
-    chapter_id: str,
-) -> list[str]:
-    items = workspace.list(project_id).get("items") or []
-    suffix = chapter_suffix_ids(
-        getattr(workspace, "_session", None), project_id, chapter_id
-    ) if getattr(workspace, "_session", None) is not None else []
-    required = {
-        str(item.get("id"))
-        for item in items
-        if isinstance(item, dict) and item.get("cataloging_required")
-    }
-    return [item for item in suffix if item in required]
-
-
 @router.get("/projects/{project_id}/chapters")
 def list_chapters(
     project_id: str,
@@ -193,7 +178,10 @@ async def create_chapter(
             raise ValidationError("修订候选不能新建为另一份章节；请在原章节中审阅并保存")
         if existing_draft.status == "saved" and existing_draft.saved_chapter_id:
             data = workspace.detail(project_id, existing_draft.saved_chapter_id)
-            if cataloging_mode == "save_and_catalog" and data.get("cataloging_required"):
+            if (
+                cataloging_mode == "save_and_catalog"
+                and data.get("cataloging_required")
+            ):
                 data = _start_chapter_cataloging(db, project_id, data)
             return ApiResponse.success(data=data, message=_save_message(data))
         ensure_generated_draft_outline_is_unused(
@@ -266,7 +254,10 @@ async def save_chapter(
             raise ValidationError("修订候选与当前章节不匹配，未写入任何正文")
         if draft.status == "saved" and draft.saved_chapter_id:
             data = workspace.detail(project_id, draft.saved_chapter_id)
-            if cataloging_mode == "save_and_catalog" and data.get("cataloging_required"):
+            if (
+                cataloging_mode == "save_and_catalog"
+                and data.get("cataloging_required")
+            ):
                 data = _start_chapter_cataloging(db, project_id, data)
             return ApiResponse.success(data=data, message=_save_message(data))
         if draft.status != "pending":
@@ -284,7 +275,11 @@ async def save_chapter(
             draft_id,
             title=str(values.get("title") or draft.title or ""),
             outline_node_id=values.get("outline_node_id", draft.outline_node_id),
-            content=str(values.get("content") if "content" in values else draft.content or ""),
+            content=str(
+                values.get("content")
+                if "content" in values
+                else draft.content or ""
+            ),
         )
     result = workspace.save(project_id, chapter_id, values)
     command.queue_all(result.sync_intents)
@@ -292,10 +287,10 @@ async def save_chapter(
         mark_chapter_draft_saved(db, draft, chapter_id)
     command.finish()
     data = result.data
-    recatalog_ids = data.get("recatalog_required_chapter_ids") or [chapter_id]
-    if data.get("narrative_content_changed"):
-        cancel_superseded_chapter_cataloging_jobs(db, project_id, recatalog_ids)
-    if cataloging_mode == "save_and_catalog" and data.get("cataloging_impact") != "style_only":
+    if (
+        cataloging_mode == "save_and_catalog"
+        and data.get("cataloging_impact") != "style_only"
+    ):
         data = _start_chapter_cataloging(db, project_id, data)
     return ApiResponse.success(data=data, message=_save_message(data))
 
@@ -309,7 +304,7 @@ async def start_chapter_cataloging(
     db: Annotated[Session, Depends(get_db)],
 ):
     data = workspace.detail(project_id, chapter_id)
-    required = _required_suffix(workspace, project_id, chapter_id)
+    required = cataloging_required_suffix_ids(db, project_id, chapter_id)
     if required:
         data["recatalog_required_chapter_ids"] = required
     data = _start_chapter_cataloging(
@@ -361,7 +356,7 @@ async def quality_score_preview(
     payload: ChapterQualityScoreRequest,
     db: Annotated[Session, Depends(get_db)],
 ):
-    """Return a manual quality review without changing chapter data."""
+    """Return a manual quality review without changing the saved chapter."""
     data = await preview_chapter_quality(
         db,
         project_id,
@@ -393,7 +388,10 @@ async def draft_de_ai_preview(
         model=payload.model,
     )
     data["draft_id"] = draft_id
-    return ApiResponse.success(data=data, message="草稿去除 AI 味候选已生成；尚未保存")
+    return ApiResponse.success(
+        data=data,
+        message="草稿去除 AI 味候选已生成；尚未保存",
+    )
 
 
 @router.post("/projects/{project_id}/chapter-drafts/{draft_id}/quality-score-preview")
@@ -414,7 +412,10 @@ async def draft_quality_score_preview(
         model=payload.model,
     )
     data["draft_id"] = draft_id
-    return ApiResponse.success(data=data, message="草稿质量评分已完成；草稿仍未保存")
+    return ApiResponse.success(
+        data=data,
+        message="草稿质量评分已完成；草稿仍未保存",
+    )
 
 
 @router.delete("/projects/{project_id}/chapters/{chapter_id}")
@@ -457,7 +458,10 @@ def diff_chapter_snapshots(
 ):
     return ApiResponse.success(
         data=workspace.diff(
-            project_id, chapter_id, from_snapshot_id, to_snapshot_id
+            project_id,
+            chapter_id,
+            from_snapshot_id,
+            to_snapshot_id,
         )
     )
 
