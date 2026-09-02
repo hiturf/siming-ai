@@ -12,7 +12,6 @@ SnapshotTrigger = Literal[
     "restore",
 ]
 ChapterSaveMode = Literal["save_only", "save_and_catalog"]
-ChapterCatalogingImpact = Literal["semantic", "style_only"]
 
 
 class ChapterCreate(BaseModel):
@@ -27,12 +26,7 @@ class ChapterCreate(BaseModel):
 
 
 class ChapterUpdate(BaseModel):
-    """Schema for saving a chapter.
-
-    ``cataloging_impact`` is author-declared.  The server never guesses whether
-    prose edits changed story facts: semantic edits roll back this chapter and
-    every later cataloging projection, while style-only edits preserve them.
-    """
+    """Schema for saving a chapter."""
 
     title: Optional[str] = Field(None, min_length=1, max_length=200)
     outline_node_id: Optional[str] = None
@@ -46,13 +40,6 @@ class ChapterUpdate(BaseModel):
         description="Optimistic concurrency guard for the chapter version loaded by the editor",
     )
     cataloging_mode: ChapterSaveMode = "save_only"
-    cataloging_impact: ChapterCatalogingImpact = Field(
-        "semantic",
-        description=(
-            "semantic rolls back this and later cataloging projections; "
-            "style_only preserves the existing cataloging projection"
-        ),
-    )
 
     model_config = {"extra": "forbid"}
 
@@ -142,7 +129,7 @@ class ChapterDetail(ChapterListItem):
 
 
 class ChapterSnapshotItem(BaseModel):
-    """Schema for a version snapshot list item."""
+    """Snapshot list item."""
 
     id: str
     chapter_id: str
