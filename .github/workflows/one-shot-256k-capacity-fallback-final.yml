@@ -107,34 +107,42 @@ jobs:
 
           orchestrator_path = Path("backend/app/services/context_orchestrator.py")
           orchestrator = orchestrator_path.read_text(encoding="utf-8")
-          verbose_capacity = '''        fallback_window = (
-            DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
-            if provider == "local_llama_cpp"
-            else DEFAULT_CONTEXT_WINDOW_TOKENS
-        )
-        fallback_output = min(
-            output_limit(),
-            max(1, fallback_window // 4),
-            max(1, fallback_window - DEFAULT_SAFETY_MARGIN_TOKENS - 1),
-        )'''
-          compact_capacity = '''        fallback_window = DEFAULT_CONTEXT_WINDOW_TOKENS
-        if provider == "local_llama_cpp":
-            fallback_window = DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
-        fallback_output = min(
-            output_limit(), max(1, fallback_window // 4),
-            max(1, fallback_window - DEFAULT_SAFETY_MARGIN_TOKENS - 1),
-        )'''
+          verbose_capacity = "\n".join((
+              "        fallback_window = (",
+              "            DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS",
+              "            if provider == \"local_llama_cpp\"",
+              "            else DEFAULT_CONTEXT_WINDOW_TOKENS",
+              "        )",
+              "        fallback_output = min(",
+              "            output_limit(),",
+              "            max(1, fallback_window // 4),",
+              "            max(1, fallback_window - DEFAULT_SAFETY_MARGIN_TOKENS - 1),",
+              "        )",
+          ))
+          compact_capacity = "\n".join((
+              "        fallback_window = DEFAULT_CONTEXT_WINDOW_TOKENS",
+              "        if provider == \"local_llama_cpp\":",
+              "            fallback_window = DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS",
+              "        fallback_output = min(",
+              "            output_limit(), max(1, fallback_window // 4),",
+              "            max(1, fallback_window - DEFAULT_SAFETY_MARGIN_TOKENS - 1),",
+              "        )",
+          ))
           if orchestrator.count(verbose_capacity) != 1:
               raise SystemExit("context_orchestrator.py: capacity block did not match once")
           orchestrator = orchestrator.replace(verbose_capacity, compact_capacity, 1)
-          verbose_warning = '''                warnings.append(
-                    "No exact model context profile is configured; "
-                    "the temporary 256K fallback was used. "
-                    "Configure the exact provider/model limit when available."
-                )'''
-          compact_warning = '''                warnings.append(
-                    "No exact model context profile is configured; the temporary 256K "
-                    "fallback was used. Configure the exact provider/model limit when available.")'''
+          verbose_warning = "\n".join((
+              "                warnings.append(",
+              "                    \"No exact model context profile is configured; \"",
+              "                    \"the temporary 256K fallback was used. \"",
+              "                    \"Configure the exact provider/model limit when available.\"",
+              "                )",
+          ))
+          compact_warning = "\n".join((
+              "                warnings.append(",
+              "                    \"No exact model context profile is configured; the temporary 256K \"",
+              "                    \"fallback was used. Configure the exact provider/model limit when available.\")",
+          ))
           if orchestrator.count(verbose_warning) != 1:
               raise SystemExit("context_orchestrator.py: fallback warning did not match once")
           orchestrator_path.write_text(
