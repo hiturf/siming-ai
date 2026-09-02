@@ -1,4 +1,4 @@
-"""Read, restore, diff, and delete chapter workspace tools.
+"""Read, restore, diff, and delete chapter data.
 
 Creating and editing chapter prose is intentionally absent here. AI writing
 produces a pending ``ChapterDraft``; only the author-facing chapter HTTP API
