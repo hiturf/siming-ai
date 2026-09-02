@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.orm import Session
 
 from ..architecture.uow import commit_session
@@ -237,11 +237,18 @@ async def save_chapter(
     project_id: str,
     chapter_id: str,
     payload: ChapterUpdate,
+    request: Request,
     workspace: Annotated[ChapterWorkspace, Depends(get_chapter_workspace)],
     command: Annotated[StoryCommandContext, Depends(get_story_command)],
     db: Annotated[Session, Depends(get_db)],
 ):
     values = payload.model_dump(exclude_unset=True)
+    cataloging_impact = str(
+        request.headers.get("X-Siming-Cataloging-Impact") or "semantic"
+    ).strip().lower()
+    if cataloging_impact not in {"semantic", "style_only"}:
+        raise ValidationError("X-Siming-Cataloging-Impact 必须是 semantic 或 style_only")
+    values["cataloging_impact"] = cataloging_impact
     cataloging_mode = values.pop("cataloging_mode", "save_only")
     lock_chapter_draft_project(db, project_id)
     draft_id = values.pop("draft_id", None)
