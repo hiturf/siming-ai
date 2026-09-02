@@ -66,6 +66,21 @@ if (checkOnly) {
   }
   const existing = readFileSync(generatedPath, 'utf8').replaceAll('\r\n', '\n')
   if (existing !== generated) {
+    let firstDifference = 0
+    while (
+      firstDifference < existing.length
+      && firstDifference < generated.length
+      && existing[firstDifference] === generated[firstDifference]
+    ) {
+      firstDifference += 1
+    }
+    const start = Math.max(0, firstDifference - 400)
+    const end = firstDifference + 1200
+    console.error(`OpenAPI type drift starts at character ${firstDifference}.`)
+    console.error('--- existing ---')
+    console.error(existing.slice(start, end))
+    console.error('--- generated ---')
+    console.error(generated.slice(start, end))
     throw new Error('Generated OpenAPI types are stale. Run npm run api:generate.')
   }
   console.log('OpenAPI types are current.')
