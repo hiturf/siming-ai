@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.exceptions import ValidationError
 from app.database.models import (
     CatalogingApplyLog,
     CatalogingCandidate,
@@ -84,6 +85,8 @@ def _run(
         context_integrity="clean",
         model_source=f"chapter_save:{chapter.id}",
     )
+    db.add(job)
+    db.flush()
     run = CatalogingChapterRun(
         id=f"run-{index}-{item_type}",
         job_id=job.id,
@@ -93,6 +96,8 @@ def _run(
         chapter_order=index,
         chapter_version=chapter.current_version,
     )
+    db.add(run)
+    db.flush()
     candidate = CatalogingCandidate(
         id=f"candidate-{index}-{item_type}",
         job_id=job.id,
@@ -106,18 +111,30 @@ def _run(
         raw_payload="{}",
         status="applied",
     )
-    log = CatalogingApplyLog(
-        id=f"log-{index}-{item_type}",
-        job_id=job.id,
-        chapter_run_id=run.id,
-        candidate_id=candidate.id,
-        target_type=target_type,
-        target_id=target_id,
-        operation="upsert",
-        old_value=json.dumps(old_value, ensure_ascii=False) if old_value is not None else None,
-        new_value=json.dumps(new_value, ensure_ascii=False) if new_value is not None else None,
+    db.add(candidate)
+    db.flush()
+    db.add(
+        CatalogingApplyLog(
+            id=f"log-{index}-{item_type}",
+            job_id=job.id,
+            chapter_run_id=run.id,
+            candidate_id=candidate.id,
+            target_type=target_type,
+            target_id=target_id,
+            operation="upsert",
+            old_value=(
+                json.dumps(old_value, ensure_ascii=False)
+                if old_value is not None
+                else None
+            ),
+            new_value=(
+                json.dumps(new_value, ensure_ascii=False)
+                if new_value is not None
+                else None
+            ),
+        )
     )
-    db.add_all([job, run, candidate, log])
+    db.flush()
     return candidate
 
 
@@ -251,8 +268,16 @@ def _seed_cataloged_suffix(db: Session):
 
     db.add_all(
         [
-            ChapterSummary(id="summary-2", chapter_id=second.id, summary_text="第二章摘要"),
-            ChapterSummary(id="summary-3", chapter_id=third.id, summary_text="第三章摘要"),
+            ChapterSummary(
+                id="summary-2",
+                chapter_id=second.id,
+                summary_text="第二章摘要",
+            ),
+            ChapterSummary(
+                id="summary-3",
+                chapter_id=third.id,
+                summary_text="第三章摘要",
+            ),
             ChapterCharacter(
                 id="appearance-2",
                 chapter_id=second.id,
@@ -301,8 +326,12 @@ def _seed_cataloged_suffix(db: Session):
     return first, second, third, existing, new_character, new_world
 
 
-def test_delete_middle_chapter_rolls_back_suffix_and_preserves_project_checkpoint(db: Session):
-    _first, second, third, existing, new_character, new_world = _seed_cataloged_suffix(db)
+def test_delete_middle_chapter_rolls_back_suffix_and_preserves_project_checkpoint(
+    db: Session,
+):
+    _first, second, third, existing, new_character, new_world = (
+        _seed_cataloged_suffix(db)
+    )
 
     mutation = SqlAlchemyChapterWorkspace(db).delete("p1", second.id)
     db.commit()
@@ -313,15 +342,27 @@ def test_delete_middle_chapter_rolls_back_suffix_and_preserves_project_checkpoin
     assert db.get(Character, existing.id).current_goal == "出发前"
     assert db.get(Character, new_character.id) is None
     assert db.get(WorldbuildingEntry, new_world.id) is None
-    assert db.query(ChapterSummary).filter(ChapterSummary.chapter_id == third.id).count() == 0
+    assert (
+        db.query(ChapterSummary)
+        .filter(ChapterSummary.chapter_id == third.id)
+        .count()
+        == 0
+    )
     assert {
-        row.id for row in db.query(NarrativeCheckpoint).order_by(NarrativeCheckpoint.sequence).all()
+        row.id
+        for row in db.query(NarrativeCheckpoint)
+        .order_by(NarrativeCheckpoint.sequence)
+        .all()
     } == {"checkpoint-project", "checkpoint-1"}
     assert mutation.data["recatalog_required_chapter_ids"] == [third.id]
 
 
-def test_semantic_edit_keeps_ids_but_rolls_back_current_and_later_cataloging(db: Session):
-    _first, second, third, existing, new_character, new_world = _seed_cataloged_suffix(db)
+def test_semantic_edit_keeps_ids_but_rolls_back_current_and_later_cataloging(
+    db: Session,
+):
+    _first, second, third, existing, new_character, new_world = (
+        _seed_cataloged_suffix(db)
+    )
 
     mutation = SqlAlchemyChapterWorkspace(db).save(
         "p1",
@@ -343,12 +384,17 @@ def test_semantic_edit_keeps_ids_but_rolls_back_current_and_later_cataloging(db:
     assert db.get(WorldbuildingEntry, new_world.id) is None
     assert mutation.data["recatalog_required_chapter_ids"] == [second.id, third.id]
     checkpoints = db.query(NarrativeCheckpoint).all()
-    assert any(row.chapter_id == second.id and row.trigger_type == "manual_save" for row in checkpoints)
+    assert any(
+        row.chapter_id == second.id and row.trigger_type == "manual_save"
+        for row in checkpoints
+    )
     assert not any(row.chapter_id == third.id for row in checkpoints)
 
 
 def test_style_only_edit_preserves_cataloging_projection(db: Session):
-    _first, second, third, existing, new_character, new_world = _seed_cataloged_suffix(db)
+    _first, second, third, existing, new_character, new_world = (
+        _seed_cataloged_suffix(db)
+    )
 
     mutation = SqlAlchemyChapterWorkspace(db).save(
         "p1",
@@ -366,15 +412,22 @@ def test_style_only_edit_preserves_cataloging_projection(db: Session):
     assert db.get(Character, existing.id).current_goal == "第三章目标"
     assert db.get(Character, new_character.id) is not None
     assert db.get(WorldbuildingEntry, new_world.id) is not None
-    assert db.query(ChapterSummary).filter(ChapterSummary.chapter_id == third.id).count() == 1
+    assert (
+        db.query(ChapterSummary)
+        .filter(ChapterSummary.chapter_id == third.id)
+        .count()
+        == 1
+    )
     assert mutation.data["cataloging_impact"] == "style_only"
     assert mutation.data["cataloging_rollback"] is None
 
 
 def test_style_only_cannot_change_outline_or_title(db: Session):
-    _first, second, _third, _existing, _new_character, _new_world = _seed_cataloged_suffix(db)
+    _first, second, _third, _existing, _new_character, _new_world = (
+        _seed_cataloged_suffix(db)
+    )
 
-    with pytest.raises(Exception, match="仅润色模式"):
+    with pytest.raises(ValidationError, match="仅润色模式"):
         SqlAlchemyChapterWorkspace(db).save(
             "p1",
             second.id,
