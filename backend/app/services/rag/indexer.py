@@ -262,6 +262,11 @@ def _get_or_create_document(
         indexed_at=datetime.utcnow(),
     )
     db.add(doc)
+    # Flush the document before any chunk references it. rag_documents and
+    # rag_chunks share a ForeignKey but no ORM relationship, so the unit of
+    # work cannot order them within one flush; with SQLite foreign keys on,
+    # a same-flush chunk insert would fail because the parent row is skipped.
+    db.flush()
     return doc
 
 

@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.bootstrap.composition import configure_application_services
@@ -83,6 +83,16 @@ def _database(path: Path):
     )
     Base.metadata.create_all(bind=engine)
     return engine, sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+
+def _enable_sqlite_foreign_keys(engine) -> None:
+    """Enable SQLite foreign-key enforcement for one engine (matches production)."""
+
+    @event.listens_for(engine, "connect")
+    def _set_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 
 def _seed_project(db: Session, root: Path, *, project_id: str = "source-project") -> Path:
@@ -507,6 +517,39 @@ def test_full_roundtrip_cross_database_restores_author_data_and_rebuilds_indexes
         destination.close()
         Base.metadata.drop_all(bind=destination_engine)
         destination_engine.dispose()
+
+
+def test_full_package_import_with_foreign_keys_rebuilds_rag_index(seeded, tmp_path: Path):
+    """Foreign-key enabled import rebuilds the RAG index without UOW ordering failures."""
+    source_db, _factory, _content = seeded
+    payload = _export_bytes(source_db, "source-project", "full")
+    source_path = _write_package(tmp_path / f"fk-full{PACKAGE_EXTENSION}", payload)
+
+    engine = create_engine(
+        f"sqlite:///{(tmp_path / 'fk-destination.db').as_posix()}",
+        connect_args={"check_same_thread": False},
+    )
+    _enable_sqlite_foreign_keys(engine)
+    Base.metadata.create_all(bind=engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    destination = factory()
+    validated = ProjectPackageValidator(source_path).validate()
+    try:
+        outcome = ProjectPackageImporter(
+            destination,
+            validated,
+            idempotency_key=uuid.uuid4(),
+            new_title="fk-import",
+        ).restore()
+        destination.commit()
+        project_id = outcome.result["project_id"]
+        assert destination.query(RagDocument).filter_by(project_id=project_id).count() > 0
+        assert destination.query(RagChunk).filter_by(project_id=project_id).count() > 0
+    finally:
+        validated.cleanup()
+        destination.close()
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
 
 
 def test_full_package_accepts_stale_narrative_checkpoint_references(seeded, tmp_path: Path):
