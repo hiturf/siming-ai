@@ -253,6 +253,9 @@ class SqlAlchemyChapterWorkspace:
         detail["recatalog_required_chapter_ids"] = (
             rollback.get("recatalog_required_chapter_ids", []) if rollback else []
         )
+        detail["governance_invalidated_count"] = (
+            rollback.get("governance_invalidated_count", 0) if rollback else 0
+        )
         sync_intents = [
             ContentSyncIntent(
                 project_id=project_id,
@@ -406,9 +409,8 @@ class SqlAlchemyChapterWorkspace:
                     "recatalog_required_chapter_ids", []
                 ),
                 "governance_invalidated_count": rollback.get(
-                    "deleted_governance_items", 0
-                )
-                + rollback.get("restored_governance_items", 0),
+                    "governance_invalidated_count", 0
+                ),
             }
         )
         return StoryMutation(
