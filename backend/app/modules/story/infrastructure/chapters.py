@@ -178,7 +178,9 @@ class SqlAlchemyChapterWorkspace:
         data = dict(payload)
         trigger_type = data.pop("trigger_type", "manual_save")
         expected_version = data.pop("expected_version", None)
-        cataloging_impact = str(data.pop("cataloging_impact", "semantic") or "semantic").strip().lower()
+        cataloging_impact = str(
+            data.pop("cataloging_impact", "semantic") or "semantic"
+        ).strip().lower()
         if cataloging_impact not in {"semantic", "style_only"}:
             raise ValidationError("cataloging_impact 必须是 semantic 或 style_only")
         if (
@@ -193,7 +195,10 @@ class SqlAlchemyChapterWorkspace:
             raise ValidationError("未提供任何更新字段")
 
         ensure_current_snapshot(self._session, chapter, "manual_save")
-        content_changed = "content" in data and (data.get("content") or "") != (chapter.content or "")
+        content_changed = (
+            "content" in data
+            and (data.get("content") or "") != (chapter.content or "")
+        )
         title_changed = "title" in data and data.get("title") != chapter.title
         outline_changed = (
             "outline_node_id" in data
