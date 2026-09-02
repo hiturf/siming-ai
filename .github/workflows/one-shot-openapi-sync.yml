@@ -1,3 +1,4 @@
+# One-shot repair workflow; the generated repair branch removes this file.
 name: One-shot OpenAPI type regeneration
 
 on:
