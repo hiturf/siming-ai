@@ -84,11 +84,43 @@ def _catalog_node_safe_to_delete(
     )
 
 
+def _invalidate_chapter_reviews(
+    db: Session,
+    project_id: str,
+    affected_ids: set[str],
+    deleted_chapter_ids: set[str],
+    result: dict[str, Any],
+) -> None:
+    reviews = (
+        db.query(ChapterGovernanceReview)
+        .filter(
+            ChapterGovernanceReview.project_id == project_id,
+            ChapterGovernanceReview.chapter_id.in_(affected_ids),
+        )
+        .all()
+    )
+    deleted = 0
+    stale = 0
+    for review in reviews:
+        if review.chapter_id in deleted_chapter_ids:
+            db.delete(review)
+            deleted += 1
+            continue
+        if review.status != "stale":
+            review.status = "stale"
+            review.reviewed_at = None
+            review.updated_at = datetime.utcnow()
+            stale += 1
+    result["removed_rows"]["chapter_governance_reviews"] = deleted
+    result["stale_governance_reviews"] += stale
+
+
 def cleanup_chapter_owned_rows(
     db: Session,
     project_id: str,
     affected_ids: set[str],
     affected_outline_ids: set[str],
+    deleted_chapter_ids: set[str],
     result: dict[str, Any],
 ) -> None:
     for key, model in (
@@ -100,11 +132,18 @@ def cleanup_chapter_owned_rows(
         ("worldbuilding_timeline_rows", WorldbuildingTimeline),
         ("character_narrative_states", CharacterNarrativeState),
         ("chapter_quality_metrics", ChapterQualityMetric),
-        ("chapter_governance_reviews", ChapterGovernanceReview),
     ):
         column = getattr(model, "chapter_id")
         rows = db.query(model).filter(column.in_(affected_ids)).all()
         result["removed_rows"][key] = delete_rows(rows)
+
+    _invalidate_chapter_reviews(
+        db,
+        project_id,
+        affected_ids,
+        deleted_chapter_ids,
+        result,
+    )
 
     snapshot_ids = {
         row.id
@@ -189,28 +228,6 @@ def cleanup_chapter_owned_rows(
     result["removed_rows"]["cataloging_facts_superseded"] = len(facts)
 
 
-def _prior_governance_status(
-    db: Session,
-    project_id: str,
-    item_id: str,
-    affected_ids: set[str],
-) -> str | None:
-    event_row = (
-        db.query(NarrativeGovernanceEvent)
-        .filter(
-            NarrativeGovernanceEvent.project_id == project_id,
-            NarrativeGovernanceEvent.item_id == item_id,
-            NarrativeGovernanceEvent.chapter_id.in_(affected_ids),
-        )
-        .order_by(
-            NarrativeGovernanceEvent.created_at.asc(),
-            NarrativeGovernanceEvent.id.asc(),
-        )
-        .first()
-    )
-    return str(event_row.from_status) if event_row and event_row.from_status else None
-
-
 def _has_governance_lifecycle_outside_suffix(
     db: Session,
     project_id: str,
@@ -231,10 +248,60 @@ def _has_governance_lifecycle_outside_suffix(
     )
 
 
+def _governance_item_type(row: Any) -> str:
+    if isinstance(row, Foreshadowing):
+        return "foreshadowings"
+    if isinstance(row, CausalEdge):
+        return "causal-edges"
+    return "narrative-debts"
+
+
+def _linked_chapter_id(row: Any, affected_ids: set[str]) -> str | None:
+    for field in ("source_chapter_id", "target_chapter_id", "resolved_chapter_id"):
+        value = getattr(row, field, None)
+        if value in affected_ids:
+            return str(value)
+    return None
+
+
+def _mark_governance_stale(
+    db: Session,
+    project_id: str,
+    row: Any,
+    affected_ids: set[str],
+    reason: str,
+    result: dict[str, Any],
+) -> None:
+    previous = str(row.status or "open")
+    if previous != "stale":
+        row.status = "stale"
+        db.add(
+            NarrativeGovernanceEvent(
+                project_id=project_id,
+                item_type=_governance_item_type(row),
+                item_id=row.id,
+                from_status=previous,
+                to_status="stale",
+                chapter_id=_linked_chapter_id(row, affected_ids),
+                note=reason[:4000],
+                actor="chapter_cataloging_rollback",
+            )
+        )
+        result["stale_governance_items"] += 1
+    if hasattr(row, "stale_reason"):
+        row.stale_reason = reason[:4000]
+    if hasattr(row, "last_checked_at"):
+        row.last_checked_at = datetime.utcnow()
+    for field in ("verified_at", "verification_note", "closed_by"):
+        if hasattr(row, field):
+            setattr(row, field, None)
+
+
 def rollback_governance(
     db: Session,
     project_id: str,
     affected_ids: set[str],
+    deleted_chapter_ids: set[str],
     deleted_character_ids: set[str],
     reason: str,
     result: dict[str, Any],
@@ -286,44 +353,36 @@ def rollback_governance(
                     f"治理项 {row.id} 在失效章节范围外仍有生命周期记录，已保留并标记待复核"
                 )
 
-            prior = _prior_governance_status(
+            _mark_governance_stale(
                 db,
                 project_id,
-                row.id,
+                row,
                 affected_ids,
+                reason,
+                result,
             )
-            if prior:
-                row.status = prior
-            elif getattr(row, "resolved_chapter_id", None) in affected_ids:
-                row.status = "open"
-            if getattr(row, "source_chapter_id", None) in affected_ids:
+            if getattr(row, "source_chapter_id", None) in deleted_chapter_ids:
                 row.source_chapter_id = None
             if (
                 hasattr(row, "target_chapter_id")
-                and row.target_chapter_id in affected_ids
+                and row.target_chapter_id in deleted_chapter_ids
             ):
                 row.target_chapter_id = None
-            if getattr(row, "resolved_chapter_id", None) in affected_ids:
+            if getattr(row, "resolved_chapter_id", None) in deleted_chapter_ids:
                 row.resolved_chapter_id = None
                 for field in (
                     "resolved_chapter_version",
                     "resolution_note",
                     "resolution_evidence",
-                    "verification_note",
-                    "verified_at",
-                    "closed_by",
                 ):
                     if hasattr(row, field):
                         setattr(row, field, None)
-            if hasattr(row, "stale_reason"):
-                row.stale_reason = reason[:4000]
             if isinstance(row, CausalEdge) and deleted_character_ids:
                 row.character_ids = [
                     item
                     for item in (row.character_ids or [])
                     if str(item) not in deleted_character_ids
                 ]
-            result["restored_governance_items"] += 1
 
 
 def restore_ledger_projection(
