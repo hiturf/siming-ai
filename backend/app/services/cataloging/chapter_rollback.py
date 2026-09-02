@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from sqlalchemy import event, or_
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from app.modules.continuity.infrastructure.models import (
@@ -112,7 +112,9 @@ def _result(
         "deleted_outline_nodes": 0,
         "restored_outline_nodes": 0,
         "deleted_governance_items": 0,
-        "restored_governance_items": 0,
+        "stale_governance_items": 0,
+        "stale_governance_reviews": 0,
+        "governance_invalidated_count": 0,
         "legacy_character_changes_reverted": 0,
         "ledger_keys_restored": 0,
         "rag_documents_invalidated": 0,
@@ -236,6 +238,7 @@ def rollback_cataloging_from_chapter(
         return {
             "affected_chapter_ids": [],
             "recatalog_required_chapter_ids": [],
+            "governance_invalidated_count": 0,
             "warnings": [],
         }
 
@@ -269,6 +272,7 @@ def rollback_cataloging_from_chapter(
         project_id,
         affected_ids,
         outline_ids,
+        deleted_ids,
         result,
     )
 
@@ -278,9 +282,16 @@ def rollback_cataloging_from_chapter(
         db,
         project_id,
         affected_ids,
+        deleted_ids,
         deleted_character_ids,
         reason,
         result,
+    )
+    result["governance_invalidated_count"] = (
+        result["deleted_governance_items"]
+        + result["stale_governance_items"]
+        + result["stale_governance_reviews"]
+        + int(result["removed_rows"].get("chapter_governance_reviews") or 0)
     )
     result["ledger_keys_restored"] = restore_ledger_projection(
         db,
