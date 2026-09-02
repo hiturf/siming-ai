@@ -81,26 +81,24 @@ jobs:
               r"(?=    private fun replica)",
               re.S,
           )
-          replacement = '''    @Test
-    fun `assistant task model override uses bounded 256k fallback`() {
-        val config = DirectApiConfig(
-            displayName = "test",
-            baseUrl = "https://example.test/v1",
-            apiKey = "secret",
-            model = "general-model",
-            taskModels = mapOf(DirectApiConfig.TASK_ASSISTANT to "assistant-model"),
-            contextWindowTokens = 128_000,
-        )
-
-        val resolved = mobileCapacityBoundTaskConfig(config, DirectApiConfig.TASK_ASSISTANT)
-
-        assertEquals("assistant-model", resolved.model)
-        assertEquals(DirectApiConfig.DEFAULT_CONTEXT_WINDOW_TOKENS, resolved.contextWindowTokens)
-        assertEquals(DirectApiConfig.DEFAULT_AGENT_OUTPUT_TOKENS, resolved.maxOutputTokens)
-        assertEquals(128_000, config.contextWindowTokens)
-    }
-
-'''
+          replacement = (
+              "    @Test\n"
+              "    fun `assistant task model override uses bounded 256k fallback`() {\n"
+              "        val config = DirectApiConfig(\n"
+              "            displayName = \"test\",\n"
+              "            baseUrl = \"https://example.test/v1\",\n"
+              "            apiKey = \"secret\",\n"
+              "            model = \"general-model\",\n"
+              "            taskModels = mapOf(DirectApiConfig.TASK_ASSISTANT to \"assistant-model\"),\n"
+              "            contextWindowTokens = 128_000,\n"
+              "        )\n\n"
+              "        val resolved = mobileCapacityBoundTaskConfig(config, DirectApiConfig.TASK_ASSISTANT)\n\n"
+              "        assertEquals(\"assistant-model\", resolved.model)\n"
+              "        assertEquals(DirectApiConfig.DEFAULT_CONTEXT_WINDOW_TOKENS, resolved.contextWindowTokens)\n"
+              "        assertEquals(DirectApiConfig.DEFAULT_AGENT_OUTPUT_TOKENS, resolved.maxOutputTokens)\n"
+              "        assertEquals(128_000, config.contextWindowTokens)\n"
+              "    }\n\n"
+          )
           text, count = pattern.subn(replacement, text, count=1)
           if count != 1:
               raise SystemExit(
