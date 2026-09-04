@@ -18,7 +18,7 @@ from alembic import command
 from app.database.bootstrap import SCHEMA_EPOCH, alembic_config, bootstrap_database
 from app.database.models import AssistantRun, AssistantRunStep, Project
 
-HEAD_REVISION = "300a35_relationship_integrity"
+HEAD_REVISION = "300a36_outline_projection_identity"
 
 
 def _database_url(path: Path) -> str:

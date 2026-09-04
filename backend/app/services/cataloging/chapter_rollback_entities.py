@@ -33,7 +33,11 @@ from app.modules.story.infrastructure.entities import (
     WorldbuildingRelation,
 )
 
-from .chapter_rollback_common import json_value, same_projection
+from .chapter_rollback_common import (
+    json_value,
+    reset_chapter_outline_projection,
+    same_projection,
+)
 from .snapshots import character_snapshot, outline_snapshot, worldbuilding_snapshot
 
 _UNSUPPORTED = object()
@@ -153,10 +157,11 @@ def _restore_outline(node: OutlineNode, snapshot: dict[str, Any]) -> None:
         "source_chapter_id",
         "actual_summary",
         "planned_summary",
+        "cataloging_status",
     ):
         if field in snapshot:
             setattr(node, field, snapshot.get(field))
-    if not node.source_chapter_id:
+    if "cataloging_status" not in snapshot and not node.source_chapter_id:
         node.cataloging_status = None
     node.updated_at = datetime.utcnow()
 
@@ -388,6 +393,7 @@ def _undo_apply_log(
     old_value: Any,
     affected_ids: set[str],
     affected_outline_ids: set[str],
+    preserved_outline_ids: set[str],
     rollback_relationship_ids: set[str],
     result: dict[str, Any],
 ) -> None:
@@ -503,8 +509,12 @@ def _undo_apply_log(
                 and node.source_chapter_id in affected_ids
                 and node.cataloging_status == "cataloged"
             ):
-                db.delete(node)
-                result["deleted_outline_nodes"] += 1
+                if node.id in preserved_outline_ids and node.node_type == "chapter":
+                    reset_chapter_outline_projection(node)
+                    result["preserved_entities"].append(node.id)
+                else:
+                    db.delete(node)
+                    result["deleted_outline_nodes"] += 1
         elif node and isinstance(old_value, dict):
             _restore_outline(node, old_value)
             result["restored_outline_nodes"] += 1
@@ -515,6 +525,7 @@ def rollback_apply_logs(
     project_id: str,
     affected_ids: set[str],
     affected_outline_ids: set[str],
+    preserved_outline_ids: set[str],
     result: dict[str, Any],
 ) -> None:
     rows = (
@@ -576,6 +587,7 @@ def rollback_apply_logs(
                 json_value(log.old_value),
                 affected_ids,
                 affected_outline_ids,
+                preserved_outline_ids,
                 rollback_relationship_ids,
                 result,
             )

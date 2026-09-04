@@ -467,6 +467,19 @@ def test_full_roundtrip_cross_database_restores_author_data_and_rebuilds_indexes
     tmp_path: Path,
 ):
     source_db, _factory, content = seeded
+    source_db.add(
+        OutlineNode(
+            id="planning-section-old",
+            project_id="source-project",
+            parent_id="outline-1",
+            node_type="section",
+            title="立项旧场景",
+            summary="已经被正文建档替换的规划",
+            status="pending",
+            sort_order=1000,
+        )
+    )
+    source_db.commit()
     payload = _export_bytes(source_db, "source-project", "full")
     source_path = _write_package(tmp_path / f"book{PACKAGE_EXTENSION}", payload)
 
@@ -491,8 +504,18 @@ def test_full_roundtrip_cross_database_restores_author_data_and_rebuilds_indexes
         assert chapter.id == str(uuid.uuid5(PACKAGE_ID_NAMESPACE, f"{key}:chapters:chapter-1"))
         assert destination.query(ChapterSnapshot).one().content == SNAPSHOT_SENTINEL
         assert destination.query(ChapterSummary).one().summary_text == SUMMARY_SENTINEL
-        restored_outline = destination.query(OutlineNode).filter_by(project_id=project_id).one()
+        restored_outline = destination.query(OutlineNode).filter_by(
+            project_id=project_id,
+            node_type="chapter",
+        ).one()
         assert restored_outline.cataloging_status == "cataloged"
+        assert restored_outline.summary == SUMMARY_SENTINEL
+        assert restored_outline.actual_summary == SUMMARY_SENTINEL
+        assert restored_outline.source_chapter_id == chapter.id
+        assert destination.query(OutlineNode).filter_by(
+            project_id=project_id,
+            node_type="section",
+        ).count() == 0
         draft = destination.query(ChapterDraft).one()
         assert draft.content == DRAFT_SENTINEL
         assert draft.saved_chapter_id is None

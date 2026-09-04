@@ -248,6 +248,11 @@ def rollback_cataloging_from_chapter(
     if deleting_chapter:
         deleted_ids.add(chapter_id)
     recatalog = [item for item in affected if item.id not in deleted_ids]
+    preserved_outline_ids = {
+        str(item.outline_node_id)
+        for item in recatalog
+        if item.outline_node_id
+    }
     result = _result(chapter_id, affected, recatalog)
 
     application_rows = _application_rows(db, project_id, affected_ids)
@@ -264,6 +269,7 @@ def rollback_cataloging_from_chapter(
         project_id,
         affected_ids,
         outline_ids,
+        preserved_outline_ids,
         result,
     )
     rollback_legacy_character_changes(db, affected_ids, result)
@@ -272,6 +278,7 @@ def rollback_cataloging_from_chapter(
         project_id,
         affected_ids,
         outline_ids,
+        preserved_outline_ids,
         deleted_ids,
         result,
     )

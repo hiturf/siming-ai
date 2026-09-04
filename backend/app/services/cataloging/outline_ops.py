@@ -39,23 +39,6 @@ def apply_outline(
         if scene_number <= 0:
             raise ValueError("场景大纲缺少有效的 scene_number，拒绝写入不稳定场景标识")
         payload["scene_number"] = scene_number
-    parent = _resolve_requested_parent(
-        db,
-        chapter.project_id,
-        payload.get("parent_id") or payload.get("parent_title"),
-    )
-    if node_type == "volume":
-        parent_id = None
-    elif node_type == "chapter":
-        volume = parent if parent and parent.node_type == "volume" else _volume_for_chapter(db, chapter)
-        parent_id = volume.id
-    else:
-        chapter_parent = chapter_outline_node(db, chapter.project_id, chapter)
-        if not chapter_parent and parent and parent.node_type == "chapter":
-            chapter_parent = parent
-        if not chapter_parent:
-            chapter_parent = _ensure_chapter_container(db, chapter)
-        parent_id = chapter_parent.id
     node = _find_outline_for_candidate(
         db,
         chapter,
@@ -64,13 +47,33 @@ def apply_outline(
         exact=create,
         scene_number=scene_number,
     )
-    # A formal chapter outline is author-owned structure. Cataloging may fill
-    # its actual summary and scenes, but it must not move that chapter between
-    # volumes based on an omitted or model-proposed parent. In particular,
-    # chapter titles often contain no ordinal, so the generic volume fallback
-    # would otherwise silently move later-volume chapters into the first one.
-    if node and node_type == "chapter" and not node.source_chapter_id:
-        parent_id = node.parent_id
+    parent = _resolve_requested_parent(
+        db,
+        chapter.project_id,
+        payload.get("parent_id") or payload.get("parent_title"),
+    )
+    if node_type == "volume":
+        parent_id = None
+    elif node_type == "chapter":
+        if node is not None:
+            # A chapter outline is replaced in place.  Its persisted identity,
+            # parent and sort order are deterministic placement data; a new
+            # model title must not move it to a fallback volume.
+            parent_id = node.parent_id
+        else:
+            volume = (
+                parent
+                if parent and parent.node_type == "volume"
+                else _volume_for_chapter(db, chapter)
+            )
+            parent_id = volume.id
+    else:
+        chapter_parent = chapter_outline_node(db, chapter.project_id, chapter)
+        if not chapter_parent and parent and parent.node_type == "chapter":
+            chapter_parent = parent
+        if not chapter_parent:
+            chapter_parent = _ensure_chapter_container(db, chapter)
+        parent_id = chapter_parent.id
     old = outline_snapshot(node) if node else None
     if not node:
         node = OutlineNode(
@@ -81,7 +84,9 @@ def apply_outline(
             summary=str(payload.get("summary") or payload.get("actual_summary") or "")[:8000],
             status=str(payload.get("status") or "completed")[:20],
             source_chapter_id=chapter.id,
-            actual_summary=str(payload.get("actual_summary") or payload.get("summary") or "")[:8000],
+            actual_summary=str(
+                payload.get("actual_summary") or payload.get("summary") or ""
+            )[:8000],
             planned_summary=str(payload.get("planned_summary") or "")[:8000],
             cataloging_status="cataloged",
             sort_order=next_outline_sort_order(db, chapter.project_id, parent_id),
@@ -93,22 +98,19 @@ def apply_outline(
             node.parent_id = parent_id
         if payload.get("node_type"):
             node.node_type = node_type
-        catalog_owned = bool(node.source_chapter_id) and node.cataloging_status == "cataloged"
-        if payload.get("title") and (node_type != "chapter" or catalog_owned):
+        if payload.get("title"):
             node.title = title[:200]
         actual_summary = str(payload.get("actual_summary") or payload.get("summary") or "")[:8000]
         if actual_summary:
-            # The actual summary is a projection of this saved chapter version,
-            # not an append-only note. Keep author-owned planning text separate.
+            # Replace the visible outline with this saved chapter projection.
+            # Keep the original plan separately for audit and later comparison.
             node.actual_summary = actual_summary
-            if node_type != "chapter" or catalog_owned:
-                node.summary = actual_summary
+            node.summary = actual_summary
         if payload.get("planned_summary") and not node.planned_summary:
             node.planned_summary = str(payload.get("planned_summary"))[:8000]
         if payload.get("status"):
             node.status = str(payload.get("status"))[:20]
-        if node_type != "chapter" or catalog_owned:
-            node.source_chapter_id = node.source_chapter_id or chapter.id
+        node.source_chapter_id = node.source_chapter_id or chapter.id
         node.cataloging_status = "cataloged"
 
     if node.node_type == "section":
@@ -192,12 +194,12 @@ def _find_outline_for_candidate(
             OutlineNode.node_type == "chapter",
         ).first()
         if linked:
-            return _repair_legacy_duplicate_chapter_outline(
-                db,
-                chapter,
-                linked,
-                value,
-            )
+            # The saved chapter-to-outline relation is the authoritative
+            # identity.  Cataloging may update that node's projection fields,
+            # but it must never swap or delete the node as a side effect of a
+            # model-proposed title.  Historical duplicate cleanup belongs in
+            # an explicit migration/repair operation, outside normal writes.
+            return linked
     if node_type == "section":
         numbered = _find_cataloged_section_by_scene_number(
             db,
@@ -270,75 +272,6 @@ def _find_cataloged_section_by_scene_number(
         if observed == wanted:
             return row
     return None
-
-
-def _repair_legacy_duplicate_chapter_outline(
-    db: Session,
-    chapter: Chapter,
-    linked: OutlineNode,
-    candidate_title: Any,
-) -> OutlineNode:
-    """Reattach a chapter from an old catalog duplicate to its planned node.
-
-    Older builds could replace ``chapter.outline_node_id`` with a newly
-    cataloged chapter node when punctuation in the extracted title differed
-    from the planned outline.  Repair only the unambiguous ownership shape:
-    the linked node is catalog-owned and exactly one author-owned chapter node
-    has the same normalized title.  Children and character links are moved
-    before the duplicate container is deleted.
-    """
-    if not linked.source_chapter_id or linked.cataloging_status != "cataloged":
-        return linked
-    wanted_titles = {
-        normalize_lookup(value)
-        for value in (chapter.title, linked.title, candidate_title)
-        if normalize_lookup(value)
-    }
-    if not wanted_titles:
-        return linked
-    candidates = (
-        db.query(OutlineNode)
-        .filter(
-            OutlineNode.project_id == chapter.project_id,
-            OutlineNode.node_type == "chapter",
-            OutlineNode.id != linked.id,
-        )
-        .order_by(OutlineNode.created_at.asc(), OutlineNode.id.asc())
-        .all()
-    )
-    planned = [
-        node
-        for node in candidates
-        if not node.source_chapter_id
-        and node.cataloging_status != "cataloged"
-        and normalize_lookup(node.title) in wanted_titles
-    ]
-    if len(planned) != 1:
-        return linked
-    planned_node = planned[0]
-    if db.query(Chapter).filter(
-        Chapter.project_id == chapter.project_id,
-        Chapter.id != chapter.id,
-        Chapter.outline_node_id == linked.id,
-    ).first():
-        return linked
-
-    for child in list(linked.children):
-        child.parent = planned_node
-    existing_character_ids = {
-        relation.character_id for relation in planned_node.linked_characters
-    }
-    for relation in list(linked.linked_characters):
-        if relation.character_id in existing_character_ids:
-            db.delete(relation)
-        else:
-            relation.outline_node = planned_node
-            existing_character_ids.add(relation.character_id)
-    chapter.outline_node_id = planned_node.id
-    db.flush()
-    db.delete(linked)
-    db.flush()
-    return planned_node
 
 
 def _resolve_requested_parent(db: Session, project_id: str, value: Any) -> OutlineNode | None:

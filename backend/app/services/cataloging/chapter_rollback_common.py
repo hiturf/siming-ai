@@ -6,7 +6,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.modules.story.infrastructure.entities import Chapter
+from app.modules.story.infrastructure.entities import Chapter, OutlineNode
 
 
 def json_value(value: str | None) -> Any:
@@ -46,9 +46,20 @@ def delete_rows(rows: list[Any]) -> int:
     return count
 
 
+def reset_chapter_outline_projection(node: OutlineNode) -> None:
+    """Keep a chapter's structural slot while invalidating its old projection."""
+
+    node.summary = node.planned_summary or ""
+    node.actual_summary = None
+    node.status = "pending"
+    node.source_chapter_id = None
+    node.cataloging_status = None
+
+
 __all__ = [
     "delete_rows",
     "json_value",
     "ordered_project_chapters",
+    "reset_chapter_outline_projection",
     "same_projection",
 ]

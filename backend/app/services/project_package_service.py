@@ -708,11 +708,32 @@ class ProjectPackageImporter:
         }
         if not summarized_chapters:
             return
-        cataloged_outline_ids = {
-            str(row.get("outline_node_id"))
-            for row in self.package.rows.get("chapters", [])
-            if row.get("id") in summarized_chapters and row.get("outline_node_id")
-        }
+        cataloged_outline_ids: set[str] = set()
+        for row in self.package.rows.get("chapters", []):
+            source_chapter_id = str(row.get("id") or "")
+            source_outline_id = str(row.get("outline_node_id") or "")
+            if (
+                source_chapter_id not in summarized_chapters
+                or not source_outline_id
+            ):
+                continue
+            cataloged_outline_ids.add(source_outline_id)
+            mapped_outline_id = self.identifier_map.get(source_outline_id)
+            mapped_chapter_id = self.identifier_map.get(source_chapter_id)
+            outline = (
+                self.db.get(OutlineNode, mapped_outline_id)
+                if mapped_outline_id
+                else None
+            )
+            if outline is None:
+                continue
+            # Older full packages kept the planning summary visible even after
+            # cataloging had written an actual summary.  Import the durable
+            # chapter projection as the current outline while retaining the
+            # original plan in planned_summary.
+            if str(outline.actual_summary or "").strip():
+                outline.summary = outline.actual_summary
+            outline.source_chapter_id = mapped_chapter_id
         cataloged_outline_ids.update(
             str(row.get("id"))
             for row in self.package.rows.get("outline_nodes", [])
@@ -723,6 +744,23 @@ class ProjectPackageImporter:
             outline = self.db.get(OutlineNode, mapped_id) if mapped_id else None
             if outline is not None:
                 outline.cataloging_status = "cataloged"
+        mapped_cataloged_outline_ids = {
+            self.identifier_map[source_id]
+            for source_id in cataloged_outline_ids
+            if source_id in self.identifier_map
+        }
+        if mapped_cataloged_outline_ids:
+            stale_planning_sections = (
+                self.db.query(OutlineNode)
+                .filter(
+                    OutlineNode.node_type == "section",
+                    OutlineNode.parent_id.in_(mapped_cataloged_outline_ids),
+                    OutlineNode.source_chapter_id.is_(None),
+                )
+                .all()
+            )
+            for outline in stale_planning_sections:
+                self.db.delete(outline)
         self.db.flush()
 
     def _insert_collection(self, key: str) -> None:

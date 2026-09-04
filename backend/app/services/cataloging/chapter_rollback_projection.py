@@ -45,6 +45,7 @@ from .chapter_rollback_common import (
     delete_rows,
     json_value,
     ordered_project_chapters,
+    reset_chapter_outline_projection,
 )
 
 
@@ -120,6 +121,7 @@ def cleanup_chapter_owned_rows(
     project_id: str,
     affected_ids: set[str],
     affected_outline_ids: set[str],
+    preserved_outline_ids: set[str],
     deleted_chapter_ids: set[str],
     result: dict[str, Any],
 ) -> None:
@@ -201,6 +203,10 @@ def cleanup_chapter_owned_rows(
     )
     for node in sorted(catalog_nodes, key=_catalog_node_depth, reverse=True):
         if node in db.deleted:
+            continue
+        if node.id in preserved_outline_ids and node.node_type == "chapter":
+            reset_chapter_outline_projection(node)
+            result["preserved_entities"].append(node.id)
             continue
         if _catalog_node_safe_to_delete(db, node, affected_ids):
             for chapter in ordered_project_chapters(db, project_id):

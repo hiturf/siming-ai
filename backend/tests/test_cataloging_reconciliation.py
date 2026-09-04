@@ -23,6 +23,7 @@ from app.database.models import (
     WorldbuildingTimeline,
 )
 from app.services.cataloging.applier import apply_candidates_for_run
+from app.services.cataloging.chapter_rollback import rollback_cataloging_from_chapter
 from app.services.cataloging.orchestrator import create_cataloging_job
 
 
@@ -99,8 +100,25 @@ def test_cataloging_preserves_author_owned_chapter_volume():
             current_version=1,
             sort_order=22000,
         )
-        db.add_all([project, first_volume, second_volume, planned, chapter])
+        planning_section = OutlineNode(
+            id="planning-section",
+            project_id=project.id,
+            parent_id=planned.id,
+            node_type="section",
+            title="立项场景",
+            summary="尚未发生的规划",
+            sort_order=1000,
+        )
+        db.add_all([
+            project,
+            first_volume,
+            second_volume,
+            planned,
+            planning_section,
+            chapter,
+        ])
         db.commit()
+        planning_section_id = planning_section.id
 
         job, run = _new_run(db, project, chapter)
         row = _candidate(
@@ -128,13 +146,270 @@ def test_cataloging_preserves_author_owned_chapter_volume():
         assert planned.actual_summary == "正文实际摘要"
         assert chapter.outline_node_id == planned.id
         assert row.target_id == planned.id
+        assert db.get(OutlineNode, planning_section_id) is None
     finally:
         db.close()
         Base.metadata.drop_all(engine)
         engine.dispose()
 
 
-def test_revised_chapter_reconciles_projection_instead_of_appending_duplicates():
+def test_cataloging_replaces_completed_planning_outline_in_place():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    try:
+        project = Project(id="project-completed-outline", title="已完成大纲")
+        planned = OutlineNode(
+            id="outline-completed",
+            project_id=project.id,
+            node_type="chapter",
+            title="第一章 归港",
+            summary="作者已完成的大纲",
+            planned_summary="作者已完成的大纲",
+            status="completed",
+            sort_order=1000,
+        )
+        sibling = OutlineNode(
+            id="outline-sibling",
+            project_id=project.id,
+            node_type="chapter",
+            title="第二章 起航",
+            status="pending",
+            sort_order=2000,
+        )
+        chapter = Chapter(
+            id="chapter-completed-outline",
+            project_id=project.id,
+            outline_node_id=planned.id,
+            title=planned.title,
+            content="正式正文",
+            current_version=1,
+            sort_order=1000,
+        )
+        db.add_all([project, planned, sibling, chapter])
+        db.commit()
+
+        before_ids = {
+            row.id
+            for row in db.query(OutlineNode).filter_by(
+                project_id=project.id,
+                node_type="chapter",
+            ).all()
+        }
+        job, run = _new_run(db, project, chapter)
+        row = _candidate(
+            db,
+            job,
+            run,
+            "outline_create",
+            {
+                "node_type": "chapter",
+                "title": "第一章：归港",
+                "summary": "正文实际摘要",
+            },
+            1,
+        )
+        db.flush()
+        apply_candidates_for_run(db, job, run)
+        db.commit()
+
+        db.refresh(planned)
+        db.refresh(chapter)
+        db.refresh(row)
+        after_ids = {
+            item.id
+            for item in db.query(OutlineNode).filter_by(
+                project_id=project.id,
+                node_type="chapter",
+            ).all()
+        }
+        assert after_ids == before_ids
+        assert chapter.outline_node_id == planned.id
+        assert row.target_id == planned.id
+        assert planned.title == "第一章：归港"
+        assert planned.status == "completed"
+        assert planned.planned_summary == "作者已完成的大纲"
+        assert planned.actual_summary == "正文实际摘要"
+        assert planned.summary == "正文实际摘要"
+        assert planned.source_chapter_id == chapter.id
+        assert planned.cataloging_status == "cataloged"
+    finally:
+        db.close()
+        Base.metadata.drop_all(engine)
+        engine.dispose()
+
+
+def test_recataloging_replaces_projection_without_losing_outline_position():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    try:
+        project = Project(id="project-recatalog-position", title="重建档位置")
+        first_volume = OutlineNode(
+            id="volume-first",
+            project_id=project.id,
+            node_type="volume",
+            title="第一卷",
+            sort_order=0,
+        )
+        second_volume = OutlineNode(
+            id="volume-second",
+            project_id=project.id,
+            node_type="volume",
+            title="第二卷",
+            sort_order=1000,
+        )
+        planned = OutlineNode(
+            id="outline-stable-slot",
+            project_id=project.id,
+            parent_id=second_volume.id,
+            node_type="chapter",
+            title="立项旧名",
+            summary="立项时的情节规划",
+            planned_summary="立项时的情节规划",
+            status="completed",
+            sort_order=7300,
+        )
+        chapter = Chapter(
+            id="chapter-without-number",
+            project_id=project.id,
+            outline_node_id=planned.id,
+            title="没有序号的正文标题",
+            content="第一版正文",
+            current_version=1,
+            sort_order=22000,
+        )
+        db.add_all([project, first_volume, second_volume, planned, chapter])
+        db.commit()
+
+        first_job, first_run = _new_run(db, project, chapter)
+        _candidate(
+            db,
+            first_job,
+            first_run,
+            "outline_update",
+            {
+                "id": planned.id,
+                "node_type": "chapter",
+                "title": "第一版实际标题",
+                "summary": "第一版实际摘要",
+            },
+            1,
+        )
+        _candidate(
+            db,
+            first_job,
+            first_run,
+            "outline_create",
+            {
+                "node_type": "section",
+                "scene_number": 1,
+                "title": "旧场景",
+                "summary": "第一版场景",
+            },
+            2,
+        )
+        db.flush()
+        apply_candidates_for_run(db, first_job, first_run)
+        db.commit()
+
+        first_section = db.query(OutlineNode).filter_by(
+            project_id=project.id,
+            node_type="section",
+        ).one()
+        first_section_id = first_section.id
+        assert planned.title == "第一版实际标题"
+        assert planned.parent_id == second_volume.id
+        assert first_section.parent_id == planned.id
+
+        rollback_cataloging_from_chapter(
+            db,
+            project.id,
+            chapter.id,
+            reason="semantic_edit",
+        )
+        db.commit()
+        db.refresh(chapter)
+        db.refresh(planned)
+        assert chapter.outline_node_id == planned.id
+        assert planned.parent_id == second_volume.id
+        assert planned.sort_order == 7300
+        assert planned.summary == "立项时的情节规划"
+        assert planned.actual_summary is None
+        assert planned.cataloging_status is None
+        assert db.get(OutlineNode, first_section_id) is None
+
+        chapter.current_version = 2
+        chapter.content = "第二版正文"
+        second_job, second_run = _new_run(db, project, chapter)
+        chapter_candidate = _candidate(
+            db,
+            second_job,
+            second_run,
+            "outline_update",
+            {
+                "id": planned.id,
+                "node_type": "chapter",
+                "title": "与立项完全不同的新标题",
+                "summary": "第二版实际摘要",
+            },
+            1,
+        )
+        _candidate(
+            db,
+            second_job,
+            second_run,
+            "outline_create",
+            {
+                "node_type": "section",
+                "scene_number": 1,
+                "title": "新场景",
+                "summary": "第二版场景",
+            },
+            2,
+        )
+        _candidate(
+            db,
+            second_job,
+            second_run,
+            "chapter_link",
+            {
+                "outline_title": "立项旧名",
+                "source": "立项旧名",
+                "characters": [],
+                "worldbuilding_titles": [],
+            },
+            3,
+        )
+        db.flush()
+        apply_candidates_for_run(db, second_job, second_run)
+        db.commit()
+
+        db.refresh(chapter)
+        db.refresh(planned)
+        db.refresh(chapter_candidate)
+        assert chapter.outline_node_id == planned.id
+        assert chapter_candidate.target_id == planned.id
+        assert planned.parent_id == second_volume.id
+        assert planned.sort_order == 7300
+        assert planned.title == "与立项完全不同的新标题"
+        assert planned.summary == "第二版实际摘要"
+        assert planned.actual_summary == "第二版实际摘要"
+        assert planned.source_chapter_id == chapter.id
+        sections = db.query(OutlineNode).filter_by(
+            project_id=project.id,
+            node_type="section",
+        ).all()
+        assert [(item.title, item.parent_id) for item in sections] == [
+            ("新场景", planned.id)
+        ]
+    finally:
+        db.close()
+        Base.metadata.drop_all(engine)
+        engine.dispose()
+
+
+def test_revised_chapter_updates_linked_projection_without_deleting_outline_nodes():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     db = sessionmaker(bind=engine)()
@@ -310,15 +585,18 @@ def test_revised_chapter_reconciles_projection_instead_of_appending_duplicates()
 
         db.refresh(chapter)
         db.refresh(planned)
-        assert chapter.outline_node_id == planned.id
+        assert chapter.outline_node_id == legacy_duplicate.id
         assert planned.title == "第一章 归港"
         assert planned.planned_summary == "作者原定：主角雨夜归港。"
-        assert planned.actual_summary == "新实际摘要"
+        assert planned.actual_summary in {None, ""}
+        db.refresh(legacy_duplicate)
+        assert legacy_duplicate.title == "第一章 归航"
+        assert legacy_duplicate.actual_summary == "新实际摘要"
         assert (
             db.query(OutlineNode)
             .filter(OutlineNode.project_id == project.id, OutlineNode.node_type == "chapter")
             .count()
-            == 1
+            == 2
         )
         sections = (
             db.query(OutlineNode)

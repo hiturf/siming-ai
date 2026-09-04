@@ -12,6 +12,7 @@ import json
 import re
 from typing import Any
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ...database.models import (
@@ -208,7 +209,11 @@ def prepare_reconciled_payload(
             "worldbuilding_update",
         }:
             prepared["id"] = previous.target_id
-        elif candidate.item_type not in {"character_create", "character_update", "character_state_update"}:
+        elif candidate.item_type not in {
+            "character_create",
+            "character_update",
+            "character_state_update",
+        }:
             prepared["_cataloging_target_id"] = previous.target_id
     return prepared
 
@@ -463,16 +468,30 @@ def reconcile_successful_run(db: Session, run: CatalogingChapterRun) -> dict[str
         and row.item_type in {"outline_create", "outline_update"}
         and str(_payload(row).get("node_type") or "chapter").lower() in {"section", "scene"}
     }
-    stale_sections = (
-        db.query(OutlineNode)
-        .filter(
-            OutlineNode.project_id == run.project_id,
-            OutlineNode.source_chapter_id == run.chapter_id,
-            OutlineNode.node_type == "section",
-            OutlineNode.cataloging_status == "cataloged",
+    chapter_outline_ids = {
+        str(row.target_id)
+        for row in applied
+        if row.target_id
+        and row.item_type in {"outline_create", "outline_update"}
+        and str(_payload(row).get("node_type") or "chapter").lower() == "chapter"
+    }
+    stale_sections: list[OutlineNode] = []
+    if chapter_outline_ids:
+        # The latest successful chapter projection replaces the whole scene
+        # collection.  Include initial planning scenes under the stable chapter
+        # slot as well as older catalog-owned scenes, without title matching.
+        stale_sections = (
+            db.query(OutlineNode)
+            .filter(
+                OutlineNode.project_id == run.project_id,
+                OutlineNode.node_type == "section",
+                or_(
+                    OutlineNode.parent_id.in_(chapter_outline_ids),
+                    OutlineNode.source_chapter_id == run.chapter_id,
+                ),
+            )
+            .all()
         )
-        .all()
-    )
     for node in stale_sections:
         if str(node.id) not in section_ids:
             db.delete(node)
