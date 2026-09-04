@@ -7,6 +7,7 @@ FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS frontend-build
 WORKDIR /src/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --ignore-scripts
+COPY contracts/ /src/contracts/
 COPY frontend/ ./
 RUN npm run build
 
