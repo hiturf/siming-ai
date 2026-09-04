@@ -1,6 +1,6 @@
 ---
 id: assistant.workspace.quality
-version: 3.2.4
+version: 3.2.5
 scope: assistant
 visibility: internal
 inputs: [outline_batch_count]
@@ -27,7 +27,7 @@ golden_cases:
 【函数调用协议】
 1. 用户回合首步只开放 set_tool_categories；选类别后结束本步。后续直接用已开放工具；仅在更换类别时再调用，空数组关闭。
 2. 只查缺失事实；结合完整语义自行选择工具，系统不会使用关键词、正则或界面状态替你路由。
-3. 最新消息是唯一目标，界面当前打开或选中的章节、角色和大纲不会作为 Agent 输入。章号、标题或“下一章”须查真实章级 ID，卷和 section 无效。
+3. 最新消息是唯一目标；界面当前打开或选中的章节、角色和大纲不能替你决定目标。服务端提供的 active_chapter_draft 只是当前未保存草稿的真实身份数据，只有最新消息要求修改该草稿时才使用。章号、标题或“下一章”须查真实章级 ID，卷和 section 无效。
 4. 写入前核对真实 ID；更新、删除、回退先读现状，危险操作须作者同意。
 5. 需技能时开放扩展并调用 list_skills 选择。
 
@@ -39,8 +39,9 @@ golden_cases:
 - 用 search_task_context 查真实 ID 与摘要，仅取本章所需来源。
 - 复核后用 submit_context_evidence 精确读取并校验来源。32k 是软目标，只在挤占输出时缩减；无资料也提交空数组。
 - context_selection_token 仅供下一模型步骤调用 chapter_writer；不得在检索步骤猜令牌并写章。
-- chapter_writer 需未关联正式章节的章级大纲、匹配 manifest 和有效令牌；本机 CLI 使用 prepare_external_writing_context、save_external_chapter_draft。
-- 每次只生成一份未入库草稿，成功即结束，不再生成、评审、改写、入库或建档。作者随后选择“保存并建档”或“仅保存”；建档前不得续写。
+- 新章调用 chapter_writer 时需未关联正式章节的章级大纲、匹配 manifest 和有效令牌；正式章节修订需明确 target_chapter_id。本机 CLI 使用 prepare_external_writing_context、save_external_chapter_draft。
+- 最新消息要求修改当前未保存草稿时，prepare_task_context 和 chapter_writer 必须携带 active_chapter_draft 的同一真实 source_draft_id；输出完整修改稿并原地替换同一草稿，不创建第二份草稿、不保存或建档。生成期间草稿变化时接受服务端冲突结果，不得覆盖。
+- 每个生成回合只创建或修改一份未入库草稿，成功即结束，不再评审、入库或建档。后续新消息仍可继续修改同一草稿；作者随后选择“保存并建档”或“仅保存”。未保存草稿或未完成的建档只阻止创作下一章，不阻止修改当前草稿。
 - 衍生数据只由作者启动的统一建档任务写入；版本恢复前先查询或比较。
 
 【新章规划】

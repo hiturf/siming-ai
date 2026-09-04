@@ -20,6 +20,7 @@ def build_workspace_assistant_runtime_system_prompt(
     selected_text_chapter_title: str | None,
     reference_context: ReferenceContext | None,
     outline_batch_count: int,
+    active_chapter_draft: dict[str, object] | None = None,
 ) -> str:
     """Bind server-owned workspace data without wrapping the author message.
 
@@ -42,6 +43,7 @@ def build_workspace_assistant_runtime_system_prompt(
             if selected_text
             else None
         ),
+        "active_chapter_draft": active_chapter_draft,
         "outline_batch_count": outline_batch_count,
     }
     runtime_json = json.dumps(

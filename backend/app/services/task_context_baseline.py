@@ -9,7 +9,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from ..database.models import Chapter, OutlineNode
+from ..database.models import Chapter, ChapterDraft, OutlineNode
 from ..modules.story.domain.outline_contract import OUTLINE_PROPOSAL_MAX_NODES
 from .rag.context_packer import estimate_tokens
 
@@ -137,6 +137,49 @@ def _collect_writing_target(
         )
     )
     coverage["target_outline"] = {
+        "required": True,
+        "status": "covered",
+        "item_count": 1,
+    }
+
+    source_draft_id = str(arguments.get("source_draft_id") or "").strip()
+    if not source_draft_id:
+        return
+    source_draft = db.query(ChapterDraft).filter(
+        ChapterDraft.project_id == project_id,
+        ChapterDraft.id == source_draft_id,
+        ChapterDraft.status == "pending",
+    ).first()
+    if source_draft is None or str(source_draft.outline_node_id or "") != target_id:
+        coverage["target_draft"] = {
+            "required": True,
+            "status": "missing",
+            "item_count": 0,
+            "reason": "The selected pending chapter draft is unavailable or has a different outline.",
+        }
+        return
+
+    from .workspace.generated_drafts import (
+        chapter_draft_source_hash,
+        chapter_draft_source_text,
+    )
+
+    add(
+        ManifestCandidate(
+            category="target_draft",
+            source_type="chapter_draft",
+            source_id=source_draft.id,
+            title=source_draft.title or node.title or "Current unsaved chapter draft",
+            content=chapter_draft_source_text(source_draft),
+            required=True,
+            tier=1,
+            structural_score=1.0,
+            final_score=1.0,
+            selection_reason="Exact pending draft selected by the Agent for revision.",
+            source_hash=chapter_draft_source_hash(source_draft),
+        )
+    )
+    coverage["target_draft"] = {
         "required": True,
         "status": "covered",
         "item_count": 1,

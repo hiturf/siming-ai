@@ -27,7 +27,10 @@ internal class PcPromptContract(context: Context) {
         "outline_batch_count" to "3",
     )
 
-    fun workspaceRuntimeSystem(project: JsonObject): String {
+    fun workspaceRuntimeSystem(
+        project: JsonObject,
+        activeChapterDraft: JsonObject? = null,
+    ): String {
         val runtime = buildJsonObject {
             put("schema", "workspace_assistant_runtime.v1")
             put("data_only", true)
@@ -36,6 +39,15 @@ internal class PcPromptContract(context: Context) {
                 put("title", project.string("title"))
             })
             put("editor_selection", kotlinx.serialization.json.JsonNull)
+            put("active_chapter_draft", activeChapterDraft?.let { draft ->
+                buildJsonObject {
+                    put("id", draft.string("draft_id"))
+                    put("title", draft.string("title"))
+                    put("outline_node_id", draft["outline_node_id"] ?: kotlinx.serialization.json.JsonNull)
+                    put("status", "pending")
+                    put("instruction_priority", "none")
+                }
+            } ?: kotlinx.serialization.json.JsonNull)
             put("outline_batch_count", 3)
         }
         return listOf(
@@ -93,6 +105,7 @@ internal class PcPromptContract(context: Context) {
         characterProfiles: String,
         recentSummaries: String,
         requirements: String,
+        sourceDraft: String = "",
     ): List<JsonObject> {
         val chapter = root["chapter"] as JsonObject
         val style = styleContext(project)
@@ -109,6 +122,13 @@ internal class PcPromptContract(context: Context) {
         )
         if (requirements.isBlank()) {
             user = user.replace("【写作要求】\n\n\n\n", "")
+        }
+        if (sourceDraft.isNotBlank()) {
+            user = listOf(
+                user,
+                "【当前未保存草稿（完整原文）】\n$sourceDraft",
+                "请按作者本轮要求修改上面的当前未保存草稿。必须输出修改后的完整章节正文，不要只给差异、建议或说明；结果仍是同一份未保存草稿。",
+            ).joinToString("\n\n")
         }
         return listOf(message("system", system), message("user", user))
     }

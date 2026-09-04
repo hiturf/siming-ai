@@ -25,7 +25,7 @@ vi.mock('../hooks/useModelOptions', () => ({
 }))
 
 import WriterPage from '../pages/WriterPage'
-import { AiPanelProvider } from '../contexts/AiPanelContext'
+import { AiPanelProvider, useAiPanelContext } from '../contexts/AiPanelContext'
 import { storeNarrativeSourceLocator } from '../features/narrativeGovernance/sourceLocator'
 
 const source = '他站在门边，心中不由得涌起一阵复杂的情绪。值得注意的是，这一切都说明命运已经改变。'
@@ -279,6 +279,70 @@ describe('WriterPage manual writing actions', () => {
       expect.objectContaining({ draft_id: 'draft-2', content: secondDraft.content }),
     ))
     expect(api.put).not.toHaveBeenCalled()
+  })
+
+  it('replaces the editor text when AI returns a new version of the same pending draft', async () => {
+    const pendingDraft = {
+      draft_id: 'draft-same-id',
+      project_id: 'project-1',
+      title: '第二章 旧标题',
+      outline_node_id: 'outline-2',
+      context_manifest_id: 'manifest-before-revision',
+      saved_chapter_id: null,
+      draft_status: 'pending' as const,
+      content: '模型修改前的草稿正文。',
+      word_count: 12,
+    }
+    api.get.mockImplementation((url: string) => {
+      if (url.endsWith('/chapter-drafts/pending')) return Promise.resolve(response(pendingDraft))
+      if (url.endsWith('/outline')) return Promise.resolve(response({ items: [], flat: [], total: 0 }))
+      if (url.endsWith('/chapters')) return Promise.resolve(response({ items: [chapter], total: 1 }))
+      if (url.endsWith('/snapshots')) return Promise.resolve(response({ items: [], total: 0 }))
+      if (url.endsWith('/chapters/chapter-1')) return Promise.resolve(response(chapter))
+      throw new Error(`Unexpected GET ${url}`)
+    })
+
+    function SameDraftRevisionTrigger() {
+      const { openGeneratedDraft } = useAiPanelContext()
+      return (
+        <button type="button" onClick={() => openGeneratedDraft({
+          draftId: pendingDraft.draft_id,
+          projectId: pendingDraft.project_id,
+          title: '第二章 新标题',
+          outlineNodeId: pendingDraft.outline_node_id,
+          contextManifestId: 'manifest-after-revision',
+          savedChapterId: null,
+          draftKind: 'new',
+          targetChapterId: null,
+          baseChapterVersion: null,
+          content: 'AI 返回的同一草稿完整修改稿。',
+          wordCount: 16,
+          status: 'pending',
+        })}>
+          模拟 AI 完成修改
+        </button>
+      )
+    }
+
+    render(
+      <AiPanelProvider>
+        <SameDraftRevisionTrigger />
+        <WriterPage projectId="project-1" />
+      </AiPanelProvider>,
+    )
+
+    const editor = await waitFor(() => {
+      const value = document.querySelector<HTMLTextAreaElement>('.writer-content-input textarea')
+      expect(value).toHaveValue(pendingDraft.content)
+      return value as HTMLTextAreaElement
+    })
+    fireEvent.change(editor, { target: { value: '作者发送请求前刚改过的正文。' } })
+    fireEvent.click(screen.getByRole('button', { name: '模拟 AI 完成修改' }))
+
+    await waitFor(() => expect(editor).toHaveValue('AI 返回的同一草稿完整修改稿。'))
+    expect(await screen.findByText('第二章 新标题 · 未保存')).toBeInTheDocument()
+    expect(api.put).not.toHaveBeenCalled()
+    expect(api.post).not.toHaveBeenCalled()
   })
 
   it('discards a pending AI draft and restores the formal chapter editor', async () => {

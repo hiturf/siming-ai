@@ -125,6 +125,7 @@ async def prepare_task_context(db: Session, project_id: str, args: dict[str, Any
         "target_chapter_id",
         "outline_node_id",
         "target_outline_id",
+        "source_draft_id",
         "target_text",
         "chapter_text",
         "content",

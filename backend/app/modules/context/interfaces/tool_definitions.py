@@ -104,6 +104,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
                 "type": "string",
                 "description": "writing 修订任务对应的既有章节ID",
             },
+            "source_draft_id": {
+                "type": "string",
+                "description": "继续修改当前未保存章节草稿时必填；必须是当前作品真实 pending 草稿ID",
+            },
             "chapter_id": {
                 "type": "string",
                 "description": "cataloging/review/rewrite 的目标章节ID",

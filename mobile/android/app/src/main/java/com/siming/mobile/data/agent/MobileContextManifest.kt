@@ -116,6 +116,7 @@ internal class PcContextManifestPolicy(context: Context) {
 internal data class MobileContextRequest(
     val outlineNodeId: String = "",
     val targetChapterId: String = "",
+    val sourceDraftId: String = "",
     val requirements: String,
     val minimumHanCharacters: Int? = null,
     val taskType: String = "writing",
@@ -127,6 +128,7 @@ internal data class MobileContextRequest(
         put("task_type", taskType)
         put("outline_node_id", outlineNodeId)
         put("target_chapter_id", targetChapterId)
+        put("source_draft_id", sourceDraftId)
         put("requirements", requirements)
         minimumHanCharacters?.let { put("minimum_han_characters", it) }
         put("parent_id", parentId)
@@ -139,6 +141,7 @@ internal data class MobileContextRequest(
             "project=$projectId",
             "outline=$outlineNodeId",
             "chapter=$targetChapterId",
+            "source_draft=$sourceDraftId",
             "task=$taskType",
             "parent=$parentId",
             "insert_after=$insertAfterId",
@@ -152,6 +155,7 @@ internal data class MobileContextRequest(
         fun fromJson(root: JsonObject): MobileContextRequest = MobileContextRequest(
             outlineNodeId = root.stringValue("outline_node_id"),
             targetChapterId = root.stringValue("target_chapter_id"),
+            sourceDraftId = root.stringValue("source_draft_id"),
             requirements = root.stringValue("requirements"),
             minimumHanCharacters = root.optionalInt("minimum_han_characters")
                 ?.takeIf { it in 1..100_000 },
@@ -165,6 +169,7 @@ internal data class MobileContextRequest(
         fun fromArgs(taskType: String, args: JsonObject): MobileContextRequest = MobileContextRequest(
             outlineNodeId = args.stringValue("outline_node_id"),
             targetChapterId = args.stringValue("target_chapter_id"),
+            sourceDraftId = args.stringValue("source_draft_id"),
             requirements = args.stringValue("requirements").trim(),
             minimumHanCharacters = args.optionalInt("minimum_han_characters")
                 ?.takeIf { it in 1..100_000 },
@@ -185,6 +190,7 @@ internal data class MobileContextInputs(
     val styleText: String,
     val primaryRecords: List<JsonObject>,
     val rawRecords: List<JsonObject>,
+    val sourceDraft: MobileChapterWriteRun? = null,
     val contextWindowTokens: Int? = null,
     val maxOutputTokens: Int? = null,
 )
@@ -496,7 +502,10 @@ internal class MobileContextManifestEngine(
 
         addStyle(inputs, candidates, coverage)
         when (policy.taskType) {
-            "writing" -> addTargetOutline(inputs, candidates, coverage)
+            "writing" -> {
+                addTargetOutline(inputs, candidates, coverage)
+                addTargetDraft(inputs, candidates, coverage)
+            }
             "outline_planning" -> addOutlinePosition(inputs, candidates, coverage)
         }
         addRequirements(inputs, candidates, coverage)
@@ -513,7 +522,10 @@ internal class MobileContextManifestEngine(
         val outputReserve = max(policy.minimumOutputReserveTokens, min(configuredLimit, ratioLimit))
         val inputBudget = max(0, window - outputReserve - policy.safetyMarginTokens)
         val selected = budget(candidates, coverage, warnings, inputBudget)
-        val missingRequired = policy.requiredCategories.filter { category ->
+        val requiredCategories = policy.requiredCategories + coverage
+            .filterValues { item -> item.required }
+            .keys
+        val missingRequired = requiredCategories.filter { category ->
             coverage[category]?.status !in setOf("covered", "not_applicable")
         }
         val status = if (missingRequired.isEmpty()) "ready" else "needs_confirmation"
@@ -975,6 +987,48 @@ internal class MobileContextManifestEngine(
             sourceHash = mobileSha256(canonicalMobileJson(target)),
         )
         coverage["target_outline"] = MobileContextCoverage(true, "covered", 1)
+    }
+
+    private fun addTargetDraft(
+        inputs: MobileContextInputs,
+        candidates: MutableList<MobileContextManifestItem>,
+        coverage: MutableMap<String, MobileContextCoverage>,
+    ) {
+        val sourceDraftId = inputs.request.sourceDraftId.trim()
+        if (sourceDraftId.isBlank()) return
+        val draft = inputs.sourceDraft
+        if (
+            draft == null ||
+            draft.id != sourceDraftId ||
+            draft.projectId != inputs.projectId ||
+            draft.state != MobileChapterWriteState.GENERATED ||
+            draft.manifest.request.outlineNodeId != inputs.request.outlineNodeId
+        ) {
+            coverage["target_draft"] = MobileContextCoverage(
+                true,
+                "missing",
+                0,
+                "The selected pending chapter draft is unavailable or has a different outline.",
+            )
+            return
+        }
+        val content = buildJsonObject {
+            put("title", draft.title)
+            put("outline_node_id", draft.manifest.request.outlineNodeId)
+            put("content", draft.content)
+        }.toString()
+        candidates += item(
+            category = "target_draft",
+            sourceType = "chapter_draft",
+            sourceId = draft.id,
+            title = draft.title.ifBlank { "Current unsaved chapter draft" },
+            content = content,
+            required = true,
+            score = 1.0,
+            reason = "Exact pending draft selected by the Agent for revision.",
+            sourceHash = mobileSha256(content),
+        )
+        coverage["target_draft"] = MobileContextCoverage(true, "covered", 1)
     }
 
     private fun addOutlinePosition(

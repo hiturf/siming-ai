@@ -247,6 +247,7 @@ function WorkspaceAssistantChat({
   const historyMessageRequestGate = useRef(createLatestRequestGate<string>())
   const historyTargetRef = useRef<string | null>(null)
   const activeConversationIdRef = useRef<string | null>(null)
+  const generatedDraftRef = useRef(generatedDraft)
   const resumePersistedRunRef = useRef<(
     detail: WorkspaceAssistantRunDetail,
     conversationId: string,
@@ -269,6 +270,10 @@ function WorkspaceAssistantChat({
   useEffect(() => {
     activeConversationIdRef.current = activeConversationId
   }, [activeConversationId])
+
+  useEffect(() => {
+    generatedDraftRef.current = generatedDraft
+  }, [generatedDraft])
 
   const selectedProvider = String(defaultModel || '').split(':', 1)[0]
   const isLocalCliModel = selectedProvider.endsWith('_cli')
@@ -1237,6 +1242,27 @@ function WorkspaceAssistantChat({
     }
     const grantedReadPaths = isOpenCodeCliModel ? proposedReadPaths : []
 
+    const activeChapterDraft = (
+      generatedDraft
+      && generatedDraft.projectId === projectId
+      && generatedDraft.status === 'pending'
+    ) ? generatedDraft : null
+    if (activeChapterDraft) {
+      try {
+        await apiClient.put(
+          `/projects/${projectId}/chapter-drafts/${activeChapterDraft.draftId}`,
+          {
+            title: activeChapterDraft.title,
+            outline_node_id: activeChapterDraft.outlineNodeId,
+            content: activeChapterDraft.content,
+          },
+        )
+      } catch (error) {
+        message.error(error instanceof Error ? error.message : '同步当前未保存草稿失败')
+        return
+      }
+    }
+
     setGenerating(true)
     setModelContextCapacityIssue(null)
     cancelRequestedRef.current = false
@@ -1279,6 +1305,7 @@ function WorkspaceAssistantChat({
           conversation_id: activeConversationId || undefined,
           selected_text: selectedText || undefined,
           selected_text_chapter_id: selectedTextChapterId || undefined,
+          active_chapter_draft_id: activeChapterDraft?.draftId || undefined,
           model: defaultModel || undefined,
           temperature: 0.3,
           max_tokens: undefined,
@@ -1307,7 +1334,7 @@ function WorkspaceAssistantChat({
       const decoder = new TextDecoder()
       let buffer = ''
       let completed = false
-      const handleFrame = (frame: string) => {
+      const handleFrame = async (frame: string) => {
         const data = frame
           .split(/\r?\n/)
           .filter((line) => line.startsWith('data:'))
@@ -1442,8 +1469,35 @@ function WorkspaceAssistantChat({
             .find((action) => generatedDraftFromAction(action, projectId) !== null)
           const nextDraft = draftAction ? generatedDraftFromAction(draftAction, projectId) : null
           if (nextDraft?.status === 'pending') {
-            openGeneratedDraft(nextDraft)
-            navigate(`/project/${encodeURIComponent(projectId)}`)
+            const currentEditorDraft = generatedDraftRef.current
+            const editorChangedWhileRunning = Boolean(
+              activeChapterDraft
+              && currentEditorDraft?.draftId === activeChapterDraft.draftId
+              && currentEditorDraft.status === 'pending'
+              && (
+                currentEditorDraft.title !== activeChapterDraft.title
+                || currentEditorDraft.outlineNodeId !== activeChapterDraft.outlineNodeId
+                || currentEditorDraft.content !== activeChapterDraft.content
+              ),
+            )
+            if (editorChangedWhileRunning && currentEditorDraft) {
+              try {
+                await apiClient.put(
+                  `/projects/${projectId}/chapter-drafts/${currentEditorDraft.draftId}`,
+                  {
+                    title: currentEditorDraft.title,
+                    outline_node_id: currentEditorDraft.outlineNodeId,
+                    content: currentEditorDraft.content,
+                  },
+                )
+                message.warning('AI 修改期间检测到新的手动编辑；编辑器保留手动版本，AI 结果仍可在本次对话中查看')
+              } catch (error) {
+                message.error(error instanceof Error ? error.message : '保留生成期间的手动编辑失败，请重试')
+              }
+            } else {
+              openGeneratedDraft(nextDraft)
+              navigate(`/project/${encodeURIComponent(projectId)}`)
+            }
           }
           const outlineDraftAction = [...(payload.applied_actions || [])]
             .reverse()
@@ -1493,11 +1547,11 @@ function WorkspaceAssistantChat({
         const frames = buffer.split(/\r?\n\r?\n/)
         buffer = frames.pop() || ''
         for (const frame of frames) {
-          if (frame.trim()) handleFrame(frame)
+          if (frame.trim()) await handleFrame(frame)
         }
       }
       buffer += decoder.decode()
-      if (buffer.trim()) handleFrame(buffer)
+      if (buffer.trim()) await handleFrame(buffer)
       if (!completed && !controller.signal.aborted) {
         await reconcileDetachedRun(execution.run, execution)
       }

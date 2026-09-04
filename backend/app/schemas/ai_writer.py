@@ -41,6 +41,10 @@ class WorkspaceAssistantRequest(BaseModel):
     selected_text_chapter_id: str | None = Field(
         None, description="Chapter ID the selected text belongs to"
     )
+    active_chapter_draft_id: str | None = Field(
+        None,
+        description="Current pending editor draft ID; context only and never an intent override",
+    )
     reference_context: ReferenceContext | None = Field(
         None,
         description="Typed data-only reference material for the current exact author message",

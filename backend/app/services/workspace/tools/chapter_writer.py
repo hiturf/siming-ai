@@ -23,17 +23,21 @@ from ....services.cataloging.launcher import (
     find_blocking_chapter_cataloging_job,
     find_cataloging_required_chapter,
 )
-from ....services.context_orchestrator import ContextOrchestrator
 from ....services.chapter_writing_constraints import (
     check_chapter_length,
     recommended_han_character_target,
 )
+from ....services.context_orchestrator import ContextOrchestrator
 from ..generated_drafts import (
     ChapterDraftOutlineConflict,
+    ChapterDraftRevisionConflict,
     ChapterDraftTargetConflict,
     PendingChapterDraftConflict,
+    chapter_draft_result_data,
+    find_chapter_draft,
     find_pending_chapter_draft,
     pending_draft_block_result,
+    replace_pending_chapter_draft_after_ai_revision,
     store_chapter_draft,
 )
 from ..turn_control import AssistantTurnDirective, apply_turn_directive
@@ -68,12 +72,13 @@ def _chapter_writer_target(
     project_id: str,
     outline_node_id: str | None,
     target_chapter_id: str | None,
-) -> tuple[Any | None, Any | None, dict | None]:
+    source_draft_id: str | None,
+) -> tuple[Any | None, Any | None, Any | None, dict | None]:
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
-        return None, None, _writer_result("skipped", "项目不存在")
+        return None, None, None, _writer_result("skipped", "项目不存在")
     if not outline_node_id:
-        return None, None, _writer_result(
+        return None, None, None, _writer_result(
             "skipped",
             "必须先根据用户当前消息确定章级大纲节点，再生成正文",
         )
@@ -83,11 +88,45 @@ def _chapter_writer_target(
         .first()
     )
     if not target_outline or target_outline.node_type != "chapter":
-        return None, None, _writer_result(
+        return None, None, None, _writer_result(
             "skipped",
             "outline_node_id 必须是当前作品的章级节点，不能使用卷级或场景级节点",
             {"outline_node_id": outline_node_id},
         )
+
+    source_draft = None
+    if source_draft_id:
+        pending_draft = find_pending_chapter_draft(db, project_id)
+        source_draft = find_chapter_draft(db, project_id, source_draft_id)
+        if (
+            source_draft is None
+            or str(source_draft.status or "") != "pending"
+            or pending_draft is None
+            or str(pending_draft.id) != source_draft_id
+        ):
+            return None, None, None, _writer_result(
+                "skipped",
+                "source_draft_id 必须是当前作品正在编辑的未保存章节草稿",
+                {"source_draft_id": source_draft_id},
+            )
+        if str(source_draft.outline_node_id or "") != outline_node_id:
+            return None, None, None, _writer_result(
+                "skipped",
+                "当前草稿与所选章级大纲不匹配，未执行修改",
+                {
+                    "source_draft_id": source_draft_id,
+                    "outline_node_id": outline_node_id,
+                },
+            )
+        draft_target_id = str(source_draft.target_chapter_id or "") or None
+        if target_chapter_id and target_chapter_id != draft_target_id:
+            return None, None, None, _writer_result(
+                "skipped",
+                "target_chapter_id 与当前草稿的正式章节目标不匹配",
+                {"source_draft_id": source_draft_id},
+            )
+        target_chapter_id = draft_target_id
+
     existing_chapter = (
         db.query(Chapter)
         .filter(
@@ -98,7 +137,7 @@ def _chapter_writer_target(
     )
     if existing_chapter:
         if not target_chapter_id or str(existing_chapter.id) != target_chapter_id:
-            return None, None, _writer_result(
+            return None, None, None, _writer_result(
                 "skipped",
                 "该章级大纲已关联正式章节，不能覆盖；如需修订，"
                 "必须明确提供该正式章节的 target_chapter_id",
@@ -108,21 +147,25 @@ def _chapter_writer_target(
                 },
             )
     elif target_chapter_id:
-        return None, None, _writer_result(
+        return None, None, None, _writer_result(
             "skipped",
             "target_chapter_id 与所选章级大纲不匹配，未生成修订候选",
             {"outline_node_id": outline_node_id, "target_chapter_id": target_chapter_id},
         )
-    pending_draft = find_pending_chapter_draft(db, project_id)
-    if pending_draft:
-        return None, None, pending_draft_block_result("chapter_writer", pending_draft)
-    blocking_job = find_blocking_chapter_cataloging_job(db, project_id)
-    if blocking_job:
-        return None, None, cataloging_block_result("chapter_writer", blocking_job)
-    required_chapter = find_cataloging_required_chapter(db, project_id)
-    if required_chapter:
-        return None, None, cataloging_required_block_result("chapter_writer", required_chapter)
-    return target_outline, existing_chapter, None
+    if source_draft is None:
+        pending_draft = find_pending_chapter_draft(db, project_id)
+        if pending_draft:
+            return None, None, None, pending_draft_block_result("chapter_writer", pending_draft)
+        # Cataloging gates progression to another chapter. A reviewable
+        # revision of the current formal chapter does not advance the story.
+        if target_chapter_id is None:
+            blocking_job = find_blocking_chapter_cataloging_job(db, project_id)
+            if blocking_job:
+                return None, None, None, cataloging_block_result("chapter_writer", blocking_job)
+            required_chapter = find_cataloging_required_chapter(db, project_id)
+            if required_chapter:
+                return None, None, None, cataloging_required_block_result("chapter_writer", required_chapter)
+    return target_outline, existing_chapter, source_draft, None
 
 
 def _prepare_chapter_writer_manifest(
@@ -130,6 +173,7 @@ def _prepare_chapter_writer_manifest(
     project_id: str,
     args: dict[str, Any],
     outline_node_id: str,
+    source_draft_id: str | None,
 ) -> tuple[ContextOrchestrator, Any | None, dict | None]:
     # Writing never creates context implicitly. The outer Agent must first
     # inspect the compact anchors, search focused gaps, and finalize exact
@@ -155,6 +199,7 @@ def _prepare_chapter_writer_manifest(
         token=selection_token,
         task_type="writing",
         outline_node_id=outline_node_id,
+        source_draft_id=source_draft_id,
     )
     if not manifest_ok:
         status = (
@@ -237,6 +282,10 @@ async def _generate_chapter_prose(
         generation_items,
         categories={"user_requirement"},
     )
+    source_draft = _manifest_item_text(
+        generation_items,
+        categories={"target_draft"},
+    )
     messages = compose_chapter_writer_messages(
         pack=get_chapter_pack(),
         style_context=style_ctx,
@@ -245,6 +294,7 @@ async def _generate_chapter_prose(
         character_profiles=characters,
         recent_summaries=summaries,
         requirements=requirements,
+        source_draft=source_draft,
     )
     timeout_seconds, max_output_tokens = _chapter_writer_limits(model)
     max_output_tokens = min(max_output_tokens, max(1, manifest.output_reserve_tokens))
@@ -293,11 +343,13 @@ async def chapter_writer(
     """Generate an independent chapter draft for the model-selected outline."""
     outline_node_id = str(args.get("outline_node_id") or "").strip() or None
     target_chapter_id = str(args.get("target_chapter_id") or "").strip() or None
-    target_outline, target_chapter, preflight_error = _chapter_writer_target(
+    source_draft_id = str(args.get("source_draft_id") or "").strip() or None
+    target_outline, target_chapter, source_draft, preflight_error = _chapter_writer_target(
         db,
         project_id,
         outline_node_id,
         target_chapter_id,
+        source_draft_id,
     )
     if preflight_error:
         return preflight_error
@@ -309,6 +361,7 @@ async def chapter_writer(
         project_id,
         args,
         str(outline_node_id),
+        source_draft_id,
     )
     if manifest_error:
         return manifest_error
@@ -361,19 +414,52 @@ async def chapter_writer(
             },
         )
 
+    stored_draft = None
     try:
-        draft_id = store_chapter_draft(
-            project_id=project_id,
-            content=content,
-            title=outline_title,
-            outline_node_id=outline_node_id,
-            context_manifest_id=manifest_id,
-            target_chapter_id=target_chapter_id,
-            base_chapter_version=base_chapter_version,
-            db=db,
-        )
+        if source_draft_id:
+            source_item = next(
+                (
+                    item
+                    for item in orchestrator.task_generation_items(manifest)
+                    if item.category == "target_draft"
+                    and str(item.source_id or "") == source_draft_id
+                ),
+                None,
+            )
+            stored_draft = replace_pending_chapter_draft_after_ai_revision(
+                db,
+                project_id,
+                source_draft_id,
+                expected_source_hash=str(getattr(source_item, "source_hash", "") or ""),
+                content=content,
+                context_manifest_id=manifest_id,
+            )
+            draft_id = source_draft_id
+        else:
+            draft_id = store_chapter_draft(
+                project_id=project_id,
+                content=content,
+                title=outline_title,
+                outline_node_id=outline_node_id,
+                context_manifest_id=manifest_id,
+                target_chapter_id=target_chapter_id,
+                base_chapter_version=base_chapter_version,
+                db=db,
+            )
     except PendingChapterDraftConflict as conflict:
         return pending_draft_block_result("chapter_writer", conflict.draft)
+    except ChapterDraftRevisionConflict as conflict:
+        data = (
+            chapter_draft_result_data(conflict.draft, db=db)
+            if conflict.draft is not None
+            else {"draft_id": source_draft_id}
+        )
+        data["late_result_discarded"] = True
+        return _writer_result(
+            "skipped",
+            f"{conflict.reason}；迟到的 AI 修改未覆盖当前内容",
+            data,
+        )
     except ChapterDraftOutlineConflict as conflict:
         return _writer_result(
             "skipped",
@@ -393,21 +479,37 @@ async def chapter_writer(
             {"target_chapter_id": conflict.target_chapter_id},
         )
 
+    result_draft_kind = (
+        str(stored_draft.draft_kind or "new")
+        if stored_draft is not None
+        else ("revision" if target_chapter_id else "new")
+    )
+    result_target_chapter_id = (
+        stored_draft.target_chapter_id if stored_draft is not None else target_chapter_id
+    )
+    result_base_chapter_version = (
+        stored_draft.base_chapter_version if stored_draft is not None else base_chapter_version
+    )
     return apply_turn_directive({
         "tool": "chapter_writer",
         "status": "ok",
-        "detail": f"已生成章节草稿（{count_words(content)} 字），尚未保存",
+        "detail": (
+            f"已修改当前章节草稿（{count_words(content)} 字），仍未保存"
+            if source_draft_id
+            else f"已生成章节草稿（{count_words(content)} 字），尚未保存"
+        ),
         "data": {
             "draft_id": draft_id,
             "content_ref": draft_id,
             "content": content,
-            "title": outline_title,
+            "title": str(stored_draft.title or "") if stored_draft is not None else outline_title,
             "outline_node_id": outline_node_id,
             "draft_status": "pending",
-            "draft_kind": "revision" if target_chapter_id else "new",
-            "target_chapter_id": target_chapter_id,
-            "base_chapter_version": base_chapter_version,
-            "next_actions": ["save_and_catalog", "save_only"],
+            "draft_kind": result_draft_kind,
+            "target_chapter_id": result_target_chapter_id,
+            "base_chapter_version": result_base_chapter_version,
+            "source_draft_id": source_draft_id,
+            "next_actions": ["revise_draft", "save_and_catalog", "save_only", "discard"],
             "word_count": count_words(content),
             "han_character_count": length_check.actual_han_characters,
             "minimum_han_characters": length_check.minimum_han_characters,

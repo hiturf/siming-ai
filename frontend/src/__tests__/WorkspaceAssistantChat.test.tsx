@@ -1,17 +1,19 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Modal, message } from 'antd'
+import { useEffect } from 'react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { mockDelete, mockGet, mockPost } = vi.hoisted(() => ({
+const { mockDelete, mockGet, mockPost, mockPut } = vi.hoisted(() => ({
   mockDelete: vi.fn(),
   mockGet: vi.fn(),
   mockPost: vi.fn(),
+  mockPut: vi.fn(),
 }))
 
 vi.mock('../api/client', () => ({
-  apiClient: { delete: mockDelete, get: mockGet, post: mockPost },
+  apiClient: { delete: mockDelete, get: mockGet, post: mockPost, put: mockPut },
 }))
 
 vi.mock('../shared/operations/queries', () => ({
@@ -19,6 +21,7 @@ vi.mock('../shared/operations/queries', () => ({
 }))
 
 import WorkspaceAssistantChat from '../components/WorkspaceAssistantChat'
+import { AiPanelProvider, useAiPanelContext } from '../contexts/AiPanelContext'
 
 const encoder = new TextEncoder()
 
@@ -154,6 +157,7 @@ describe('WorkspaceAssistantChat cancellation and recovery', () => {
     mockGet.mockResolvedValue({ data: { data: { items: [], total: 0 } } })
     mockDelete.mockResolvedValue({ data: { data: null } })
     mockPost.mockResolvedValue({ data: { data: { status: 'cancelled' } } })
+    mockPut.mockResolvedValue({ data: { data: null } })
   })
 
   it('submits only one cancellation and exposes the pending state', async () => {
@@ -549,6 +553,166 @@ describe('WorkspaceAssistantChat cancellation and recovery', () => {
     })
     const lastPostPayload = mockPost.mock.calls[mockPost.mock.calls.length - 1]?.[1]
     expect(lastPostPayload).not.toHaveProperty('target_chapter_id')
+  })
+
+  it('syncs the current editor draft and binds its id before asking AI to revise it', async () => {
+    const stream = createControlledResponse([
+      conversationEvent + runEvent + sse({
+        type: 'complete',
+        data: {
+          reply: '正在修改当前草稿。',
+          actions: [],
+          applied_actions: [],
+          tool_logs: [],
+          run: { id: 'run-1', operation_id: 'operation-1', status: 'completed', phase: 'completed' },
+        },
+      }) + sse('[DONE]'),
+    ])
+    stream.close()
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      stream.bindSignal(init?.signal)
+      return Promise.resolve(stream.response)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    function PendingDraftChat() {
+      const { openGeneratedDraft } = useAiPanelContext()
+      useEffect(() => {
+        openGeneratedDraft({
+          draftId: 'draft-current',
+          projectId: 'project-1',
+          title: '第一章 潮声',
+          outlineNodeId: 'outline-1',
+          contextManifestId: 'manifest-old',
+          savedChapterId: null,
+          draftKind: 'new',
+          targetChapterId: null,
+          baseChapterVersion: null,
+          content: '编辑器中最新的未保存正文。',
+          wordCount: 14,
+          status: 'pending',
+        })
+      }, [openGeneratedDraft])
+      return (
+        <WorkspaceAssistantChat
+          projectId="project-1"
+          defaultModel="openai:test"
+          modelOptions={[{ value: 'openai:test', label: 'OpenAI · test' }]}
+        />
+      )
+    }
+
+    render(
+      <MemoryRouter>
+        <AiPanelProvider>
+          <PendingDraftChat />
+        </AiPanelProvider>
+      </MemoryRouter>,
+    )
+    const user = userEvent.setup()
+    await user.type(screen.getByPlaceholderText(/告诉AI你想写什么/), '把结尾改得更紧张')
+    await user.click(screen.getByRole('button', { name: /发送/ }))
+
+    await waitFor(() => expect(mockPut).toHaveBeenCalledWith(
+      '/projects/project-1/chapter-drafts/draft-current',
+      {
+        title: '第一章 潮声',
+        outline_node_id: 'outline-1',
+        content: '编辑器中最新的未保存正文。',
+      },
+    ))
+    const requestBody = JSON.parse(String(fetchMock.mock.calls[0][1]?.body))
+    expect(requestBody.active_chapter_draft_id).toBe('draft-current')
+    expect(requestBody.message).toBe('把结尾改得更紧张')
+  })
+
+  it('keeps newer manual edits when the same-draft AI result arrives late', async () => {
+    const stream = createControlledResponse([conversationEvent + runEvent])
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      stream.bindSignal(init?.signal)
+      return Promise.resolve(stream.response)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    function EditableDraftChat() {
+      const { generatedDraft, openGeneratedDraft, updateGeneratedDraft } = useAiPanelContext()
+      useEffect(() => {
+        openGeneratedDraft({
+          draftId: 'draft-current',
+          projectId: 'project-1',
+          title: '第一章 潮声',
+          outlineNodeId: 'outline-1',
+          contextManifestId: 'manifest-old',
+          savedChapterId: null,
+          draftKind: 'new',
+          targetChapterId: null,
+          baseChapterVersion: null,
+          content: '发起修改时的草稿。',
+          wordCount: 10,
+          status: 'pending',
+        })
+      }, [openGeneratedDraft])
+      return (
+        <>
+          <button type="button" onClick={() => updateGeneratedDraft({ content: '等待期间的手动编辑。' })}>
+            手动编辑草稿
+          </button>
+          <output data-testid="current-draft-content">{generatedDraft?.content}</output>
+          <WorkspaceAssistantChat
+            projectId="project-1"
+            defaultModel="openai:test"
+            modelOptions={[{ value: 'openai:test', label: 'OpenAI · test' }]}
+          />
+        </>
+      )
+    }
+
+    render(
+      <MemoryRouter>
+        <AiPanelProvider>
+          <EditableDraftChat />
+        </AiPanelProvider>
+      </MemoryRouter>,
+    )
+    const user = userEvent.setup()
+    await user.type(screen.getByPlaceholderText(/告诉AI你想写什么/), '修改当前草稿')
+    await user.click(screen.getByRole('button', { name: /发送/ }))
+    await waitFor(() => expect(mockPut).toHaveBeenCalledTimes(1))
+
+    await user.click(screen.getByRole('button', { name: '手动编辑草稿' }))
+    stream.push(sse({
+      type: 'complete',
+      data: {
+        reply: '当前草稿已修改。',
+        actions: [],
+        applied_actions: [{
+          tool: 'chapter_writer',
+          status: 'ok',
+          data: {
+            draft_id: 'draft-current',
+            title: '第一章 潮声',
+            outline_node_id: 'outline-1',
+            context_manifest_id: 'manifest-ai-result',
+            content: '迟到的 AI 完整修改稿。',
+            draft_status: 'pending',
+          },
+        }],
+        tool_logs: [],
+        run: { id: 'run-1', operation_id: 'operation-1', status: 'completed', phase: 'completed' },
+      },
+    }), sse('[DONE]'))
+    stream.close()
+
+    await waitFor(() => expect(mockPut).toHaveBeenCalledTimes(2))
+    expect(mockPut).toHaveBeenLastCalledWith(
+      '/projects/project-1/chapter-drafts/draft-current',
+      {
+        title: '第一章 潮声',
+        outline_node_id: 'outline-1',
+        content: '等待期间的手动编辑。',
+      },
+    )
+    expect(screen.getByTestId('current-draft-content')).toHaveTextContent('等待期间的手动编辑。')
   })
 
   it('lets the author discard a generated chapter draft from its chat card', async () => {

@@ -67,6 +67,7 @@ def _external_writing_context_result(
     project: Any,
     target_outline: Any,
     target_chapter: Any | None,
+    source_draft: Any | None,
     manifest: Any,
     manifest_payload: dict[str, Any],
     args: dict[str, Any],
@@ -126,6 +127,8 @@ def _external_writing_context_result(
         })
         if target_chapter:
             page_arguments["target_chapter_id"] = target_chapter.id
+        if source_draft:
+            page_arguments["source_draft_id"] = source_draft.id
     detail = (
         f"Compact writing anchors prepared: {manifest.estimated_input_tokens}/"
         f"{manifest.input_budget_tokens} available input tokens; "
@@ -180,6 +183,7 @@ def _external_writing_context_result(
                 "base_chapter_version": (
                     int(target_chapter.current_version or 1) if target_chapter else None
                 ),
+                "source_draft_id": source_draft.id if source_draft else None,
             },
             "prompt_pack": {key: value for key, value in prompt_pack.items() if key != "system_prompt"} if prompt_pack else None,
             "context_manifest_id": manifest.id,
@@ -199,7 +203,11 @@ def _external_writing_context_result(
             },
             "warnings": list(dict.fromkeys(warnings)),
             "workflow_boundaries": {
-                "current_task": "chapter_revision" if target_chapter else "base_chapter_writing",
+                "current_task": (
+                    "pending_draft_revision"
+                    if source_draft
+                    else ("chapter_revision" if target_chapter else "base_chapter_writing")
+                ),
                 "de_ai_revision": "separate_user_action",
                 "quality_review": "separate_user_action",
             },
@@ -216,6 +224,10 @@ async def prepare_external_writing_context(
     """Prepare one governed, API-free context package for chapter writing."""
     from app.database.models import Chapter, OutlineNode, Project
     from app.services.context_orchestrator import ContextOrchestrator
+    from app.services.workspace.generated_drafts import (
+        find_chapter_draft,
+        find_pending_chapter_draft,
+    )
 
     try:
         args = normalize_writing_arguments(args)
@@ -262,6 +274,35 @@ async def prepare_external_writing_context(
             "detail": "outline_node_id must identify a chapter node in the current project.",
             "data": {"outline_node_id": outline_node_id},
         }
+    source_draft_id = str(args.get("source_draft_id") or "").strip() or None
+    source_draft = None
+    if source_draft_id:
+        pending = find_pending_chapter_draft(db, project_id)
+        source_draft = find_chapter_draft(db, project_id, source_draft_id)
+        if (
+            source_draft is None
+            or str(source_draft.status or "") != "pending"
+            or pending is None
+            or str(pending.id) != source_draft_id
+            or str(source_draft.outline_node_id or "") != outline_node_id
+        ):
+            return {
+                "tool": "prepare_external_writing_context",
+                "status": "skipped",
+                "detail": "source_draft_id must identify the current pending draft for this outline.",
+                "data": {"source_draft_id": source_draft_id},
+            }
+        draft_target_id = str(source_draft.target_chapter_id or "").strip()
+        requested_target_id = str(args.get("target_chapter_id") or "").strip()
+        if requested_target_id and requested_target_id != draft_target_id:
+            return {
+                "tool": "prepare_external_writing_context",
+                "status": "skipped",
+                "detail": "target_chapter_id does not match the current pending draft.",
+                "data": {"source_draft_id": source_draft_id},
+            }
+        args["target_chapter_id"] = draft_target_id or None
+
     existing_chapter = db.query(Chapter).filter(
         Chapter.project_id == project_id,
         Chapter.outline_node_id == outline_node_id,
@@ -339,6 +380,7 @@ async def prepare_external_writing_context(
         project,
         target_outline,
         existing_chapter,
+        source_draft,
         manifest,
         manifest_payload,
         args,
@@ -351,6 +393,7 @@ def _external_draft_manifest_error(
     args: dict[str, Any],
     context_manifest_id: str | None,
     outline_node_id: str,
+    source_draft_id: str | None,
 ) -> dict | None:
     if not context_manifest_id:
         return {
@@ -380,6 +423,7 @@ def _external_draft_manifest_error(
         token=selection_token,
         task_type="writing",
         outline_node_id=outline_node_id,
+        source_draft_id=source_draft_id,
     )
     if usable:
         if not orchestrator.mark_consumed(manifest):
@@ -569,10 +613,14 @@ async def save_external_chapter_draft(
     from app.services.context_orchestrator import ContextOrchestrator
     from app.services.workspace.generated_drafts import (
         ChapterDraftOutlineConflict,
+        ChapterDraftRevisionConflict,
         ChapterDraftTargetConflict,
         PendingChapterDraftConflict,
+        chapter_draft_result_data,
+        find_chapter_draft,
         find_pending_chapter_draft,
         pending_draft_block_result,
+        replace_pending_chapter_draft_after_ai_revision,
         store_chapter_draft,
     )
     from app.services.workspace.turn_control import AssistantTurnDirective, apply_turn_directive
@@ -588,6 +636,62 @@ async def save_external_chapter_draft(
 
     context_manifest_id = str(args.get("context_manifest_id") or "").strip() or None
     source_agent = str(args.get("source_agent") or "external").strip()
+    source_draft_id = str(args.get("source_draft_id") or "").strip() or None
+    source_draft = None
+    if source_draft_id:
+        pending = find_pending_chapter_draft(db, project_id)
+        source_draft = find_chapter_draft(db, project_id, source_draft_id)
+        requested_outline_id = str(args.get("outline_node_id") or "").strip()
+        if (
+            source_draft is None
+            or str(source_draft.status or "") != "pending"
+            or pending is None
+            or str(pending.id) != source_draft_id
+            or str(source_draft.outline_node_id or "") != requested_outline_id
+        ):
+            return {
+                "tool": "save_external_chapter_draft",
+                "status": "skipped",
+                "detail": "source_draft_id must identify the current pending draft for this outline.",
+                "data": {"source_draft_id": source_draft_id},
+            }
+        args = dict(args)
+        draft_target_id = str(source_draft.target_chapter_id or "").strip() or None
+        supplied_target_id = str(args.get("target_chapter_id") or "").strip() or None
+        if supplied_target_id and supplied_target_id != draft_target_id:
+            return {
+                "tool": "save_external_chapter_draft",
+                "status": "skipped",
+                "detail": "target_chapter_id does not match the current pending draft.",
+                "data": {"source_draft_id": source_draft_id},
+            }
+        args["target_chapter_id"] = draft_target_id
+        if draft_target_id:
+            supplied_base = args.get("base_chapter_version")
+            try:
+                supplied_base_version = (
+                    int(supplied_base) if supplied_base is not None else None
+                )
+            except (TypeError, ValueError):
+                return {
+                    "tool": "save_external_chapter_draft",
+                    "status": "skipped",
+                    "detail": (
+                        "base_chapter_version must be the integer returned by "
+                        "prepare_external_writing_context."
+                    ),
+                    "data": {"source_draft_id": source_draft_id},
+                }
+            if supplied_base_version is not None and supplied_base_version != int(
+                source_draft.base_chapter_version or 0
+            ):
+                return {
+                    "tool": "save_external_chapter_draft",
+                    "status": "skipped",
+                    "detail": "base_chapter_version does not match the current pending draft.",
+                    "data": {"source_draft_id": source_draft_id},
+                }
+            args["base_chapter_version"] = source_draft.base_chapter_version
     (
         outline_node_id,
         title,
@@ -600,20 +704,21 @@ async def save_external_chapter_draft(
     assert outline_node_id is not None
 
     pending_draft = find_pending_chapter_draft(db, project_id)
-    if pending_draft:
+    if pending_draft and source_draft is None:
         return pending_draft_block_result("save_external_chapter_draft", pending_draft)
-    blocking_job = find_blocking_chapter_cataloging_job(
-        db,
-        project_id,
-    )
-    if blocking_job:
-        return cataloging_block_result("save_external_chapter_draft", blocking_job)
-    required_chapter = find_cataloging_required_chapter(
-        db,
-        project_id,
-    )
-    if required_chapter:
-        return cataloging_required_block_result("save_external_chapter_draft", required_chapter)
+    if source_draft is None and target_chapter_id is None:
+        blocking_job = find_blocking_chapter_cataloging_job(
+            db,
+            project_id,
+        )
+        if blocking_job:
+            return cataloging_block_result("save_external_chapter_draft", blocking_job)
+        required_chapter = find_cataloging_required_chapter(
+            db,
+            project_id,
+        )
+        if required_chapter:
+            return cataloging_required_block_result("save_external_chapter_draft", required_chapter)
 
     length_error = _external_draft_length_error(
         db,
@@ -631,23 +736,60 @@ async def save_external_chapter_draft(
         args,
         context_manifest_id,
         outline_node_id,
+        source_draft_id,
     )
     if manifest_error:
         return manifest_error
 
     try:
-        draft_id = store_chapter_draft(
-            project_id=project_id,
-            content=content,
-            title=title,
-            outline_node_id=outline_node_id,
-            context_manifest_id=context_manifest_id,
-            target_chapter_id=target_chapter_id or None,
-            base_chapter_version=base_chapter_version,
-            db=db,
-        )
+        if source_draft_id:
+            manifest = ContextOrchestrator(db).get_manifest(
+                context_manifest_id, project_id
+            ) if context_manifest_id else None
+            source_item = next(
+                (
+                    item
+                    for item in ContextOrchestrator(db).task_generation_items(manifest)
+                    if item.category == "target_draft"
+                    and str(item.source_id or "") == source_draft_id
+                ),
+                None,
+            ) if manifest is not None else None
+            source_draft = replace_pending_chapter_draft_after_ai_revision(
+                db,
+                project_id,
+                source_draft_id,
+                expected_source_hash=str(getattr(source_item, "source_hash", "") or ""),
+                content=content,
+                context_manifest_id=str(context_manifest_id or ""),
+            )
+            draft_id = source_draft_id
+        else:
+            draft_id = store_chapter_draft(
+                project_id=project_id,
+                content=content,
+                title=title,
+                outline_node_id=outline_node_id,
+                context_manifest_id=context_manifest_id,
+                target_chapter_id=target_chapter_id or None,
+                base_chapter_version=base_chapter_version,
+                db=db,
+            )
     except PendingChapterDraftConflict as conflict:
         return pending_draft_block_result("save_external_chapter_draft", conflict.draft)
+    except ChapterDraftRevisionConflict as conflict:
+        data = (
+            chapter_draft_result_data(conflict.draft, db=db)
+            if conflict.draft is not None
+            else {"draft_id": source_draft_id}
+        )
+        data["late_result_discarded"] = True
+        return {
+            "tool": "save_external_chapter_draft",
+            "status": "skipped",
+            "detail": f"{conflict.reason}; the late external revision did not overwrite the draft.",
+            "data": data,
+        }
     except ChapterDraftOutlineConflict as conflict:
         return {
             "tool": "save_external_chapter_draft",
@@ -683,19 +825,34 @@ async def save_external_chapter_draft(
     return apply_turn_directive({
         "tool": "save_external_chapter_draft",
         "status": "ok",
-        "detail": f"章节草稿已生成（{count_words(content)} 字），尚未保存；本轮必须结束",
+        "detail": (
+            f"当前章节草稿已修改（{count_words(content)} 字），仍未保存；本轮必须结束"
+            if source_draft_id
+            else f"章节草稿已生成（{count_words(content)} 字），尚未保存；本轮必须结束"
+        ),
         "data": {
             "draft_id": draft_id,
             "content_ref": draft_id,
-            "title": title,
+            "title": str(source_draft.title or "") if source_draft is not None else title,
             "outline_node_id": outline_node_id,
             "context_manifest_id": context_manifest_id,
             "content": content,
             "draft_status": "pending",
-            "draft_kind": "revision" if target_chapter_id else "new",
-            "target_chapter_id": target_chapter_id or None,
-            "base_chapter_version": base_chapter_version,
-            "next_actions": ["save_and_catalog", "save_only"],
+            "draft_kind": (
+                str(source_draft.draft_kind or "new")
+                if source_draft is not None
+                else ("revision" if target_chapter_id else "new")
+            ),
+            "target_chapter_id": (
+                source_draft.target_chapter_id if source_draft is not None else target_chapter_id
+            ) or None,
+            "base_chapter_version": (
+                source_draft.base_chapter_version
+                if source_draft is not None
+                else base_chapter_version
+            ),
+            "source_draft_id": source_draft_id,
+            "next_actions": ["revise_draft", "save_and_catalog", "save_only", "discard"],
             "word_count": count_words(content),
             "han_character_count": length_check.actual_han_characters,
             "minimum_han_characters": length_check.minimum_han_characters,
@@ -816,14 +973,28 @@ async def get_external_chapter_draft(
 
     API-free: reads from draft storage.
     """
-    from app.services.workspace.generated_drafts import get_chapter_draft
+    from app.services.workspace.generated_drafts import (
+        chapter_draft_result_data,
+        get_chapter_draft,
+        latest_pending_chapter_draft,
+    )
 
     draft_id = str(args.get("draft_id") or args.get("content_ref") or "").strip()
     if not draft_id:
+        from app.database.models import ChapterDraft
+
+        pending = latest_pending_chapter_draft(db, project_id)
+        if isinstance(pending, ChapterDraft):
+            return {
+                "tool": "get_external_chapter_draft",
+                "status": "ok",
+                "detail": "Current pending chapter draft retrieved.",
+                "data": chapter_draft_result_data(pending, db=db),
+            }
         return {
             "tool": "get_external_chapter_draft",
             "status": "skipped",
-            "detail": "draft_id is required",
+            "detail": "No pending chapter draft exists in this project.",
             "data": None,
         }
 
@@ -836,7 +1007,6 @@ async def get_external_chapter_draft(
             "data": None,
         }
 
-    # get_chapter_draft returns the content string directly
     content = draft_content if isinstance(draft_content, str) else str(draft_content)
 
     return {

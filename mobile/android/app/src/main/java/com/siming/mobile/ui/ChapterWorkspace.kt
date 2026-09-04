@@ -1,5 +1,6 @@
 package com.siming.mobile.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -166,6 +167,23 @@ internal fun PendingChapterDraftEditorScreen(
         if (title.isBlank() && draft.title.isNotBlank()) title = draft.title
     }
 
+    val leaveEditor = {
+        if (!busy) {
+            if (draft.generating) {
+                viewModel.cancelAssistant(draft.projectId)
+                onBack()
+            } else {
+                viewModel.updatePendingChapterDraft(
+                    draft,
+                    title,
+                    content,
+                    onUpdated = onBack,
+                )
+            }
+        }
+    }
+    BackHandler(onBack = leaveEditor)
+
     Scaffold(
         containerColor = SimingPaper,
         topBar = {
@@ -184,10 +202,7 @@ internal fun PendingChapterDraftEditorScreen(
                     }
                 },
                 navigationIcon = {
-                    IconButton(onClick = {
-                        if (draft.generating) viewModel.cancelAssistant(draft.projectId)
-                        onBack()
-                    }) {
+                    IconButton(onClick = leaveEditor, enabled = !busy) {
                         Icon(Icons.AutoMirrored.Outlined.ArrowBack, "返回")
                     }
                 },
@@ -278,6 +293,13 @@ internal fun PendingChapterDraftEditorScreen(
                 ) {
                     Text(if (showingFormalText) "返回修订候选" else "对比当前正式正文")
                 }
+            }
+            if (!draft.generating && !showingFormalText) {
+                Text(
+                    "如果对草稿不满意，可以返回 AI 工作区直接要求司命修改当前草稿；无需先保存或建档。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
             }
             OutlinedTextField(
                 value = if (showingFormalText) draft.targetChapterTitle.orEmpty() else title,

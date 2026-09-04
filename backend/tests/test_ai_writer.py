@@ -512,7 +512,7 @@ class AIChapterDraftFlowTestCase(unittest.TestCase):
                 word_count=12,
                 sort_order=1000,
                 current_version=1,
-                cataloging_required=False,
+                cataloging_required=True,
             )
             db.add(chapter)
             db.commit()
@@ -561,6 +561,173 @@ class AIChapterDraftFlowTestCase(unittest.TestCase):
         self.assertEqual(result["data"]["draft_kind"], "revision")
         self.assertEqual(result["data"]["target_chapter_id"], chapter_id)
         mock_completion.assert_awaited_once()
+
+    @patch(
+        "app.services.workspace.tools.chapter_writer.LLMGateway.chat_completion",
+        new_callable=AsyncMock,
+    )
+    def test_chapter_writer_revises_same_pending_draft_without_cataloging(self, mock_completion):
+        from app.services.context_orchestrator import ContextOrchestrator
+
+        project_id = self.create_project("Revise pending draft")
+        outline_id = self.create_outline(project_id, "第一章 雾港")
+        db = SessionLocal()
+        try:
+            draft_id = store_chapter_draft(
+                project_id=project_id,
+                title="第一章 雾港",
+                outline_node_id=outline_id,
+                content="旧草稿里，雾港没有风。",
+                db=db,
+            )
+            orchestrator = ContextOrchestrator(db)
+            manifest = orchestrator.prepare(
+                project_id=project_id,
+                task_type="writing",
+                model="openai:gpt-test",
+                arguments={
+                    "outline_node_id": outline_id,
+                    "source_draft_id": draft_id,
+                    "requirements": "让风暴提前出现",
+                },
+            )
+            selection = orchestrator.submit_evidence(manifest, [])
+            mock_completion.return_value = {
+                "content": "修改后的完整草稿里，风暴越过雾港外墙。",
+                "model": "gpt-test",
+            }
+
+            result = asyncio.run(_execute_workspace_action(
+                db,
+                project_id,
+                {
+                    "tool": "chapter_writer",
+                    "arguments": {
+                        "outline_node_id": outline_id,
+                        "source_draft_id": draft_id,
+                        "context_manifest_id": manifest.id,
+                        "context_selection_token": selection["context_selection_token"],
+                    },
+                },
+            ))
+
+            stored = db.get(ChapterDraft, draft_id)
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["data"]["draft_id"], draft_id)
+            self.assertEqual(result["data"]["source_draft_id"], draft_id)
+            self.assertEqual(stored.status, "pending")
+            self.assertEqual(stored.content, "修改后的完整草稿里，风暴越过雾港外墙。")
+            self.assertEqual(db.query(ChapterDraft).count(), 1)
+            self.assertEqual(db.query(Chapter).count(), 0)
+            prompt = json.dumps(mock_completion.await_args.kwargs["messages"], ensure_ascii=False)
+            self.assertIn("旧草稿里，雾港没有风。", prompt)
+            self.assertIn("输出修改后的完整章节正文", prompt)
+        finally:
+            db.close()
+
+    @patch(
+        "app.services.workspace.tools.chapter_writer.LLMGateway.chat_completion",
+        new_callable=AsyncMock,
+    )
+    def test_late_ai_draft_revision_does_not_overwrite_newer_editor_text(self, mock_completion):
+        from app.services.context_orchestrator import ContextOrchestrator
+
+        project_id = self.create_project("Late draft revision")
+        outline_id = self.create_outline(project_id, "第一章 灯塔")
+        db = SessionLocal()
+        try:
+            draft_id = store_chapter_draft(
+                project_id=project_id,
+                title="第一章 灯塔",
+                outline_node_id=outline_id,
+                content="模型开始修改前的草稿。",
+                db=db,
+            )
+            orchestrator = ContextOrchestrator(db)
+            manifest = orchestrator.prepare(
+                project_id=project_id,
+                task_type="writing",
+                model="openai:gpt-test",
+                arguments={"outline_node_id": outline_id, "source_draft_id": draft_id},
+            )
+            selection = orchestrator.submit_evidence(manifest, [])
+
+            async def completion_after_author_edit(**_kwargs):
+                editing_db = SessionLocal()
+                try:
+                    editing_draft = editing_db.get(ChapterDraft, draft_id)
+                    editing_draft.content = "作者在等待期间写下的更新版本。"
+                    editing_db.commit()
+                finally:
+                    editing_db.close()
+                return {"content": "迟到的 AI 版本。", "model": "gpt-test"}
+
+            mock_completion.side_effect = completion_after_author_edit
+            result = asyncio.run(_execute_workspace_action(
+                db,
+                project_id,
+                {
+                    "tool": "chapter_writer",
+                    "arguments": {
+                        "outline_node_id": outline_id,
+                        "source_draft_id": draft_id,
+                        "context_manifest_id": manifest.id,
+                        "context_selection_token": selection["context_selection_token"],
+                    },
+                },
+            ))
+
+            db.expire_all()
+            self.assertEqual(result["status"], "skipped")
+            self.assertTrue(result["data"]["late_result_discarded"])
+            self.assertEqual(db.get(ChapterDraft, draft_id).content, "作者在等待期间写下的更新版本。")
+        finally:
+            db.close()
+
+    def test_pending_draft_editor_state_can_be_synchronized_without_saving(self):
+        project_id = self.create_project("Sync pending draft")
+        outline_id = self.create_outline(project_id, "第一章 潮汐")
+        db = SessionLocal()
+        try:
+            draft_id = store_chapter_draft(
+                project_id=project_id,
+                title="第一章 潮汐",
+                outline_node_id=outline_id,
+                content="服务端旧草稿。",
+                db=db,
+            )
+        finally:
+            db.close()
+
+        response = self.client.put(
+            f"{API_PREFIX}/projects/{project_id}/chapter-drafts/{draft_id}",
+            json={
+                "title": "第一章 潮汐（草稿）",
+                "outline_node_id": outline_id,
+                "content": "编辑器里尚未保存的新内容。",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["data"]["draft_status"], "pending")
+        self.assertIn("revise_draft", response.json()["data"]["next_actions"])
+
+        rejected = self.client.put(
+            f"{API_PREFIX}/projects/{project_id}/chapter-drafts/{draft_id}",
+            json={
+                "title": "第一章 潮汐（草稿）",
+                "outline_node_id": "outline-from-another-project",
+                "content": "不能把草稿改挂到其他作品的大纲。",
+            },
+        )
+        self.assertEqual(rejected.status_code, 400, rejected.text)
+        db = SessionLocal()
+        try:
+            stored = db.get(ChapterDraft, draft_id)
+            self.assertEqual(stored.content, "编辑器里尚未保存的新内容。")
+            self.assertEqual(db.query(Chapter).count(), 0)
+        finally:
+            db.close()
 
     @patch(
         "app.services.workspace.tools.chapter_writer.LLMGateway.chat_completion",

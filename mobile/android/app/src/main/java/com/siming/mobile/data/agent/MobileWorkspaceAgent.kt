@@ -62,6 +62,7 @@ internal class MobileWorkspaceAgent(
             put("word_count", countWords(run.content))
             put("execution_route", "android_standalone")
             put("next_actions", buildJsonArray {
+                add(JsonPrimitive("revise_draft"))
                 add(JsonPrimitive("save_only"))
                 add(JsonPrimitive("save_and_catalog"))
                 add(JsonPrimitive("discard"))
@@ -71,6 +72,17 @@ internal class MobileWorkspaceAgent(
 
     suspend fun markChapterDraftSaved(draftId: String) {
         chapterWriteStore.markSaved(draftId)
+    }
+
+    suspend fun updateChapterDraft(
+        draftId: String,
+        title: String,
+        content: String,
+    ): JsonObject? {
+        val run = chapterWriteStore.load(draftId) ?: return null
+        if (run.state != MobileChapterWriteState.GENERATED) return null
+        chapterWriteStore.save(run.copy(title = title, content = content))
+        return pendingChapterDraft(run.projectId)
     }
 
     suspend fun discardChapterDraft(draftId: String): Boolean =
@@ -531,7 +543,7 @@ internal class MobileWorkspaceAgent(
         extraBody: JsonObject? = null,
     ): MobilePreparedConversationRequest {
         val systemPrompt = listOf(
-            contract.workspaceRuntimeSystem(project),
+            contract.workspaceRuntimeSystem(project, pendingChapterDraft(projectId)),
             extraRuntimeInstruction.trim().takeIf(String::isNotBlank)?.let { instruction ->
                 "[SERVER_RUNTIME_INSTRUCTION]\n$instruction\n[/SERVER_RUNTIME_INSTRUCTION]"
             },
@@ -1382,6 +1394,7 @@ internal class MobileWorkspaceAgent(
         val manifestId = args.string("context_manifest_id")
         val selectionToken = args.string("context_selection_token")
         val requestedOutlineId = args.string("outline_node_id")
+        val requestedSourceDraftId = args.string("source_draft_id")
         val cachedManifest = contextManifests[manifestId]
             ?: return result(
                 "chapter_writer",
@@ -1399,6 +1412,17 @@ internal class MobileWorkspaceAgent(
             )
         }
         val engine = contextEngine("writing")
+        if (requestedSourceDraftId != request.sourceDraftId) {
+            return result(
+                "chapter_writer",
+                "needs_confirmation",
+                "上下文清单中的当前草稿与本次 source_draft_id 不一致",
+                buildJsonObject {
+                    put("context_manifest_id", manifestId)
+                    put("source_draft_id", requestedSourceDraftId)
+                },
+            )
+        }
         if (requestedOutlineId != request.outlineNodeId) {
             return result(
                 "chapter_writer",
@@ -1455,19 +1479,28 @@ internal class MobileWorkspaceAgent(
                 },
             )
         }
-        if (activePendingRun != null) {
+        if (activePendingRun != null && activePendingRun.id != requestedSourceDraftId) {
             return result(
                 "chapter_writer",
                 "blocked",
-                "当前章节草稿尚未保存并完成建档，本轮未生成下一章。",
+                "当前章节草稿尚未处理，本轮未生成下一章；可以指定该草稿继续修改。",
                 buildJsonObject {
                     put("blocking_draft_id", activePendingRun.id)
                     put("outline_node_id", activePendingRun.manifest.request.outlineNodeId)
                     put("allowed_actions", buildJsonArray {
+                        add(JsonPrimitive("revise_draft"))
                         add(JsonPrimitive("save_and_catalog"))
                         add(JsonPrimitive("save_only"))
+                        add(JsonPrimitive("discard"))
                     })
                 },
+            )
+        }
+        if (requestedSourceDraftId.isNotBlank() && activePendingRun == null) {
+            return skipped(
+                "chapter_writer",
+                "source_draft_id 必须是当前作品正在编辑的未保存章节草稿",
+                buildJsonObject { put("source_draft_id", requestedSourceDraftId) },
             )
         }
         val inputs = manifestInputs(projectId, config.model, request, project, all, rawPayloads)
@@ -1586,9 +1619,11 @@ internal class MobileWorkspaceAgent(
             characterProfiles = characterProfiles,
             recentSummaries = recentSummaries,
             requirements = requirements,
+            sourceDraft = manifest.categoryText("target_draft", ""),
         )
         var checkpointContent = checkpointRun.content
         var persistedChars = checkpointContent.length
+        var firstDraftStreamEvent = true
         if (checkpointContent.isNotBlank()) {
             onEvent(event("status", "已恢复 ${checkpointContent.length} 字本机检查点，正在验证接缝并继续生成"))
         }
@@ -1610,12 +1645,24 @@ internal class MobileWorkspaceAgent(
                         nextContent
                     }
                     if (delta.isNotEmpty()) {
+                        val replaceDraftContent = firstDraftStreamEvent
+                        firstDraftStreamEvent = false
                         onEvent(
                             event(
                                 type = "chapter_draft_delta",
                                 delta = delta,
                                 data = buildJsonObject {
-                                    put("draft_id", runId)
+                                    put(
+                                        "draft_id",
+                                        requestedSourceDraftId.ifBlank { runId },
+                                    )
+                                    requestedSourceDraftId.takeIf(String::isNotBlank)?.let {
+                                        put("source_draft_id", it)
+                                    }
+                                    if (replaceDraftContent) {
+                                        put("content", nextContent)
+                                        put("replace_content", true)
+                                    }
                                     put("title", checkpointRun.title)
                                     put("outline_node_id", request.outlineNodeId)
                                     put("draft_status", MobileChapterWriteState.GENERATING)
@@ -1684,18 +1731,68 @@ internal class MobileWorkspaceAgent(
                 },
             )
         }
-        val generated = chapterWriteStore.save(
-            checkpointRun.copy(
-                content = content,
-                state = MobileChapterWriteState.GENERATED,
-                error = null,
-            ),
-        )
+        val generated = if (requestedSourceDraftId.isNotBlank()) {
+            val currentSource = chapterWriteStore.load(requestedSourceDraftId)
+            val expectedSourceHash = manifest.generationItems.firstOrNull {
+                it.category == "target_draft" && it.sourceId == requestedSourceDraftId
+            }?.sourceHash.orEmpty()
+            val currentSourceContent = currentSource?.let { source ->
+                buildJsonObject {
+                    put("title", source.title)
+                    put("outline_node_id", source.manifest.request.outlineNodeId)
+                    put("content", source.content)
+                }.toString()
+            }.orEmpty()
+            if (
+                currentSource == null ||
+                currentSource.state != MobileChapterWriteState.GENERATED ||
+                expectedSourceHash.isBlank() ||
+                mobileSha256(currentSourceContent) != expectedSourceHash
+            ) {
+                chapterWriteStore.transition(
+                    checkpointRun.copy(content = checkpointContent),
+                    MobileChapterWriteState.SUPERSEDED,
+                    error = "当前草稿在生成期间已改变；迟到结果未覆盖。",
+                )
+                return skipped(
+                    "chapter_writer",
+                    "当前草稿在生成期间已修改、保存或丢弃；迟到的 AI 修改未覆盖当前内容",
+                    buildJsonObject {
+                        put("draft_id", requestedSourceDraftId)
+                        put("late_result_discarded", true)
+                    },
+                )
+            }
+            val revised = chapterWriteStore.save(
+                currentSource.copy(
+                    content = content,
+                    state = MobileChapterWriteState.GENERATED,
+                    manifest = manifest,
+                    error = null,
+                ),
+            )
+            chapterWriteStore.transition(
+                checkpointRun,
+                MobileChapterWriteState.SUPERSEDED,
+                error = "修改结果已写回原草稿。",
+            )
+            revised
+        } else {
+            chapterWriteStore.save(
+                checkpointRun.copy(
+                    content = content,
+                    state = MobileChapterWriteState.GENERATED,
+                    error = null,
+                ),
+            )
+        }
         return chapterDraftResult(
             run = generated,
             outlineTitle = outlineTitle,
             rawPayloads = rawPayloads,
-            detail = if (resumeContent.isNotBlank()) {
+            detail = if (requestedSourceDraftId.isNotBlank()) {
+                "已修改当前未保存章节草稿（${countWords(content)} 字），草稿 ID 保持不变"
+            } else if (resumeContent.isNotBlank()) {
                 "已从本机检查点续传并生成章节正文（${countWords(content)} 字），草稿与 ContextManifest 已持久化"
             } else {
                 "已生成章节正文（${countWords(content)} 字），草稿与 ContextManifest 已持久化"
@@ -1737,6 +1834,13 @@ internal class MobileWorkspaceAgent(
             put("write_run_state", run.state)
             put("draft_status", "pending")
             put("recovered", recovered)
+            request.sourceDraftId.takeIf(String::isNotBlank)?.let { put("source_draft_id", it) }
+            put("next_actions", buildJsonArray {
+                add(JsonPrimitive("revise_draft"))
+                add(JsonPrimitive("save_and_catalog"))
+                add(JsonPrimitive("save_only"))
+                add(JsonPrimitive("discard"))
+            })
             put("context_snapshot", buildJsonObject {
                 put("outline_node_id", request.outlineNodeId)
                 put("outline_title", outlineTitle)
@@ -2169,7 +2273,7 @@ internal class MobileWorkspaceAgent(
         return ok("update_worldbuilding_entry", "已更新世界观：${payload.string("title")}", clean(payload))
     }
 
-    private fun manifestInputs(
+    private suspend fun manifestInputs(
         projectId: String,
         model: String,
         request: MobileContextRequest,
@@ -2184,6 +2288,9 @@ internal class MobileWorkspaceAgent(
         styleText = contract.styleContext(project),
         primaryRecords = all.map(LocalRecord::payload),
         rawRecords = rawPayloads,
+        sourceDraft = request.sourceDraftId.takeIf(String::isNotBlank)?.let {
+            chapterWriteStore.load(it)
+        },
     )
 
     private fun contextTaskConfig(config: DirectApiConfig, taskType: String): DirectApiConfig =

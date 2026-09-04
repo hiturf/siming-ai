@@ -14,11 +14,13 @@ class WorkspaceAssistantRequestTest {
             WorkspaceAssistantRequest(
                 message = "继续检查",
                 conversationId = "conversation-1",
+                activeChapterDraftId = "draft-1",
             ),
         )
         val root = Json.parseToJsonElement(encoded).jsonObject
         assertEquals("conversation-1", root.getValue("conversation_id").jsonPrimitive.content)
         assertEquals("继续检查", root.getValue("message").jsonPrimitive.content)
+        assertEquals("draft-1", root.getValue("active_chapter_draft_id").jsonPrimitive.content)
         assertEquals(false, "history" in root)
     }
 }

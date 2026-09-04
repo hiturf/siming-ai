@@ -44,6 +44,16 @@ class ChapterUpdate(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class ChapterDraftUpdate(BaseModel):
+    """Persist the editor's current pending draft before an Agent turn."""
+
+    title: str = Field("", max_length=200)
+    outline_node_id: Optional[str] = None
+    content: str = Field("", max_length=1_000_000)
+
+    model_config = {"extra": "forbid"}
+
+
 class ChapterCatalogingRequest(BaseModel):
     """Explicitly start cataloging for the chapter's current saved version."""
 

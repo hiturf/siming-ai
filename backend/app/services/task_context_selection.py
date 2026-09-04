@@ -44,6 +44,7 @@ TASK_CONTEXT_ANCHOR_CATEGORIES = frozenset(
     {
         "style",
         "target_outline",
+        "target_draft",
         "outline_parent",
         "outline_position",
         "user_requirement",
@@ -409,6 +410,7 @@ class TaskContextSelector:
         *,
         task_type: str,
         outline_node_id: str | None = None,
+        source_draft_id: str | None = None,
         parent_id: str | None = None,
         insert_after_id: str | None = None,
     ) -> tuple[bool, str]:
@@ -444,6 +446,19 @@ class TaskContextSelector:
             }
             if not outline_node_id or outline_node_id not in target_ids:
                 return False, "The context manifest target does not match the chapter outline."
+            query = manifest.query_json if isinstance(manifest.query_json, dict) else {}
+            arguments = query.get("arguments") if isinstance(query.get("arguments"), dict) else {}
+            expected_draft_id = str(arguments.get("source_draft_id") or "")
+            if str(source_draft_id or "") != expected_draft_id:
+                return False, "The context manifest pending draft does not match this revision."
+            if expected_draft_id:
+                draft_ids = {
+                    str(item.source_id)
+                    for item in generation_items(manifest)
+                    if item.category == "target_draft" and item.source_id
+                }
+                if expected_draft_id not in draft_ids:
+                    return False, "The pending draft revision source is missing from task context."
         elif task_type == "outline_planning":
             query = manifest.query_json if isinstance(manifest.query_json, dict) else {}
             arguments = query.get("arguments") if isinstance(query.get("arguments"), dict) else {}

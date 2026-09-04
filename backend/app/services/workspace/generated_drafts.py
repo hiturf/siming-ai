@@ -10,6 +10,8 @@ restarts. The in-memory OrderedDict acts as an L1 cache for fast lookups.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import OrderedDict
 from datetime import datetime
 from typing import Any
@@ -48,6 +50,37 @@ class ChapterDraftTargetConflict(RuntimeError):
     def __init__(self, target_chapter_id: str):
         super().__init__("the revision target no longer matches the selected outline")
         self.target_chapter_id = target_chapter_id
+
+
+class ChapterDraftRevisionConflict(RuntimeError):
+    """The pending draft changed while an AI revision was being generated."""
+
+    def __init__(self, draft: Any | None, reason: str):
+        super().__init__(reason)
+        self.draft = draft
+        self.reason = reason
+
+
+def chapter_draft_source_text(draft: Any) -> str:
+    """Render the complete mutable draft state used as an AI revision source."""
+
+    return json.dumps(
+        {
+            "title": str(draft.title or ""),
+            "outline_node_id": str(draft.outline_node_id or "") or None,
+            "draft_kind": str(draft.draft_kind or "new"),
+            "target_chapter_id": str(draft.target_chapter_id or "") or None,
+            "base_chapter_version": draft.base_chapter_version,
+            "content": str(draft.content or ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def chapter_draft_source_hash(draft: Any) -> str:
+    return hashlib.sha256(chapter_draft_source_text(draft).encode("utf-8")).hexdigest()
 
 
 def _cache_chapter_draft(
@@ -542,11 +575,19 @@ def pending_draft_block_result(tool: str, draft: Any) -> dict[str, Any]:
         {
             "tool": tool,
             "status": "blocked",
-            "detail": "当前章节草稿尚未保存并完成建档，本轮未生成下一章。",
+            "detail": (
+                "当前章节草稿尚未处理，本轮未生成下一章。"
+                "可以继续修改这份草稿，或由作者保存、建档、丢弃。"
+            ),
             "data": {
                 "blocking_draft_id": draft.id,
                 "outline_node_id": draft.outline_node_id,
-                "allowed_actions": ["save_and_catalog", "save_only", "discard"],
+                "allowed_actions": [
+                    "revise_draft",
+                    "save_and_catalog",
+                    "save_only",
+                    "discard",
+                ],
             },
         },
         AssistantTurnDirective.BLOCKED_ON_CATALOGING,
@@ -582,6 +623,7 @@ def update_chapter_draft(
     row.title = title
     row.outline_node_id = outline_node_id
     row.content = content
+    row.updated_at = datetime.utcnow()
     cached = _CHAPTER_DRAFTS.get(draft_id)
     if cached:
         cached.update(
@@ -590,6 +632,62 @@ def update_chapter_draft(
                 "outline_node_id": outline_node_id or "",
                 "content": content,
             }
+        )
+    return row
+
+
+def replace_pending_chapter_draft_after_ai_revision(
+    db: Any,
+    project_id: str,
+    draft_id: str,
+    *,
+    expected_source_hash: str,
+    content: str,
+    context_manifest_id: str,
+) -> Any:
+    """Replace one pending draft only when the exact reviewed source is current.
+
+    Model generation can run for minutes. The project lock and source hash keep
+    a late result from overwriting author edits, a newer AI revision, or a draft
+    that was saved/discarded while the request was in flight.
+    """
+
+    from ...database.models import ChapterDraft
+
+    commit_session(db)
+    lock_chapter_draft_project(db, project_id)
+    row = db.query(ChapterDraft).filter(
+        ChapterDraft.id == draft_id,
+        ChapterDraft.project_id == project_id,
+    ).first()
+    if row is None:
+        db.rollback()
+        raise ChapterDraftRevisionConflict(None, "章节草稿已不存在")
+    if str(row.status or "") != "pending":
+        db.rollback()
+        raise ChapterDraftRevisionConflict(row, "章节草稿已保存、丢弃或失效")
+    if not expected_source_hash or chapter_draft_source_hash(row) != expected_source_hash:
+        db.rollback()
+        raise ChapterDraftRevisionConflict(row, "章节草稿在生成期间已被修改")
+
+    row.content = content
+    row.context_manifest_id = context_manifest_id
+    row.updated_at = datetime.utcnow()
+    commit_session(db)
+    if not session_commits_deferred(db):
+        _cache_chapter_draft(
+            draft_id=str(row.id),
+            project_id=str(row.project_id),
+            title=str(row.title or ""),
+            outline_node_id=row.outline_node_id,
+            context_manifest_id=row.context_manifest_id,
+            saved_chapter_id=row.saved_chapter_id,
+            draft_kind=str(row.draft_kind or "new"),
+            target_chapter_id=row.target_chapter_id,
+            base_chapter_version=row.base_chapter_version,
+            status=str(row.status or "pending"),
+            content=str(row.content or ""),
+            created_at=row.created_at,
         )
     return row
 
@@ -619,7 +717,7 @@ def chapter_draft_result_data(draft: Any, *, db: Any = None) -> dict[str, Any]:
         "content": str(draft.content or ""),
         "word_count": count_words(str(draft.content or "")),
         "next_actions": (
-            ["save_and_catalog", "save_only", "discard"]
+            ["revise_draft", "save_and_catalog", "save_only", "discard"]
             if draft.status == "pending"
             else []
         ),

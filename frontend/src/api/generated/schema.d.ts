@@ -3203,7 +3203,11 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        put?: never;
+        /**
+         * Update Pending Chapter Draft
+         * @description Synchronize editor text without promoting it to a formal chapter.
+         */
+        put: operations["update_pending_chapter_draft_api_v1_projects__project_id__chapter_drafts__draft_id__put"];
         post?: never;
         /** Discard Generated Chapter Draft */
         delete: operations["discard_generated_chapter_draft_api_v1_projects__project_id__chapter_drafts__draft_id__delete"];
@@ -6266,6 +6270,24 @@ export interface components {
              * @default 1
              */
             revision_round: number;
+        };
+        /**
+         * ChapterDraftUpdate
+         * @description Persist the editor's current pending draft before an Agent turn.
+         */
+        ChapterDraftUpdate: {
+            /**
+             * Content
+             * @default
+             */
+            content: string;
+            /** Outline Node Id */
+            outline_node_id?: string | null;
+            /**
+             * Title
+             * @default
+             */
+            title: string;
         };
         /**
          * ChapterQualityScoreRequest
@@ -9618,6 +9640,11 @@ export interface components {
          * @description Conversational assistant for a project workspace.
          */
         WorkspaceAssistantRequest: {
+            /**
+             * Active Chapter Draft Id
+             * @description Current pending editor draft ID; context only and never an intent override
+             */
+            active_chapter_draft_id?: string | null;
             /**
              * Canonical Conversation Id
              * @description Canonical project conversation ID used to reuse the internal execution thread
@@ -16287,6 +16314,42 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_pending_chapter_draft_api_v1_projects__project_id__chapter_drafts__draft_id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                draft_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChapterDraftUpdate"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {

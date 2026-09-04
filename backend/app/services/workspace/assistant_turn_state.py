@@ -51,6 +51,7 @@ class WorkspaceAssistantTurnState:
     reference_context_audit: dict[str, Any] | None = None
     selected_text: str | None = None
     selected_text_chapter_title: str | None = None
+    active_chapter_draft: dict[str, Any] | None = None
     authorized_tool_names: set[str] = field(default_factory=set)
     active_categories: tuple[str, ...] = ()
     category_selected: bool = False

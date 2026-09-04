@@ -306,6 +306,15 @@ def _character_text(db: Session, character: Character) -> str:
 
 
 def _current_source_hash(db: Session, project_id: str | None, source_type: str, source_id: str | None, fallback_content: str) -> str | None:
+    if source_type == "chapter_draft":
+        if not source_id or not project_id:
+            return None
+        from .workspace.generated_drafts import chapter_draft_source_hash, find_chapter_draft
+
+        draft = find_chapter_draft(db, project_id, source_id)
+        if draft is None or str(draft.status or "") != "pending":
+            return None
+        return chapter_draft_source_hash(draft)
     if source_type in {
         "chapter",
         "chapter_summary",
@@ -1661,6 +1670,7 @@ class ContextOrchestrator:
         token: str,
         task_type: str,
         outline_node_id: str | None = None,
+        source_draft_id: str | None = None,
         parent_id: str | None = None,
         insert_after_id: str | None = None,
     ) -> tuple[bool, str]:
@@ -1674,6 +1684,7 @@ class ContextOrchestrator:
             token,
             task_type=task_type,
             outline_node_id=outline_node_id,
+            source_draft_id=source_draft_id,
             parent_id=parent_id,
             insert_after_id=insert_after_id,
         )

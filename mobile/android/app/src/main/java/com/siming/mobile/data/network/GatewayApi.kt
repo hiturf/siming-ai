@@ -203,6 +203,18 @@ class GatewayApi(private val tokenStore: SecureTokenStore) {
             ?: throw GatewayHttpException(502, "PC API 返回的章节草稿结构无效")
     }
 
+    suspend fun updateChapterDraft(
+        connection: GatewayConnection,
+        projectId: String,
+        draftId: String,
+        payload: JsonObject,
+    ): JsonObject = canonicalWrite(
+        connection,
+        PcApiPaths.chapterDraft(projectId, draftId),
+        "PUT",
+        payload,
+    )
+
     suspend fun pendingOutlineDraft(
         connection: GatewayConnection,
         projectId: String,

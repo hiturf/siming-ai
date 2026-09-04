@@ -385,12 +385,16 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="prepare_external_writing_context",
-        description="Prepare governed writing context for a model-selected chapter. Writing instructions and source text are returned only in context_page.text; follow the next_tool_suggestions arguments until has_more=false. Then search and submit exact evidence, read all selected-context pages, and use the selection token. API-free and never overwrites prose.",
+        description="Prepare governed writing context for a model-selected chapter or the current pending draft. To revise that draft, pass its real source_draft_id; its full current text becomes a required, hash-checked context anchor. Writing instructions and source text are returned only in context_page.text; follow the next_tool_suggestions arguments until has_more=false. Then search and submit exact evidence, read all selected-context pages, and use the selection token. API-free and never overwrites formal prose.",
         input_schema={
             "outline_node_id": {"type": "string", "description": "Target outline node ID"},
             "target_chapter_id": {
                 "type": "string",
                 "description": "Existing chapter ID when preparing a reviewable revision",
+            },
+            "source_draft_id": {
+                "type": "string",
+                "description": "Current pending draft ID when revising the same unsaved draft",
             },
             "include_prompt_pack": {
                 "type": "boolean",
@@ -424,7 +428,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="save_external_chapter_draft",
-        description="Save one not-yet-official new-chapter draft or reviewable existing-chapter revision and end the model turn. A revision requires the matching target_chapter_id and base_chapter_version; this tool never overwrites saved prose.",
+        description="Save one not-yet-official new-chapter draft, reviewable existing-chapter revision, or replace the exact current pending draft and end the model turn. Pending-draft revision requires the same source_draft_id used for context and is rejected if the author changed it meanwhile. This tool never overwrites saved prose.",
         input_schema={
             "content": {"type": "string", "description": "Chapter content to save"},
             "outline_node_id": {"type": "string", "description": "Linked outline node ID"},
@@ -435,6 +439,10 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             "base_chapter_version": {
                 "type": "integer",
                 "description": "Version returned by prepare_external_writing_context for conflict protection",
+            },
+            "source_draft_id": {
+                "type": "string",
+                "description": "Current pending draft ID to replace after exact-context revision",
             },
             "context_manifest_id": {
                 "type": "string",
@@ -459,12 +467,12 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="get_external_chapter_draft",
-        description="Get a saved chapter draft by ID. API-free.",
+        description="Get a chapter draft by ID, or omit the ID to discover the current pending draft. API-free.",
         input_schema={
             "draft_id": {"type": "string", "description": "Draft ID to retrieve"},
             "content_ref": {"type": "string", "description": "Alias for draft_id"},
         },
-        required=["draft_id"],
+        required=[],
         tool_type="read",
         direct_mcp_project_scoped=True,
         direct_mcp_transactional=True,

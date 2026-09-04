@@ -70,6 +70,38 @@ class MobileContextManifestTest {
     }
 
     @Test
+    fun `pending draft revision requires and hashes the exact source draft`() {
+        val baseline = engine().prepare(inputs())
+        val source = MobileChapterWriteRun(
+            id = "chapter-source-draft",
+            projectId = "p1",
+            model = "deepseek-chat",
+            title = "第一章 断线重连",
+            content = "旧草稿中，城门在雨里保持沉默。",
+            state = MobileChapterWriteState.GENERATED,
+            manifest = baseline,
+        )
+        val revisionRequest = request(requirements = "让城门发出警报").copy(
+            sourceDraftId = source.id,
+        )
+
+        val revision = engine().prepare(
+            inputs(request = revisionRequest).copy(sourceDraft = source),
+        )
+        val targetDraft = revision.generationItems.single { it.category == "target_draft" }
+
+        assertEquals("ready", revision.status)
+        assertEquals(source.id, targetDraft.sourceId)
+        assertTrue(targetDraft.required)
+        assertTrue(targetDraft.content.contains(source.content))
+        assertEquals(mobileSha256(targetDraft.content), targetDraft.sourceHash)
+
+        val missing = engine().prepare(inputs(request = revisionRequest))
+        assertEquals("needs_confirmation", missing.status)
+        assertEquals("missing", missing.coverage.getValue("target_draft").status)
+    }
+
+    @Test
     fun `context request reads only the explicit flat target contract`() {
         val request = MobileContextRequest.fromArgs("writing", buildJsonObject {
             put("outline_node_id", "outline-current")

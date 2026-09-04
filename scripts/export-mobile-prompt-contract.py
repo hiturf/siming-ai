@@ -367,7 +367,7 @@ def build_contract() -> dict:
     contract = {
         "schema_version": 3,
         "source_versions": {
-            "workspace": "assistant.workspace.quality@3.2.0",
+            "workspace": "assistant.workspace.quality@3.2.5",
             "chapter_quality": "assistant.chapter.quality@3.1.0",
             "novel_creation": "creation.novel.stage@3.1.0",
         },

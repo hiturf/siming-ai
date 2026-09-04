@@ -1066,7 +1066,11 @@ private fun updateCatalogingProgress(
                             if (parsed != null && update.draftDelta != null) {
                                 val previous = current.pendingChapterDraft
                                     ?.takeIf { it.draftId == parsed.draftId }
-                                parsed.copy(content = previous?.content.orEmpty() + update.draftDelta)
+                                if (update.replaceDraftContent) {
+                                    parsed
+                                } else {
+                                    parsed.copy(content = previous?.content.orEmpty() + update.draftDelta)
+                                }
                             } else parsed ?: current.pendingChapterDraft
                         }
                         else -> current.pendingChapterDraft
@@ -1196,6 +1200,34 @@ private fun updateCatalogingProgress(
 
     fun hidePendingChapterDraft() {
         uiState.value = uiState.value.copy(pendingChapterDraft = null)
+    }
+
+    fun updatePendingChapterDraft(
+        draft: MobilePendingChapterDraft,
+        title: String,
+        content: String,
+        onUpdated: () -> Unit = {},
+    ) {
+        viewModelScope.launch {
+            uiState.value = uiState.value.copy(
+                busy = true,
+                activity = "正在同步未保存章节草稿…",
+                error = null,
+            )
+            try {
+                val updated = repository.updatePendingChapterDraft(draft, title, content)
+                uiState.value = uiState.value.copy(
+                    busy = false,
+                    activity = "",
+                    pendingChapterDraft = updated,
+                    notice = "未保存章节草稿已同步，可以继续让 AI 修改",
+                )
+                onUpdated()
+            } catch (error: Exception) {
+                uiState.value = uiState.value.copy(busy = false, activity = "")
+                showError(error)
+            }
+        }
     }
 
     fun savePendingChapterDraft(
@@ -1589,6 +1621,10 @@ private fun updateCatalogingProgress(
                 activity = "章节正在正文编辑器中实时生成…",
                 draftData = event["data"] as? JsonObject,
                 draftDelta = delta,
+                replaceDraftContent = (
+                    ((event["data"] as? JsonObject)?.get("replace_content") as? JsonPrimitive)
+                        ?.booleanOrNull == true
+                    ),
             )
             "outline_draft" -> AssistantEventUpdate(
                 activity = detail ?: "大纲草稿已生成，等待作者审阅",
@@ -1679,6 +1715,7 @@ private data class AssistantEventUpdate(
     val toolLog: String? = null,
     val draftData: JsonObject? = null,
     val draftDelta: String? = null,
+    val replaceDraftContent: Boolean = false,
     val outlineDraftData: JsonObject? = null,
     val contextState: MobileAssistantContextState? = null,
 )

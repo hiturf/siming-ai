@@ -93,7 +93,7 @@ class ExternalWritingNoApiE2ETest(unittest.TestCase):
             self.assertTrue(draft_result["turn_terminal"])
             self.assertEqual(
                 draft_result["data"]["next_actions"],
-                ["save_and_catalog", "save_only"],
+                ["revise_draft", "save_and_catalog", "save_only", "discard"],
             )
             self.assertEqual(db.query(Chapter).count(), 0)
             self.assertEqual(db.query(CatalogingJob).count(), 0)
@@ -110,6 +110,86 @@ class ExternalWritingNoApiE2ETest(unittest.TestCase):
 
         # This read-only context tool must remain usable without the internal gateway.
         self.assertTrue(callable(prepare_external_writing_context))
+
+    def test_external_agent_can_replace_the_same_pending_draft(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from app.database.models import Base, ChapterDraft, OutlineNode, Project
+        from app.services.workspace.generated_drafts import store_chapter_draft
+        from app.services.workspace.tools.context_governance import submit_context_evidence
+        from app.services.workspace.tools.external_writing import (
+            get_external_chapter_draft,
+            prepare_external_writing_context,
+            save_external_chapter_draft,
+        )
+
+        engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+        Base.metadata.create_all(engine)
+        db = sessionmaker(bind=engine)()
+        try:
+            project = Project(id="p-revise", title="Revise draft", writing_style="natural")
+            outline = OutlineNode(
+                id="o-revise",
+                project_id=project.id,
+                title="第一章 雨夜",
+                node_type="chapter",
+                summary="雨夜抵达。",
+            )
+            db.add_all([project, outline])
+            db.commit()
+            draft_id = store_chapter_draft(
+                project_id=project.id,
+                title=outline.title,
+                outline_node_id=outline.id,
+                content="需要修改的原始草稿。",
+                db=db,
+            )
+
+            discovered = asyncio.run(get_external_chapter_draft(db, project.id, {}))
+            self.assertEqual(discovered["status"], "ok")
+            self.assertEqual(discovered["data"]["draft_id"], draft_id)
+
+            prepared = asyncio.run(prepare_external_writing_context(
+                db,
+                project.id,
+                {
+                    "outline_node_id": outline.id,
+                    "source_draft_id": draft_id,
+                    "include_prompt_pack": False,
+                    "requirements": "增加雨声",
+                },
+            ))
+            self.assertEqual(prepared["status"], "ok")
+            self.assertEqual(prepared["data"]["target"]["source_draft_id"], draft_id)
+            self.assertIn("需要修改的原始草稿。", prepared["data"]["context_page"]["text"])
+            manifest_id = prepared["data"]["context_manifest_id"]
+            selected = asyncio.run(submit_context_evidence(
+                db,
+                project.id,
+                {"context_manifest_id": manifest_id, "sources": []},
+            ))
+
+            revised = asyncio.run(save_external_chapter_draft(
+                db,
+                project.id,
+                {
+                    "content": "修改后的完整草稿响着密集雨声。",
+                    "outline_node_id": outline.id,
+                    "source_draft_id": draft_id,
+                    "context_manifest_id": manifest_id,
+                    "context_selection_token": selected["data"]["context_selection_token"],
+                },
+            ))
+
+            self.assertEqual(revised["status"], "ok")
+            self.assertEqual(revised["data"]["draft_id"], draft_id)
+            self.assertEqual(db.query(ChapterDraft).count(), 1)
+            self.assertEqual(db.get(ChapterDraft, draft_id).content, "修改后的完整草稿响着密集雨声。")
+        finally:
+            db.close()
+            Base.metadata.drop_all(engine)
+            engine.dispose()
 
     def test_structured_han_minimum_rejects_short_draft_without_consuming_token(self):
         from sqlalchemy import create_engine

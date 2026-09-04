@@ -383,6 +383,25 @@ class WorkspaceAssistantTurnRunner:
             chapter = state.workspace.chapter(state.project_id, payload.selected_text_chapter_id)
             if chapter:
                 state.selected_text_chapter_title = str(chapter.title or "") or None
+        if payload.active_chapter_draft_id:
+            from app.services.workspace.generated_drafts import find_chapter_draft
+
+            draft = find_chapter_draft(
+                state.db,
+                state.project_id,
+                str(payload.active_chapter_draft_id),
+            )
+            if draft is None or str(draft.status or "") != "pending":
+                raise ValidationError("当前编辑器章节草稿已保存、丢弃或失效，请刷新后重试")
+            state.active_chapter_draft = {
+                "id": str(draft.id),
+                "title": str(draft.title or ""),
+                "outline_node_id": str(draft.outline_node_id or "") or None,
+                "draft_kind": str(draft.draft_kind or "new"),
+                "target_chapter_id": str(draft.target_chapter_id or "") or None,
+                "status": "pending",
+                "instruction_priority": "none",
+            }
         state.authorized_tool_names = set(select_workspace_tool_names())
         if state.local_cli_mcp_enabled:
             state.authorized_tool_names = {
@@ -465,7 +484,8 @@ class WorkspaceAssistantTurnRunner:
             "不要输出工具 JSON，不要启动另一个 CLI，不要修改任何全局 MCP 配置。"
             "请依据用户最新消息和真实项目数据自行判断任务、选择目标与工具。"
             "若决定生成章节正文，必须先取得真实章级大纲 ID，再读取写作上下文并保存一份未入库草稿；"
-            "草稿保存成功后立即结束，不得继续执行角色、关系、世界观或建档写入。"
+            "若当前消息要求修改 active_chapter_draft，必须将其真实 ID 作为 source_draft_id 建立上下文并原地更新；"
+            "草稿生成或修改成功后立即结束，不得继续执行角色、关系、世界观或建档写入。"
         )
 
     async def _run_iterations(
@@ -638,6 +658,7 @@ class WorkspaceAssistantTurnRunner:
             selected_text_chapter_title=state.selected_text_chapter_title,
             reference_context=durable_reference,
             outline_batch_count=state.payload.outline_batch_count,
+            active_chapter_draft=state.active_chapter_draft,
         )
         return system_prompt, schemas, "required" if not state.category_selected else "auto"
 

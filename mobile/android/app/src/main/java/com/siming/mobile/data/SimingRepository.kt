@@ -1595,12 +1595,16 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
                 onEvent(raw)
             }
             try {
+                val activeChapterDraftId = api.pendingChapterDraft(connection, projectId)
+                    ?.string("draft_id")
+                    ?.ifBlank { null }
                 api.streamAssistant(
                     connection,
                     projectId,
                     WorkspaceAssistantRequest(
                         message = prompt,
                         conversationId = canonicalConversationId,
+                        activeChapterDraftId = activeChapterDraftId,
                         modelRoute = if (directConfig == null) "pc" else "mobile",
                         mobileProvider = directConfig?.let {
                             MobileProviderEncryption.seal(
@@ -1834,6 +1838,41 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
             mobileWorkspaceAgent.pendingChapterDraft(projectId) ?: importedPendingChapterDraft(projectId)
         } ?: return null
         return MobilePendingChapterDraft.fromJson(projectId, value)
+    }
+
+    suspend fun updatePendingChapterDraft(
+        draft: MobilePendingChapterDraft,
+        title: String,
+        content: String,
+    ): MobilePendingChapterDraft {
+        require(!draft.generating) { "章节仍在生成，暂时不能编辑" }
+        val value = when (draft.executionRoute) {
+            "android_standalone" -> mobileWorkspaceAgent.updateChapterDraft(
+                draft.draftId,
+                title,
+                content,
+            ) ?: error("手机章节草稿不存在或已处理")
+            "project_package" -> updateImportedChapterDraft(draft, title, content)
+            else -> {
+                val connection = dao.connection()
+                    ?: error("同步 PC 章节草稿需要恢复 Gateway 连接")
+                api.updateChapterDraft(
+                    connection,
+                    draft.projectId,
+                    draft.draftId,
+                    buildJsonObject {
+                        put("title", title)
+                        put("content", content)
+                        put(
+                            "outline_node_id",
+                            draft.outlineNodeId?.let(::JsonPrimitive) ?: JsonNull,
+                        )
+                    },
+                )
+            }
+        }
+        return MobilePendingChapterDraft.fromJson(draft.projectId, value)
+            ?: error("章节草稿同步结果无效")
     }
 
     suspend fun pendingOutlineDraft(projectId: String): MobilePendingOutlineDraft? {
@@ -2199,6 +2238,49 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
     private suspend fun markChapterDraftConsumed(draft: MobilePendingChapterDraft) {
         mobileWorkspaceAgent.markChapterDraftSaved(draft.draftId)
         markChapterDraftReplicaStatus(draft, "saved")
+    }
+
+    private suspend fun updateImportedChapterDraft(
+        draft: MobilePendingChapterDraft,
+        title: String,
+        content: String,
+    ): JsonObject {
+        val key = ReplicaEntity.key(draft.projectId, "chapter_draft", draft.draftId)
+        val entity = dao.entity(key) ?: error("项目包章节草稿不存在")
+        val payload = entity.payloadJson
+            ?.let { runCatching { json.parseToJsonElement(it) as? JsonObject }.getOrNull() }
+            ?: error("项目包章节草稿数据无效")
+        require(payload.string("status") in setOf("pending", "generated")) {
+            "项目包章节草稿已经处理或失效"
+        }
+        val now = Instant.now().toString()
+        val updated = JsonObject(
+            payload.toMutableMap().apply {
+                put("title", JsonPrimitive(title))
+                put("content", JsonPrimitive(content))
+                put("updated_at", JsonPrimitive(now))
+            },
+        )
+        val encoded = json.encodeToString(updated)
+        dao.saveEntity(
+            entity.copy(
+                payloadJson = encoded,
+                contentHash = sha256(encoded),
+                serverModifiedAt = now,
+                dirty = false,
+                conflicted = false,
+                localModifiedAt = System.currentTimeMillis(),
+            ),
+        )
+        return buildJsonObject {
+            put("draft_id", draft.draftId)
+            put("project_id", draft.projectId)
+            put("title", title)
+            put("content", content)
+            draft.outlineNodeId?.let { put("outline_node_id", it) }
+            put("draft_status", "pending")
+            put("execution_route", "project_package")
+        }
     }
 
     private suspend fun markChapterDraftReplicaStatus(
