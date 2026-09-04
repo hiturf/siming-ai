@@ -7,7 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from ....architecture.tool_spec import ToolSpec, project_typed_tool_spec
-from ...story.domain.outline_contract import OUTLINE_PROPOSAL_MAX_NODES
+from ...story.interfaces.outline_contract import OUTLINE_PROPOSAL_MAX_NODES
 from .cataloging_contract import CatalogingFactType
 
 
@@ -85,7 +85,10 @@ class SaveExternalOutlineDraftInput(CompatibleInput):
     insert_after_id: str | None = None
     nodes: list[OutlineProposalNodeInput] = Field(
         min_length=1, max_length=OUTLINE_PROPOSAL_MAX_NODES,
-        description="Native node array; length must equal the prepared outline_planning batch_count. summary describes future plans, not actual events.",
+        description=(
+            "Native node array; length must equal the prepared outline_planning "
+            "batch_count. summary describes future plans, not actual events."
+        ),
     )
     design_notes: str = ""
 

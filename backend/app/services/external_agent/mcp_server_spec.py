@@ -10,6 +10,7 @@ from sqlalchemy.engine import make_url
 
 from app.core.config import get_settings
 from app.core.crypto import key_file_path
+from app.core.legacy_env import compatible_env_names
 from app.services.application_settings import app_home
 
 
@@ -32,7 +33,7 @@ def managed_mcp_environment() -> dict[str, str]:
             raise ValueError("临时 MCP 需要与主进程共享持久数据库，不能使用内存数据库")
         url = url.set(database=str(Path(url.database).expanduser().resolve()))
     runtime_home = str(Path(key_file_path()).expanduser().resolve().parent)
-    return {
+    environment = {
         "DATABASE_URL": url.render_as_string(hide_password=False),
         "SIMING_CONTENT_ROOT": str(content_root()),
         "SIMING_KEY_FILE": key_file_path(),
@@ -40,9 +41,10 @@ def managed_mcp_environment() -> dict[str, str]:
         # Pin every home alias as well as the concrete stores so the child
         # cannot rediscover an older installed-data directory.
         "SIMING_HOME": runtime_home,
-        "MOSHU_HOME": runtime_home,
-        "NOVEL_AGENT_HOME": runtime_home,
     }
+    for name in compatible_env_names("SIMING_HOME"):
+        environment[name] = runtime_home
+    return environment
 
 
 def resolve_siming_mcp_server(

@@ -154,10 +154,15 @@ def prepare_direct_mcp_launch(
         # them a cataloging MCP sees the right database but mistakes an
         # automatic worker for a generic client, stages complete candidates,
         # and then cannot perform the owning transaction.
+        from ..core.legacy_env import compatible_env_prefixes
+
+        managed_prefixes = tuple(
+            f"{prefix}_MANAGED_" for prefix in compatible_env_prefixes()
+        )
         turn_binding_env = {
             name: value
             for name, value in env.items()
-            if name.startswith(("SIMING_MANAGED_", "MOSHU_MANAGED_"))
+            if name.startswith(managed_prefixes)
         }
         server_env = {
             **managed_env,

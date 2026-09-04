@@ -27,7 +27,7 @@ from ....services.narrative_governance import create_narrative_checkpoint
 from ....services.outline_service import load_outline_nodes, outline_sort_context
 from ..application.results import StoryMutation
 from ..domain.content_sync import ContentSyncIntent, ContentSyncTarget
-from .entities import Chapter, ChapterSnapshot
+from .entities import Chapter, ChapterSnapshot, OutlineNode
 
 
 class SqlAlchemyChapterWorkspace:
@@ -65,6 +65,18 @@ class SqlAlchemyChapterWorkspace:
 
     def _outline_context(self, project_id: str) -> dict:
         return outline_sort_context(load_outline_nodes(self._session, project_id))
+
+    def chapter_outline_exists(self, project_id: str, outline_node_id: str) -> bool:
+        return (
+            self._session.query(OutlineNode.id)
+            .filter(
+                OutlineNode.id == outline_node_id,
+                OutlineNode.project_id == project_id,
+                OutlineNode.node_type == "chapter",
+            )
+            .first()
+            is not None
+        )
 
     def _validate_manifest_reference(
         self, project_id: str, manifest_id: str | None

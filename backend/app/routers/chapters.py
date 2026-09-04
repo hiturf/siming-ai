@@ -13,7 +13,6 @@ from ..database.session import get_db
 from ..modules.story.application.chapters import ChapterWorkspace
 from ..modules.story.application.commands import StoryCommandContext
 from ..modules.story.domain.content_sync import ContentSyncIntent, ContentSyncTarget
-from ..modules.story.infrastructure.entities import OutlineNode
 from ..modules.story.interfaces.chapter_dependencies import get_chapter_workspace
 from ..modules.story.interfaces.dependencies import get_story_command
 from ..schemas.chapter import (
@@ -166,22 +165,15 @@ def update_pending_chapter_draft(
     draft_id: str,
     payload: ChapterDraftUpdate,
     db: Annotated[Session, Depends(get_db)],
+    workspace: Annotated[ChapterWorkspace, Depends(get_chapter_workspace)],
 ):
     """Synchronize editor text without promoting it to a formal chapter."""
 
     lock_chapter_draft_project(db, project_id)
-    if payload.outline_node_id:
-        outline = (
-            db.query(OutlineNode)
-            .filter(
-                OutlineNode.id == payload.outline_node_id,
-                OutlineNode.project_id == project_id,
-                OutlineNode.node_type == "chapter",
-            )
-            .first()
-        )
-        if outline is None:
-            raise ValidationError("章节草稿只能绑定当前作品中的章级大纲节点")
+    if payload.outline_node_id and not workspace.chapter_outline_exists(
+        project_id, payload.outline_node_id
+    ):
+        raise ValidationError("章节草稿只能绑定当前作品中的章级大纲节点")
     draft = update_chapter_draft(
         db,
         project_id,

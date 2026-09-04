@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from app.architecture.tool_definition import ToolDef
 from app.modules.continuity.domain.cataloging_contract import CATALOGING_FACT_TYPES
-from app.modules.story.domain.outline_contract import OUTLINE_PROPOSAL_MAX_NODES
+from app.modules.story.interfaces.outline_contract import OUTLINE_PROPOSAL_MAX_NODES
 from app.services.task_context_delivery import CONTEXT_PAGE_INPUTS
 
 TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
