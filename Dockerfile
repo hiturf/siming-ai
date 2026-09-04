@@ -1,4 +1,4 @@
-ARG NODE_IMAGE=node:22-alpine
+ARG NODE_IMAGE=node:24.14.1-alpine
 ARG PYTHON_IMAGE=python:3.11-slim
 
 # Frontend output is architecture-neutral. Build it on the native runner so
