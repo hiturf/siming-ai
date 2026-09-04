@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.architecture.tool_categories import TOOL_CATEGORY_CONTROLLER
-from app.services.workspace.tool_result_projection import MAX_NATIVE_TOOL_CALLS_PER_STEP
 
 
 class NativeToolBatchValidationError(ValueError):
@@ -41,13 +40,6 @@ def validate_workspace_native_tool_batch(
 ) -> ValidatedNativeToolBatch:
     """Validate every native call before returning any executable arguments."""
 
-    if len(raw_calls) > MAX_NATIVE_TOOL_CALLS_PER_STEP:
-        raise NativeToolBatchValidationError(
-            "native_tool_call_batch_too_large",
-            "模型单步返回的原生工具调用超过 12 个，整批未执行。",
-            call_count=len(raw_calls),
-            max_call_count=MAX_NATIVE_TOOL_CALLS_PER_STEP,
-        )
     calls: list[dict[str, Any]] = []
     arguments_by_id: dict[str, dict[str, Any]] = {}
     for index, raw_call in enumerate(raw_calls):

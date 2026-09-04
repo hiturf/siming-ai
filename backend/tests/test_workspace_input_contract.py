@@ -1,8 +1,9 @@
 """Malformed model parameters fail before business writes on every transport."""
 import asyncio
 import json
-import pytest
 from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
 
 from app.services.workspace.executor import execute_workspace_action
 from app.services.workspace.registry import registry
@@ -59,3 +60,6 @@ def test_outline_nodes_require_a_native_nonempty_object_array(nodes):
         }))
     handler.assert_not_awaited()
     assert result["data"]["reason"] == "native_tool_contract_invalid"
+    assert result["data"]["failure_class"] == "invalid_tool_arguments"
+    assert result["data"]["path"].startswith("$")
+    assert result["data"]["rule"]

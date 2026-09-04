@@ -19,7 +19,7 @@ import kotlinx.serialization.json.put
 
 class MobileConversationContextTest {
     @Test
-    fun `task model cannot inherit the default model capacity profile`() {
+    fun `task model uses 256k fallback without inheriting the default profile`() {
         val config = DirectApiConfig(
             displayName = "test",
             baseUrl = "https://example.com/v1",
@@ -31,15 +31,15 @@ class MobileConversationContextTest {
             safetyMarginTokens = 4_096,
         )
 
-        val error = assertFailsWith<MobileConversationContextException> {
-            mobileCapacityBoundTaskConfig(config, DirectApiConfig.TASK_WRITING)
-        }
-        assertEquals(MobileConversationContextErrorCode.CAPACITY_UNKNOWN, error.code)
-        assertTrue(error.message.orEmpty().contains("writer-model"))
+        val writing = mobileCapacityBoundTaskConfig(config, DirectApiConfig.TASK_WRITING)
+        assertEquals("writer-model", writing.model)
+        assertEquals(DirectApiConfig.DEFAULT_CONTEXT_WINDOW_TOKENS, writing.contextWindowTokens)
+        assertEquals(DirectApiConfig.CONTEXT_CAPACITY_FALLBACK, writing.contextCapacitySource)
 
         val defaultTask = mobileCapacityBoundTaskConfig(config, DirectApiConfig.TASK_ASSISTANT)
         assertEquals("general-model", defaultTask.model)
         assertEquals(128_000, defaultTask.contextWindowTokens)
+        assertEquals(DirectApiConfig.CONTEXT_CAPACITY_CONFIGURED, defaultTask.contextCapacitySource)
     }
 
     @Test
@@ -59,11 +59,13 @@ class MobileConversationContextTest {
         assertEquals("gpt-4o", assistant.model)
         assertEquals(128_000, assistant.contextWindowTokens)
         assertEquals(6_000, assistant.maxOutputTokens)
+        assertEquals(DirectApiConfig.CONTEXT_CAPACITY_CATALOG, assistant.contextCapacitySource)
 
         val writing = mobileCapacityBoundTaskConfig(config, DirectApiConfig.TASK_WRITING)
         assertEquals("gpt-4.1-mini", writing.model)
         assertEquals(1_047_576, writing.contextWindowTokens)
         assertEquals(6_000, writing.maxOutputTokens)
+        assertEquals(DirectApiConfig.CONTEXT_CAPACITY_CATALOG, writing.contextCapacitySource)
     }
 
     @Test
@@ -80,6 +82,7 @@ class MobileConversationContextTest {
 
         assertEquals("deepseek-v4-flash", assistant.model)
         assertEquals(128_000, assistant.contextWindowTokens)
+        assertEquals(DirectApiConfig.CONTEXT_CAPACITY_CONFIGURED, assistant.contextCapacitySource)
     }
 
     @Test
@@ -473,8 +476,12 @@ class MobileConversationContextTest {
     }
 
     @Test
-    fun `native tool batch limits match golden and reject the whole response before handlers`() {
+    fun `native tool byte limits match golden and reject the whole response before handlers`() {
         val fixture = interopFixture()["native_tool_budget"] as JsonObject
+        assertEquals(
+            (fixture["schema"] as JsonPrimitive).content,
+            MobileNativeToolBudgetContract.SCHEMA,
+        )
         assertEquals(
             fixture["max_native_assistant_transaction_json_bytes"]?.toString()?.toInt(),
             MobileNativeToolBudgetContract.MAX_NATIVE_ASSISTANT_TRANSACTION_JSON_BYTES,
@@ -483,10 +490,7 @@ class MobileConversationContextTest {
             fixture["max_model_visible_tool_result_batch_json_bytes"]?.toString()?.toInt(),
             MobileNativeToolBudgetContract.MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES,
         )
-        assertEquals(
-            fixture["max_native_tool_calls_per_step"]?.toString()?.toInt(),
-            MobileNativeToolBudgetContract.MAX_NATIVE_TOOL_CALLS_PER_STEP,
-        )
+        assertFalse("max_native_tool_calls_per_step" in fixture)
         assertEquals(
             fixture["next_step_wrapper_tokens"]?.toString()?.toInt(),
             MobileNativeToolBudgetContract.NEXT_STEP_WRAPPER_TOKENS,
@@ -510,6 +514,15 @@ class MobileConversationContextTest {
             orderedToolNames = listOf("set_tool_categories"),
         )
         assertTrue(accepted.accepted)
+
+        val manySmallCalls = (1..20).map { index -> "tiny-status-$index" }
+        val acceptedMany = MobileNativeToolBudgetContract.admitExactAssistantTransaction(
+            assistantPayload = nativeAssistantPayload(manySmallCalls),
+            orderedToolNames = manySmallCalls,
+            resultJsonBytes = { 128 },
+        )
+        assertTrue(acceptedMany.accepted)
+        assertEquals(20, acceptedMany.callCount)
 
         val resultBatch = MobileNativeToolBudgetContract.admitExactAssistantTransaction(
             assistantPayload = nativeAssistantPayload(
@@ -915,6 +928,32 @@ class MobileConversationContextTest {
         assertFalse(envelope.fitsProjected)
         envelope.requireSendable()
         assertEquals(binding.fingerprint, envelope.toJson()["model_binding_fingerprint"]?.toString()?.trim('"'))
+    }
+
+    @Test
+    fun `bounded 256k unknown-model fallback is sendable but larger unverified windows are rejected`() {
+        val fallbackBinding = testBinding().copy(
+            contextWindowTokens = DirectApiConfig.DEFAULT_CONTEXT_WINDOW_TOKENS,
+            tokenCounterId = MobileFallbackUtf8ByteTokenCounter.counterId,
+            capacityAssurance = MobileFallbackUtf8ByteTokenCounter.assurance,
+        )
+        val fallback = buildMobileRequestBudget(
+            binding = fallbackBinding,
+            counter = MobileFallbackUtf8ByteTokenCounter,
+            components = MobileRequestTokenComponents(currentUserTokens = 20),
+            safetyMarginTokens = 4_096,
+        )
+
+        assertTrue(fallback.boundedFallback)
+        fallback.requireSendable()
+
+        val unbounded = fallback.copy(
+            contextWindowTokens = DirectApiConfig.DEFAULT_CONTEXT_WINDOW_TOKENS + 1,
+        )
+        val error = assertFailsWith<MobileConversationContextException> {
+            unbounded.requireSendable()
+        }
+        assertEquals(MobileConversationContextErrorCode.CAPACITY_UNKNOWN, error.code)
     }
 
     @Test

@@ -1343,7 +1343,7 @@ Android Gateway PC route
 | 项目事实过期 | 用旧角色/大纲继续 | checkpoint 只存 ID，使用前重新读取当前 revision |
 | 压缩增加费用和延迟 | 用户体验下降 | 仅容量触发、缓存、幂等、轻提示 |
 | PC/Android结果不同 | 跨端继续失败 | 共享协议、golden fixture、同模型策略 |
-| 未知模型窗口 | 仍可能超限 | capacity assurance；无法证明则明确阻断 |
+| 未知模型窗口 | 仍可能超限 | capacity assurance；精确档案优先，否则只允许 256K 有界兜底 |
 | 并发新消息覆盖 checkpoint | 丢上下文 | source range + revision/CAS + supersede |
 | 历史提示词注入 | 越权执行 | checkpoint 非当前指令、无工具权限、项目归属校验 |
 

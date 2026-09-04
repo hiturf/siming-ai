@@ -18,9 +18,6 @@ from app.services.conversation_context.tool_transactions import (
     ToolExecutionReceipt,
 )
 from app.services.creation_agent_turn_records import canonical_tool_call
-from app.services.workspace.tool_result_projection import (
-    MAX_NATIVE_TOOL_CALLS_PER_STEP,
-)
 
 _SAFE_TOOL_SUCCESS_STATUSES = frozenset({
     "ok", "warning", "running", "queued", "completed",
@@ -39,7 +36,7 @@ _SAFE_TOOL_DIAGNOSTICS = {
     "model_result_projection_failed": "工具结果无法安全投影；请缩小范围或重试。",
 }
 _SAFE_DIAGNOSTIC_NUMERIC_FIELDS = frozenset({
-    "actual_bytes", "max_bytes", "batch_call_count", "max_batch_call_count",
+    "actual_bytes", "max_bytes", "batch_call_count",
     "declared_batch_json_bytes", "max_batch_json_bytes", "successful_writes",
     "write_limit", "failed_writes", "failed_write_limit",
 })
@@ -119,13 +116,6 @@ def validate_native_call_batch(
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Validate the complete native batch before the first handler runs."""
 
-    if len(raw_calls) > MAX_NATIVE_TOOL_CALLS_PER_STEP:
-        raise _native_protocol_error(
-            iteration=iteration,
-            reason="native_tool_call_batch_too_large",
-            call_count=len(raw_calls),
-            max_call_count=MAX_NATIVE_TOOL_CALLS_PER_STEP,
-        )
     calls: list[dict[str, Any]] = []
     arguments_by_call_id: dict[str, dict[str, Any]] = {}
     for index, raw_call in enumerate(raw_calls):

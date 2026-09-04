@@ -20,8 +20,6 @@ from app.services.workspace.registry import registry
 from app.services.workspace.tool_result_projection import (
     MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES,
     MAX_NATIVE_ASSISTANT_TRANSACTION_JSON_BYTES,
-    MAX_NATIVE_TOOL_CALLS_PER_STEP,
-    NATIVE_TOOL_RESULT_MESSAGE_WRAPPER_TOKENS_PER_CALL,
     ToolResultBatchOverCapacity,
     ToolResultOverCapacity,
     ToolResultProjectionError,
@@ -662,18 +660,32 @@ def test_open_tool_reserve_and_batch_admission_share_one_hard_boundary() -> None
     )
 
 
-def test_eight_small_status_results_fill_batch_and_twelve_are_rejected() -> None:
-    writes = declared_model_results_for_tool_names(
-        ["create_character"] * 8,
-        resolve_tool=registry.get,
+def test_native_batch_admission_has_no_fixed_call_count_limit() -> None:
+    tools = tuple(
+        _tool(
+            f"tiny_status_{index}",
+            ModelResultContract(
+                policy=ModelResultPolicy.STATUS_ONLY,
+                max_json_bytes=128,
+            ),
+        )
+        for index in range(20)
     )
-    assert admit_model_tool_result_batch(writes) == (MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES)
-    too_many_writes = declared_model_results_for_tool_names(
-        ["create_character"] * MAX_NATIVE_TOOL_CALLS_PER_STEP,
-        resolve_tool=registry.get,
-    )
-    with pytest.raises(ToolResultBatchOverCapacity):
-        admit_model_tool_result_batch(too_many_writes)
+    assistant_payload = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": f"call-{index}",
+                "type": "function",
+                "function": {"name": tool.name, "arguments": "{}"},
+            }
+            for index, tool in enumerate(tools)
+        ],
+    }
+
+    assert admit_model_tool_result_batch(tools) == 20 * 128
+    assert admit_native_assistant_transaction(assistant_payload, tools) > 20 * 128
 
 
 def _assistant_payload(arguments: str = "{}", **extra: object) -> dict[str, object]:
@@ -768,10 +780,8 @@ def test_native_tool_budget_constants_match_cross_platform_fixture() -> None:
     assert fixture["max_model_visible_tool_result_batch_json_bytes"] == (
         MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES
     )
-    assert fixture["max_native_tool_calls_per_step"] == MAX_NATIVE_TOOL_CALLS_PER_STEP
-    assert fixture["tool_result_message_wrapper_tokens_per_call"] == (
-        NATIVE_TOOL_RESULT_MESSAGE_WRAPPER_TOKENS_PER_CALL
-    )
+    assert fixture["schema"] == "native_tool_transaction_budget.v2"
+    assert "max_native_tool_calls_per_step" not in fixture
     assert fixture["next_step_wrapper_tokens"] == (max_native_tool_transaction_wrapper_tokens())
     assert fixture["max_projected_transaction_growth_tokens"] == (
         max_native_tool_transaction_wrapper_tokens()
@@ -797,15 +807,12 @@ def test_native_tool_budget_constants_match_cross_platform_fixture() -> None:
 
 def test_next_step_reserve_counts_independent_native_replay_objects_once() -> None:
     # The first 16 KiB is the exact assistant message (content, calls,
-    # reasoning and provider state).  The second independently bounds the
-    # aggregate repeated tool_call_id values in result-message wrappers;
+    # reasoning and provider state). The second bounds the aggregate result
+    # message wrappers using metadata already present in that assistant JSON;
     # declared result contents are the separate 32 KiB batch below.
     wrapper = max_native_tool_transaction_wrapper_tokens()
-    assert wrapper == (
-        2 * MAX_NATIVE_ASSISTANT_TRANSACTION_JSON_BYTES
-        + MAX_NATIVE_TOOL_CALLS_PER_STEP * NATIVE_TOOL_RESULT_MESSAGE_WRAPPER_TOKENS_PER_CALL
-    )
-    assert wrapper + MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES == 67_072
+    assert wrapper == 2 * MAX_NATIVE_ASSISTANT_TRANSACTION_JSON_BYTES
+    assert wrapper + MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES == 65_536
 
 
 def test_default_contract_and_common_read_pairs_do_not_consume_the_whole_batch_alone() -> None:

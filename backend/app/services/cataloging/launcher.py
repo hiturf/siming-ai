@@ -23,16 +23,15 @@ from ...database.models import (
 )
 from ...database.session import SessionLocal
 from ...database.write_coordination import DatabaseWriteCoordinator, sqlite_database_path
-from .job_control import cancel_job, refresh_job_progress
 from .constants import JOB_RUNNING_STATUSES
+from .context import ordered_chapters
+from .job_control import cancel_job, refresh_job_progress
 from .local_cli_agent import (
     cancel_local_cli_cataloging_worker,
     ensure_local_cli_cataloging_worker,
 )
-from .context import ordered_chapters
 from .model_selection import cataloging_model_selection
 from .orchestrator import create_cataloging_job, job_to_dict, stream_cataloging_job
-
 
 CHAPTER_SAVE_SOURCE = "chapter_save"
 _LAUNCH_TASKS: dict[str, asyncio.Task[None]] = {}
@@ -62,6 +61,30 @@ def _serialized_cataloging_launch(function):
     return wrapped
 
 
+def cancel_cataloging_runtime(job_ids: list[str]) -> None:
+    """Stop committed cataloging jobs without opening another transaction.
+
+    Chapter rollback marks jobs cancelled inside its owning database
+    transaction, then calls this function from ``Session.after_commit``.  That
+    ordering prevents an external process from surviving a successful rollback
+    while also avoiding irreversible process cancellation when the database
+    transaction itself fails.
+    """
+
+    for job_id in dict.fromkeys(str(item) for item in job_ids if str(item)):
+        task = _LAUNCH_TASKS.get(job_id)
+        if task is not None and not task.done():
+            loop = task.get_loop()
+            if loop.is_running():
+                loop.call_soon_threadsafe(task.cancel)
+            else:
+                task.cancel()
+        try:
+            cancel_local_cli_cataloging_worker(job_id, terminal=True)
+        except Exception:
+            logger.exception("Failed to cancel cataloging runtime %s", job_id)
+
+
 def cancel_superseded_chapter_cataloging_jobs(
     db: Session,
     project_id: str,
@@ -85,11 +108,10 @@ def cancel_superseded_chapter_cataloging_jobs(
     for job in jobs:
         cancel_job(job)
         refresh_job_progress(db, job)
-        if job.execution_backend == "local_cli_agent":
-            cancel_local_cli_cataloging_worker(job.id, terminal=True)
         cancelled.append(job.id)
     if cancelled:
         commit_session(db)
+        cancel_cataloging_runtime(cancelled)
     return cancelled
 
 
@@ -118,7 +140,10 @@ def find_blocking_chapter_cataloging_job(
     allowed = str(allow_chapter_id or "").strip()
     if allowed:
         query = query.filter(CatalogingChapterRun.chapter_id != allowed)
-    return query.order_by(CatalogingJob.updated_at.desc(), CatalogingJob.created_at.desc()).first()
+    return query.order_by(
+        CatalogingJob.updated_at.desc(),
+        CatalogingJob.created_at.desc(),
+    ).first()
 
 
 def cataloging_block_result(tool: str, job: CatalogingJob) -> dict[str, Any]:
@@ -199,10 +224,14 @@ def _pause_failed_worker(
     job.status = "paused_on_failure"
     job.error = message
     refresh_job_progress(db, job)
-    operation = db.query(OperationRun).filter(OperationRun.id == job.operation_id).first()
+    operation = (
+        db.query(OperationRun).filter(OperationRun.id == job.operation_id).first()
+    )
     if operation:
         operation.failure_class = failure_class[:80]
-        operation.health_status = "disconnected" if failure_class == "interrupted" else "stalled"
+        operation.health_status = (
+            "disconnected" if failure_class == "interrupted" else "stalled"
+        )
         operation.next_action = "请重试当前建档章节，或取消任务后重新建档"
 
 
@@ -368,9 +397,6 @@ def create_and_queue_cataloging_job(
 
     backend = str(backend_override or "").strip()
     if backend == "external_agent" and not model_override:
-        # An unmanaged MCP client must not cause an implicit internal-model
-        # selection (or spend).  The durable job is handed back to that same
-        # client through the canonical external-cataloging protocol.
         model = None
         provider = str(provider_override or "external_agent").strip().lower()
         selection_source = "external_agent"
@@ -385,7 +411,9 @@ def create_and_queue_cataloging_job(
         ).strip().lower()
         selection_source = str(selection.source or "default").strip()
     if not backend:
-        backend = "local_cli_agent" if is_local_cli_provider(provider) else "internal_llm"
+        backend = (
+            "local_cli_agent" if is_local_cli_provider(provider) else "internal_llm"
+        )
 
     queued_chapter_ids = [chapter.id for chapter in missing_chapters]
     cancelled = (
@@ -418,7 +446,10 @@ def create_and_queue_cataloging_job(
             )
             .all()
         )
-        chapter_titles = [str(chapter.title or "未命名章节").strip() for chapter in chapters]
+        chapter_titles = [
+            str(chapter.title or "未命名章节").strip()
+            for chapter in chapters
+        ]
         chapter_label = (
             f"《{chapter_titles[0]}》"
             if len(chapter_titles) == 1
@@ -434,24 +465,26 @@ def create_and_queue_cataloging_job(
             commit_session(db)
     queued = queue_managed_cataloging_job(job, run_now=run_now)
     data = job_to_dict(job)
-    data.update({
-        "started": run_now,
-        "worker_queued": queued,
-        "trigger_source": trigger_source,
-        "superseded_job_ids": cancelled,
-        "idempotent_reuse": False,
-        "requested_chapter_ids": [chapter.id for chapter in chapters],
-        "already_cataloged_chapter_ids": sorted(reusable),
-        "in_progress_chapter_ids": [],
-        "queued_chapter_ids": queued_chapter_ids,
-        "deferred_chapter_ids": [],
-        "reused_job_ids": sorted({run.job_id for run in reusable.values()}),
-        "next_action": (
-            "background_cataloging"
-            if queued
-            else "continue_external_cataloging"
-        ),
-    })
+    data.update(
+        {
+            "started": run_now,
+            "worker_queued": queued,
+            "trigger_source": trigger_source,
+            "superseded_job_ids": cancelled,
+            "idempotent_reuse": False,
+            "requested_chapter_ids": [chapter.id for chapter in chapters],
+            "already_cataloged_chapter_ids": sorted(reusable),
+            "in_progress_chapter_ids": [],
+            "queued_chapter_ids": queued_chapter_ids,
+            "deferred_chapter_ids": [],
+            "reused_job_ids": sorted({run.job_id for run in reusable.values()}),
+            "next_action": (
+                "background_cataloging"
+                if queued
+                else "continue_external_cataloging"
+            ),
+        }
+    )
     return job, data
 
 
@@ -532,6 +565,7 @@ def queue_managed_cataloging_job(
 
 __all__ = [
     "CHAPTER_SAVE_SOURCE",
+    "cancel_cataloging_runtime",
     "cancel_superseded_chapter_cataloging_jobs",
     "cataloging_block_result",
     "cataloging_required_block_result",

@@ -196,6 +196,40 @@ class MobileCreationConversationAgentTest {
     }
 
     @Test
+    fun `standalone agent continues past the old six step limit`() {
+        val requests = AtomicInteger()
+        withServer(object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+                return when (val step = requests.getAndIncrement()) {
+                    0 -> chatStreamResponse(
+                        """{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-categories","type":"function","function":{"name":"set_tool_categories","arguments":"{\"enabled_categories\":[\"creation_data\"]}"}}]}}]}""",
+                    )
+                    in 1..6 -> {
+                        assertTrue(body.getValue("tools").jsonArray.isNotEmpty())
+                        chatStreamResponse(
+                            """{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-read-$step","type":"function","function":{"name":"get_creation_snapshot","arguments":"{}"}}]}}]}""",
+                        )
+                    }
+                    else -> chatStreamResponse(
+                        """{"choices":[{"message":{"role":"assistant","content":"已在超过旧上限后完成检查。"}}]}""",
+                    )
+                }
+            }
+        }) { server ->
+            val result = runBlocking { agent().run(
+                source = session(),
+                message = "连续检查多轮",
+                config = config(server),
+            ) }
+
+            assertEquals(8, requests.get())
+            assertEquals("completed", result.status)
+            assertEquals("已在超过旧上限后完成检查。", result.reply)
+        }
+    }
+
+    @Test
     fun `deepseek standalone conversation preserves thinking and omits unsupported tool choice`() {
         val requests = AtomicInteger()
         withServer(object : Dispatcher() {
@@ -306,7 +340,7 @@ class MobileCreationConversationAgentTest {
     }
 
     @Test
-    fun `more than twelve creation calls reject the whole batch before any handler`() {
+    fun `oversized declared creation results reject the whole batch before any handler`() {
         val requests = AtomicInteger()
         val persisted = AtomicInteger()
         withServer(object : Dispatcher() {
@@ -362,7 +396,7 @@ class MobileCreationConversationAgentTest {
             assertEquals(1, result.session.getValue("revision").jsonPrimitive.content.toInt())
             assertEquals(13, result.toolResults.count {
                 it.jsonObject.string("status") == "denied" &&
-                    it.jsonObject.string("detail").contains("超过 12 个")
+                    it.jsonObject.string("detail").contains("超过 32KiB")
             })
         }
     }

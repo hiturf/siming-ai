@@ -393,7 +393,7 @@ describe('SettingsPage startup and update controls', () => {
     expect(saveCall?.[1]?.context_window_tokens).toBe(96_000)
   })
 
-  it('requires unknown custom models to declare capacity in the model dialog', async () => {
+  it('uses the 256K fallback when an unknown custom model has no capacity profile', async () => {
     mockCustomModelConfig()
     api.post.mockImplementation((url: string) => {
       if (url === '/config/models/list') {
@@ -410,11 +410,14 @@ describe('SettingsPage startup and update controls', () => {
 
     const capacity = await screen.findByLabelText('模型上下文窗口 tokens')
     expect(capacity).not.toBeDisabled()
-    expect(screen.getByText(/未识别的自定义模型或 CLI 必须按模型文档填写一次/)).toBeInTheDocument()
+    expect(screen.getByText(/可留空；司命会按 256,000 tokens 临时兜底/)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /^OK$/ }))
 
-    expect(await screen.findByText('请填写模型上下文窗口')).toBeInTheDocument()
-    expect(api.post).not.toHaveBeenCalledWith('/config/models', expect.anything())
+    await waitFor(() => expect(api.post).toHaveBeenCalledWith('/config/models', expect.objectContaining({
+      provider: 'vendor',
+      default_model: 'legacy-model',
+      context_window_tokens: null,
+    })))
   })
 
   it('asks OpenCode CLI itself for available models', async () => {

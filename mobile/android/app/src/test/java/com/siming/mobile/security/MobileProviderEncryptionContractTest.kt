@@ -3,7 +3,6 @@ package com.siming.mobile.security
 import com.siming.mobile.data.network.DirectApiConfig
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.int
@@ -30,12 +29,13 @@ class MobileProviderEncryptionContractTest {
         assertEquals(128_000, (payload["context_window_tokens"] as JsonPrimitive).int)
         assertEquals(8_000, (payload["max_output_tokens"] as JsonPrimitive).int)
         assertEquals(4_096, (payload["safety_margin_tokens"] as JsonPrimitive).int)
+        assertEquals("conservative", (payload["capacity_assurance"] as JsonPrimitive).content)
         assertEquals(1234L, (payload["issued_at"] as JsonPrimitive).long)
         assertFalse("capacity" in payload.keys)
     }
 
     @Test
-    fun `unknown capacity fails before a provider envelope is created`() {
+    fun `unknown capacity uses 256k fallback before a provider envelope is created`() {
         val config = DirectApiConfig(
             displayName = "phone",
             baseUrl = "https://example.com/v1",
@@ -44,8 +44,15 @@ class MobileProviderEncryptionContractTest {
             contextWindowTokens = null,
         )
 
-        assertFailsWith<IllegalArgumentException> {
-            MobileProviderEncryption.providerPlaintext(config, issuedAt = 1234L)
-        }
+        val payload = MobileProviderEncryption.providerPlaintext(config, issuedAt = 1234L)
+        assertEquals(
+            DirectApiConfig.DEFAULT_CONTEXT_WINDOW_TOKENS,
+            (payload["context_window_tokens"] as JsonPrimitive).int,
+        )
+        assertEquals(
+            DirectApiConfig.DEFAULT_AGENT_OUTPUT_TOKENS,
+            (payload["max_output_tokens"] as JsonPrimitive).int,
+        )
+        assertEquals("unverified", (payload["capacity_assurance"] as JsonPrimitive).content)
     }
 }

@@ -37,8 +37,6 @@ from .tool_result_projection import (
 from .tool_schemas import build_workspace_tool_schemas
 from .turn_control import is_terminal_tool_result, terminal_reply
 
-MAX_SCHEDULED_AGENT_STEPS = 10
-MAX_SCHEDULED_TOOL_CALLS_PER_STEP = 12
 logger = logging.getLogger(__name__)
 
 
@@ -188,7 +186,7 @@ def run_workspace_scheduled_task(db: Session, task: ScheduledTask) -> str:
     async def run_agent_loop() -> str:
         active_categories: tuple[str, ...] = ()
         category_selected = False
-        for _turn in range(MAX_SCHEDULED_AGENT_STEPS):
+        while True:
             result = await collect_tool_turn(
                 LLMGateway,
                 messages=messages,
@@ -251,8 +249,6 @@ def run_workspace_scheduled_task(db: Session, task: ScheduledTask) -> str:
 
                 if tool_name == TOOL_CATEGORY_CONTROLLER:
                     break
-
-        raise RuntimeError("定时任务超过最大 Agent 步骤数，已停止继续执行")
 
     try:
         return asyncio.run(run_agent_loop())

@@ -1631,9 +1631,8 @@ function SettingsPage({ embedded = false }: SettingsPageProps = {}) {
               ? '已按服务商公开规格或模型接口自动验证；模型切换时会同步更新。'
               : contextProfileSource === 'configured'
                 ? '这是你已确认并保存的容量档案，可按当前模型文档修改。'
-                : '未识别的自定义模型或 CLI 必须按模型文档填写一次，避免错误截断或超出容量。'}
+                : '可留空；司命会按 256,000 tokens 临时兜底。若知道服务商的实际窗口，可填写并优先使用该档案。'}
             rules={[
-              { required: true, message: '请填写模型上下文窗口' },
               ({ getFieldValue }) => ({
                 validator: async (_, value) => {
                   if (!value) return

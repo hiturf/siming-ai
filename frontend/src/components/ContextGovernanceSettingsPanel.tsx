@@ -89,7 +89,7 @@ export default function ContextGovernanceSettingsPanel() {
         <Text type="secondary" style={{ fontSize: 12 }}>{semantic?.model || 'multilingual-e5-small'}{semantic?.reason ? ` · ${semantic.reason}` : ''}</Text>
       </div>
       <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
-        未配置档案时，1M 只是预览估算，不作为安全容量。请按服务商公布的当前模型规格填写确切窗口和最大输出；否则长对话 Agent 会在执行前明确报告容量未知。
+        未配置精确档案时，远程未知模型按 256K 临时容量运行。若保存并启用服务商公布的实际窗口和最大输出，司命会优先使用该档案。
       </Text>
       <Table
         rowKey="id"

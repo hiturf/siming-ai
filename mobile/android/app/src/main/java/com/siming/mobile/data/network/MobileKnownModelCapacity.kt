@@ -133,6 +133,7 @@ internal object MobileKnownModelCapacityCatalog {
         return config.copy(
             model = normalizedModel,
             contextWindowTokens = capacity.contextWindowTokens,
+            contextCapacitySource = DirectApiConfig.CONTEXT_CAPACITY_CATALOG,
             maxOutputTokens = minOf(
                 config.maxOutputTokens,
                 capacity.maxOutputTokens,

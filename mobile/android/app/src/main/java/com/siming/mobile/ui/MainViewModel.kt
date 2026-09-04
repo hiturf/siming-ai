@@ -514,7 +514,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         protocol: String,
         availableModels: List<String>,
         taskModels: Map<String, String>,
-        contextWindowTokens: Int,
+        contextWindowTokens: Int?,
         maxOutputTokens: Int,
         safetyMarginTokens: Int,
         onConfigured: () -> Unit,

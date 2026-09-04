@@ -1,6 +1,7 @@
 package com.siming.mobile.data.agent
 
 import android.content.Context
+import com.siming.mobile.data.network.DirectApiConfig
 import java.security.MessageDigest
 import java.util.UUID
 import kotlin.math.max
@@ -68,7 +69,10 @@ internal data class MobileContextPolicy(
                 sourceHash = root.stringValue("source_sha256"),
                 requiredCategories = contract.stringList("required_categories").toSet(),
                 optionalCategories = contract.stringList("optional_categories").toSet(),
-                contextWindowTokens = defaults.intValue("context_window_tokens", 1_000_000),
+                contextWindowTokens = defaults.intValue(
+                    "context_window_tokens",
+                    DirectApiConfig.DEFAULT_CONTEXT_WINDOW_TOKENS,
+                ),
                 safetyMarginTokens = defaults.intValue("safety_margin_tokens", 512),
                 minimumOutputReserveTokens = defaults.intValue("minimum_output_reserve_tokens", 2_048),
                 outputRatio = defaults.doubleValue("output_ratio", 0.45),
@@ -380,7 +384,10 @@ internal data class MobileContextManifest(
                 request = request,
                 requestFingerprint = root.stringValue("request_fingerprint"),
                 selectionFingerprint = root.stringValue("selection_fingerprint"),
-                contextWindowTokens = budget.intValue("context_window_tokens", 1_000_000),
+                contextWindowTokens = budget.intValue(
+                    "context_window_tokens",
+                    DirectApiConfig.DEFAULT_CONTEXT_WINDOW_TOKENS,
+                ),
                 inputBudgetTokens = inputBudgetTokens,
                 softInputTargetTokens = budget.intValue(
                     "soft_input_target_tokens",

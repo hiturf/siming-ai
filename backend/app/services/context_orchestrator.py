@@ -613,13 +613,6 @@ class ContextOrchestrator:
             except Exception:
                 provider = "unknown"
         request_capacity = active_request_capacity(provider, model_name)
-        if request_capacity is not None:
-            return ResolvedModelContextProfile(
-                provider=provider, model_name=model_name,
-                context_window_tokens=request_capacity.context_window_tokens,
-                max_output_tokens=request_capacity.max_output_tokens,
-                safety_margin_tokens=request_capacity.safety_margin_tokens, known=True,
-            )
         profile = configured_model_context_profile(
             self.db,
             provider=provider,
@@ -670,6 +663,15 @@ class ContextOrchestrator:
                 ),
                 known=True,
             )
+        if request_capacity is not None and request_capacity.known:
+            return ResolvedModelContextProfile(
+                provider=provider,
+                model_name=model_name,
+                context_window_tokens=request_capacity.context_window_tokens,
+                max_output_tokens=request_capacity.max_output_tokens,
+                safety_margin_tokens=request_capacity.safety_margin_tokens,
+                known=True,
+            )
         if local_context:
             return ResolvedModelContextProfile(
                 provider=provider,
@@ -694,15 +696,27 @@ class ContextOrchestrator:
                 safety_margin_tokens=cloud_capacity.safety_margin_tokens,
                 known=True,
             )
+        if request_capacity is not None:
+            return ResolvedModelContextProfile(
+                provider=provider,
+                model_name=model_name,
+                context_window_tokens=request_capacity.context_window_tokens,
+                max_output_tokens=request_capacity.max_output_tokens,
+                safety_margin_tokens=request_capacity.safety_margin_tokens,
+                known=False,
+            )
+        fallback_window = DEFAULT_CONTEXT_WINDOW_TOKENS
+        if provider == "local_llama_cpp":
+            fallback_window = DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
+        fallback_output = min(
+            output_limit(), max(1, fallback_window // 4),
+            max(1, fallback_window - DEFAULT_SAFETY_MARGIN_TOKENS - 1),
+        )
         return ResolvedModelContextProfile(
             provider=provider,
             model_name=model_name,
-            context_window_tokens=(
-                DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
-                if provider == "local_llama_cpp"
-                else DEFAULT_CONTEXT_WINDOW_TOKENS
-            ),
-            max_output_tokens=output_limit(),
+            context_window_tokens=fallback_window,
+            max_output_tokens=fallback_output,
             safety_margin_tokens=DEFAULT_SAFETY_MARGIN_TOKENS,
             known=False,
         )
@@ -1429,10 +1443,8 @@ class ContextOrchestrator:
                 )
             else:
                 warnings.append(
-                    "No exact model context profile is configured; "
-                    "the platform 1M context default was used. "
-                    "Configure a profile when the provider exposes a lower limit."
-                )
+                    "No exact model context profile is configured; the temporary 256K "
+                    "fallback was used. Configure the exact provider/model limit when available.")
 
         for order, candidate in enumerate(selected):
             item = ContextManifestItem(

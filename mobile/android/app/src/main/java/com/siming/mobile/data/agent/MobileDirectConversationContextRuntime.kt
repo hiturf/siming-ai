@@ -170,11 +170,15 @@ internal class MobileDirectConversationContextRuntime(
         pendingTransactions: List<MobileToolTransaction>,
         onStatus: suspend (MobileConversationPreparationStatus) -> Unit = {},
     ): MobilePreparedConversationRequest {
-        val contextWindow = config.contextWindowTokens ?: throw MobileConversationContextException(
-            MobileConversationContextErrorCode.CAPACITY_UNKNOWN,
-            "手机直连 Agent 模型尚未配置上下文窗口，未执行任何业务工具",
-        )
-        val counter = MobileUtf8ByteTokenCounter
+        val effectiveConfig = config.withContextWindowFallback()
+        val contextWindow = requireNotNull(effectiveConfig.contextWindowTokens)
+        val counter = if (
+            effectiveConfig.contextCapacitySource == DirectApiConfig.CONTEXT_CAPACITY_FALLBACK
+        ) {
+            MobileFallbackUtf8ByteTokenCounter
+        } else {
+            MobileUtf8ByteTokenCounter
+        }
         val currentUserContent = conversation.messages.firstOrNull {
             it.id == turnContext.userMessageId && it.sequenceNo == turnContext.userSequence
         }?.content ?: throw MobileConversationContextException(
@@ -192,9 +196,9 @@ internal class MobileDirectConversationContextRuntime(
         val binding = MobileGenerationModelBinding(
             taskType = taskType,
             provider = "android_direct_api",
-            modelName = config.model.trim(),
-            normalizedModel = config.model.trim(),
-            protocol = config.protocol,
+            modelName = effectiveConfig.model.trim(),
+            normalizedModel = effectiveConfig.model.trim(),
+            protocol = effectiveConfig.protocol,
             contextWindowTokens = contextWindow,
             maxOutputTokens = maxOutputTokens,
             tokenCounterId = counter.counterId,
@@ -202,13 +206,13 @@ internal class MobileDirectConversationContextRuntime(
             promptContractHash = promptHash,
             toolSchemaHash = toolSchemaHash,
             configFingerprint = mobileCanonicalSha256(buildJsonObject {
-                put("base_url", config.baseUrl.trim().trimEnd('/'))
-                put("model", config.model.trim())
-                put("protocol", config.protocol)
+                put("base_url", effectiveConfig.baseUrl.trim().trimEnd('/'))
+                put("model", effectiveConfig.model.trim())
+                put("protocol", effectiveConfig.protocol)
                 put("task_type", taskType)
                 put("context_window_tokens", contextWindow)
                 put("max_output_tokens", maxOutputTokens)
-                put("safety_margin_tokens", config.safetyMarginTokens)
+                put("safety_margin_tokens", effectiveConfig.safetyMarginTokens)
                 put("tool_choice", toolChoice?.let(::JsonPrimitive) ?: kotlinx.serialization.json.JsonNull)
                 put("temperature", temperature)
                 put("extra_body", extraBody ?: JsonObject(emptyMap()))
@@ -221,7 +225,7 @@ internal class MobileDirectConversationContextRuntime(
                 binding = binding,
                 counter = counter,
                 components = MobileRequestTokenComponents(),
-                safetyMarginTokens = config.safetyMarginTokens,
+                safetyMarginTokens = effectiveConfig.safetyMarginTokens,
             )
             fun provisionalFrame(
                 recentExactTurns: List<MobileConversationTurn>,
@@ -243,7 +247,7 @@ internal class MobileDirectConversationContextRuntime(
                 counter = counter,
                 components = countMobileRenderedRequestComponents(
                     directApi = directApi,
-                    config = config,
+                    config = effectiveConfig,
                     frame = baselineFrame,
                     rendered = baselineRendered,
                     scopedTools = scopedTools,
@@ -253,7 +257,7 @@ internal class MobileDirectConversationContextRuntime(
                     extraBody = extraBody,
                     counter = counter,
                 ),
-                safetyMarginTokens = config.safetyMarginTokens,
+                safetyMarginTokens = effectiveConfig.safetyMarginTokens,
             )
             baseline.requireSendable()
             if (!baseline.fitsProjected) {
@@ -271,7 +275,7 @@ internal class MobileDirectConversationContextRuntime(
                     counter = counter,
                     components = countMobileRenderedRequestComponents(
                         directApi = directApi,
-                        config = config,
+                        config = effectiveConfig,
                         frame = provisional,
                         rendered = provisionalRendered,
                         scopedTools = scopedTools,
@@ -281,7 +285,7 @@ internal class MobileDirectConversationContextRuntime(
                         extraBody = extraBody,
                         counter = counter,
                     ),
-                    safetyMarginTokens = config.safetyMarginTokens,
+                    safetyMarginTokens = effectiveConfig.safetyMarginTokens,
                 )
                 finalBudget.requireSendable()
                 if (!finalBudget.fitsProjected) {
@@ -348,11 +352,11 @@ internal class MobileDirectConversationContextRuntime(
                 )
             val generator = MobileDirectCheckpointGenerator(
                 directApi = directApi,
-                config = config,
+                config = effectiveConfig,
                 counter = counter,
                 contextWindowTokens = contextWindow,
                 maxOutputTokens = minOf(maxOutputTokens, CHECKPOINT_OUTPUT_TOKENS),
-                safetyMarginTokens = config.safetyMarginTokens,
+                safetyMarginTokens = effectiveConfig.safetyMarginTokens,
             )
             val sourceTurns = largestCheckpointPrefix(generator, current, range, binding)
             val sourceFirst = sourceTurns.first().firstSequence

@@ -253,10 +253,10 @@ export default function ContextGovernancePage({ projectId }: { projectId: string
       key: 'model',
       render: (_: unknown, item: ContextManifest) => (
         <Text
-          ellipsis={{ tooltip: item.model || '未知模型：1M 仅用于预览估算，Agent 会阻断执行' }}
+          ellipsis={{ tooltip: item.model || '未记录模型名称；本次按 256K 临时容量兜底。已配置的精确档案会优先使用。' }}
           style={{ maxWidth: 180 }}
         >
-          {item.model || '未知模型（1M 未验证预览，Agent 会阻断）'}
+          {item.model || '未知模型（256K 临时兜底）'}
         </Text>
       ),
     },

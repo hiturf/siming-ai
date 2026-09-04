@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from itertools import count
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -737,7 +738,7 @@ async def run_native_steps(
 ) -> None:
     if state.tool_mode != "native":
         return
-    for iteration in range(6):
+    for iteration in count():
         if not await _run_native_step(state, bindings, iteration):
             break
 

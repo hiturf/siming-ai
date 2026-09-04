@@ -559,11 +559,7 @@ async def save_external_chapter_draft(
     project_id: str,
     args: dict[str, Any],
 ) -> dict:
-    """Save an externally generated chapter draft.
-
-    API-free: stores draft content server-side and returns draft_id/content_ref.
-    Saving the draft is the terminal boundary for an AI chapter-writing turn.
-    """
+    """Persist an external draft; this is the terminal AI-writing boundary."""
     from app.services.cataloging.launcher import (
         cataloging_block_result,
         cataloging_required_block_result,
@@ -680,10 +676,10 @@ async def save_external_chapter_draft(
             "data": {"target_chapter_id": conflict.target_chapter_id},
         }
 
-    length_check = check_chapter_length(
-        content,
-        ContextOrchestrator(db).get_manifest(context_manifest_id, project_id),
-    )
+    manifest = ContextOrchestrator(db).get_manifest(
+        context_manifest_id, project_id
+    ) if context_manifest_id else None
+    length_check = check_chapter_length(content, manifest)
     return apply_turn_directive({
         "tool": "save_external_chapter_draft",
         "status": "ok",
@@ -714,8 +710,8 @@ async def save_external_outline_draft(
     args: dict[str, Any],
 ) -> dict[str, Any]:
     """Persist an external Agent's reviewed-context outline proposal."""
-    from ....services.context_orchestrator import ContextOrchestrator
     from ....core.exceptions import ValidationError
+    from ....services.context_orchestrator import ContextOrchestrator
     from ..outline_drafts import (
         PendingOutlineDraftConflict,
         latest_pending_outline_draft,

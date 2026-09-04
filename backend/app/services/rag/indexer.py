@@ -264,8 +264,10 @@ def _get_or_create_document(
     )
     db.add(doc)
     # Production sessions disable autoflush. Persist the parent inside this
-    # transaction before chunks reference it; raw IDs alone do not establish
-    # ORM insertion ordering. The caller still owns commit/rollback.
+    # transaction before chunks reference it. RagDocument and RagChunk have no
+    # ORM relationship, so raw foreign-key IDs do not establish insertion
+    # order when SQLite foreign keys are enabled. Flush only the new parent;
+    # the caller still owns the surrounding commit or rollback.
     db.flush([doc])
     return doc
 

@@ -1074,7 +1074,7 @@ describe('WorkspaceAssistantChat cancellation and recovery', () => {
     expect(document.querySelector('.workspace-assistant-messages')).not.toHaveTextContent('已整理较早上下文')
   })
 
-  it('blocks on unknown model capacity and opens the exact governance settings panel', async () => {
+  it('handles an explicit server capacity error and opens the exact governance settings panel', async () => {
     const stream = createControlledResponse([
       sse({
         type: 'error',

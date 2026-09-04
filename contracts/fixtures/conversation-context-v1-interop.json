@@ -18,13 +18,11 @@
     "final_agent_request_over_capacity"
   ],
   "native_tool_budget": {
-    "schema": "native_tool_transaction_budget.v1",
+    "schema": "native_tool_transaction_budget.v2",
     "max_native_assistant_transaction_json_bytes": 16384,
     "max_model_visible_tool_result_batch_json_bytes": 32768,
-    "max_native_tool_calls_per_step": 12,
-    "tool_result_message_wrapper_tokens_per_call": 128,
-    "next_step_wrapper_tokens": 34304,
-    "max_projected_transaction_growth_tokens": 67072,
+    "next_step_wrapper_tokens": 32768,
+    "max_projected_transaction_growth_tokens": 65536,
     "assistant_replay_fields": [
       "content",
       "tool_calls",

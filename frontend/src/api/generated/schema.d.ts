@@ -3354,7 +3354,7 @@ export interface paths {
         put?: never;
         /**
          * Quality Score Preview
-         * @description Return a manual quality review without changing chapter data.
+         * @description Return a manual quality review without changing the saved chapter.
          */
         post: operations["quality_score_preview_api_v1_projects__project_id__chapters__chapter_id__quality_score_preview_post"];
         delete?: never;
@@ -3695,7 +3695,15 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        put?: never;
+        /**
+         * Upsert Character Chapter Appearance
+         * @description Create or correct one author-confirmed chapter/person association.
+         *
+         *     The chapter and character IDs are validated against the current project.
+         *     Repeating the same request updates the one existing association instead of
+         *     creating duplicate rows.
+         */
+        put: operations["upsert_character_chapter_appearance_api_v1_projects__project_id__characters__character_id__appearances__chapter_id__put"];
         post?: never;
         /**
          * Delete Character Chapter Appearance
@@ -6371,6 +6379,23 @@ export interface components {
              * @description 话量偏好 brief/moderate/verbose
              */
             verbosity?: string | null;
+        };
+        /**
+         * CharacterChapterAppearanceUpsert
+         * @description Author-owned chapter appearance correction.
+         */
+        CharacterChapterAppearanceUpsert: {
+            /**
+             * Appearance Type
+             * @description 本章中的确定性人物出现类型
+             * @enum {string}
+             */
+            appearance_type: "出场" | "提及" | "回忆";
+            /**
+             * Description
+             * @description 作者确认的本章人物关联说明
+             */
+            description?: string | null;
         };
         /**
          * CharacterCreate
@@ -17347,6 +17372,43 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["CharacterAIConfigUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    upsert_character_chapter_appearance_api_v1_projects__project_id__characters__character_id__appearances__chapter_id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                character_id: string;
+                chapter_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CharacterChapterAppearanceUpsert"];
             };
         };
         responses: {

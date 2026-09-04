@@ -653,9 +653,6 @@ internal class MobileWorkspaceAgent(
         val detail = if (reason == MobileNativeToolBudgetContract.NATIVE_ASSISTANT_TRANSACTION_OVER_CAPACITY) {
             "当前原生工具 assistant 事务为 ${admission.declaredJsonBytes} 字节，超过协议上限 " +
                 "${admission.maxJsonBytes} 字节；整批未执行。请减少并行调用或缩小工具参数。"
-        } else if (admission.callCount > MobileNativeToolBudgetContract.MAX_NATIVE_TOOL_CALLS_PER_STEP) {
-            "当前步骤包含 ${admission.callCount} 个工具调用，超过协议上限 " +
-                "${MobileNativeToolBudgetContract.MAX_NATIVE_TOOL_CALLS_PER_STEP}；整批未执行。"
         } else {
             "当前工具批次的声明结果上限为 ${admission.declaredJsonBytes} 字节，超过单步 " +
                 "${admission.maxJsonBytes} 字节上限；整批未执行。请减少并行调用或使用分页。"
@@ -667,7 +664,6 @@ internal class MobileWorkspaceAgent(
             put("data", buildJsonObject {
                 put("reason", reason)
                 put("batch_call_count", admission.callCount)
-                put("max_batch_call_count", MobileNativeToolBudgetContract.MAX_NATIVE_TOOL_CALLS_PER_STEP)
                 put("declared_batch_json_bytes", admission.declaredJsonBytes)
                 put("max_batch_json_bytes", admission.maxJsonBytes)
             })
@@ -783,9 +779,9 @@ internal class MobileWorkspaceAgent(
     ): JsonObject = when (tool) {
         "get_project_info" -> getProjectInfo(projectId)
         "update_project_info" -> updateProjectInfo(projectId, args)
-        "list_characters" -> listCharacters(projectId)
-        "list_chapters" -> listChapters(projectId)
-        "list_worldbuilding" -> listWorldbuilding(projectId)
+        "list_characters" -> listCharacters(projectId, args)
+        "list_chapters" -> listChapters(projectId, args)
+        "list_worldbuilding" -> listWorldbuilding(projectId, args)
         "search_characters" -> searchCharacters(projectId, args)
         "search_chapters" -> searchChapters(projectId, args)
         "search_outline" -> searchOutline(projectId, args)
@@ -848,78 +844,132 @@ internal class MobileWorkspaceAgent(
         return ok("update_project_info", "已更新作品：${payload.string("title")}", clean(payload))
     }
 
-    private suspend fun listCharacters(projectId: String): JsonObject {
-        val items = records(projectId, "character")
-            .sortedBy { it.payload.string("name") }
-            .take(100)
-            .map { item -> select(item.payload, "id", "name", "role_type") }
-        return ok("list_characters", if (items.isEmpty()) "该项目暂无角色" else "共 ${items.size} 个角色", JsonArray(items))
+    private suspend fun listCharacters(projectId: String, args: JsonObject): JsonObject {
+        val page = mobilePage(
+            records(projectId, "character").sortedBy { it.payload.string("name") },
+            args.cursor(),
+            args.limit(10, 10),
+        )
+        val items = page.values.map { item -> select(item.payload, "id", "name", "role_type") }
+        if (items.isEmpty()) return ok("list_characters", "该项目暂无角色", JsonArray(emptyList()))
+        return pagedOk("list_characters", "共 ${items.size} 个角色", JsonArray(items), page)
     }
 
-    private suspend fun listChapters(projectId: String): JsonObject {
-        val items = records(projectId, "chapter")
-            .take(500)
-            .map { item -> select(item.payload, "id", "title", "outline_node_id") }
-        return ok("list_chapters", if (items.isEmpty()) "该项目暂无章节" else "共 ${items.size} 个章节", JsonArray(items))
+    private suspend fun listChapters(projectId: String, args: JsonObject): JsonObject {
+        val page = mobilePage(records(projectId, "chapter"), args.cursor(), args.limit(10, 10))
+        val items = page.values.map { item -> select(item.payload, "id", "title", "outline_node_id") }
+        if (items.isEmpty()) return ok("list_chapters", "该项目暂无章节", JsonArray(emptyList()))
+        return pagedOk("list_chapters", "共 ${items.size} 个章节", JsonArray(items), page)
     }
 
-    private suspend fun listWorldbuilding(projectId: String): JsonObject {
-        val items = records(projectId, "world")
+    private suspend fun listWorldbuilding(projectId: String, args: JsonObject): JsonObject {
+        val ordered = records(projectId, "world")
             .filter { it.payload.isCurrentWorldbuildingEntry() }
-            .sortedWith(compareBy<LocalRecord> { it.payload.string("dimension") }.thenBy { it.payload.int("sort_order") })
-            .take(200)
-            .map { item -> select(item.payload, "id", "title", "dimension") }
-        return ok(
+            .sortedWith(
+                compareBy<LocalRecord> { it.payload.string("dimension") }
+                    .thenBy { it.payload.int("sort_order") }
+                    .thenBy { it.entity.entityId },
+            )
+        val page = mobilePage(ordered, args.cursor(), args.limit(10, 10))
+        val items = page.values.map { item -> select(item.payload, "id", "title", "dimension") }
+        if (items.isEmpty()) {
+            return ok("list_worldbuilding", "该项目暂无世界观条目", JsonArray(emptyList()))
+        }
+        return pagedOk(
             "list_worldbuilding",
-            if (items.isEmpty()) "该项目暂无世界观条目" else "共 ${items.size} 个世界观条目",
+            "共 ${items.size} 个世界观条目",
             JsonArray(items),
+            page,
         )
     }
 
     private suspend fun searchCharacters(projectId: String, args: JsonObject): JsonObject {
         val query = args.string("query")
-        val limit = args.limit(10, 30)
-        val items = records(projectId, "character")
-            .filter { query.isBlank() || it.payload.string("name").contains(query, ignoreCase = true) }
-            .sortedBy { it.payload.string("name") }
-            .take(limit)
-            .map { item ->
+        if (query.length > 100) return skipped("search_characters", "角色查询超过100字符，请缩小范围", JsonArray(emptyList()))
+        val rawFields = args["fields"]
+        val fields = when (rawFields) {
+            null, JsonNull -> DEFAULT_CHARACTER_RANGE_FIELDS
+            is JsonArray -> rawFields.mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.trim() }
+                .filter(String::isNotBlank)
+                .distinct()
+            else -> return skipped("search_characters", "fields 必须是字段名数组", JsonArray(emptyList()))
+        }
+        if (fields.size > 3 || fields.any { it !in CHARACTER_RANGE_FIELDS }) {
+            return skipped("search_characters", "fields 每次最多选3个声明字段，请分次读取", JsonArray(emptyList()))
+        }
+        val page = mobilePage(
+            records(projectId, "character")
+                .filter { query.isBlank() || it.payload.string("name").contains(query, ignoreCase = true) }
+                .sortedBy { it.payload.string("name") },
+            args.cursor(),
+            args.limit(2, 2),
+        )
+        val fieldOffset = args.int("field_offset_chars").coerceAtLeast(0)
+        val fieldChars = args.int("field_chars", 200).coerceIn(1, 200)
+        val items = page.values.map { item ->
+            val selectedFields = linkedMapOf<String, JsonElement>()
+            val ranges = linkedMapOf<String, JsonElement>()
+            fields.forEach { field ->
+                val range = mobileTextRange(item.payload.text(field), fieldOffset, fieldChars)
+                selectedFields[field] = JsonPrimitive(range.text)
+                ranges[field] = range.metadata
+            }
+            buildJsonObject {
                 select(
                     item.payload,
-                    "id", "name", "role_type", "appearance", "personality", "background", "abilities",
-                    "life_status", "current_location", "realm_or_level", "physical_state", "mental_state",
-                    "current_goal", "active_conflict", "abilities_state", "items_or_assets", "profile",
-                )
+                    "id", "name", "role_type", "life_status", "current_location", "realm_or_level",
+                ).forEach { (key, value) -> put(key, value) }
+                put("fields", JsonObject(selectedFields))
+                put("field_ranges", JsonObject(ranges))
             }
+        }
         val detail = if (items.isEmpty()) {
             if (query.isBlank()) "该项目暂无角色" else "未找到匹配「$query」的角色"
         } else {
             "找到 ${items.size} 个角色" + if (query.isBlank()) "" else "（搜索「$query」）"
         }
-        return ok("search_characters", detail, JsonArray(items))
+        if (items.isEmpty()) return ok("search_characters", detail, JsonArray(emptyList()))
+        return pagedOk("search_characters", detail, JsonArray(items), page)
     }
 
     private suspend fun searchChapters(projectId: String, args: JsonObject): JsonObject {
         val query = args.string("query")
+        if (query.length > 200) return skipped("search_chapters", "章节查询超过200字符，请缩小范围", JsonArray(emptyList()))
         val outlineId = args.string("outline_node_id")
-        val items = records(projectId, "chapter")
-            .filter {
+        val page = mobilePage(
+            records(projectId, "chapter").filter {
                 if (outlineId.isNotBlank()) it.payload.string("outline_node_id") == outlineId
                 else query.isBlank() || it.payload.string("title").contains(query, ignoreCase = true)
+            },
+            args.cursor(),
+            args.limit(2, 2),
+        )
+        val contentOffset = args.int("content_offset_chars").coerceAtLeast(0)
+        val contentChars = args.int("content_chars", 400).coerceIn(1, 400)
+        val items = page.values.map { item ->
+            val payload = item.payload
+            val content = mobileTextRange(payload.text("content"), contentOffset, contentChars)
+            val summary = payload.text("summary")
+            val qualityDetail = payload.text("quality_detail")
+            buildJsonObject {
+                select(payload, "id", "title", "outline_node_id", "word_count").forEach { (key, value) -> put(key, value) }
+                put("summary", summary.take(100))
+                put("summary_truncated", summary.length > 100)
+                put("content", content.text)
+                put("content_range", content.metadata)
+                put("quality_score", payload["quality_score"] ?: JsonNull)
+                put("quality_detail", qualityDetail.take(100))
+                put("quality_detail_truncated", qualityDetail.length > 100)
+                put("quality_evaluated_at", payload["quality_evaluated_at"] ?: JsonNull)
             }
-            .take(args.limit(5, 20))
-            .map { item ->
-                val payload = item.payload
-                buildJsonObject {
-                    select(
-                        payload,
-                        "id", "title", "outline_node_id", "word_count", "summary",
-                        "quality_score", "quality_detail", "quality_evaluated_at",
-                    ).forEach { (key, value) -> put(key, value) }
-                    put("content", payload.string("content").take(8_000))
-                }
-            }
-        return ok("search_chapters", if (items.isEmpty()) "未找到匹配章节" else "找到 ${items.size} 个章节", JsonArray(items))
+        }
+        if (items.isEmpty()) return ok("search_chapters", "未找到匹配章节", JsonArray(emptyList()))
+        val labels = buildList {
+            if (query.isNotBlank()) add("「$query」")
+            if (outlineId.isNotBlank()) add("大纲节点 $outlineId")
+        }
+        val detail = if (labels.isEmpty()) "找到 ${items.size} 个章节" else "找到 ${items.size} 个章节（${labels.joinToString("，")}）"
+        return pagedOk("search_chapters", detail, JsonArray(items), page)
     }
 
     private suspend fun searchOutline(projectId: String, args: JsonObject): JsonObject {
@@ -992,38 +1042,67 @@ internal class MobileWorkspaceAgent(
         val all = records(projectId, "outline")
         if (all.isEmpty()) return ok("search_outline_tree", "该项目暂无大纲", JsonArray(emptyList()))
         val rootId = args.string("root_id")
-        val parentId = if (rootId.isBlank()) "" else rootId
-        if (rootId.isNotBlank() && all.none { it.entity.entityId == rootId }) {
+        val root = rootId.takeIf(String::isNotBlank)?.let { id -> all.firstOrNull { it.entity.entityId == id } }
+        if (rootId.isNotBlank() && root == null) {
             return skipped("search_outline_tree", "未找到大纲节点 $rootId", JsonArray(emptyList()))
         }
-        val tree = outlineTree(all, parentId, emptySet())
-        val label = if (rootId.isBlank()) "完整大纲树：${all.size} 个节点" else "大纲子树：${countTree(tree)} 个节点"
-        return ok("search_outline_tree", label, tree)
+        val flattened = flattenOutline(
+            all,
+            parentId = root?.entity?.entityId.orEmpty(),
+            depth = if (root == null) 0 else 1,
+            visited = root?.let { setOf(it.entity.entityId) }.orEmpty(),
+        )
+        val page = mobilePage(flattened, args.cursor(), args.limit(10, 10))
+        val detail = if (root == null) {
+            "完整大纲树：${flattened.size} 个节点"
+        } else {
+            "大纲子树「${root.payload.string("title")}」：${flattened.size} 个节点"
+        }
+        return pagedOk(
+            "search_outline_tree",
+            detail,
+            JsonArray(page.values),
+            page,
+            totalItems = flattened.size,
+        )
     }
 
     private suspend fun searchWorldbuilding(projectId: String, args: JsonObject): JsonObject {
         val query = args.string("query")
+        if (query.length > 200) return skipped("search_worldbuilding", "世界观查询超过200字符，请缩小范围", JsonArray(emptyList()))
         val dimension = args.string("dimension")
-        val items = records(projectId, "world")
-            .filter {
-                it.payload.isCurrentWorldbuildingEntry() &&
-                    (query.isBlank() || it.payload.string("title").contains(query, ignoreCase = true)) &&
-                    (dimension.isBlank() || it.payload.string("dimension") == dimension)
-            }
-            .sortedBy { it.payload.int("sort_order") }
-            .take(args.limit(10, 30))
-            .map { item ->
+        val page = mobilePage(
+            records(projectId, "world")
+                .filter {
+                    it.payload.isCurrentWorldbuildingEntry() &&
+                        (query.isBlank() || it.payload.string("title").contains(query, ignoreCase = true)) &&
+                        (dimension.isBlank() || it.payload.string("dimension") == dimension)
+                }
+                .sortedWith(compareBy<LocalRecord> { it.payload.int("sort_order") }.thenBy { it.entity.entityId }),
+            args.cursor(),
+            args.limit(2, 2),
+        )
+        val contentOffset = args.int("content_offset_chars").coerceAtLeast(0)
+        val contentChars = args.int("content_chars", 400).coerceIn(1, 400)
+        val items = page.values.map { item ->
+            val content = mobileTextRange(item.payload.text("content"), contentOffset, contentChars)
+            buildJsonObject {
                 select(
                     item.payload,
-                    "id", "dimension", "title", "content", "sort_order", "status", "confidence",
-                    "first_seen_chapter_id", "last_updated_chapter_id", "plot_usage", "constraints",
-                )
+                    "id", "dimension", "title", "sort_order", "status", "confidence",
+                    "first_seen_chapter_id", "last_updated_chapter_id",
+                ).forEach { (key, value) -> put(key, value) }
+                put("content", content.text)
+                put("content_range", content.metadata)
             }
-        return ok(
-            "search_worldbuilding",
-            if (items.isEmpty()) "未找到匹配的世界观条目" else "找到 ${items.size} 个世界观条目",
-            JsonArray(items),
-        )
+        }
+        if (items.isEmpty()) return ok("search_worldbuilding", "未找到匹配的世界观条目", JsonArray(emptyList()))
+        val labels = buildList {
+            if (query.isNotBlank()) add("「$query」")
+            if (dimension.isNotBlank()) add("维度 $dimension")
+        }
+        val detail = "找到 ${items.size} 个世界观条目" + if (labels.isEmpty()) "" else "（${labels.joinToString("，")}）"
+        return pagedOk("search_worldbuilding", detail, JsonArray(items), page)
     }
 
     private suspend fun prepareTaskContext(
@@ -2183,26 +2262,54 @@ internal class MobileWorkspaceAgent(
         if (entityType != "project") put("project_id", projectId)
     }
 
-    private fun outlineTree(all: List<LocalRecord>, parentId: String, visited: Set<String>): JsonArray = buildJsonArray {
-        all.filter { it.payload.string("parent_id") == parentId && it.entity.entityId !in visited }
-            .sortedBy { it.payload.int("sort_order") }
+    private fun flattenOutline(
+        all: List<LocalRecord>,
+        parentId: String,
+        depth: Int,
+        visited: Set<String>,
+    ): List<JsonObject> {
+        val flattened = mutableListOf<JsonObject>()
+        all.asSequence()
+            .filter { it.payload.string("parent_id") == parentId && it.entity.entityId !in visited }
+            .sortedWith(compareBy<LocalRecord> { it.payload.int("sort_order") }.thenBy { it.entity.entityId })
             .forEach { node ->
-                add(buildJsonObject {
-                    put("id", node.entity.entityId)
+                val id = node.entity.entityId
+                flattened += buildJsonObject {
+                    put("id", id)
+                    put("parent_id", node.payload["parent_id"] ?: JsonNull)
                     put("node_type", node.payload.string("node_type"))
                     put("title", node.payload.string("title"))
-                    put("children", outlineTree(all, node.entity.entityId, visited + node.entity.entityId))
-                })
+                    put("depth", depth)
+                    put("sort_order", node.payload.int("sort_order"))
+                }
+                flattened += flattenOutline(all, id, depth + 1, visited + id)
             }
+        return flattened
     }
 
-    private fun countTree(tree: JsonArray): Int = tree.sumOf { raw ->
-        val node = raw as? JsonObject ?: return@sumOf 0
-        1 + countTree(node["children"] as? JsonArray ?: JsonArray(emptyList()))
+    private fun pageMetadata(page: MobilePage<*>, totalItems: Int? = null): JsonObject = buildJsonObject {
+        mobilePageMetadata(page).forEach { (key, value) -> put(key, value) }
+        totalItems?.let { put("total_items", it) }
+    }
+
+    private fun pagedOk(
+        tool: String,
+        detail: String,
+        data: JsonElement,
+        page: MobilePage<*>,
+        totalItems: Int? = null,
+    ): JsonObject = buildJsonObject {
+        put("tool", tool)
+        put("status", "ok")
+        put("detail", detail)
+        put("data", data)
+        put("page", pageMetadata(page, totalItems))
     }
 
     private fun worldContext(all: List<LocalRecord>): String {
-        val entries = all.filter { it.entity.entityType == "world" }
+        val entries = all.filter {
+            it.entity.entityType == "world" && it.payload.isCurrentWorldbuildingEntry()
+        }
             .sortedWith(compareBy<LocalRecord> { it.payload.string("dimension") }.thenBy { it.payload.int("sort_order") })
             .take(32)
         if (entries.isEmpty()) return "暂无世界观设定。"
@@ -2293,8 +2400,16 @@ internal class MobileWorkspaceAgent(
 
     private fun JsonObject.string(name: String): String = (get(name) as? JsonPrimitive)?.contentOrNull.orEmpty()
 
+    private fun JsonObject.text(name: String): String = when (val value = get(name)) {
+        null, JsonNull -> ""
+        is JsonPrimitive -> value.contentOrNull.orEmpty()
+        else -> value.toString()
+    }
+
     private fun JsonObject.int(name: String, fallback: Int = 0): Int =
         (get(name) as? JsonPrimitive)?.intOrNull ?: fallback
+
+    private fun JsonObject.cursor(): Int = int("cursor").coerceAtLeast(0)
 
     private fun JsonObject.limit(fallback: Int, maximum: Int): Int = int("limit", fallback).coerceIn(1, maximum)
 
@@ -2337,6 +2452,19 @@ internal class MobileWorkspaceAgent(
                 "只依据本轮已验证的工具结果，直接回答作者最新消息。" +
                 "必须给出具体结论、依据和仍缺少的信息；不能只声称已分析、已完成或让作者等待。"
         private const val MAX_CONTEXT_MANIFESTS = 20
+        private val CHARACTER_RANGE_FIELDS = setOf(
+            "appearance",
+            "personality",
+            "background",
+            "abilities",
+            "physical_state",
+            "mental_state",
+            "current_goal",
+            "active_conflict",
+            "abilities_state",
+            "items_or_assets",
+        )
+        private val DEFAULT_CHARACTER_RANGE_FIELDS = listOf("appearance", "personality", "background")
         private val TERMINAL_DRAFT_TOOLS = setOf("chapter_writer", "outline_writer")
         private val STATUS_ONLY_RESULT_TOOLS = setOf(
             "update_project_info",
@@ -2420,34 +2548,18 @@ internal fun existingMobileChapterIdForOutline(
         ?: "linked-chapter"
 }
 
-internal data class MobileOutlinePage(
-    val items: List<JsonObject>,
-    val cursor: Int,
-    val limit: Int,
-    val totalItems: Int,
-    val nextCursor: Int?,
-)
+internal typealias MobileOutlinePage = MobilePage<JsonObject>
 
 internal fun mobileOutlinePage(
     values: List<JsonObject>,
     cursor: Int,
     limit: Int,
 ): MobileOutlinePage {
-    val safeCursor = cursor.coerceAtLeast(0)
-    val safeLimit = limit.coerceIn(1, 2)
     val ordered = values.sortedWith(
         compareBy<JsonObject> { it.mobileOutlineInt("sort_order") }
             .thenBy { it.mobileOutlineString("id") },
     )
-    val visible = ordered.drop(safeCursor).take(safeLimit)
-    val nextCursor = (safeCursor + visible.size).takeIf { it < ordered.size }
-    return MobileOutlinePage(
-        items = visible,
-        cursor = safeCursor,
-        limit = safeLimit,
-        totalItems = ordered.size,
-        nextCursor = nextCursor,
-    )
+    return mobilePage(ordered, cursor, limit.coerceIn(1, 2))
 }
 
 internal fun mobileOutlineSearchResult(
@@ -2462,15 +2574,7 @@ internal fun mobileOutlineSearchResult(
     put("status", "ok")
     put("detail", detail)
     put("data", data)
-    put("page", buildJsonObject {
-        put("cursor", page.cursor)
-        put("limit", page.limit)
-        put("returned_items", page.items.size)
-        put("total_items", page.totalItems)
-        if (page.nextCursor == null) put("next_cursor", JsonNull)
-        else put("next_cursor", page.nextCursor)
-        put("has_more", page.nextCursor != null)
-    })
+    put("page", mobilePageMetadata(page))
     page.nextCursor?.let { nextCursor ->
         put("next_arguments", buildJsonObject {
             put("cursor", nextCursor)
@@ -2495,46 +2599,40 @@ internal fun mobileOutlineSearchItem(
     val summaryChars = args.mobileOutlineInt("summary_chars", 100).coerceIn(1, 100)
     val linkedCursor = args.mobileOutlineInt("linked_cursor").coerceAtLeast(0)
     val linkedLimit = args.mobileOutlineInt("linked_limit", 2).coerceIn(1, 2)
-    val (summary, summaryRange) = mobileOutlineTextRange(
+    val summary = mobileTextRange(
         payload.mobileOutlineString("summary"),
         summaryOffset,
         summaryChars,
     )
-    val (actualSummary, actualSummaryRange) = mobileOutlineTextRange(
+    val actualSummary = mobileTextRange(
         payload.mobileOutlineString("actual_summary"),
         summaryOffset,
         summaryChars,
     )
-    val (plannedSummary, plannedSummaryRange) = mobileOutlineTextRange(
+    val plannedSummary = mobileTextRange(
         payload.mobileOutlineString("planned_summary"),
         summaryOffset,
         summaryChars,
     )
     val linked = mobileOutlineLinkedCharacters(payload, characterNamesById)
-    val linkedVisible = linked.drop(linkedCursor).take(linkedLimit)
-    val linkedNextCursor = (linkedCursor + linkedVisible.size).takeIf { it < linked.size }
+    val linkedPage = mobilePage(linked, linkedCursor, linkedLimit)
     return buildJsonObject {
         put("id", payload.mobileOutlineString("id"))
         put("parent_id", payload["parent_id"] ?: JsonNull)
         put("node_type", payload.mobileOutlineString("node_type"))
         put("title", payload.mobileOutlineString("title"))
-        put("summary", summary)
-        put("summary_range", summaryRange)
+        put("summary", summary.text)
+        put("summary_range", summary.metadata)
         put("status", payload.mobileOutlineString("status"))
         put("sort_order", payload.mobileOutlineInt("sort_order"))
         put("source_chapter_id", payload["source_chapter_id"] ?: JsonNull)
-        put("actual_summary", actualSummary)
-        put("actual_summary_range", actualSummaryRange)
-        put("planned_summary", plannedSummary)
-        put("planned_summary_range", plannedSummaryRange)
+        put("actual_summary", actualSummary.text)
+        put("actual_summary_range", actualSummary.metadata)
+        put("planned_summary", plannedSummary.text)
+        put("planned_summary_range", plannedSummary.metadata)
         put("cataloging_status", payload["cataloging_status"] ?: JsonNull)
-        put("linked_characters", JsonArray(linkedVisible))
-        put("linked_page", buildJsonObject {
-            put("cursor", linkedCursor)
-            if (linkedNextCursor == null) put("next_cursor", JsonNull)
-            else put("next_cursor", linkedNextCursor)
-            put("has_more", linkedNextCursor != null)
-        })
+        put("linked_characters", JsonArray(linkedPage.values))
+        put("linked_page", mobilePageMetadata(linkedPage))
         children?.let { childRows ->
             put("children", JsonArray(childRows.map { child ->
                 buildJsonObject {
@@ -2543,34 +2641,16 @@ internal fun mobileOutlineSearchItem(
                     put("title", child.mobileOutlineString("title"))
                     put(
                         "summary",
-                        mobileOutlineTextRange(
+                        mobileTextRange(
                             child.mobileOutlineString("summary"),
                             summaryOffset,
                             summaryChars,
-                        ).first,
+                        ).text,
                     )
                     put("status", child.mobileOutlineString("status"))
                 }
             }))
         }
-    }
-}
-
-private fun mobileOutlineTextRange(
-    value: String,
-    offset: Int,
-    maximum: Int,
-): Pair<String, JsonObject> {
-    val safeOffset = offset.coerceAtLeast(0)
-    val safeMaximum = maximum.coerceAtLeast(1)
-    val end = (safeOffset + safeMaximum).coerceAtMost(value.length)
-    val visible = if (safeOffset >= value.length) "" else value.substring(safeOffset, end)
-    return visible to buildJsonObject {
-        put("offset_chars", safeOffset)
-        put("returned_chars", visible.length)
-        if (end < value.length) put("next_offset_chars", end) else put("next_offset_chars", JsonNull)
-        put("has_more", end < value.length)
-        put("total_chars", value.length)
     }
 }
 

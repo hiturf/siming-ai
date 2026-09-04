@@ -12,6 +12,7 @@ class RequestModelCapacity:
     context_window_tokens: int
     max_output_tokens: int
     safety_margin_tokens: int
+    known: bool
 
 
 def active_request_capacity(
@@ -36,6 +37,7 @@ def active_request_capacity(
         context_window_tokens=window,
         max_output_tokens=output,
         safety_margin_tokens=margin,
+        known=config.capacity_assurance != "unverified",
     )
 
 

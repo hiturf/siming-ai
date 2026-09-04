@@ -10,8 +10,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database.models import (
-    APIConfig,
     AgentRun,
+    APIConfig,
     Base,
     Chapter,
     Character,
@@ -30,6 +30,8 @@ from app.database.models import (
     RagChunk,
     WorldbuildingEntry,
 )
+from app.modules.model_runtime.application.request_override import use_request_provider
+from app.modules.model_runtime.domain.configuration import ModelProviderConfig
 from app.services.context_orchestrator import TASK_CONTEXT_CONTRACTS, ContextOrchestrator
 from app.services.conversation_context.assembly import resolve_generation_model_binding
 from app.services.task_context_sources import TaskContextSourceResolver
@@ -56,14 +58,14 @@ class ContextOrchestratorTestCase(unittest.TestCase):
         self.db.close()
         self.engine.dispose()
 
-    def test_unknown_remote_model_uses_large_platform_window_and_hard_budget(self):
+    def test_unknown_remote_model_uses_256k_fallback_and_hard_budget(self):
         manifest = self.service.prepare(
             project_id="p1",
             task_type="writing",
             model="unknown-provider:unknown-model",
             arguments={"outline_node_id": "o1", "requirements": "Write the opening."},
         )
-        self.assertEqual(manifest.context_window_tokens, 1_000_000)
+        self.assertEqual(manifest.context_window_tokens, 256_000)
         self.assertEqual(manifest.output_reserve_tokens, 16_000)
         self.assertEqual(
             manifest.input_budget_tokens,
@@ -74,7 +76,7 @@ class ContextOrchestratorTestCase(unittest.TestCase):
         self.assertGreater(manifest.input_budget_tokens, 32_000)
         self.assertLessEqual(manifest.estimated_input_tokens, manifest.input_budget_tokens)
         self.assertEqual(manifest.status, "ready")
-        self.assertTrue(any("platform 1M context default" in warning for warning in manifest.warnings_json))
+        self.assertTrue(any("temporary 256K fallback" in warning for warning in manifest.warnings_json))
 
     def test_outline_planning_uses_only_position_style_and_model_selected_evidence(self):
         manifest = self.service.prepare(
@@ -540,6 +542,71 @@ class ContextOrchestratorTestCase(unittest.TestCase):
         self.assertEqual(profile.context_window_tokens, 64_000)
         self.assertEqual(profile.max_output_tokens, 4_000)
         self.assertEqual(profile.safety_margin_tokens, 1_024)
+
+    def test_manual_profile_overrides_unknown_model_fallback(self):
+        self.db.add(ModelContextProfile(
+            provider="custom_vendor",
+            model_name="writer-private",
+            context_window_tokens=96_000,
+            max_output_tokens=8_000,
+            safety_margin_tokens=1_024,
+        ))
+        self.db.commit()
+
+        profile = self.service.resolve_model_profile(
+            "custom_vendor:writer-private",
+            "writing",
+        )
+        binding, counter, margin = resolve_generation_model_binding(
+            orchestrator=self.service,
+            model="custom_vendor:writer-private",
+            task_type="writing",
+            protocol="chat_completions",
+            system_prompt="system",
+            current_tools=(),
+        )
+
+        self.assertTrue(profile.known)
+        self.assertEqual(profile.context_window_tokens, 96_000)
+        self.assertEqual(profile.max_output_tokens, 8_000)
+        self.assertEqual(profile.safety_margin_tokens, 1_024)
+        self.assertEqual(binding.capacity_assurance.value, "conservative")
+        self.assertEqual(binding.context_window_tokens, 96_000)
+        self.assertEqual(counter.counter_id, "conservative.utf8_bytes.v1")
+        self.assertEqual(margin, 1_024)
+
+    def test_persistent_profile_overrides_mobile_request_capacity(self):
+        self.db.add(ModelContextProfile(
+            provider="mobile_openai",
+            model_name="phone-model",
+            context_window_tokens=96_000,
+            max_output_tokens=8_000,
+            safety_margin_tokens=1_024,
+        ))
+        self.db.commit()
+        for assurance in ("conservative", "unverified"):
+            with self.subTest(assurance=assurance):
+                request_provider = ModelProviderConfig(
+                    provider="mobile_openai",
+                    default_model="phone-model",
+                    api_key="request-only-secret",
+                    base_url="https://api.example.test/v1",
+                    context_window_tokens=256_000,
+                    max_output_tokens=6_000,
+                    safety_margin_tokens=4_096,
+                    capacity_assurance=assurance,
+                )
+
+                with use_request_provider(request_provider):
+                    profile = self.service.resolve_model_profile(
+                        "mobile_openai:phone-model",
+                        "writing",
+                    )
+
+                self.assertTrue(profile.known)
+                self.assertEqual(profile.context_window_tokens, 96_000)
+                self.assertEqual(profile.max_output_tokens, 8_000)
+                self.assertEqual(profile.safety_margin_tokens, 1_024)
 
     def test_provider_discovery_metadata_is_a_verified_exact_capacity(self):
         self.db.add(APIConfig(

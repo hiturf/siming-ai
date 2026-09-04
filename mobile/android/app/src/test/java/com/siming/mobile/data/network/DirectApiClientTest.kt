@@ -26,7 +26,7 @@ import okhttp3.mockwebserver.RecordedRequest
 
 class DirectApiClientTest {
     @Test
-    fun `task model without its own capacity profile fails closed`() {
+    fun `task model without its own capacity profile uses 256k fallback`() {
         val config = DirectApiConfig(
             displayName = "test",
             baseUrl = "https://api.example.test/v1",
@@ -37,16 +37,34 @@ class DirectApiClientTest {
             contextWindowTokens = 128_000,
         )
 
-        val error = assertFailsWith<DirectApiTaskCapacityUnknownException> {
-            config.forTask(DirectApiConfig.TASK_WRITING)
-        }
-        assertEquals(DirectApiConfig.TASK_WRITING, error.taskType)
-        assertEquals("writer-model", error.selectedModel)
+        val writing = config.forTask(DirectApiConfig.TASK_WRITING)
+        assertEquals("writer-model", writing.model)
+        assertEquals(DirectApiConfig.DEFAULT_CONTEXT_WINDOW_TOKENS, writing.contextWindowTokens)
+        assertEquals(DirectApiConfig.CONTEXT_CAPACITY_FALLBACK, writing.contextCapacitySource)
         val assistant = config.forTask(DirectApiConfig.TASK_ASSISTANT)
         assertEquals("general-model", assistant.model)
         assertEquals(128_000, assistant.contextWindowTokens)
+        assertEquals(DirectApiConfig.CONTEXT_CAPACITY_CONFIGURED, assistant.contextCapacitySource)
         assertEquals(config.availableModels, config.summary().availableModels)
         assertEquals("writer-model", config.summary().taskModels[DirectApiConfig.TASK_WRITING])
+    }
+
+    @Test
+    fun `explicit profile for the selected model is retained ahead of fallback`() {
+        val config = DirectApiConfig(
+            displayName = "test",
+            baseUrl = "https://api.example.test/v1",
+            apiKey = "secret",
+            model = "writer-model",
+            contextWindowTokens = 96_000,
+            contextCapacitySource = DirectApiConfig.CONTEXT_CAPACITY_CONFIGURED,
+            maxOutputTokens = 8_000,
+        )
+
+        val writing = config.forTask(DirectApiConfig.TASK_WRITING)
+
+        assertEquals(96_000, writing.contextWindowTokens)
+        assertEquals(DirectApiConfig.CONTEXT_CAPACITY_CONFIGURED, writing.contextCapacitySource)
     }
 
     @Test

@@ -669,10 +669,10 @@ internal object MobileRecentTurnPlanner {
         counter: MobileConversationTokenCounter,
         baselineBudget: MobileRequestBudgetEnvelope,
     ): MobileRecentTurnPlan {
-        if (!baselineBudget.verified) {
+        if (!baselineBudget.verified && !baselineBudget.boundedFallback) {
             throw MobileConversationContextException(
                 MobileConversationContextErrorCode.CAPACITY_UNKNOWN,
-                "动态历史规划需要已验证或保守 TokenCounter",
+                "动态历史规划需要已验证容量或有界 256K 兜底",
             )
         }
         require(baselineBudget.tokenCounterId == counter.counterId &&
@@ -828,14 +828,11 @@ internal data class MobileNativeToolBatchAdmission(
  * of an over-capacity batch.
  */
 internal object MobileNativeToolBudgetContract {
-    const val SCHEMA = "native_tool_transaction_budget.v1"
+    const val SCHEMA = "native_tool_transaction_budget.v2"
     const val MAX_NATIVE_ASSISTANT_TRANSACTION_JSON_BYTES = 16 * 1024
     const val MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES = 32 * 1024
-    const val MAX_NATIVE_TOOL_CALLS_PER_STEP = 12
-    const val TOOL_RESULT_MESSAGE_WRAPPER_TOKENS_PER_CALL = 128
     const val NEXT_STEP_WRAPPER_TOKENS =
-        2 * MAX_NATIVE_ASSISTANT_TRANSACTION_JSON_BYTES +
-            MAX_NATIVE_TOOL_CALLS_PER_STEP * TOOL_RESULT_MESSAGE_WRAPPER_TOKENS_PER_CALL
+        2 * MAX_NATIVE_ASSISTANT_TRANSACTION_JSON_BYTES
     const val NATIVE_ASSISTANT_TRANSACTION_OVER_CAPACITY =
         "native_assistant_transaction_over_capacity"
     const val NATIVE_ASSISTANT_TRANSACTION_INVALID = "native_assistant_transaction_invalid"
@@ -935,10 +932,7 @@ internal object MobileNativeToolBudgetContract {
             )
         }
         val declaredResultBytes = orderedToolNames.sumOf(resultJsonBytes)
-        if (
-            orderedToolNames.size > MAX_NATIVE_TOOL_CALLS_PER_STEP ||
-            declaredResultBytes > MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES
-        ) {
+        if (declaredResultBytes > MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES) {
             return MobileNativeToolBatchAdmission(
                 accepted = false,
                 reason = TOOL_RESULT_BATCH_OVER_CAPACITY,

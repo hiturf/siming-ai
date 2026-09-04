@@ -1,7 +1,6 @@
 package com.siming.mobile.data.agent
 
 import com.siming.mobile.data.network.DirectApiConfig
-import com.siming.mobile.data.network.MobileKnownModelCapacityCatalog
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -14,40 +13,11 @@ internal object MobileCapacityAssurance {
     val ALL = setOf(EXACT, CONSERVATIVE, UNVERIFIED)
 }
 
-/** Resolves a task model only from an author profile or an exact first-party fact. */
+/** Resolve every task model through DirectApiConfig's single capacity path. */
 internal fun mobileCapacityBoundTaskConfig(
     config: DirectApiConfig,
     taskType: String,
-): DirectApiConfig {
-    val defaultModel = MobileKnownModelCapacityCatalog.canonicalModelForOfficialEndpoint(
-        config.baseUrl,
-        config.model,
-    )
-    val requestedModel = config.modelForTask(taskType).trim()
-    val selectedModel = MobileKnownModelCapacityCatalog.canonicalModelForOfficialEndpoint(
-        config.baseUrl,
-        requestedModel,
-    )
-    val selected = if (selectedModel == defaultModel) {
-        config.copy(model = selectedModel)
-    } else {
-        // The author-confirmed default profile cannot be inherited by another
-        // task model.  An exact catalog entry may still bind the selected model.
-        config.copy(model = selectedModel, contextWindowTokens = null)
-    }
-    val bound = if (selected.contextWindowTokens != null) {
-        selected
-    } else {
-        MobileKnownModelCapacityCatalog.applyIfKnown(selected)
-    }
-    if (bound?.contextWindowTokens == null) {
-        throw MobileConversationContextException(
-            MobileConversationContextErrorCode.CAPACITY_UNKNOWN,
-            "任务 $taskType 的模型 $requestedModel 未配置独立容量档案",
-        )
-    }
-    return bound
-}
+): DirectApiConfig = config.forTask(taskType)
 
 /** Immutable model/capacity identity. It never guesses a window from a model name. */
 internal data class MobileGenerationModelBinding(
@@ -113,6 +83,14 @@ internal interface MobileConversationTokenCounter {
 internal object MobileUtf8ByteTokenCounter : MobileConversationTokenCounter {
     override val counterId: String = "conservative.utf8_bytes.v1"
     override val assurance: String = MobileCapacityAssurance.CONSERVATIVE
+    override fun countText(text: String): Int = text.toByteArray(Charsets.UTF_8).size
+    override fun countValue(value: JsonElement): Int = countText(mobileCanonicalJson(value))
+}
+
+/** Conservative byte count paired only with the bounded unknown-model fallback. */
+internal object MobileFallbackUtf8ByteTokenCounter : MobileConversationTokenCounter {
+    override val counterId: String = FALLBACK_UTF8_BYTE_TOKEN_COUNTER_ID
+    override val assurance: String = MobileCapacityAssurance.UNVERIFIED
     override fun countText(text: String): Int = text.toByteArray(Charsets.UTF_8).size
     override fun countValue(value: JsonElement): Int = countText(mobileCanonicalJson(value))
 }
@@ -192,6 +170,11 @@ internal data class MobileRequestBudgetEnvelope(
     val verified: Boolean
         get() = capacityAssurance in setOf(MobileCapacityAssurance.EXACT, MobileCapacityAssurance.CONSERVATIVE)
 
+    val boundedFallback: Boolean
+        get() = capacityAssurance == MobileCapacityAssurance.UNVERIFIED &&
+            tokenCounterId == FALLBACK_UTF8_BYTE_TOKEN_COUNTER_ID &&
+            contextWindowTokens in 1..DirectApiConfig.DEFAULT_CONTEXT_WINDOW_TOKENS
+
     init {
         require(schema == SCHEMA) { "请求预算 Schema 不受支持" }
         require(modelBindingFingerprint.isNotBlank() && tokenCounterId.isNotBlank()) {
@@ -201,7 +184,7 @@ internal data class MobileRequestBudgetEnvelope(
     }
 
     fun requireSendable() {
-        if (!verified) throw MobileConversationContextException(
+        if (!verified && !boundedFallback) throw MobileConversationContextException(
             MobileConversationContextErrorCode.CAPACITY_UNKNOWN,
             "当前模型缺少可验证的 Token 计数与容量档案",
         )
@@ -264,6 +247,8 @@ internal data class MobileRequestBudgetEnvelope(
         const val SCHEMA = "request_budget_envelope.v1"
     }
 }
+
+private const val FALLBACK_UTF8_BYTE_TOKEN_COUNTER_ID = "fallback.utf8_bytes.v1"
 
 internal fun buildMobileRequestBudget(
     binding: MobileGenerationModelBinding,

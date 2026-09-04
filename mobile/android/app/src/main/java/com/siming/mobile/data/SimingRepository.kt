@@ -32,6 +32,7 @@ import com.siming.mobile.data.network.GatewayHttpException
 import com.siming.mobile.data.network.DirectApiClient
 import com.siming.mobile.data.network.DirectApiConfig
 import com.siming.mobile.data.network.DirectApiSummary
+import com.siming.mobile.data.network.MobileKnownModelCapacityCatalog
 import com.siming.mobile.data.network.PairingCompleteResponse
 import com.siming.mobile.data.network.PcApiPayloads
 import com.siming.mobile.data.network.RemoteSyncProject
@@ -155,7 +156,7 @@ class SimingRepository(context: Context) {
         protocol: String,
         availableModels: List<String>,
         taskModels: Map<String, String>,
-        contextWindowTokens: Int,
+        contextWindowTokens: Int?,
         maxOutputTokens: Int,
         safetyMarginTokens: Int,
     ): DirectApiSummary {
@@ -178,7 +179,7 @@ class SimingRepository(context: Context) {
                 taskType to normalizedModel
             }
         }.toMap()
-        val config = DirectApiConfig(
+        val unboundConfig = DirectApiConfig(
             displayName = displayName.trim().ifBlank { "自定义 API" },
             baseUrl = baseUrl.trim().trimEnd('/'),
             apiKey = apiKey.trim().ifBlank { existing?.apiKey.orEmpty() },
@@ -190,6 +191,19 @@ class SimingRepository(context: Context) {
             maxOutputTokens = maxOutputTokens,
             safetyMarginTokens = safetyMarginTokens,
         )
+        val documentedCapacity = MobileKnownModelCapacityCatalog.resolve(
+            unboundConfig.baseUrl,
+            unboundConfig.model,
+        )
+        val config = when {
+            contextWindowTokens == null ->
+                MobileKnownModelCapacityCatalog.applyIfKnown(unboundConfig) ?: unboundConfig
+            documentedCapacity?.contextWindowTokens == contextWindowTokens ->
+                requireNotNull(MobileKnownModelCapacityCatalog.applyIfKnown(unboundConfig))
+            else -> unboundConfig.copy(
+                contextCapacitySource = DirectApiConfig.CONTEXT_CAPACITY_CONFIGURED,
+            )
+        }
         val probe = directApi.testAndResolve(config)
         val resolved = config.copy(protocol = probe.protocol)
         directApiStore.save(resolved)
@@ -3493,15 +3507,8 @@ suspend fun exportProjectPackage(projectId: String, profile: String): MobileExpo
     private fun creationConversationStorageId(sessionId: String): String =
         "creation-${sha256(sessionId).take(32)}"
 
-    private fun requireMobileProviderCapacity(config: DirectApiConfig): DirectApiConfig {
-        if (config.contextWindowTokens == null) {
-            throw MobileConversationContextException(
-                MobileConversationContextErrorCode.CAPACITY_UNKNOWN,
-                "手机模型线路尚未配置上下文窗口，未创建 Gateway 凭据密文",
-            )
-        }
-        return config
-    }
+    private fun requireMobileProviderCapacity(config: DirectApiConfig): DirectApiConfig =
+        config.withContextWindowFallback()
 
     companion object {
         private const val MAX_ENTITY_BYTES = 1024 * 1024

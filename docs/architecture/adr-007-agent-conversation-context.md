@@ -85,13 +85,13 @@ call. Long conversations retain a bounded active prompt without deleting the
 author-visible transcript. A checkpoint can help the model navigate earlier
 intent, but it cannot manufacture project state or execute a tool.
 
-Models without a verified context profile or native tool support may now stop
-before an Agent turn that previously attempted a best-effort request. Users must
-configure an authoritative model profile, or choose a supported provider. This
-failure is intentional because silent truncation and text-tool fallback can
-cause irreversible writes.
+Models without a verified context profile use the shared 256K bounded fallback
+with an `unverified` capacity marker and the UTF-8 byte counter. A matching saved
+profile always takes precedence. Other unverified capacity/counter combinations
+still stop before an Agent turn because silent truncation can cause irreversible
+writes.
 
 All new Agent entry points must reuse the shared context runtime and protocol
 validator. Adding another fixed history slice, text fallback, provider-specific
-checkpoint store, or unverified capacity default creates a second authority path
-and violates this decision.
+checkpoint store, or a different unverified capacity default creates a second
+authority path and violates this decision.

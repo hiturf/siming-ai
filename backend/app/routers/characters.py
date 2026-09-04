@@ -1,6 +1,5 @@
 """Character CRUD, version history, relationship network, and AI suggestion endpoints."""
 import json
-from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
@@ -8,12 +7,11 @@ from sqlalchemy.orm import Session
 from ..core.db_helpers import get_character_or_404, get_project_or_404
 from ..core.exceptions import NotFoundError, ValidationError
 from ..core.response import ApiResponse
-from ..database.models import Chapter, ChapterCharacter, CharacterVersion, OutlineNode, OutlineNodeCharacter
 from ..database.session import get_db
 from ..modules.story.application.commands import StoryCommandContext
 from ..modules.story.domain.content_sync import ContentSyncIntent, ContentSyncTarget
-from ..modules.story.interfaces.dependencies import get_story_command
 from ..modules.story.interfaces.character_dependencies import character_workspace
+from ..modules.story.interfaces.dependencies import get_story_command
 from ..schemas.character import (
     CharacterAIConfigUpdate,
     CharacterChapterAppearanceUpsert,
@@ -23,6 +21,18 @@ from ..schemas.character import (
     CharacterVersionItem,
     RelationshipUpdate,
 )
+from ..services.character_appearance_service import (
+    remove_character_chapter_appearance,
+)
+from ..services.character_appearance_service import (
+    upsert_character_chapter_appearance as upsert_character_chapter_appearance_record,
+)
+from ..services.character_merge_service import (
+    build_character_merge_preview,
+    find_duplicate_character_candidates,
+    merge_characters,
+)
+from ..services.character_role_types import normalize_character_role_type
 from ..services.character_service import (
     apply_change_log_to_character,
     character_to_dict,
@@ -33,19 +43,13 @@ from ..services.character_service import (
     snapshot_character,
     sync_character_aliases,
 )
-from ..services.character_merge_service import (
-    build_character_merge_preview,
-    find_duplicate_character_candidates,
-    merge_characters,
-)
-from ..services.character_role_types import normalize_character_role_type
 from ..services.planned_character_links import resolve_planned_outline_character_links
 
 router = APIRouter(tags=["characters"])
 
 
 @router.get("/projects/{project_id}/characters")
-def list_characters(project_id: str, q: Optional[str] = None, db: Session = Depends(get_db)):
+def list_characters(project_id: str, q: str | None = None, db: Session = Depends(get_db)):
     """Get project character list."""
     get_project_or_404(db, project_id)
     characters = character_workspace(db).list_characters(project_id, q)
@@ -310,80 +314,12 @@ def delete_character_chapter_appearance(
     for the same chapter and the character's chapter provenance pointers.
     """
     db = command.session
-    get_project_or_404(db, project_id)
-    character = get_character_or_404(db, project_id, character_id)
-    chapter = (
-        db.query(Chapter)
-        .filter(Chapter.project_id == project_id, Chapter.id == chapter_id)
-        .first()
+    data = remove_character_chapter_appearance(
+        db,
+        project_id,
+        character_id,
+        chapter_id,
     )
-    if chapter is None:
-        raise NotFoundError("章节不存在")
-
-    appearance = (
-        db.query(ChapterCharacter)
-        .filter(
-            ChapterCharacter.chapter_id == chapter_id,
-            ChapterCharacter.character_id == character_id,
-        )
-        .first()
-    )
-    if appearance is None:
-        raise NotFoundError("该角色没有此章节关联")
-    db.delete(appearance)
-
-    chapter_outline_ids = {
-        node_id
-        for (node_id,) in (
-            db.query(OutlineNode.id)
-            .filter(
-                OutlineNode.project_id == project_id,
-                (
-                    (OutlineNode.source_chapter_id == chapter_id)
-                    | (OutlineNode.id == chapter.outline_node_id)
-                ),
-            )
-            .all()
-        )
-    }
-    removed_outline_links = 0
-    if chapter_outline_ids:
-        removed_outline_links = (
-            db.query(OutlineNodeCharacter)
-            .filter(
-                OutlineNodeCharacter.character_id == character_id,
-                OutlineNodeCharacter.outline_node_id.in_(chapter_outline_ids),
-            )
-            .delete(synchronize_session=False)
-        )
-
-    db.flush()
-    if character.last_seen_chapter_id == chapter_id:
-        prior_appearance = (
-            db.query(Chapter)
-            .join(ChapterCharacter, ChapterCharacter.chapter_id == Chapter.id)
-            .filter(
-                Chapter.project_id == project_id,
-                ChapterCharacter.character_id == character_id,
-            )
-            .order_by(Chapter.sort_order.desc(), Chapter.created_at.desc())
-            .first()
-        )
-        character.last_seen_chapter_id = prior_appearance.id if prior_appearance else None
-    if character.last_updated_chapter_id == chapter_id:
-        prior_version = (
-            db.query(CharacterVersion)
-            .filter(
-                CharacterVersion.character_id == character_id,
-                CharacterVersion.source_chapter_id.is_not(None),
-                CharacterVersion.source_chapter_id != chapter_id,
-            )
-            .order_by(CharacterVersion.version_number.desc())
-            .first()
-        )
-        character.last_updated_chapter_id = (
-            prior_version.source_chapter_id if prior_version else None
-        )
 
     command.queue(
         ContentSyncIntent(
@@ -392,20 +328,13 @@ def delete_character_chapter_appearance(
             entity_id=character_id,
         ),
     )
-    if removed_outline_links:
+    if data["removed_outline_links"]:
         command.queue(
             ContentSyncIntent(project_id=project_id, target=ContentSyncTarget.OUTLINE),
         )
     command.finish()
     return ApiResponse.success(
-        data={
-            "character_id": character_id,
-            "chapter_id": chapter_id,
-            "removed_chapter_links": 1,
-            "removed_outline_links": removed_outline_links,
-            "last_seen_chapter_id": character.last_seen_chapter_id,
-            "last_updated_chapter_id": character.last_updated_chapter_id,
-        },
+        data=data,
         message="章节角色关联已移除",
     )
 
@@ -427,72 +356,26 @@ def upsert_character_chapter_appearance(
     creating duplicate rows.
     """
     db = command.session
-    get_project_or_404(db, project_id)
-    character = get_character_or_404(db, project_id, character_id)
-    chapter = (
-        db.query(Chapter)
-        .filter(Chapter.project_id == project_id, Chapter.id == chapter_id)
-        .first()
+    data = upsert_character_chapter_appearance_record(
+        db,
+        project_id,
+        character_id,
+        chapter_id,
+        appearance_type=payload.appearance_type,
+        description=payload.description,
     )
-    if chapter is None:
-        raise NotFoundError("章节不存在")
-
-    appearance = (
-        db.query(ChapterCharacter)
-        .filter(
-            ChapterCharacter.chapter_id == chapter_id,
-            ChapterCharacter.character_id == character_id,
-        )
-        .first()
-    )
-    created = appearance is None
-    if appearance is None:
-        appearance = ChapterCharacter(
-            chapter_id=chapter_id,
-            character_id=character_id,
-        )
-        db.add(appearance)
-    appearance.appearance_type = payload.appearance_type
-    appearance.description = payload.description
-
-    latest_seen = None
-    if character.last_seen_chapter_id:
-        latest_seen = (
-            db.query(Chapter)
-            .filter(
-                Chapter.project_id == project_id,
-                Chapter.id == character.last_seen_chapter_id,
-            )
-            .first()
-        )
-    if latest_seen is None or (
-        int(chapter.sort_order or 0), chapter.created_at
-    ) >= (
-        int(latest_seen.sort_order or 0), latest_seen.created_at
-    ):
-        character.last_seen_chapter_id = chapter.id
-    db.flush()
 
     command.queue(
         ContentSyncIntent(
             project_id=project_id,
             target=ContentSyncTarget.CHARACTER,
-            entity_id=character.id,
+            entity_id=character_id,
         ),
     )
     command.finish()
     return ApiResponse.success(
-        data={
-            "id": appearance.id,
-            "chapter_id": chapter.id,
-            "chapter_title": chapter.title,
-            "character_id": character.id,
-            "character_name": character.name,
-            "appearance_type": appearance.appearance_type,
-            "description": appearance.description,
-            "created": created,
-        },
-        message="章节人物关联已新增" if created else "章节人物关联已更新",
+        data=data,
+        message="章节人物关联已新增" if data["created"] else "章节人物关联已更新",
     )
 
 
@@ -643,9 +526,9 @@ def update_character_ai_config(
 @router.get("/projects/{project_id}/characters/change-logs")
 def list_change_logs(
     project_id: str,
-    chapter_id: Optional[str] = None,
-    character_id: Optional[str] = None,
-    confirmed: Optional[bool] = None,
+    chapter_id: str | None = None,
+    character_id: str | None = None,
+    confirmed: bool | None = None,
     db: Session = Depends(get_db),
 ):
     """List character change logs, filterable by chapter/character/confirmed status."""
@@ -727,8 +610,8 @@ def reject_change_log(
 @router.post("/projects/{project_id}/characters/change-logs/batch")
 def batch_confirm_change_logs(
     project_id: str,
-    chapter_id: Optional[str] = None,
-    character_id: Optional[str] = None,
+    chapter_id: str | None = None,
+    character_id: str | None = None,
     action: str = Query("confirm", description="confirm or reject"),
     command: StoryCommandContext = Depends(get_story_command),
 ):
@@ -767,4 +650,5 @@ def batch_confirm_change_logs(
             ),
         )
     command.finish()
-    return ApiResponse.success(message=f"已{ '确认' if action == 'confirm' else '拒绝' } {len(logs)} 条变更记录")
+    verb = "确认" if action == "confirm" else "拒绝"
+    return ApiResponse.success(message=f"已{verb} {len(logs)} 条变更记录")

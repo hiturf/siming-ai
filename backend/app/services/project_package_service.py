@@ -329,6 +329,8 @@ class ProjectPackageExporter:
         manifest_entries: list[dict[str, Any]] = []
         material_assets: list[tuple[Path, str, str]] = []
 
+        valid_chapter_ids = {row.id for row in collected.get("chapters", [])}
+        valid_snapshot_ids = {row.id for row in collected.get("chapter_snapshots", [])}
         for spec in COLLECTION_SPECS:
             if self.profile not in spec.profiles:
                 continue
@@ -347,6 +349,13 @@ class ProjectPackageExporter:
                     if spec.key == "chapter_drafts":
                         row["saved_chapter_id"] = None
                         row["status"] = "pending"
+                    if spec.key == "narrative_checkpoints":
+                        chapter_id = row.get("chapter_id")
+                        snapshot_id = row.get("chapter_snapshot_id")
+                        if chapter_id not in valid_chapter_ids:
+                            row["chapter_id"] = None
+                        if snapshot_id not in valid_snapshot_ids or row.get("chapter_id") is None:
+                            row["chapter_snapshot_id"] = None
                     if spec.key == "creation_materials":
                         source, size, digest = material_metadata[model_row.id]
                         filename = _safe_filename(model_row.filename, "material")

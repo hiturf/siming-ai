@@ -30,11 +30,6 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
-internal class DirectApiTaskCapacityUnknownException(
-    val taskType: String,
-    val selectedModel: String,
-) : IllegalStateException("任务 $taskType 的模型 $selectedModel 未配置独立容量档案")
-
 @Serializable
 data class DirectApiConfig(
     val displayName: String,
@@ -44,13 +39,18 @@ data class DirectApiConfig(
     val protocol: String = PROTOCOL_AUTO,
     val availableModels: List<String> = emptyList(),
     val taskModels: Map<String, String> = emptyMap(),
-    /** Explicit author-supplied capacity profile; never inferred from model_name. */
+    /** Author-supplied capacity; null temporarily uses the bounded 256K fallback. */
     val contextWindowTokens: Int? = null,
+    /** Provenance is persisted so the 256K fallback is never presented as a model profile. */
+    val contextCapacitySource: String? = null,
     val maxOutputTokens: Int = DEFAULT_AGENT_OUTPUT_TOKENS,
     val safetyMarginTokens: Int = DEFAULT_SAFETY_MARGIN_TOKENS,
 ) {
     init {
         require(contextWindowTokens == null || contextWindowTokens > 0) { "模型上下文窗口必须大于零" }
+        require(contextCapacitySource == null || contextCapacitySource in contextCapacitySources) {
+            "模型容量来源无效"
+        }
         require(maxOutputTokens > 0) { "模型输出预留必须大于零" }
         require(safetyMarginTokens >= 0) { "模型安全余量不能为负数" }
         contextWindowTokens?.let { window ->
@@ -68,18 +68,51 @@ data class DirectApiConfig(
     fun isDeepSeekProvider(): Boolean = listOf(displayName, baseUrl, model)
         .any { it.contains("deepseek", ignoreCase = true) }
 
+    fun withContextWindowFallback(): DirectApiConfig {
+        if (contextWindowTokens != null) {
+            return if (contextCapacitySource == null) {
+                copy(contextCapacitySource = CONTEXT_CAPACITY_CONFIGURED)
+            } else {
+                this
+            }
+        }
+        val outputLimit = DEFAULT_CONTEXT_WINDOW_TOKENS - safetyMarginTokens - 1
+        require(outputLimit > 0) { "256K 兜底窗口无法为输入保留空间" }
+        return copy(
+            contextWindowTokens = DEFAULT_CONTEXT_WINDOW_TOKENS,
+            contextCapacitySource = CONTEXT_CAPACITY_FALLBACK,
+            maxOutputTokens = minOf(maxOutputTokens, outputLimit),
+        )
+    }
+
     /**
-     * A capacity profile belongs to the configured default model. Until Android
-     * stores per-task profiles, selecting a different task model must fail closed
-     * instead of presenting the default model's capacity as known.
+     * Preserve an explicit profile, use exact first-party metadata when available,
+     * otherwise bind the selected task model to the shared 256K fallback.
      */
     fun forTask(taskType: String): DirectApiConfig {
-        val configuredDefaultModel = model.trim()
-        val selectedModel = modelForTask(taskType).trim()
-        if (selectedModel != configuredDefaultModel) {
-            throw DirectApiTaskCapacityUnknownException(taskType, selectedModel)
+        val defaultModel = MobileKnownModelCapacityCatalog.canonicalModelForOfficialEndpoint(
+            baseUrl,
+            model,
+        )
+        val selectedModel = MobileKnownModelCapacityCatalog.canonicalModelForOfficialEndpoint(
+            baseUrl,
+            modelForTask(taskType),
+        )
+        val selected = if (selectedModel == defaultModel) {
+            copy(model = selectedModel)
+        } else {
+            copy(
+                model = selectedModel,
+                contextWindowTokens = null,
+                contextCapacitySource = null,
+            )
         }
-        return copy(model = selectedModel)
+        val bound = if (selected.contextWindowTokens != null) {
+            selected
+        } else {
+            MobileKnownModelCapacityCatalog.applyIfKnown(selected)
+        }
+        return (bound ?: selected).withContextWindowFallback()
     }
 
     fun summary() = DirectApiSummary(
@@ -90,6 +123,7 @@ data class DirectApiConfig(
         availableModels = availableModels,
         taskModels = taskModels,
         contextWindowTokens = contextWindowTokens,
+        contextCapacitySource = contextCapacitySource,
         maxOutputTokens = maxOutputTokens,
         safetyMarginTokens = safetyMarginTokens,
     )
@@ -104,12 +138,21 @@ data class DirectApiConfig(
         const val TASK_WRITING = "writing"
         const val TASK_EVALUATION = "evaluation"
         const val TASK_DECONSTRUCT = "deconstruct"
+        const val CONTEXT_CAPACITY_CONFIGURED = "configured"
+        const val CONTEXT_CAPACITY_CATALOG = "catalog"
+        const val CONTEXT_CAPACITY_FALLBACK = "fallback"
+        const val DEFAULT_CONTEXT_WINDOW_TOKENS = 256_000
         const val DEFAULT_AGENT_OUTPUT_TOKENS = 6_000
         const val DEFAULT_SAFETY_MARGIN_TOKENS = 4_096
         val supportedProtocols = setOf(
             PROTOCOL_AUTO,
             PROTOCOL_RESPONSES,
             PROTOCOL_CHAT_COMPLETIONS,
+        )
+        val contextCapacitySources = setOf(
+            CONTEXT_CAPACITY_CONFIGURED,
+            CONTEXT_CAPACITY_CATALOG,
+            CONTEXT_CAPACITY_FALLBACK,
         )
         val taskModelLabels = linkedMapOf(
             TASK_ASSISTANT to "项目助手",
@@ -130,6 +173,7 @@ data class DirectApiSummary(
     val availableModels: List<String> = emptyList(),
     val taskModels: Map<String, String> = emptyMap(),
     val contextWindowTokens: Int? = null,
+    val contextCapacitySource: String? = null,
     val maxOutputTokens: Int = DirectApiConfig.DEFAULT_AGENT_OUTPUT_TOKENS,
     val safetyMarginTokens: Int = DirectApiConfig.DEFAULT_SAFETY_MARGIN_TOKENS,
 )

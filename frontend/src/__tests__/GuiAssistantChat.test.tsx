@@ -637,7 +637,7 @@ describe('GuiAssistantChat new-book handoff', () => {
     expect(within(dialog).getAllByText('未提供').length).toBeGreaterThan(0)
   })
 
-  it('offers model capacity configuration when a creation turn is safely blocked', async () => {
+  it('offers model capacity configuration for an explicit server capacity error', async () => {
     const event = {
       client_turn_id: 'turn-capacity',
       sequence: 1,

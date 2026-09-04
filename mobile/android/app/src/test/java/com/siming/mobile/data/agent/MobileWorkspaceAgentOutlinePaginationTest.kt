@@ -99,6 +99,10 @@ class MobileWorkspaceAgentOutlinePaginationTest {
         assertEquals("c2", linked.single().jsonObject.getValue("id").jsonPrimitive.content)
         assertEquals("乙", linked.single().jsonObject.getValue("name").jsonPrimitive.content)
         val linkedPage = item.getValue("linked_page").jsonObject
+        assertEquals(1, linkedPage.getValue("cursor").jsonPrimitive.int)
+        assertEquals(1, linkedPage.getValue("limit").jsonPrimitive.int)
+        assertEquals(1, linkedPage.getValue("returned_items").jsonPrimitive.int)
+        assertEquals(3, linkedPage.getValue("total_items").jsonPrimitive.int)
         assertEquals(2, linkedPage.getValue("next_cursor").jsonPrimitive.int)
         assertTrue(linkedPage.getValue("has_more").jsonPrimitive.content.toBoolean())
     }

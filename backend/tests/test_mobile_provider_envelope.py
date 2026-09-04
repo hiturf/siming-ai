@@ -63,6 +63,7 @@ def _seal(
     context_window_tokens: int = 128_000,
     max_output_tokens: int = 8_192,
     safety_margin_tokens: int = 4_096,
+    capacity_assurance: str = "conservative",
 ) -> MobileProviderEnvelope:
     ephemeral = X25519PrivateKey.generate()
     peer = X25519PublicKey.from_public_bytes(_decode(public_key))
@@ -82,6 +83,7 @@ def _seal(
                 "context_window_tokens": context_window_tokens,
                 "max_output_tokens": max_output_tokens,
                 "safety_margin_tokens": safety_margin_tokens,
+                "capacity_assurance": capacity_assurance,
             }
         )
     plaintext = json.dumps(credentials).encode()
@@ -130,7 +132,23 @@ def test_mobile_provider_envelope_decrypts_without_persisting_key(tmp_path, monk
                 context_window_tokens=128_000,
                 max_output_tokens=8_192,
                 safety_margin_tokens=4_096,
+                capacity_assurance="conservative",
             )
+            fallback = decrypt_mobile_provider(
+                db,
+                _seal(
+                    gateway_encryption_public_key(identity),
+                    device_id="android-device",
+                    project_id="project-1",
+                    issued_at=int(time.time() * 1000),
+                    context_window_tokens=256_000,
+                    capacity_assurance="unverified",
+                ),
+                device_id="android-device",
+                project_id="project-1",
+            )
+            assert fallback.context_window_tokens == 256_000
+            assert fallback.capacity_assurance == "unverified"
             assert "phone-secret-key" not in identity.private_key_encrypted
     finally:
         engine.dispose()
@@ -297,6 +315,25 @@ def test_request_provider_override_is_context_scoped_and_non_persistent():
     with pytest.raises(NotFoundError):
         runtime.provider_config("mobile_openai")
     assert active_request_capacity("mobile_openai", "phone-model") is None
+
+
+def test_request_provider_capacity_preserves_unverified_fallback_assurance():
+    ephemeral = ModelProviderConfig(
+        provider="mobile_openai",
+        default_model="phone-model",
+        api_key="phone-secret-key",
+        base_url="https://8.8.8.8/v1",
+        context_window_tokens=256_000,
+        max_output_tokens=8_192,
+        safety_margin_tokens=4_096,
+        capacity_assurance="unverified",
+    )
+
+    with use_request_provider(ephemeral):
+        capacity = active_request_capacity("mobile_openai", "phone-model")
+        assert capacity is not None
+        assert capacity.context_window_tokens == 256_000
+        assert capacity.known is False
 
 
 def test_gateway_mobile_key_uses_one_workspace_model_path_without_hidden_calls(

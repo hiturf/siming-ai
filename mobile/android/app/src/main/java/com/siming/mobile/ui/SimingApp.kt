@@ -1687,7 +1687,15 @@ private fun DirectApiSetupScreen(
         mutableStateOf(existing?.protocol ?: DirectApiConfig.PROTOCOL_AUTO)
     }
     var contextWindowTokens by rememberSaveable(existing?.baseUrl) {
-        mutableStateOf(existing?.contextWindowTokens?.toString().orEmpty())
+        mutableStateOf(
+            existing
+                ?.takeIf {
+                    it.contextCapacitySource != DirectApiConfig.CONTEXT_CAPACITY_FALLBACK
+                }
+                ?.contextWindowTokens
+                ?.toString()
+                .orEmpty(),
+        )
     }
     var maxOutputTokens by rememberSaveable(existing?.baseUrl) {
         mutableStateOf((existing?.maxOutputTokens ?: DirectApiConfig.DEFAULT_AGENT_OUTPUT_TOKENS).toString())
@@ -1697,8 +1705,11 @@ private fun DirectApiSetupScreen(
     }
     var contextProfileIdentity by rememberSaveable(existing?.baseUrl) {
         mutableStateOf(
-            existing?.contextWindowTokens?.let {
-                "${existing.baseUrl.trim()}\u001f${existing.model.trim()}"
+            existing?.takeIf {
+                it.contextWindowTokens != null &&
+                    it.contextCapacitySource != DirectApiConfig.CONTEXT_CAPACITY_FALLBACK
+            }?.let { saved ->
+                "${saved.baseUrl.trim()}\u001f${saved.model.trim()}"
             },
         )
     }
@@ -1882,7 +1893,7 @@ private fun DirectApiSetupScreen(
                 if (documentedCapacity != null) {
                     "已按官方 API 端点和精确模型 ID 验证容量；切换模型时会同步更新。"
                 } else {
-                    "容量必须来自模型服务商文档或你的部署配置；司命不会根据模型名猜测。UTF-8 保守计数只会低估可用空间，不会把未知容量伪装成安全。"
+                    "未取得官方或作者配置时，司命临时按未验证的 256K 上下文兜底，并使用 UTF-8 保守计数；服务商实际窗口更小时请填写档案。"
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1895,14 +1906,14 @@ private fun DirectApiSetupScreen(
                         contextWindowTokens.isNotBlank()
                     }
                 },
-                label = { Text("上下文窗口（tokens）") },
-                placeholder = { Text("例如 128000") },
+                label = { Text("上下文窗口（tokens，可留空）") },
+                placeholder = { Text("留空则临时使用 256000") },
                 supportingText = {
                     Text(
                         if (documentedCapacity != null) {
                             "已由官方模型规格自动填写"
                         } else {
-                            "必填；留空时手机直连 Agent 会明确停止，不裁剪历史继续执行"
+                            "留空时使用未验证的 256K 兜底；填写后该模型档案优先"
                         },
                     )
                 },
@@ -1993,7 +2004,7 @@ private fun DirectApiSetupScreen(
                         protocol,
                         modelChoices,
                         taskModels.toMap(),
-                        contextWindowTokens.toIntOrNull() ?: 0,
+                        contextWindowTokens.toIntOrNull(),
                         maxOutputTokens.toIntOrNull() ?: 0,
                         safetyMarginTokens.toIntOrNull() ?: -1,
                         onConfigured,
@@ -2001,11 +2012,13 @@ private fun DirectApiSetupScreen(
                 },
                 enabled = baseUrl.isNotBlank() &&
                     (apiKey.isNotBlank() || existing != null) &&
-                    (contextWindowTokens.toIntOrNull() ?: 0) > 0 &&
+                    (contextWindowTokens.isBlank() ||
+                        (contextWindowTokens.toIntOrNull() ?: 0) > 0) &&
                     (maxOutputTokens.toIntOrNull() ?: 0) > 0 &&
                     (safetyMarginTokens.toIntOrNull() ?: -1) >= 0 &&
                     ((maxOutputTokens.toIntOrNull() ?: 0) + (safetyMarginTokens.toIntOrNull() ?: 0) <
-                        (contextWindowTokens.toIntOrNull() ?: 0)) &&
+                        (contextWindowTokens.toIntOrNull()
+                            ?: DirectApiConfig.DEFAULT_CONTEXT_WINDOW_TOKENS)) &&
                     !ui.busy,
                 modifier = Modifier.fillMaxWidth().height(50.dp),
             ) {

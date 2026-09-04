@@ -121,7 +121,7 @@ internal class MobileCreationConversationAgent(
                 data = buildJsonObject { put("delta", delta) },
             ))
         }
-        while (iteration < contract.maxIterations && finalReply.isBlank()) {
+        while (finalReply.isBlank()) {
             onProgress(CreationAgentProgressEvent(
                 type = "model_step_started",
                 message = if (iteration == 0) "正在判断需要哪些立项能力…" else "正在根据真实工具结果继续处理…",
@@ -597,7 +597,7 @@ internal class MobileCreationConversationAgent(
         detail = when (reason) {
             MobileNativeToolBudgetContract.NATIVE_ASSISTANT_TRANSACTION_OVER_CAPACITY ->
                 "立项原生 assistant 工具事务超过 16KiB；整批未执行。请缩小参数。"
-            else -> "立项工具批次超过 12 个调用或 32KiB 声明结果上限；整批未执行。请减少并行调用。"
+            else -> "立项工具批次超过 32KiB 声明结果上限；整批未执行。请减少并行调用。"
         },
         data = buildJsonObject { put("reason", reason) },
     )
@@ -770,20 +770,6 @@ internal class MobileCreationConversationAgent(
                     )
                 }
             }
-            "get_creation_operation", "cancel_creation_operation", "pause_creation_operation",
-            "resume_creation_operation", "retry_creation_operation" -> ToolExecution(
-                source,
-                result(tool, "skipped", "手机独立模式的单轮立项工具同步完成，不存在独立后台 Operation"),
-            )
-            "undo_creation_artifact", "list_creation_artifact_versions", "get_creation_artifact_diff",
-            "restore_creation_artifact_version" -> ToolExecution(
-                source,
-                result(tool, "skipped", "手机独立草稿当前不提供跨版本工具；现有内容未修改"),
-            )
-            "preview_creation_import", "apply_creation_import" -> ToolExecution(
-                source,
-                result(tool, "skipped", "手机独立对话式立项暂不在 Agent 内执行文件导入"),
-            )
             else -> ToolExecution(source, result(tool, "skipped", "手机独立模式暂未实现该立项工具"))
         }
     }
@@ -1247,9 +1233,6 @@ internal class MobileCreationConversationAgent(
             "list_creation_artifacts",
             "get_creation_entity",
             "list_creation_entities",
-            "get_creation_artifact_diff",
-            "list_creation_artifact_versions",
-            "preview_creation_import",
         )
         val CREATION_RECEIPT_FIELDS = setOf(
             "session_id",

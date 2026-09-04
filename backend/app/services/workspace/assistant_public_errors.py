@@ -76,7 +76,6 @@ _NUMERIC_FIELDS = {
     "iteration",
     "call_index",
     "call_count",
-    "max_call_count",
     "actual_bytes",
     "max_bytes",
     "required_tokens",

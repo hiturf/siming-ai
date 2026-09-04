@@ -1,9 +1,12 @@
 """Dispatcher for workspace assistant tool actions."""
 from __future__ import annotations
 
-from pydantic import ValidationError
+from typing import Any
+
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.orm import Session
 
+from app.architecture.tool_spec import ToolInputSchemaValidationError
 from app.architecture.uow import commit_session
 
 from .registry import registry
@@ -30,31 +33,61 @@ _GOVERNED_TASKS: dict[str, str] = {
 }
 
 
+def _validation_location(parts: tuple[Any, ...]) -> str:
+    location = "$"
+    for part in parts:
+        location += f"[{part}]" if isinstance(part, int) else f".{part}"
+    return location
+
+
+def _invalid_arguments_result(
+    tool: str,
+    error: ToolInputSchemaValidationError | PydanticValidationError,
+) -> dict[str, Any]:
+    if isinstance(error, ToolInputSchemaValidationError):
+        detail = error.public_detail
+        path = _validation_location(error.path)
+        rule = error.rule or "schema"
+    else:
+        first = error.errors(include_input=False, include_url=False)[0]
+        path_parts = tuple(first.get("loc") or ())
+        path = _validation_location(path_parts)
+        rule = str(first.get("type") or "schema")
+        detail = f"{path}：{first.get('msg') or '参数无效'}"
+    return {
+        "tool": tool,
+        "status": "error",
+        "detail": f"工具参数不符合 {tool} 的定义：{detail}",
+        "data": {
+            "reason": "native_tool_contract_invalid",
+            "failure_class": "invalid_tool_arguments",
+            "path": path,
+            "rule": rule,
+            "retryable": True,
+        },
+    }
+
+
 async def execute_workspace_action(
     db: Session,
     project_id: str,
     action: dict,
 ) -> dict:
     tool = str(action.get("tool") or "").strip()
-    args = action.get("arguments") if isinstance(action.get("arguments"), dict) else {}
     if not tool:
         return {"tool": "unknown", "status": "skipped", "detail": "工具名为空"}
 
     handler = registry.get_handler(tool)
     if not handler:
         return {"tool": tool, "status": "skipped", "detail": "未知工具"}
+    raw_args = action.get("arguments")
+    args = {} if raw_args is None else raw_args
     spec = registry.get_spec(tool)
     if spec is not None:
         try:
             args = spec.validate_input(args).model_dump(exclude_unset=True)
-        except ValidationError:
-            # Never reflect Pydantic's input values or free-form error text.
-            # The same typed contract is exported to native and MCP models.
-            return sanitize_diagnostic_tool_result(tool, {
-                "tool": tool,
-                "status": "error",
-                "data": {"reason": "native_tool_contract_invalid"},
-            })
+        except (ToolInputSchemaValidationError, PydanticValidationError) as exc:
+            return _invalid_arguments_result(tool, exc)
     task_type = _GOVERNED_TASKS.get(tool)
     if not task_type:
         result = await handler(db, project_id, args)

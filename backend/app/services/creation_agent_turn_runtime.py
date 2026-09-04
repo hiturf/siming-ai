@@ -44,13 +44,12 @@ from app.services.creation_agent_turn_records import (
     seal_creation_runtime_snapshot,
     validate_creation_runtime_snapshot,
 )
-from app.services.novel_creation_agent import run_creation_agent
 from app.services.model_readiness import sanitize_readiness_message
+from app.services.novel_creation_agent import run_creation_agent
 from app.services.observability.run_events import classify_failure
 from app.services.persistence.assistant_workspace import SqlAlchemyAssistantWorkspace
 from app.services.workspace.registry import registry
 from app.services.workspace.tool_result_projection import (
-    MAX_NATIVE_TOOL_CALLS_PER_STEP,
     max_model_visible_result_tokens_for_open_tool_schemas,
     max_native_tool_transaction_wrapper_tokens,
 )
@@ -533,20 +532,9 @@ class _CreationModelContextRuntime:
             current_tools=current_tools,
             provider_protocol_state=provider_protocol_state,
         )
-        open_tool_names = tuple(
-            str((schema.get("function") or {}).get("name") or "")
-            for schema in budget_tool_schemas
-            if isinstance(schema, Mapping)
-        )
-        native_call_limit = (
-            1
-            if open_tool_names == ("set_tool_categories",)
-            else MAX_NATIVE_TOOL_CALLS_PER_STEP
-        )
         result_token_reserve = max_model_visible_result_tokens_for_open_tool_schemas(
             budget_tool_schemas,
             resolve_tool=registry.get,
-            max_calls_per_step=native_call_limit,
         )
         conversation = ConversationIdentity(
             kind=ConversationKind.CREATION,
@@ -591,9 +579,7 @@ class _CreationModelContextRuntime:
             extra_runtime_instruction=extra_runtime_instruction,
             max_model_visible_result_tokens_for_open_tools=result_token_reserve,
             next_step_wrapper=(
-                max_native_tool_transaction_wrapper_tokens(
-                    max_calls_per_step=native_call_limit,
-                )
+                max_native_tool_transaction_wrapper_tokens()
                 if protocol == "native" and current_tools
                 else 0
             ),
