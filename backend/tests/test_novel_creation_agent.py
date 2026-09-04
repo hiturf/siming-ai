@@ -33,6 +33,7 @@ from app.services.conversation_context.canonical import canonical_sha256
 from app.services.conversation_context.checkpoint_state import (
     safe_public_error_detail,
 )
+from app.services.creation_agent_execution import run_native_steps
 from app.services.creation_agent_turn_records import (
     creation_agent_turn_records,
     creation_current_user_context_message,
@@ -200,6 +201,20 @@ def test_creation_agent_request_has_one_backend_owned_history_path():
         assistant_message_id="assistant-1",
     )
     assert request.conversation_id == "conversation-1"
+
+
+def test_native_creation_steps_continue_past_the_old_six_step_limit():
+    state = MagicMock()
+    state.tool_mode = "native"
+    run_step = AsyncMock(side_effect=[True] * 7 + [False])
+
+    with patch(
+        "app.services.creation_agent_execution._run_native_step",
+        new=run_step,
+    ):
+        asyncio.run(run_native_steps(state, MagicMock()))
+
+    assert [call.args[2] for call in run_step.await_args_list] == list(range(8))
 
 
 def test_creation_agent_request_validates_server_owned_reference_hash():
@@ -374,20 +389,6 @@ def test_creation_agent_rejects_missing_native_call_id_without_running_handler()
                 },
             ],
             "duplicate_native_tool_call_id",
-        ),
-        (
-            [
-                {
-                    "id": f"call-{index}",
-                    "type": "function",
-                    "function": {
-                        "name": "set_tool_categories",
-                        "arguments": '{"enabled_categories":["creation_data"]}',
-                    },
-                }
-                for index in range(13)
-            ],
-            "native_tool_call_batch_too_large",
         ),
         (
             [
@@ -940,7 +941,7 @@ def test_creation_agent_endpoint_persists_backend_owned_turns_and_passes_context
         "max_model_visible_result_tokens_for_open_tools"
     ] == TOOL_CATEGORY_CONTROLLER_RESULT_CONTRACT.max_json_bytes
     assert first_context["next_step_wrapper"] == (
-        max_native_tool_transaction_wrapper_tokens(max_calls_per_step=1)
+        max_native_tool_transaction_wrapper_tokens()
     )
     assert second_context["protocol"] == "direct_mcp"
     assert second_context["current_tools"] == ()
@@ -3077,6 +3078,48 @@ def test_direct_cli_rejects_text_before_category_controller_call():
             model="opencode_cli:opencode/big-pickle",
             prepare_model_messages=_test_context_preparer("玄幻"),
         ))
+
+
+def test_direct_cli_creation_continues_past_the_old_six_step_limit():
+    db = _db()
+    session = _ready_session(db)
+    call_count = 0
+
+    async def completion_response(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 7:
+            replace_tool_categories(
+                kwargs["extra_body"]["local_cli_mcp_tool_category_state_file"],
+                ["creation_data"],
+            )
+            return {"content": "", "tool_calls": []}
+        return {"content": "已在超过旧上限后完成立项检查。", "tool_calls": []}
+
+    completion = _stream_completion(completion_response)
+    with patch(
+        "app.services.novel_creation_agent.LLMGateway.supports_tool_calling",
+        return_value=False,
+    ), patch(
+        "app.services.novel_creation_agent.LLMGateway.provider_for_model",
+        return_value="opencode_cli",
+    ), patch(
+        "app.services.novel_creation_agent.LLMGateway.local_cli_extra_body",
+        side_effect=lambda _model, base=None, **_kwargs: dict(base or {}),
+    ), patch(
+        "app.services.novel_creation_agent.LLMGateway.stream_chat_completion_with_tools",
+        new=completion,
+    ):
+        result = asyncio.run(run_creation_agent(
+            db,
+            session=session,
+            message="连续检查多轮",
+            model="opencode_cli:opencode/big-pickle",
+            prepare_model_messages=_test_context_preparer("连续检查多轮"),
+        ))
+
+    assert call_count == 8
+    assert result["reply"] == "已在超过旧上限后完成立项检查。"
 
 
 def test_opencode_uses_direct_session_scoped_mcp():

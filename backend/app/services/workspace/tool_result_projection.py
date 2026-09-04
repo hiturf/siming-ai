@@ -78,9 +78,7 @@ class ToolResultOverCapacity(ToolResultProjectionError):
 # is never shortened after the model emitted it because that would orphan
 # native tool-call IDs and could hide already-committed side effects.
 MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES = 32 * 1024
-MAX_NATIVE_TOOL_CALLS_PER_STEP = 12
 MAX_NATIVE_ASSISTANT_TRANSACTION_JSON_BYTES = 16 * 1024
-NATIVE_TOOL_RESULT_MESSAGE_WRAPPER_TOKENS_PER_CALL = 128
 TOOL_CATEGORY_CONTROLLER_RESULT_CONTRACT = ModelResultContract(
     policy=ModelResultPolicy.STATUS_ONLY,
     max_json_bytes=4 * 1024,
@@ -131,7 +129,6 @@ _SAFE_DIAGNOSTIC_NUMERIC_FIELDS = frozenset({
     "declared_batch_json_bytes",
     "failed_write_limit",
     "failed_writes",
-    "max_batch_call_count",
     "max_batch_json_bytes",
     "max_bytes",
     "successful_writes",
@@ -156,7 +153,6 @@ class ToolResultBatchOverCapacity(ValueError):
         declared_json_bytes: int,
         max_json_bytes: int,
         call_count: int,
-        max_call_count: int,
         reason: str = "tool_result_batch_over_capacity",
     ) -> None:
         if reason.startswith("native_assistant_transaction_"):
@@ -164,10 +160,6 @@ class ToolResultBatchOverCapacity(ValueError):
                 f"当前原生工具 assistant 事务为 {declared_json_bytes} 字节，"
                 f"不符合协议边界（上限 {max_json_bytes} 字节）；整批未执行。"
                 "请减少并行调用或缩小工具参数。"
-            )
-        elif call_count > max_call_count:
-            detail = (
-                f"当前步骤包含 {call_count} 个工具调用，超过协议上限 {max_call_count}；整批未执行。"
             )
         else:
             detail = (
@@ -180,7 +172,6 @@ class ToolResultBatchOverCapacity(ValueError):
         self.declared_json_bytes = declared_json_bytes
         self.max_json_bytes = max_json_bytes
         self.call_count = call_count
-        self.max_call_count = max_call_count
         self.detail = detail
         self.reason = reason
 
@@ -194,7 +185,6 @@ class ToolResultBatchOverCapacity(ValueError):
             "data": {
                 "reason": self.reason,
                 "batch_call_count": self.call_count,
-                "max_batch_call_count": self.max_call_count,
                 "declared_batch_json_bytes": self.declared_json_bytes,
                 "max_batch_json_bytes": self.max_json_bytes,
             },
@@ -203,8 +193,6 @@ class ToolResultBatchOverCapacity(ValueError):
 
 def max_model_visible_result_tokens_for_open_tools(
     tools: Iterable[ToolWithModelResultContract],
-    *,
-    max_calls_per_step: int = MAX_NATIVE_TOOL_CALLS_PER_STEP,
 ) -> int:
     """Return the conservative token reserve for one *admissible* result batch.
 
@@ -214,16 +202,12 @@ def max_model_visible_result_tokens_for_open_tools(
     is the matching pre-execution gate that makes this open-tool reserve true.
     """
 
-    if max_calls_per_step <= 0:
-        raise ValueError("max_calls_per_step must be positive")
-    contracts = tuple(tool.model_result_contract for tool in tools)
-    if not contracts:
+    resolved = tuple(tools)
+    if not resolved:
         return 0
-    largest = max(contract.max_json_bytes for contract in contracts)
-    return min(
-        MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES,
-        largest * max_calls_per_step,
-    )
+    if len(resolved) == 1 and resolved[0].name == "set_tool_categories":
+        return resolved[0].model_result_contract.max_json_bytes
+    return MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES
 
 
 def _openai_tool_name(schema: Mapping[str, Any]) -> str:
@@ -284,7 +268,6 @@ def max_model_visible_result_tokens_for_open_tool_schemas(
     tool_schemas: Iterable[Mapping[str, Any]],
     *,
     resolve_tool: Callable[[str], ToolWithModelResultContract | None],
-    max_calls_per_step: int = MAX_NATIVE_TOOL_CALLS_PER_STEP,
 ) -> int:
     """Resolve OpenAI schemas and return their whole-batch token reserve."""
 
@@ -293,36 +276,26 @@ def max_model_visible_result_tokens_for_open_tool_schemas(
             tool_schemas,
             resolve_tool=resolve_tool,
         ),
-        max_calls_per_step=max_calls_per_step,
     )
 
 
-def max_native_tool_transaction_wrapper_tokens(
-    *,
-    max_calls_per_step: int = MAX_NATIVE_TOOL_CALLS_PER_STEP,
-) -> int:
+def max_native_tool_transaction_wrapper_tokens() -> int:
     """Reserve replay growth not included in model-visible result contents.
 
     ``admit_native_assistant_transaction`` hard-validates the exact UTF-8 JSON
-    payload before any handler runs.  Repeated result ``tool_call_id`` values
-    cannot contain more bytes than that validated assistant payload; fixed
-    role/key wrappers are bounded per admitted call.  The context runtime must
-    treat the returned integer as an already-counted token reserve.
+    payload before any handler runs.  Each result-message wrapper repeats only
+    metadata already present in its validated call, so a second assistant-sized
+    byte reserve bounds the wrappers without assuming a fixed call count.  The
+    context runtime treats the returned integer as an already-counted token
+    reserve.
     """
 
-    if max_calls_per_step <= 0:
-        raise ValueError("max_calls_per_step must be positive")
-    return (
-        2 * MAX_NATIVE_ASSISTANT_TRANSACTION_JSON_BYTES
-        + max_calls_per_step * NATIVE_TOOL_RESULT_MESSAGE_WRAPPER_TOKENS_PER_CALL
-    )
+    return 2 * MAX_NATIVE_ASSISTANT_TRANSACTION_JSON_BYTES
 
 
 def admit_native_assistant_transaction(
     assistant_payload: Mapping[str, Any],
     tools: Iterable[ToolWithModelResultContract],
-    *,
-    max_calls_per_step: int = MAX_NATIVE_TOOL_CALLS_PER_STEP,
 ) -> int:
     """Validate exact native assistant state and declared results pre-handler.
 
@@ -340,7 +313,6 @@ def admit_native_assistant_transaction(
             declared_json_bytes=declared_json_bytes,
             max_json_bytes=MAX_NATIVE_ASSISTANT_TRANSACTION_JSON_BYTES,
             call_count=call_count,
-            max_call_count=max_calls_per_step,
             reason="native_assistant_transaction_invalid",
         )
 
@@ -373,25 +345,14 @@ def admit_native_assistant_transaction(
             declared_json_bytes=assistant_bytes,
             max_json_bytes=MAX_NATIVE_ASSISTANT_TRANSACTION_JSON_BYTES,
             call_count=len(raw_calls),
-            max_call_count=max_calls_per_step,
             reason="native_assistant_transaction_over_capacity",
         )
-    declared_result_bytes = admit_model_tool_result_batch(
-        resolved,
-        max_calls_per_step=max_calls_per_step,
-    )
-    return (
-        assistant_bytes
-        + declared_result_bytes
-        + assistant_bytes
-        + max_calls_per_step * NATIVE_TOOL_RESULT_MESSAGE_WRAPPER_TOKENS_PER_CALL
-    )
+    declared_result_bytes = admit_model_tool_result_batch(resolved)
+    return assistant_bytes + declared_result_bytes + assistant_bytes
 
 
 def admit_model_tool_result_batch(
     tools: Iterable[ToolWithModelResultContract],
-    *,
-    max_calls_per_step: int = MAX_NATIVE_TOOL_CALLS_PER_STEP,
 ) -> int:
     """Admit a complete resolved call batch before any handler is executed.
 
@@ -399,20 +360,14 @@ def admit_model_tool_result_batch(
     order and, on failure, emit one native error result per original call ID.
     """
 
-    if max_calls_per_step <= 0:
-        raise ValueError("max_calls_per_step must be positive")
     resolved = tuple(tools)
     declared = sum(tool.model_result_contract.max_json_bytes for tool in resolved)
-    if (
-        len(resolved) > max_calls_per_step
-        or declared > MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES
-    ):
+    if declared > MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES:
         raise ToolResultBatchOverCapacity(
             tool_names=tuple(tool.name for tool in resolved),
             declared_json_bytes=declared,
             max_json_bytes=MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES,
             call_count=len(resolved),
-            max_call_count=max_calls_per_step,
         )
     return declared
 
@@ -765,8 +720,6 @@ model_tool_result_projector = ModelToolResultProjector()
 __all__ = [
     "MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES",
     "MAX_NATIVE_ASSISTANT_TRANSACTION_JSON_BYTES",
-    "MAX_NATIVE_TOOL_CALLS_PER_STEP",
-    "NATIVE_TOOL_RESULT_MESSAGE_WRAPPER_TOKENS_PER_CALL",
     "TOOL_CATEGORY_CONTROLLER_RESULT_CONTRACT",
     "ModelToolResultProjector",
     "ProjectedToolResult",

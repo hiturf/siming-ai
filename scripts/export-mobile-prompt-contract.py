@@ -28,6 +28,8 @@ from app.modules.creation.interfaces.agent_scope import (  # noqa: E402
     CREATION_AGENT_WRITE_TOOL_NAMES,
     CREATION_TURN_MAX_FAILED_WRITES,
     CREATION_TURN_MAX_SUCCESSFUL_WRITES,
+    MOBILE_CREATION_AGENT_TOOL_NAMES,
+    MOBILE_CREATION_UNSUPPORTED_TOOL_NAMES,
 )
 from app.prompts.character_writer_prompts import build_character_writer_messages  # noqa: E402
 from app.prompts.outline_writer_prompts import build_outline_writer_messages  # noqa: E402
@@ -63,7 +65,6 @@ from app.services.novel_creation_prompting import (  # noqa: E402
     CREATION_REPAIR_USER_TEMPLATE,
 )
 from app.services.novel_creation_agent import (  # noqa: E402
-    CREATION_AGENT_TOOLS,
     _domain_tool_schemas as creation_agent_domain_tool_schemas,
     _system_prompt as creation_agent_system_prompt,
 )
@@ -338,6 +339,12 @@ def build_contract() -> dict:
         requirements="{{requirements}}",
     )
     baseline_fixture = _creation_baseline_fixture()
+    mobile_creation_names = set(MOBILE_CREATION_AGENT_TOOL_NAMES)
+    mobile_creation_schemas = [
+        schema
+        for schema in creation_agent_domain_tool_schemas()
+        if schema.get("function", {}).get("name") in mobile_creation_names
+    ]
     contract = {
         "schema_version": 3,
         "source_versions": {
@@ -376,16 +383,20 @@ def build_contract() -> dict:
         },
         "creation_agent": {
             "system_template": creation_agent_system_prompt("{{session_id}}"),
-            "tool_names": sorted({*CREATION_AGENT_TOOLS, TOOL_CATEGORY_CONTROLLER}),
-            "revision_tool_names": sorted(CREATION_AGENT_REVISION_TOOL_NAMES),
-            "write_tool_names": sorted(CREATION_AGENT_WRITE_TOOL_NAMES),
+            "tool_names": sorted({*mobile_creation_names, TOOL_CATEGORY_CONTROLLER}),
+            "excluded_pc_tool_names": sorted(MOBILE_CREATION_UNSUPPORTED_TOOL_NAMES),
+            "revision_tool_names": sorted(
+                set(CREATION_AGENT_REVISION_TOOL_NAMES) & mobile_creation_names
+            ),
+            "write_tool_names": sorted(
+                set(CREATION_AGENT_WRITE_TOOL_NAMES) & mobile_creation_names
+            ),
             "max_successful_writes_per_turn": CREATION_TURN_MAX_SUCCESSFUL_WRITES,
             "max_failed_writes_per_turn": CREATION_TURN_MAX_FAILED_WRITES,
             "tool_schemas": [
                 tool_category_controller_schema(),
-                *creation_agent_domain_tool_schemas(),
+                *mobile_creation_schemas,
             ],
-            "max_iterations": 6,
         },
         "creation": {
             "schema_version": 3,

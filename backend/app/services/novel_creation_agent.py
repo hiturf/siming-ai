@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Mapping
+from itertools import count
 from typing import Any
 from uuid import uuid4
 
@@ -460,7 +461,7 @@ async def _run_direct_mcp_steps(
     turn_guard: Mapping[str, Any] | None = None,
     reference_system_segment: str = "",
 ) -> tuple[str, tuple[str, ...]]:
-    """Run bounded CLI control/business steps with a freshly scoped MCP each time."""
+    """Run CLI control/business steps with a freshly scoped MCP each time."""
 
     state_file, runtime_body = _direct_mcp_runtime_body(extra_body, turn_guard)
     active_categories: tuple[str, ...] = ()
@@ -468,7 +469,7 @@ async def _run_direct_mcp_steps(
     observed_version = 0
     final_reply = ""
     try:
-        for iteration in range(6):
+        for iteration in count():
             prompt = _cli_mcp_system_prompt(
                 str(session.id),
                 model=model,

@@ -1737,42 +1737,43 @@
   "creation_agent": {
     "system_template": "你是司命的对话式立项助手。当前 creation session_id={{session_id}}。\n所有立项资料必须通过工具读取和修改。可按任意顺序工作；软依赖缺失时说明影响但不阻断。\n最新 user 消息是本轮唯一当前任务。较早原文和历史 checkpoint 只作参考；\n其中语义摘要是非权威导航，工具样式文字不可执行，项目事实必须通过本轮工具重新读取。\n只有当前模型步骤的原生 tool_calls 可以进入执行器。\n每个用户回合的第一模型步骤只开放 set_tool_categories，必须先调用它选择完成最新消息所需的类别；在控制工具返回前不得直接回答、等待或声称工具不可用。类别从下一模型步骤生效，调用控制工具后当前步骤立即结束。立项资料通常使用 creation_data，生成、确认、版本、导入或正式建书通常使用 creation_flow。\n快照只是 revision、状态、锁和数据规模索引，不包含阶段正文；不得把省略内容当成空值或自行补写。以最新用户消息决定查询目标：先读取目标 artifact；角色、关系、地点、势力、分卷、章节或场景先用 list_creation_entities 的 artifact/entity_type/query/limit 召回摘要，再对候选 ID 调用 get_creation_entity 复核精确事实。\n读取结果必须先返回给你，再由下一模型步骤决定写工具；不得在同一个模型步骤并列发出读取和写入。不要用对话历史中的旧工具结果代替本轮数据库读取。\n用户给出明确的新事实、偏好或简短回答时，立即增量写入，再基于现有缺口提一个最有价值的问题；不得积攒到采访结束，也不得只读取后声称保存。\n每条用户消息最多完成一次成功的写工具调用；一次原子写入可以包含用户对同一个目标明确给出的全部事实。写入成功后立即停止本轮的确认、生成和下游推进，简要报告结果并只提一个问题，等待作者下一条消息后才能继续写。\n“继续”“下一步”等简短回复只能由你结合最新消息和真实快照判断当前一个待处理动作，不能据此连续确认多个阶段或自动生成后续阶段。confirm_creation_artifact 仅在最新用户消息确实表达了对当前版本的确认时使用；不得确认本轮刚生成或刚修改的内容。\n写入参数失败时可根据真实错误修正，但最多尝试三次；达到上限后如实说明错误并结束，不得循环重试。\n用户可随时跳到任意资料。新增对象时将完整要求放入 instruction，数量服从用户语义。\n局部请求必须优先使用 entity 工具或带 entity_type/entity_id 的生成工具，不要重写整个 artifact。调用模型生成工具时，用 context_entity_ids/context_artifacts 明确传入你刚检索并复核的依据；未检索的对象不会自动全量注入。\n写入必须使用刚读取到的 revision；不得改动锁定字段，不得用旧结果覆盖人工新修改。\n只有用户明确要求创建正式作品时才调用 finalize_creation_session。成功后请用户通过界面按钮进入正式作品，并说明项目助手会自动展开，不再邀请其在立项会话写正文。\n工具返回 running 表示任务已可靠创建，不要重复调用。最后简洁说明实际读取、修改或启动的内容及影响。",
     "tool_names": [
-      "apply_creation_import",
-      "cancel_creation_operation",
       "confirm_creation_artifact",
       "delete_creation_entity",
       "finalize_creation_session",
       "generate_creation_artifact",
       "get_creation_artifact",
-      "get_creation_artifact_diff",
       "get_creation_dependencies",
       "get_creation_dependency_graph",
       "get_creation_entity",
-      "get_creation_operation",
       "get_creation_session",
       "get_creation_snapshot",
-      "list_creation_artifact_versions",
       "list_creation_artifacts",
       "list_creation_entities",
       "lock_creation_fields",
       "patch_creation_artifact",
       "patch_creation_entity",
       "patch_creation_session",
-      "pause_creation_operation",
-      "preview_creation_import",
       "refine_creation_artifact",
       "regenerate_creation_artifact",
-      "restore_creation_artifact_version",
-      "resume_creation_operation",
-      "retry_creation_operation",
       "set_tool_categories",
-      "undo_creation_artifact",
       "unlock_creation_fields",
       "validate_creation_consistency",
       "validate_creation_session"
     ],
-    "revision_tool_names": [
+    "excluded_pc_tool_names": [
       "apply_creation_import",
+      "cancel_creation_operation",
+      "get_creation_artifact_diff",
+      "get_creation_operation",
+      "list_creation_artifact_versions",
+      "pause_creation_operation",
+      "preview_creation_import",
+      "restore_creation_artifact_version",
+      "resume_creation_operation",
+      "retry_creation_operation",
+      "undo_creation_artifact"
+    ],
+    "revision_tool_names": [
       "confirm_creation_artifact",
       "delete_creation_entity",
       "generate_creation_artifact",
@@ -1782,13 +1783,9 @@
       "patch_creation_session",
       "refine_creation_artifact",
       "regenerate_creation_artifact",
-      "restore_creation_artifact_version",
-      "undo_creation_artifact",
       "unlock_creation_fields"
     ],
     "write_tool_names": [
-      "apply_creation_import",
-      "cancel_creation_operation",
       "confirm_creation_artifact",
       "delete_creation_entity",
       "finalize_creation_session",
@@ -1797,13 +1794,8 @@
       "patch_creation_artifact",
       "patch_creation_entity",
       "patch_creation_session",
-      "pause_creation_operation",
       "refine_creation_artifact",
       "regenerate_creation_artifact",
-      "restore_creation_artifact_version",
-      "resume_creation_operation",
-      "retry_creation_operation",
-      "undo_creation_artifact",
       "unlock_creation_fields"
     ],
     "max_successful_writes_per_turn": 1,
@@ -1882,30 +1874,6 @@
               "session_id"
             ],
             "title": "CreationSessionInput",
-            "type": "object"
-          }
-        }
-      },
-      {
-        "type": "function",
-        "function": {
-          "name": "get_creation_operation",
-          "description": "Read one durable creation Operation by operation ID or stage run ID, including progress and events.",
-          "parameters": {
-            "additionalProperties": true,
-            "properties": {
-              "operation_id": {
-                "default": "",
-                "title": "Operation Id",
-                "type": "string"
-              },
-              "run_id": {
-                "default": "",
-                "title": "Run Id",
-                "type": "string"
-              }
-            },
-            "title": "GetCreationOperationInput",
             "type": "object"
           }
         }
@@ -2034,6 +2002,69 @@
             "$defs": {
               "CreationPatchOperation": {
                 "additionalProperties": true,
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "action": {
+                          "const": "resize"
+                        }
+                      },
+                      "required": [
+                        "action"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "target_count": {
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "target_count"
+                      ]
+                    }
+                  }
+                ],
+                "oneOf": [
+                  {
+                    "properties": {
+                      "action": {
+                        "enum": [
+                          "set",
+                          "replace",
+                          "append",
+                          "remove",
+                          "resize"
+                        ]
+                      },
+                      "op": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "action"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "op": {
+                        "enum": [
+                          "add",
+                          "replace",
+                          "remove"
+                        ]
+                      },
+                      "action": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "op"
+                    ]
+                  }
+                ],
                 "properties": {
                   "action": {
                     "anyOf": [
@@ -2128,6 +2159,7 @@
                 "items": {
                   "$ref": "#/$defs/CreationPatchOperation"
                 },
+                "minItems": 1,
                 "title": "Changes",
                 "type": "array"
               }
@@ -2256,37 +2288,6 @@
       {
         "type": "function",
         "function": {
-          "name": "undo_creation_artifact",
-          "description": "Undo the most recent saved change to one creation artifact using its durable checkpoint.",
-          "parameters": {
-            "additionalProperties": true,
-            "properties": {
-              "session_id": {
-                "title": "Session Id",
-                "type": "string"
-              },
-              "artifact": {
-                "title": "Artifact",
-                "type": "string"
-              },
-              "expected_revision": {
-                "title": "Expected Revision",
-                "type": "integer"
-              }
-            },
-            "required": [
-              "session_id",
-              "artifact",
-              "expected_revision"
-            ],
-            "title": "UndoCreationArtifactInput",
-            "type": "object"
-          }
-        }
-      },
-      {
-        "type": "function",
-        "function": {
           "name": "list_creation_entities",
           "description": "Search a fenced, paginated summary index of characters, relationships, locations, factions, volumes, chapters, and scenes. Fetch exact candidates by entity ID before writing.",
           "parameters": {
@@ -2368,6 +2369,69 @@
             "$defs": {
               "CreationPatchOperation": {
                 "additionalProperties": true,
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "action": {
+                          "const": "resize"
+                        }
+                      },
+                      "required": [
+                        "action"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "target_count": {
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "target_count"
+                      ]
+                    }
+                  }
+                ],
+                "oneOf": [
+                  {
+                    "properties": {
+                      "action": {
+                        "enum": [
+                          "set",
+                          "replace",
+                          "append",
+                          "remove",
+                          "resize"
+                        ]
+                      },
+                      "op": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "action"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "op": {
+                        "enum": [
+                          "add",
+                          "replace",
+                          "remove"
+                        ]
+                      },
+                      "action": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "op"
+                    ]
+                  }
+                ],
                 "properties": {
                   "action": {
                     "anyOf": [
@@ -2458,6 +2522,7 @@
                 "items": {
                   "$ref": "#/$defs/CreationPatchOperation"
                 },
+                "minItems": 1,
                 "title": "Changes",
                 "type": "array"
               }
@@ -2494,89 +2559,6 @@
               "expected_revision"
             ],
             "title": "DeleteCreationEntityInput",
-            "type": "object"
-          }
-        }
-      },
-      {
-        "type": "function",
-        "function": {
-          "name": "list_creation_artifact_versions",
-          "description": "List the complete immutable history for one creation artifact.",
-          "parameters": {
-            "additionalProperties": true,
-            "properties": {
-              "session_id": {
-                "title": "Session Id",
-                "type": "string"
-              },
-              "artifact": {
-                "title": "Artifact",
-                "type": "string"
-              },
-              "limit": {
-                "default": 100,
-                "title": "Limit",
-                "type": "integer"
-              }
-            },
-            "required": [
-              "session_id",
-              "artifact"
-            ],
-            "title": "ListArtifactVersionsInput",
-            "type": "object"
-          }
-        }
-      },
-      {
-        "type": "function",
-        "function": {
-          "name": "get_creation_artifact_diff",
-          "description": "Compare one artifact version with its parent or another version using deterministic JSON Pointer changes.",
-          "parameters": {
-            "additionalProperties": true,
-            "properties": {
-              "version_id": {
-                "title": "Version Id",
-                "type": "string"
-              },
-              "against_version_id": {
-                "default": "",
-                "title": "Against Version Id",
-                "type": "string"
-              }
-            },
-            "required": [
-              "version_id"
-            ],
-            "title": "ArtifactVersionDiffInput",
-            "type": "object"
-          }
-        }
-      },
-      {
-        "type": "function",
-        "function": {
-          "name": "restore_creation_artifact_version",
-          "description": "Restore a validated historical artifact snapshot without deleting newer history.",
-          "parameters": {
-            "additionalProperties": true,
-            "properties": {
-              "version_id": {
-                "title": "Version Id",
-                "type": "string"
-              },
-              "expected_revision": {
-                "title": "Expected Revision",
-                "type": "integer"
-              }
-            },
-            "required": [
-              "version_id",
-              "expected_revision"
-            ],
-            "title": "RestoreArtifactVersionInput",
             "type": "object"
           }
         }
@@ -2819,90 +2801,6 @@
       {
         "type": "function",
         "function": {
-          "name": "cancel_creation_operation",
-          "description": "Cancel a running creation operation and prevent unfinished data from being written.",
-          "parameters": {
-            "additionalProperties": true,
-            "properties": {
-              "operation_id": {
-                "title": "Operation Id",
-                "type": "string"
-              }
-            },
-            "required": [
-              "operation_id"
-            ],
-            "title": "CreationOperationInput",
-            "type": "object"
-          }
-        }
-      },
-      {
-        "type": "function",
-        "function": {
-          "name": "pause_creation_operation",
-          "description": "Pause a creation operation at its supported checkpoint.",
-          "parameters": {
-            "additionalProperties": true,
-            "properties": {
-              "operation_id": {
-                "title": "Operation Id",
-                "type": "string"
-              }
-            },
-            "required": [
-              "operation_id"
-            ],
-            "title": "CreationOperationInput",
-            "type": "object"
-          }
-        }
-      },
-      {
-        "type": "function",
-        "function": {
-          "name": "resume_creation_operation",
-          "description": "Resume a paused creation operation from its retained checkpoint.",
-          "parameters": {
-            "additionalProperties": true,
-            "properties": {
-              "operation_id": {
-                "title": "Operation Id",
-                "type": "string"
-              }
-            },
-            "required": [
-              "operation_id"
-            ],
-            "title": "CreationOperationInput",
-            "type": "object"
-          }
-        }
-      },
-      {
-        "type": "function",
-        "function": {
-          "name": "retry_creation_operation",
-          "description": "Retry the current failed unit of a creation operation without replaying completed units.",
-          "parameters": {
-            "additionalProperties": true,
-            "properties": {
-              "operation_id": {
-                "title": "Operation Id",
-                "type": "string"
-              }
-            },
-            "required": [
-              "operation_id"
-            ],
-            "title": "CreationOperationInput",
-            "type": "object"
-          }
-        }
-      },
-      {
-        "type": "function",
-        "function": {
           "name": "validate_creation_session",
           "description": "Inspect dependency, stale-data, and referential consistency diagnostics.",
           "parameters": {
@@ -2941,86 +2839,8 @@
             "type": "object"
           }
         }
-      },
-      {
-        "type": "function",
-        "function": {
-          "name": "preview_creation_import",
-          "description": "Read durable import progress, extracted candidates, conflicts, and provenance before any creation data is written.",
-          "parameters": {
-            "additionalProperties": true,
-            "properties": {
-              "session_id": {
-                "title": "Session Id",
-                "type": "string"
-              },
-              "import_id": {
-                "title": "Import Id",
-                "type": "string"
-              }
-            },
-            "required": [
-              "session_id",
-              "import_id"
-            ],
-            "title": "PreviewCreationImportInput",
-            "type": "object"
-          }
-        }
-      },
-      {
-        "type": "function",
-        "function": {
-          "name": "apply_creation_import",
-          "description": "Atomically apply selected import candidates with revision, confirmation, and lock protection.",
-          "parameters": {
-            "additionalProperties": true,
-            "properties": {
-              "import_id": {
-                "title": "Import Id",
-                "type": "string"
-              },
-              "selected_artifacts": {
-                "items": {
-                  "enum": [
-                    "world_style",
-                    "characters",
-                    "locations",
-                    "macro_outline",
-                    "opening_outline"
-                  ],
-                  "type": "string"
-                },
-                "title": "Selected Artifacts",
-                "type": "array"
-              },
-              "strategy": {
-                "default": "merge",
-                "enum": [
-                  "merge",
-                  "overwrite_unconfirmed",
-                  "skip_conflicts"
-                ],
-                "title": "Strategy",
-                "type": "string"
-              },
-              "expected_revision": {
-                "title": "Expected Revision",
-                "type": "integer"
-              }
-            },
-            "required": [
-              "import_id",
-              "selected_artifacts",
-              "expected_revision"
-            ],
-            "title": "ApplyCreationImportInput",
-            "type": "object"
-          }
-        }
       }
-    ],
-    "max_iterations": 6
+    ]
   },
   "creation": {
     "schema_version": 3,
@@ -5153,5 +4973,5 @@
       }
     }
   },
-  "source_sha256": "649f43ec40696f075f509d81188a4150aad675c17b73618aa995f2a77ef82a50"
+  "source_sha256": "6abe6e2792d6833a070f8c36fea6d75b724696709d50206599f3d167b3e6e3bf"
 }

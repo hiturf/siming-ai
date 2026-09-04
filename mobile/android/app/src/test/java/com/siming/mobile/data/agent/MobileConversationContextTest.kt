@@ -471,8 +471,12 @@ class MobileConversationContextTest {
     }
 
     @Test
-    fun `native tool batch limits match golden and reject the whole response before handlers`() {
+    fun `native tool byte limits match golden and reject the whole response before handlers`() {
         val fixture = interopFixture()["native_tool_budget"] as JsonObject
+        assertEquals(
+            (fixture["schema"] as JsonPrimitive).content,
+            MobileNativeToolBudgetContract.SCHEMA,
+        )
         assertEquals(
             fixture["max_native_assistant_transaction_json_bytes"]?.toString()?.toInt(),
             MobileNativeToolBudgetContract.MAX_NATIVE_ASSISTANT_TRANSACTION_JSON_BYTES,
@@ -481,10 +485,7 @@ class MobileConversationContextTest {
             fixture["max_model_visible_tool_result_batch_json_bytes"]?.toString()?.toInt(),
             MobileNativeToolBudgetContract.MAX_MODEL_VISIBLE_TOOL_RESULT_BATCH_JSON_BYTES,
         )
-        assertEquals(
-            fixture["max_native_tool_calls_per_step"]?.toString()?.toInt(),
-            MobileNativeToolBudgetContract.MAX_NATIVE_TOOL_CALLS_PER_STEP,
-        )
+        assertFalse("max_native_tool_calls_per_step" in fixture)
         assertEquals(
             fixture["next_step_wrapper_tokens"]?.toString()?.toInt(),
             MobileNativeToolBudgetContract.NEXT_STEP_WRAPPER_TOKENS,
@@ -508,6 +509,15 @@ class MobileConversationContextTest {
             orderedToolNames = listOf("set_tool_categories"),
         )
         assertTrue(accepted.accepted)
+
+        val manySmallCalls = (1..20).map { index -> "tiny-status-$index" }
+        val acceptedMany = MobileNativeToolBudgetContract.admitExactAssistantTransaction(
+            assistantPayload = nativeAssistantPayload(manySmallCalls),
+            orderedToolNames = manySmallCalls,
+            resultJsonBytes = { 128 },
+        )
+        assertTrue(acceptedMany.accepted)
+        assertEquals(20, acceptedMany.callCount)
 
         val resultBatch = MobileNativeToolBudgetContract.admitExactAssistantTransaction(
             assistantPayload = nativeAssistantPayload(

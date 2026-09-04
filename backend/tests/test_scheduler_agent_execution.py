@@ -174,6 +174,40 @@ class RunTaskPromptTest(unittest.TestCase):
             ["system", "user", "assistant", "tool", "assistant", "tool"],
         )
 
+    @patch(
+        "app.services.workspace.scheduled_task_runner.workspace_executor."
+        "execute_workspace_action",
+        new_callable=AsyncMock,
+    )
+    def test_agent_continues_past_the_old_ten_step_limit(
+        self,
+        mock_execute: AsyncMock,
+    ) -> None:
+        gateway = _StreamGateway([
+            {"tool_calls": [_category_call("story_knowledge")]},
+            *[
+                {
+                    "tool_calls": [
+                        _tool_call(f"character-call-{index}", "list_characters", {})
+                    ]
+                }
+                for index in range(10)
+            ],
+            {"content": "Finished after the old limit"},
+        ])
+        mock_execute.return_value = {
+            "tool": "list_characters",
+            "status": "ok",
+            "detail": "Checked",
+            "data": {"items": []},
+        }
+
+        result = self._run_with_gateway(self._mock_task(), gateway)
+
+        self.assertEqual(result, "Finished after the old limit")
+        self.assertEqual(len(gateway.calls), 12)
+        self.assertEqual(mock_execute.await_count, 10)
+
     def test_tool_policy_is_intersected_after_category_selection(self) -> None:
         task = self._mock_task()
         task.tool_policy = ["list_characters"]
@@ -422,12 +456,12 @@ class RunTaskPromptTest(unittest.TestCase):
                 [_tool_call("missing-name", "", {})],
                 "native_tool_name_missing",
             ),
-            "too_many": (
+            "result_batch_over_capacity": (
                 [
                     _tool_call(f"call-{index}", "list_characters", {})
                     for index in range(13)
                 ],
-                "native_tool_call_batch_too_large",
+                "tool_result_batch_over_capacity",
             ),
         }
         for calls, reason in cases.values():

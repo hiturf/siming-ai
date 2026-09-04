@@ -434,7 +434,14 @@ class AIChapterDraftFlowTestCase(unittest.TestCase):
                 _execute_workspace_action(
                     db,
                     project_id,
-                    {"tool": "chapter_writer", "arguments": {"outline_node_id": volume_id}},
+                    {
+                        "tool": "chapter_writer",
+                        "arguments": {
+                            "outline_node_id": volume_id,
+                            "context_manifest_id": "not-reached-for-invalid-target",
+                            "context_selection_token": "not-reached-for-invalid-target",
+                        },
+                    },
                 )
             )
         finally:
@@ -464,7 +471,14 @@ class AIChapterDraftFlowTestCase(unittest.TestCase):
                 _execute_workspace_action(
                     db,
                     project_id,
-                    {"tool": "chapter_writer", "arguments": {"outline_node_id": outline_id}},
+                    {
+                        "tool": "chapter_writer",
+                        "arguments": {
+                            "outline_node_id": outline_id,
+                            "context_manifest_id": "not-reached-for-existing-chapter",
+                            "context_selection_token": "not-reached-for-existing-chapter",
+                        },
+                    },
                 )
             )
             db.refresh(chapter)
@@ -1410,21 +1424,6 @@ class AIChapterDraftFlowTestCase(unittest.TestCase):
                         "name": "create_character",
                         "arguments_delta": json.dumps({"name": "不应执行"}),
                     },
-                    {"type": "done", "finish_reason": "tool_calls", "usage": None},
-                )
-            ],
-            "too_many_calls": [
-                async_dict_chunks(
-                    *[
-                        {
-                            "type": "tool_call_delta",
-                            "index": index,
-                            "id": f"call-{index}",
-                            "name": "set_tool_categories",
-                            "arguments_delta": json.dumps({"enabled_categories": []}),
-                        }
-                        for index in range(13)
-                    ],
                     {"type": "done", "finish_reason": "tool_calls", "usage": None},
                 )
             ],
@@ -2688,7 +2687,11 @@ class AIChapterDraftFlowTestCase(unittest.TestCase):
                     "index": 0,
                     "id": "call-blocked-writer",
                     "name": "chapter_writer",
-                    "arguments_delta": json.dumps({"outline_node_id": second_outline}),
+                    "arguments_delta": json.dumps({
+                        "outline_node_id": second_outline,
+                        "context_manifest_id": "not-reached-for-cataloging-gate",
+                        "context_selection_token": "not-reached-for-cataloging-gate",
+                    }),
                 },
                 {"type": "done", "finish_reason": "tool_calls", "usage": None},
             ),
