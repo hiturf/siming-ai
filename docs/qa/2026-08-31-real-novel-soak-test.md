@@ -731,3 +731,9 @@ API 与本机 CLI 可以有不同的传输和交互形式，例如 HTTP/SSE 与 
 ## 验收结论
 
 本轮通过：正式章节 **41 章**，严格超过 40；正文汉字 **157,104**，严格超过 100,000；41 章全部完成建档且无待存草稿。最终 `.siming-project` 已由司命官方接口导出，并以同一原文件通过官方接口真实回导；源作品与回导作品逐章正文及主要业务数据一致。最终交付以文件 SHA-256 `b5c941d0eaa10a670a0165419a28c94c2ca71dd0d9e3d6304c3436edf634fc8f` 为唯一字节标识。
+
+## 2026-09-04 当前版本补充复验
+
+远程 `main` 集成和未建档草稿 AI 修改修复完成后，当前代码提交 `4ab4af8` 又在隔离实例中导入同一最终包，执行幂等重放、逐章正文/建档状态比较、RAG 重建、失活世界资料隔离、正式再导出和真实浏览器草稿流程。项目包审计 16/16 通过；浏览器中用真实模型生成一份未保存第 42 章草稿、连续修改两次并在第二次模型运行期间人工编辑，14/14 断言通过。该测试副本始终只有一条 pending 草稿且正式章节仍为 41，因此没有改变上面的最终成书包。
+
+当前分支的完整集成说明、API/CLI 一致性结论、重复建档和旧世界资料影响、截图及新增 UX 问题见 [`2026-09-04-upstream-integration.md`](./2026-09-04-upstream-integration.md)；机器证据见 [`project-package-integrated-code-audit.json`](../../artifacts/ha-novel-20260831/project-package-integrated-code-audit.json) 与 [`pending-draft-live-ui-audit.json`](../../artifacts/ha-novel-20260831/current-head-4ab4af8/pending-draft-live-ui-audit.json)。

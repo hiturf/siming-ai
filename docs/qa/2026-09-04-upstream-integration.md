@@ -56,6 +56,32 @@ Android 查询统一使用一个分页实现，保留总数、稳定游标、`ha
 
 前端全量回归与后端扫描、Android 构建并发执行时，`GuiAssistantChat` 中一个异步保存失败场景曾超过默认 15 秒限制；该用例在 30 秒诊断阈值下通过，并在高内存扫描结束后以原始 15 秒阈值独立通过。最终在机器资源空闲时用单 worker、原始阈值重跑全部前端测试，该用例耗时 4.192 秒，51 个测试文件和 271 项测试全部通过。因此本轮把该现象记录为测试机资源争用，而不是通过永久放宽超时掩盖。
 
+### 未建档章节草稿可由 AI 连续修改（HA-059）
+
+用户反馈属实：旧路径把任何待保存草稿都当成“必须先保存并建档”的阻塞条件，模型不能读取并替换这份草稿，因此作者对初稿不满意时只能先把不满意的内容写入正式章节。现行路径把“继续修改当前草稿”加入同一权威写作流程，同时继续阻止生成下一章：前端在每次请求前把编辑器全文同步到待保存草稿，请求只传真实 `active_chapter_draft_id`；后端校验该 ID 属于当前作品、仍为唯一待保存草稿且绑定当前章级大纲，然后让模型读取完整草稿并原位替换同一记录。保存、建档和继续下一章仍由作者决定。
+
+为防止数分钟模型运行覆盖作者的新修改，后端按模型实际读取的完整草稿状态生成来源哈希，并在写回时加作品级锁重新核对；草稿已被编辑、保存、丢弃或另一轮修订替换时，迟到结果会被拒绝。PC 编辑器还会在任务结束时比较请求基线与当前编辑器内容，发现并发手改后把作者版本重新同步到 API。API、工作区工具、本机 CLI/MCP 和 Android 均使用 `source_draft_id` 与同一归属、状态和来源版本契约，没有保留入口专用的草稿语义。
+
+真实界面按以下流程复验，使用 `codex_cli:gpt-5.6-terra`，模型状态为 `ready`，上下文窗口 1,050,000 tokens：
+
+1. 在 41 章完整回导副本中新建第 42 个章级大纲，通过工作区助手生成待保存草稿；草稿 ID 为 `0db55776-5331-41a9-82c7-30cae5af0fc1`，正式章节仍为 41。
+2. 在编辑器追加“普通工作，按时交还”，直接要求 AI 把这句话自然融入正文。请求前 API 已收到 1,467 字符的作者版本；AI 完成后仍是同一草稿 ID，正文从 SHA-256 `d4f76d8f…` 变为 `e1f92671…`，短句位于正文中段而非孤立尾句。
+3. 再次请求 AI 修改，并在运行期间追加“这行人工修改不得被迟到的模型结果覆盖”。任务完成后编辑器和 pending API 都保留 1,618 字符、SHA-256 `a506e98e…` 的作者版本，标记句仍在；SQLite 中该作品只有一条 `chapter_drafts` 记录。
+4. 全程没有生成正式第 42 章，也没有启动建档；41 个原正式章节和最终交付项目包未被修改。14 项机器断言全部为真，详见 [`pending-draft-live-ui-audit.json`](../../artifacts/ha-novel-20260831/current-head-4ab4af8/pending-draft-live-ui-audit.json)。
+
+界面证据依次为：[待保存草稿与正式章节分离](../../artifacts/ha-novel-20260831/current-head-4ab4af8/screenshots/02-pending-draft-created.png)、[第一次 AI 修改后仍为同一草稿](../../artifacts/ha-novel-20260831/current-head-4ab4af8/screenshots/04-pending-draft-ai-revised-same-id.png)、[第二次运行期间保留可编辑状态](../../artifacts/ha-novel-20260831/current-head-4ab4af8/screenshots/05-manual-edit-during-ai-revision.png)和[并发复验完成](../../artifacts/ha-novel-20260831/current-head-4ab4af8/screenshots/07-concurrent-revision-completed.png)。
+
+### 本轮真实使用新增的 UX 发现
+
+| 编号 | 优先级 | 发现与证据 | 建议 |
+| --- | --- | --- | --- |
+| HA-060 | P2 | 初次生成和两次修订分别耗时 482、427、388 秒。用户能取消且编辑器仍可输入，但长时间只看到运行阶段，难以判断系统是否前进。 | 显示真实经过时间、最近一次工具进展和可安全取消说明；不要给无法兑现的预计完成时间。 |
+| HA-061 | P2 | 修订工具已经返回“当前章节草稿已修改”，但助手自然语言回执和部分界面仍可能显示“草稿已生成”，没有明确说明复用了同一草稿。 | 以结构化动作结果渲染“已修改当前未保存草稿”，同时展示草稿 ID 的短标识和“仍未保存”。 |
+| HA-062 | P2 | 历史助手消息重复显示“保存并建档/仅保存/丢弃”按钮，容易让作者误以为每次修订都生成了新草稿。 | 只让最新有效草稿卡可操作；旧卡标记“已被后续版本取代”并禁用动作。 |
+| HA-063 | P3 | 已完成任务的历史轨迹仍显示 `running` 阶段标签，视觉上像后台尚未结束。 | 完成后把阶段渲染为历史时间线，并统一使用已完成/已取消/失败终态。 |
+
+本次可见性检查确认页面有跳转链接、具名按钮/下拉框和状态区域；模型运行期间正文编辑器保持可写，助手输入框禁用并提供取消动作。截图和本轮鼠标流程没有覆盖完整键盘 Tab 顺序，也没有测量颜色对比度，因此这些证据不能替代完整 WCAG 审计。
+
 ## API 与 CLI 会不会不同
 
 传输和交互可以不同：REST 使用 HTTP/SSE，本机 CLI 使用 stdio MCP，手机可经 Gateway 或独立 Direct API；它们也会显示不同的进度日志。业务结果不能不同：目标 ID 归属、参数验证、权限、章节草稿边界、建档状态机、候选应用、重试、取消和最终持久化语义必须一致。
@@ -94,7 +120,9 @@ Android 查询统一使用一个分页实现，保留总数、稳定游标、`ha
 
 合并后的当前代码在开启 SQLite 外键约束的全新临时库中完成以下完整链路：校验源包、正式 importer 导入、同一幂等键重放、核对 41 章正文/摘要/大纲状态、重建 RAG、验证 26 个失活世界资料 ID 均未进入 RAG、再由正式 exporter 导出并重新校验。16 项断言全部通过，源包与再导出包的所有集合计数一致，41 章正文哈希逐章一致。
 
-当前代码再导出包 [`chaohen-dangan-full-41chapters-integrated-reexport.siming-project`](../../artifacts/ha-novel-20260831/chaohen-dangan-full-41chapters-integrated-reexport.siming-project) 大小为 **10,228,341 bytes**，SHA-256 为 `d5479c4471e8b7dbf0c7441a06ac2b0d7d5246f0c3fe5294ff209522c5c4420a`。机器可读证据为 [`project-package-integrated-code-audit.json`](../../artifacts/ha-novel-20260831/project-package-integrated-code-audit.json)。
+当前代码再导出包 [`chaohen-dangan-full-41chapters-integrated-reexport.siming-project`](../../artifacts/ha-novel-20260831/chaohen-dangan-full-41chapters-integrated-reexport.siming-project) 大小为 **10,228,341 bytes**，SHA-256 为 `98f283a59abea2ae2aaa7b019ac0749cd80e7d3a850125f8571e4c52c46683ee`。机器可读证据为 [`project-package-integrated-code-audit.json`](../../artifacts/ha-novel-20260831/project-package-integrated-code-audit.json)。
+
+当前 HEAD 还通过真实 HTTP 服务完成一次独立导入、幂等重放和再导出，8/8 断言通过；该副本在随后进行的草稿体验测试前保持 41 章、157,104 个正文汉字、0 待存草稿。HTTP 证据见 [`current-http-roundtrip-audit.json`](../../artifacts/ha-novel-20260831/current-head-4ab4af8/current-http-roundtrip-audit.json)，所有最终文件及哈希汇总见 [`final-delivery-manifest-current-head.json`](../../artifacts/ha-novel-20260831/final-delivery-manifest-current-head.json)。
 
 ## 验证矩阵
 
@@ -106,6 +134,8 @@ Android 查询统一使用一个分页实现，保留总数、稳定游标、`ha
 | 容量文案与交互前端定向测试 | 4 个测试文件、70 项通过 |
 | Android 容量、加密信封与上下文定向测试 | 通过 |
 | 当前代码项目包导入/重放/RAG/再导出审计 | 16/16 通过 |
+| 真实浏览器未建档草稿生成、两次 AI 修改与并发手工编辑 | 14/14 通过；同一草稿 ID、SQLite 仅一行、正式章节仍为 41 |
+| 未建档草稿修复最终定向回归 | 后端 53/53、前端 41/41 通过；前端保留既有 React 测试告警，无失败 |
 | 后端 216 个测试文件隔离全量 | 216/216 个文件通过；集成中发现的测试语义与提示词体积问题修复后均已复验 |
 | 前端全量 Vitest | 51/51 个测试文件、271/271 项测试通过；单 worker、默认 15 秒用例阈值，497.03 秒 |
 | 前端 ESLint、生产构建、OpenAPI 类型同步 | 全部通过；生产构建只有分块超过 500 kB 的提示 |
@@ -117,8 +147,9 @@ Android 查询统一使用一个分页实现，保留总数、稳定游标、`ha
 
 - 41 章真实创作、最终建档和项目包导入导出在 PC 本机实例完成；没有在 Android 真机上重新生成整部长篇。手机独立完整建档仍是原报告 HA-026 的产品缺口，自动化契约通过不等同于真机长篇验收。
 - 外部模型供应商仍可能限流、超时或临时不可用。系统现在会保留失败状态并安全重试，但无法保证第三方可用性。
+- 当前真实模型在完整长篇上下文下三次草稿操作分别耗时 482、427、388 秒。数据安全与取消路径已复验，但等待反馈仍是需要继续优化的体验风险。
 - 架构质量门禁在本地高可用父提交为 32 个错误、远程父提交为 0，当前集成结果为 29 个错误；`cycles=0`、`direct_commits=0`、`router_queries=0`、`router_orm_imports=0`、`router_model_adapters=0`。现存项主要是本地高可用实现累积的模块/函数硬长度和两处跨模块依赖边界，因此整个架构质量门禁仍未通过。
 
 ## 最终提交
 
-本文随最终合并提交提交；提交号以 `codex/ha-upstream-integration-20260904` 当前分支 HEAD 为准。
+远程集成提交为 `e304ad7`；未建档草稿连续 AI 修改及并发保护的功能提交为 `4ab4af8`。本文与最终清单在其后的文档提交中固化，分支以 `codex/ha-upstream-integration-20260904` 的最终 HEAD 为准。
