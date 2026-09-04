@@ -1,6 +1,7 @@
 """Dispatcher for workspace assistant tool actions."""
 from __future__ import annotations
 
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from app.architecture.uow import commit_session
@@ -42,6 +43,18 @@ async def execute_workspace_action(
     handler = registry.get_handler(tool)
     if not handler:
         return {"tool": tool, "status": "skipped", "detail": "未知工具"}
+    spec = registry.get_spec(tool)
+    if spec is not None:
+        try:
+            args = spec.validate_input(args).model_dump(exclude_unset=True)
+        except ValidationError:
+            # Never reflect Pydantic's input values or free-form error text.
+            # The same typed contract is exported to native and MCP models.
+            return sanitize_diagnostic_tool_result(tool, {
+                "tool": tool,
+                "status": "error",
+                "data": {"reason": "native_tool_contract_invalid"},
+            })
     task_type = _GOVERNED_TASKS.get(tool)
     if not task_type:
         result = await handler(db, project_id, args)

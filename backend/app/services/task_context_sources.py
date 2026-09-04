@@ -18,7 +18,9 @@ from ..database.models import (
     OutlineNode,
     WorldbuildingEntry,
 )
+from ..database.query_filters import current_worldbuilding_clause
 from .character_archive import character_archive_text
+from .outline_service import load_outline_nodes, outline_chapter_number
 from .rag.context_packer import estimate_tokens
 from .rag.indexer import _get_source_content_hash
 
@@ -107,6 +109,26 @@ class TaskContextSourceResolver:
         )
         return f"{character.name} timeline", clean_context_text(content)
 
+    def _target_chapter_number(self, manifest: ContextManifest) -> int | None:
+        if manifest.task_type != "writing":
+            return None
+        query = manifest.query_json if isinstance(manifest.query_json, dict) else {}
+        arguments = query.get("arguments") if isinstance(query.get("arguments"), dict) else {}
+        outline_id = str(arguments.get("outline_node_id") or "")
+        if not outline_id:
+            outline_id = next(
+                (
+                    str(item.source_id)
+                    for item in manifest.items
+                    if item.category == "target_outline" and item.source_id
+                ),
+                "",
+            )
+        if not outline_id:
+            return None
+        nodes = load_outline_nodes(self.db, manifest.project_id)
+        return outline_chapter_number(nodes, outline_id)
+
     def _chapter_source(
         self, project_id: str, source_id: str, summary_only: bool
     ) -> tuple[str, str] | None:
@@ -139,7 +161,12 @@ class TaskContextSourceResolver:
         return row.title, content
 
     def _exact_content(
-        self, project_id: str, source_type: str, source_id: str
+        self,
+        project_id: str,
+        source_type: str,
+        source_id: str,
+        *,
+        manifest: ContextManifest | None = None,
     ) -> tuple[str, str] | None:
         if source_type == "character":
             row = (
@@ -153,7 +180,13 @@ class TaskContextSourceResolver:
             if not row:
                 return None
             return row.name, "Character archive (authoritative):\n" + clean_context_text(
-                character_archive_text(row, db=self.db),
+                character_archive_text(
+                    row,
+                    db=self.db,
+                    target_chapter_number=(
+                        self._target_chapter_number(manifest) if manifest is not None else None
+                    ),
+                ),
             )
         if source_type == "character_timeline":
             return self._timeline_source(project_id, source_id)
@@ -163,6 +196,7 @@ class TaskContextSourceResolver:
                 .filter(
                     WorldbuildingEntry.project_id == project_id,
                     WorldbuildingEntry.id == source_id,
+                    current_worldbuilding_clause(WorldbuildingEntry.status),
                 )
                 .first()
             )
@@ -238,7 +272,12 @@ class TaskContextSourceResolver:
         source_id = str(item.source_id or "")
         if not project_id or not source_id:
             return None
-        resolved = self._exact_content(project_id, item.source_type, source_id)
+        resolved = self._exact_content(
+            project_id,
+            item.source_type,
+            source_id,
+            manifest=manifest,
+        )
         source_hash = self._source_hash(project_id, item.source_type, source_id)
         if not resolved or not source_hash:
             return None
@@ -256,6 +295,32 @@ class TaskContextSourceResolver:
             recency_score=item.recency_score,
             structural_score=item.structural_score,
             final_score=float(item.final_score or 0),
+        )
+
+    def exact_identity_source(
+        self,
+        manifest: ContextManifest,
+        source_type: str,
+        source_id: str,
+    ) -> ExactTaskContextSource | None:
+        """Resolve one identity for a safe search preview under this manifest."""
+        project_id = str(manifest.project_id or "")
+        resolved = self._exact_content(
+            project_id,
+            source_type,
+            source_id,
+            manifest=manifest,
+        )
+        source_hash = self._source_hash(project_id, source_type, source_id)
+        if not resolved or not source_hash:
+            return None
+        title, content = resolved
+        return ExactTaskContextSource(
+            source_type=source_type,
+            source_id=source_id,
+            source_hash=source_hash,
+            title=title,
+            content=content,
         )
 
     def governance_candidate(self, manifest: ContextManifest) -> ExactTaskContextSource | None:

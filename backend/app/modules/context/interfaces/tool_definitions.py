@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from app.architecture.tool_definition import ToolDef
+from app.services.task_context_delivery import CONTEXT_PAGE_INPUTS
 
 TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ToolDef(
@@ -73,7 +74,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="prepare_task_context",
-        description="为模型选定的任务建立可审计的精简上下文基线。写章和规划大纲都只返回目标/位置、文风、作者要求等硬锚点，不会自动带入角色、前文、世界观或检索结果；随后由模型按需检索并提交精确来源。",
+        description="建立或按原ID读取任务上下文。首次建立时直接提交当前任务的结构化目标：writing 必须提交 outline_node_id；cataloging 必须提交 chapter_id；review/rewrite 必须提交 chapter_id 或 text；outline_planning 直接提交 parent_id/insert_after_id。未选择证据时仅含目标/位置、文风、作者要求等硬锚点；选定后包含全部精确来源。正文只在 context_page.text 中分页返回；按 next_arguments 读取，直到 has_more=false，才能生成。页面有完整文档哈希，不丢弃后续内容。",
         input_schema={
             "task_type": {
                 "type": "string",
@@ -89,25 +90,48 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             },
             "model": {
                 "type": "string",
-                "description": "Provider:model used for context-window budgeting",
+                "description": "Provider:model used for budgeting by unbound external agents; managed CLI runs use their pinned executing model",
             },
             "execution_route": {
                 "type": "string",
                 "description": "external_mcp|local_cli_agent|internal_api",
             },
-            "arguments": {
-                "type": "object",
-                "description": "Task arguments used to resolve contract anchors",
+            "outline_node_id": {
+                "type": "string",
+                "description": "writing 的必填章级大纲ID；必须属于当前作品",
             },
+            "target_chapter_id": {
+                "type": "string",
+                "description": "writing 修订任务对应的既有章节ID",
+            },
+            "chapter_id": {
+                "type": "string",
+                "description": "cataloging/review/rewrite 的目标章节ID",
+            },
+            "parent_id": {"type": "string", "description": "outline_planning 的父节点ID；根级可省略"},
+            "insert_after_id": {"type": "string", "description": "outline_planning 的同级插入锚点ID"},
+            "batch_count": {"type": "integer", "minimum": 1, "maximum": 8, "default": 1},
+            "requirements": {"type": "string", "description": "作者对本次任务的明确要求"},
+            "minimum_han_characters": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100000,
+                "description": "仅当作者明确要求中文正文硬下限时，由模型结构化填写；保存边界按汉字数强制校验，不从 requirements 猜测",
+            },
+            "text": {"type": "string", "description": "review/rewrite 没有 chapter_id 时的目标文本"},
+            "title": {"type": "string", "description": "内联目标文本的标题"},
             "run_id": {
                 "type": "string",
                 "description": "Optional Agent run to bind to this manifest",
             },
             "pinned_chunk_ids": {"type": "array", "items": {"type": "string"}},
             "pinned_source_ids": {"type": "array", "items": {"type": "string"}},
+            **CONTEXT_PAGE_INPUTS,
         },
         required=["task_type"],
         tool_type="read",
+        direct_mcp_project_scoped=True,
+        direct_mcp_transactional=True,
         estimated_cost="free",
         handler_name="prepare_task_context",
     ),
@@ -146,23 +170,42 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
         },
         required=["query"],
         tool_type="read",
+        direct_mcp_project_scoped=True,
+        direct_mcp_transactional=True,
         estimated_cost="free",
         handler_name="search_task_context",
     ),
     ToolDef(
         name="submit_context_evidence",
-        description="提交模型复核后选中的 search_task_context 候选。服务端完整读取精确原文并校验归属与哈希，不设单条固定字符截断；32k token 只是可超过的精简软目标，实际容量按模型窗口扣除输出预留与安全余量，来源数量没有固定硬上限。返回的 context_selection_token 必须在下一模型步骤用于写章或规划；确实无需额外资料时可提交空数组。",
+        description="提交模型复核后选中的 search_task_context 候选，校验归属与哈希并完整读取原文。返回首个 context_page；若 has_more=true，选择令牌会被暂扣，必须逐次原样复制 next_arguments 调用 prepare_task_context，直到最后一页才返回 context_selection_token。页游标跳跃、哈希或页大小变化都会被拒绝。32k token 是可超过的精简软目标，容量依模型窗口；确实无需额外资料时可提交原生空数组。",
         input_schema={
             "context_manifest_id": {"type": "string", "description": "Baseline manifest ID"},
             "run_id": {"type": "string", "description": "Agent run bound to a baseline manifest"},
             "sources": {
                 "type": "array",
-                "items": {"type": "object"},
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "item_id": {"type": "string"},
+                        "chunk_id": {"type": "string"},
+                        "source_type": {"type": "string"},
+                        "source_id": {"type": "string"},
+                        "source_hash": {"type": "string"},
+                    },
+                    "anyOf": [
+                        {"required": ["item_id"]},
+                        {"required": ["chunk_id"]},
+                        {"required": ["source_type", "source_id"]},
+                    ],
+                    "additionalProperties": False,
+                },
                 "description": "从检索结果复制 item_id（推荐）或 chunk_id/source_type/source_id/source_hash；仅受模型实际输入预算约束",
             },
         },
         required=["sources"],
         tool_type="read",
+        direct_mcp_project_scoped=True,
+        direct_mcp_transactional=True,
         estimated_cost="free",
         handler_name="submit_context_evidence",
     ),

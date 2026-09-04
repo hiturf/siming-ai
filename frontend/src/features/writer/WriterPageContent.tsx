@@ -38,6 +38,7 @@ import { SaveStatusIndicator } from '../../components/interaction'
 import { useAiPanelContext } from '../../contexts/AiPanelContext'
 import { useModelOptions } from '../../hooks/useModelOptions'
 import { useUnsavedGuard } from '../../hooks/useUnsavedGuard'
+import { formatApiDateTime } from '../../utils/dateTime'
 import {
   WriterReviewDialogs,
   type DeAiPreview,
@@ -85,6 +86,15 @@ interface ChapterDetail extends ChapterItem {
     status?: string
     error?: string
   }
+}
+
+interface WriterCatalogingJob {
+  id: string
+  status: string
+  current_chapter_id?: string | null
+  blocked_chapter_id?: string | null
+  last_completed_chapter_id?: string | null
+  error?: string | null
 }
 
 interface SnapshotItem {
@@ -226,6 +236,7 @@ function WriterPage({ projectId, focusChapterId, sourceLocatorKey }: WriterPageP
   const [saving, setSaving] = useState(false)
   const [discardingDraft, setDiscardingDraft] = useState(false)
   const [catalogingStartedChapterId, setCatalogingStartedChapterId] = useState<string | null>(null)
+  const [catalogingError, setCatalogingError] = useState<string | null>(null)
   const [diffLoading, setDiffLoading] = useState(false)
   const [fromSnapshotId, setFromSnapshotId] = useState<string | undefined>()
   const [toSnapshotId, setToSnapshotId] = useState<string | undefined>()
@@ -423,6 +434,50 @@ function WriterPage({ projectId, focusChapterId, sourceLocatorKey }: WriterPageP
     fetchOutline()
     fetchChapters()
   }, [fetchChapters, fetchOutline])
+
+  useEffect(() => {
+    setCatalogingError(null)
+    if (!selectedId || pendingNewDraft || !detail?.cataloging_required) return
+    let active = true
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const refreshCataloging = async () => {
+      try {
+        const [response, chapterResponse] = await Promise.all([
+          apiClient.get<ApiResponse<{ items: WriterCatalogingJob[] }>>(`/projects/${projectId}/cataloging/jobs`),
+          apiClient.get<ApiResponse<ChapterDetail>>(`/projects/${projectId}/chapters/${selectedId}`),
+        ])
+        if (!active) return
+        const saved = chapterResponse.data.data
+        // The chapter is authoritative even when a completed job no longer
+        // points at this chapter (for example, a multi-chapter job moved on).
+        if (saved.id === selectedId && saved.current_version === detail.current_version
+          && !saved.cataloging_required) {
+          setDetail((current) => current?.id === saved.id && current.current_version === saved.current_version
+            ? { ...current, cataloging_required: false, summary_text: saved.summary_text, key_events: saved.key_events }
+            : current)
+          setCatalogingStartedChapterId(null)
+          setCatalogingError(null)
+          void fetchChapters()
+          return
+        }
+        const job = response.data.data.items.find((item) => (
+          item.current_chapter_id === selectedId
+          || item.blocked_chapter_id === selectedId
+          || item.last_completed_chapter_id === selectedId
+        ))
+        if (job) {
+          const running = ['pending', 'queued', 'running'].includes(job.status)
+          setCatalogingStartedChapterId(running ? selectedId : null)
+          setCatalogingError(job.error || null)
+        }
+      } catch {
+        // A transient status-read failure is not evidence that the job stopped.
+      }
+      if (active) timer = setTimeout(refreshCataloging, 5000)
+    }
+    void refreshCataloging()
+    return () => { active = false; if (timer) clearTimeout(timer) }
+  }, [detail?.cataloging_required, detail?.current_version, fetchChapters, pendingNewDraft, projectId, selectedId])
 
   useEffect(() => {
     if (generatedDraft?.projectId === projectId) return
@@ -783,6 +838,7 @@ function WriterPage({ projectId, focusChapterId, sourceLocatorKey }: WriterPageP
       markSaved()
       fetchChapters()
       if (catalogingMode === 'save_and_catalog') {
+        setCatalogingError(null)
         if (savedData.cataloging_job?.started) {
           setCatalogingStartedChapterId(savedChapterId)
           message.success('章节已保存，建档已经开始')
@@ -819,6 +875,7 @@ function WriterPage({ projectId, focusChapterId, sourceLocatorKey }: WriterPageP
   const startCurrentCataloging = async () => {
     if (!selectedId) return
     setSaving(true)
+    setCatalogingError(null)
     try {
       const res = await apiClient.post<ApiResponse<ChapterDetail>>(
         `/projects/${projectId}/chapters/${selectedId}/cataloging`,
@@ -1254,7 +1311,13 @@ function WriterPage({ projectId, focusChapterId, sourceLocatorKey }: WriterPageP
                       <div className="writer-chapter-facts">
                         <span>{chapter.word_count} 字</span>
                         <span>v{chapter.current_version}</span>
-                        {chapter.outline_status && <Tag color={STATUS_COLOR[chapter.outline_status] || 'default'}>{chapterStatusLabel(chapter.outline_status)}</Tag>}
+                        {chapter.cataloging_required ? (
+                          <Tag color={catalogingStartedChapterId === chapter.id ? 'processing' : 'warning'}>
+                            {catalogingStartedChapterId === chapter.id ? '建档中' : '待建档'}
+                          </Tag>
+                        ) : chapter.outline_status && (
+                          <Tag color={STATUS_COLOR[chapter.outline_status] || 'default'}>{chapterStatusLabel(chapter.outline_status)}</Tag>
+                        )}
                       </div>
                     </div>
                   }
@@ -1272,7 +1335,10 @@ function WriterPage({ projectId, focusChapterId, sourceLocatorKey }: WriterPageP
               {(detail || pendingNewDraft || creating || saveStatus === 'error') && (
                 <Space size={8} wrap>
                   {detail && !creating && (
-                    <Text type="secondary">{detail.word_count} 字 · v{detail.current_version} · {new Date(detail.updated_at).toLocaleString('zh-CN')}</Text>
+                    <Space size={[8, 0]} wrap>
+                      <Text type="secondary">{detail.word_count} 字 · v{detail.current_version}</Text>
+                      <Text type="secondary" style={{ whiteSpace: 'nowrap' }}>最近更新（本地时间）：{formatApiDateTime(detail.updated_at) || '时间未记录'}</Text>
+                    </Space>
                   )}
                   <SaveStatusIndicator status={saveStatus} error={saveError} />
                 </Space>
@@ -1333,7 +1399,7 @@ function WriterPage({ projectId, focusChapterId, sourceLocatorKey }: WriterPageP
               <Dropdown.Button
                 type="primary"
                 icon={<SaveOutlined />}
-                loading={saving}
+                loading={saving || Boolean(catalogingStartedChapterId && catalogingStartedChapterId === selectedId)}
                 disabled={discardingDraft || (
                   (!creating && !isDirty && !detail?.cataloging_required)
                   || Boolean(catalogingStartedChapterId && catalogingStartedChapterId === selectedId)
@@ -1346,7 +1412,9 @@ function WriterPage({ projectId, focusChapterId, sourceLocatorKey }: WriterPageP
                   },
                 }}
               >
-                {!creating && !isDirty && detail?.cataloging_required ? '开始建档' : '保存并建档'}
+                {catalogingStartedChapterId && catalogingStartedChapterId === selectedId
+                  ? '建档中'
+                  : !creating && !isDirty && detail?.cataloging_required ? '开始建档' : '保存并建档'}
               </Dropdown.Button>
             </Space>
           </div>
@@ -1355,6 +1423,15 @@ function WriterPage({ projectId, focusChapterId, sourceLocatorKey }: WriterPageP
             <Alert type="info" showIcon message="先创建一个章节，正文和版本历史会从这里开始。" />
           ) : (
             <>
+              {catalogingError && !pendingNewDraft && (
+                <Alert
+                  type="error"
+                  showIcon
+                  message="正文已保存，建档未完成"
+                  description={`${catalogingError}。${isDirty ? '当前还有未保存修改，可以点击“保存并建档”保存修改后重试。' : '可以点击“开始建档”重试；不会重新生成或丢失已保存正文。'}`}
+                  style={{ marginBottom: 16 }}
+                />
+              )}
               {pendingRevisionDraft && (
                 <Alert
                   type={revisionTargetLoaded && !revisionVersionMatches ? 'error' : 'warning'}
@@ -1481,7 +1558,7 @@ function WriterPage({ projectId, focusChapterId, sourceLocatorKey }: WriterPageP
                         children: (
                           <div className="writer-snapshot-row">
                             <div><Text strong>v{snapshot.version_number}</Text>
-                              <Text type="secondary"> · {TRIGGER_LABEL[snapshot.trigger_type] || snapshot.trigger_type} · {snapshot.word_count} 字 · {new Date(snapshot.created_at).toLocaleString('zh-CN')}</Text></div>
+                              <Text type="secondary"> · {TRIGGER_LABEL[snapshot.trigger_type] || snapshot.trigger_type} · {snapshot.word_count} 字 · 版本时间（本地）：{formatApiDateTime(snapshot.created_at) || '时间未记录'}</Text></div>
                             <Popconfirm title="恢复此版本" description="当前正文会被替换，并生成一条新的恢复快照。" okText="恢复" cancelText="取消" onConfirm={() => restoreSnapshot(snapshot.id)}>
                               <Button size="small" icon={<RollbackOutlined />}>恢复</Button>
                             </Popconfirm>

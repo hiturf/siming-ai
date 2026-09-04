@@ -294,7 +294,9 @@ describe('SettingsPage startup and update controls', () => {
       api_protocol: 'responses',
       model: 'gpt-5.6-sol',
     })))
-    expect(await screen.findByText('模型真实回复成功（Responses API）')).toBeInTheDocument()
+    expect(await screen.findByText(
+      '模型基础对话探测成功（Responses API）；长任务仍可能受到临时限流或服务容量影响',
+    )).toBeInTheDocument()
   })
 
   it('lets users revalidate a ready model instead of trusting stale status forever', async () => {

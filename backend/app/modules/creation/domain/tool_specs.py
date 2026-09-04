@@ -17,6 +17,12 @@ _CREATION_MODEL_DESCRIPTION = (
     "Optional model identity. When omitted, creation uses the active default model."
 )
 
+_PATCH_CHANGES_DESCRIPTION = (
+    "原生 JSON 操作数组，不是 JSON 编码字符串。每个元素是包含 path、action 和 value 的对象；"
+    "完整阶段使用 [{\"path\":\"/\",\"action\":\"set\",\"value\":{...}}]，"
+    "value 中的对象和数组也必须直接传入，不要转成字符串。"
+)
+
 
 class StartNovelCreationSessionInput(CompatibleInput):
     mode: Literal["internal_llm", "external_agent"] = "external_agent"
@@ -75,7 +81,7 @@ class ListCreationArtifactsInput(CompatibleInput):
 
 class PatchCreationArtifactInput(CreationArtifactInput):
     expected_revision: int
-    changes: list[CreationPatchOperation]
+    changes: list[CreationPatchOperation] = Field(description=_PATCH_CHANGES_DESCRIPTION)
 
 
 class CreationArtifactLockInput(CreationArtifactInput):
@@ -103,7 +109,7 @@ class CreationEntityInput(CompatibleInput):
 
 class PatchCreationEntityInput(CreationEntityInput):
     expected_revision: int
-    changes: list[CreationPatchOperation]
+    changes: list[CreationPatchOperation] = Field(description=_PATCH_CHANGES_DESCRIPTION)
 
 
 class DeleteCreationEntityInput(CreationEntityInput):

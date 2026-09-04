@@ -36,6 +36,29 @@ class MobileContextManifestTest {
     }
 
     @Test
+    fun `superseded worldbuilding never enters mobile retrieval context`() {
+        val stale = world(
+            id = "world-stale",
+            title = "错误旧站点",
+            content = "这条旧版错误资料不应影响后续创作。",
+            updatedAt = "2026-08-19T00:00:00Z",
+            status = "superseded",
+        )
+        val baseInputs = inputs()
+        val withStale = baseInputs.copy(rawRecords = baseInputs.rawRecords + stale)
+        val baseline = engine().prepare(withStale)
+
+        val searched = engine().search(
+            baseline,
+            withStale,
+            "旧版错误资料",
+            setOf("worldbuilding"),
+        )
+
+        assertTrue(searched.items.none { it.sourceId == stale.string("id") })
+    }
+
+    @Test
     fun `missing target outline requires confirmation instead of writing blindly`() {
         val manifest = engine().prepare(
             inputs(request = request(outlineNodeId = "missing")),
@@ -44,6 +67,36 @@ class MobileContextManifestTest {
         assertEquals("needs_confirmation", manifest.status)
         assertEquals("missing", manifest.coverage.getValue("target_outline").status)
         assertTrue(manifest.warnings.any { "target_outline" in it })
+    }
+
+    @Test
+    fun `context request reads only the explicit flat target contract`() {
+        val request = MobileContextRequest.fromArgs("writing", buildJsonObject {
+            put("outline_node_id", "outline-current")
+            put("target_chapter_id", "chapter-current")
+            put("requirements", "按当前细纲写作")
+            put("minimum_han_characters", 3600)
+            put("target_outline_node_id", "legacy-outline")
+            put("chapter_id", "legacy-chapter")
+            put("instruction", "legacy instruction")
+        })
+
+        assertEquals("outline-current", request.outlineNodeId)
+        assertEquals("chapter-current", request.targetChapterId)
+        assertEquals("按当前细纲写作", request.requirements)
+        assertEquals(3600, request.minimumHanCharacters)
+        assertEquals(3600, MobileContextRequest.fromJson(request.toJson()).minimumHanCharacters)
+    }
+
+    @Test
+    fun `structured Han minimum becomes a visible hard context constraint`() {
+        val constrained = request(requirements = "保持克制").copy(minimumHanCharacters = 3600)
+
+        val manifest = engine().prepare(inputs(request = constrained))
+        val requirement = manifest.generationItems.single { it.category == "user_requirement" }
+
+        assertTrue(requirement.content.contains("保持克制"))
+        assertTrue(requirement.content.contains("at least 3600 Han characters"))
     }
 
     @Test
@@ -189,6 +242,74 @@ class MobileContextManifestTest {
     }
 
     @Test
+    fun `evidence references use documented selectors and reject the whole invalid submission`() {
+        val engine = engine()
+        val inputs = inputs()
+        val searched = engine.search(
+            engine.prepare(inputs),
+            inputs,
+            "病毒网络",
+            setOf("worldbuilding"),
+        )
+        val original = searched.items.single { it.sourceId == "w-virus" }
+        val candidate = original.copy(chunkId = "worldbuilding:w-virus")
+        val manifest = searched.manifest.copy(
+            items = searched.manifest.items.map { item ->
+                if (item.itemId == original.itemId) candidate else item
+            },
+        )
+        val documented = listOf(
+            buildJsonObject { put("item_id", candidate.itemId) },
+            buildJsonObject { put("chunk_id", candidate.chunkId.orEmpty()) },
+            buildJsonObject {
+                put("source_type", candidate.sourceType)
+                put("source_id", candidate.sourceId.orEmpty())
+                put("source_hash", candidate.sourceHash)
+            },
+        )
+
+        documented.forEach { reference ->
+            val resolution = resolveMobileContextEvidenceSources(manifest, listOf(reference))
+            assertEquals(listOf(candidate.itemId), resolution.itemIds)
+            assertTrue(resolution.rejected.isEmpty())
+        }
+
+        val mixed = resolveMobileContextEvidenceSources(
+            manifest,
+            listOf(
+                buildJsonObject { put("item_id", candidate.itemId) },
+                buildJsonObject { put("id", candidate.itemId) },
+            ),
+        )
+        assertEquals(listOf(candidate.itemId), mixed.itemIds)
+        assertEquals(1, mixed.rejected.size)
+        val rejectedSelection = engine.select(
+            manifest,
+            inputs,
+            mixed.itemIds,
+            mixed.rejected,
+        )
+        assertFalse(rejectedSelection.ready)
+        assertTrue(rejectedSelection.accepted.isEmpty())
+        assertTrue(rejectedSelection.manifest.selectionToken.isNullOrBlank())
+
+        val conflicting = resolveMobileContextEvidenceSources(
+            manifest,
+            listOf(buildJsonObject {
+                put("item_id", candidate.itemId)
+                put("source_id", "another-source")
+            }),
+        )
+        assertTrue(conflicting.itemIds.isEmpty())
+        assertEquals(1, conflicting.rejected.size)
+
+        val empty = resolveMobileContextEvidenceSources(manifest, emptyList())
+        assertTrue(empty.itemIds.isEmpty())
+        assertTrue(empty.rejected.isEmpty())
+        assertTrue(engine.select(manifest, inputs, empty.itemIds).ready)
+    }
+
+    @Test
     fun `model selected character expands exact card and relationships`() {
         val engine = engine()
         val inputs = inputs()
@@ -207,6 +328,54 @@ class MobileContextManifestTest {
         assertEquals("陆糖", relationship.string("target_name"))
         assertEquals("父女", relationship.string("relationship_type"))
         assertEquals(64, character.sourceHash.length)
+    }
+
+    @Test
+    fun `writing search and selection withhold character secrets before reveal chapter`() {
+        val base = inputs()
+        val future = buildJsonObject {
+            character("c-future", "陈海生", aliases = listOf("老陈")).forEach { (key, value) ->
+                put(key, value)
+            }
+            put("age", "45")
+            put("appearance", "走路时右腿微跛")
+            put("background", "已经退休并经营小卖部")
+            put("current_goal", "交出私人记录副本")
+            put("profile", buildJsonObject {
+                put("hidden_persona", "秘密保存事故当夜的私人记录")
+                put("reveal_chapter", 14)
+            })
+        }
+        val targetOutline = buildJsonObject {
+            put("_record_type", "outline_node")
+            put("id", "o13")
+            put("title", "第十三章")
+            put("node_type", "chapter")
+            put("summary", "只从正式记录推进调查。")
+            put("sort_order", 13)
+        }
+        val request = request(outlineNodeId = "o13")
+        val expanded = base.copy(
+            request = request,
+            primaryRecords = base.primaryRecords + targetOutline + future,
+            rawRecords = base.rawRecords + targetOutline + future,
+        )
+        val engine = engine()
+        val searched = engine.search(
+            engine.prepare(expanded),
+            expanded,
+            "陈海生",
+            setOf("character"),
+        )
+        val candidate = searched.items.single { it.sourceId == "c-future" }
+
+        assertTrue("withheld_until_chapter" in candidate.content)
+        for (secret in listOf("小卖部", "私人记录", "右腿微跛", "老陈")) {
+            assertFalse(secret in candidate.content)
+        }
+        val selected = engine.select(searched.manifest, expanded, listOf(candidate.itemId))
+        assertTrue(selected.ready)
+        assertTrue("withheld_until_chapter" in selected.accepted.single().content)
     }
 
     @Test
@@ -457,13 +626,20 @@ class MobileContextManifestTest {
         put("aliases", JsonArray(aliases.map(::JsonPrimitive)))
     }
 
-    private fun world(id: String, title: String, content: String, updatedAt: String): JsonObject = buildJsonObject {
+    private fun world(
+        id: String,
+        title: String,
+        content: String,
+        updatedAt: String,
+        status: String = "",
+    ): JsonObject = buildJsonObject {
         put("_record_type", "world_entry")
         put("id", id)
         put("dimension", "culture")
         put("title", title)
         put("content", content)
         put("updated_at", updatedAt)
+        if (status.isNotBlank()) put("status", status)
     }
 
     private fun chapter(id: String, title: String, summary: String, sortOrder: Int): JsonObject = buildJsonObject {

@@ -888,27 +888,64 @@ internal class MobileCreationConversationAgent(
         val instruction = args.string("instruction")
         val entityId = args.string("entity_id")
         val entityType = args.string("entity_type")
+        if (entityId.isNotBlank() && entityType.isNotBlank()) {
+            return ToolExecution(source, result(tool, "error", "entity_id 和 entity_type 不能同时指定"))
+        }
+        val target = if (entityId.isNotBlank()) resolveEntity(source, entityId) else null
+        if (entityId.isNotBlank() && (target == null || target.artifact != artifact)) {
+            return ToolExecution(source, result(tool, "error", "目标实体不存在或不属于当前立项对象"))
+        }
+        val mapping = if (entityType.isNotBlank()) entityFieldMapping(artifact, entityType) else null
+        if (entityType.isNotBlank() && mapping == null) {
+            return ToolExecution(source, result(tool, "error", "目标实体类型不属于当前立项对象"))
+        }
+        val targetField = target?.field ?: mapping?.first
+        val entityTarget = targetField?.let { field ->
+            buildJsonObject {
+                put("field", field)
+                put("entity_type", target?.type ?: entityType)
+                put("mode", if (target == null) "new" else "existing")
+                target?.let {
+                    put("id", it.id)
+                    put("entity_key", entityKey(it.data))
+                }
+            }
+        }
+        val entityBaseline = targetField?.let { field ->
+            JsonObject(source.stageData(artifact).toMutableMap().apply {
+                ENTITY_FIELDS[artifact].orEmpty().forEach { (collection, _) ->
+                    put(collection, JsonArray(emptyList()))
+                }
+                put(field, JsonArray(listOfNotNull(target?.data)))
+            })
+        }
         val generated = try {
-            stageAgent.generateStage(source, artifact, instruction, config)
+            stageAgent.generateStage(source, artifact, instruction, config, entityTarget, entityBaseline)
+        } catch (error: CancellationException) {
+            throw error
         } catch (error: Exception) {
             return ToolExecution(source, result(tool, "error", error.message ?: "${stageLabel(artifact)}生成失败"))
         }
         var updated = generated
-        if (entityId.isNotBlank()) {
-            val target = resolveEntity(source, entityId)
-            if (target != null) {
-                val oldArtifact = source.stageData(target.artifact).toMutableMap()
-                val oldRows = (oldArtifact[target.field] as? JsonArray).orEmpty().toMutableList()
-                val generatedRows = (generated.stageData(target.artifact)[target.field] as? JsonArray).orEmpty()
-                val replacement = generatedRows.getOrNull(target.index) as? JsonObject
-                if (replacement != null && target.index in oldRows.indices) {
-                    oldRows[target.index] = replacement
-                    oldArtifact[target.field] = JsonArray(oldRows)
-                    updated = stageAgent.replaceArtifact(source, target.artifact, JsonObject(oldArtifact), "model")
-                }
+        if (target != null) {
+            val oldArtifact = source.stageData(target.artifact).toMutableMap()
+            val oldRows = (oldArtifact[target.field] as? JsonArray).orEmpty().toMutableList()
+            val generatedRows = (generated.stageData(target.artifact)[target.field] as? JsonArray).orEmpty()
+            val replacement = generatedRows.singleOrNull() as? JsonObject
+            if (replacement != null && target.index in oldRows.indices) {
+                oldRows[target.index] = replacement
+                oldArtifact[target.field] = JsonArray(oldRows)
+                updated = stageAgent.replaceArtifact(
+                    source, target.artifact, JsonObject(oldArtifact), generated.stageState(artifact).string("source"),
+                )
+            } else {
+                return ToolExecution(source, result(tool, "error", "模型没有返回唯一目标实体，原资料未修改"))
             }
         } else if (entityType.isNotBlank()) {
             updated = mergeOnlyNewEntities(source, generated, artifact, entityType)
+            if (updated == source) {
+                return ToolExecution(source, result(tool, "error", "模型没有生成新的目标实体，原资料未修改"))
+            }
         }
         return ToolExecution(
             updated,

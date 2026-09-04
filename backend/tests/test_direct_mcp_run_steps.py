@@ -410,7 +410,13 @@ def test_ready_direct_mcp_receipt_replays_as_usable_without_handler() -> None:
         db.close()
 
 
-def test_direct_mcp_final_text_never_creates_write_evidence() -> None:
+@pytest.mark.parametrize("persisted_status", [
+    None, "error", "failed", "denied", "blocked_rebuild", "skipped", "needs_confirmation",
+])
+def test_direct_mcp_final_text_never_creates_write_evidence(persisted_status: str | None) -> None:
+    from app.services.workspace.assistant_response import _workspace_outcome
+
+    persisted_failure = persisted_status is not None
     db = _db()
     project, conversation, run = _workspace_run(db, "Direct MCP prose is not evidence")
     state_file = _scoped_state_file(project, conversation, run, iteration=1)
@@ -454,9 +460,16 @@ def test_direct_mcp_final_text_never_creates_write_evidence() -> None:
             pass
 
     try:
+        if persisted_failure:
+            db.add(AssistantRunStep(
+                run_id=run.id, project_id=project.id, step_type="write",
+                tool="create_character", status=persisted_status, iteration=1,
+                error="private-provider-diagnostic", detail="private-provider-diagnostic",
+            ))
+            db.commit()
         asyncio.run(collect())
         steps = db.query(AssistantRunStep).filter(AssistantRunStep.run_id == run.id).all()
-        assert steps == []
+        assert len(steps) == int(persisted_failure)
         assert db.query(Character).filter(Character.project_id == project.id).count() == 0
         assert workspace_execution_ledger_from_run_steps(
             conversation,
@@ -465,6 +478,14 @@ def test_direct_mcp_final_text_never_creates_write_evidence() -> None:
             project_id=project.id,
         ) == ()
         assert "fake-character-id" in state.final_reply
+        assert bool(state.tool_logs) == persisted_failure
+        if persisted_failure:
+            assert state.tool_logs[0]["status"] == "error"
+            assert "private-provider-diagnostic" not in json.dumps(state.tool_logs)
+            assert _workspace_outcome(
+                state.final_reply, applied_actions=state.applied_actions,
+                tool_logs=state.tool_logs, searched_context=[], failed_logs=state.tool_logs,
+            ) == "failed"
     finally:
         remove_tool_category_state(state_file)
         db.close()
@@ -806,7 +827,13 @@ def test_direct_stream_error_log_does_not_emit_cli_stderr_or_secret(caplog) -> N
         turn_telemetry=SimpleNamespace(report_model_activity=lambda *_a, **_k: None),
         event=lambda payload: payload,
     )
-    gateway = SimpleNamespace(stream_chat_completion=lambda **_kwargs: failed_stream())
+    requests = []
+
+    def request_stream(**kwargs):
+        requests.append(kwargs)
+        return failed_stream()
+
+    gateway = SimpleNamespace(stream_chat_completion=request_stream)
     turn = WorkspaceDirectMcpTurn(state, gateway)
     capture = DirectMcpCapture()
 
@@ -824,6 +851,173 @@ def test_direct_stream_error_log_does_not_emit_cli_stderr_or_secret(caplog) -> N
     assert private_failure not in caplog.text
     assert "/private/mcp-config" not in caplog.text
     assert "RuntimeError" in caplog.text
+    # A long managed step can read and write without the short completion
+    # deadline, but failures still cannot automatically replay MCP mutations.
+    assert requests[0]["timeout"] == 1_800
+    assert requests[0]["retry"] == 0
+    assert requests[0]["resume"] == 0
+
+
+def test_direct_stream_rate_limit_is_classified_without_leaking_provider_text() -> None:
+    secret = "api_key=private-value /private/provider/request"
+    state = SimpleNamespace(
+        payload=SimpleNamespace(model="opencode"),
+        local_cli_mcp_enabled=True,
+        tool_logs=[],
+        final_reply="",
+        final_model="",
+        final_usage=None,
+    )
+    turn = WorkspaceDirectMcpTurn(state, SimpleNamespace())
+
+    turn._complete_interrupted(RuntimeError(f"HTTP 429 rate limit exceeded {secret}"))
+
+    assert state.tool_logs == [{
+        "tool": "stream_error",
+        "status": "error",
+        "detail": "模型额度已耗尽或请求受限，请稍后重试或切换模型。",
+        "error_code": "model_quota_or_rate_limit",
+        "failure_class": "quota_or_rate_limit",
+    }]
+    assert "模型额度已耗尽或请求受限" in state.final_reply
+    assert "没有自动重启" in state.final_reply
+    assert secret not in state.final_reply
+
+
+def test_direct_stream_provider_overload_is_reported_as_model_unavailable() -> None:
+    state = SimpleNamespace(
+        payload=SimpleNamespace(model="opencode"),
+        local_cli_mcp_enabled=True,
+        tool_logs=[],
+        final_reply="",
+        final_model="",
+        final_usage=None,
+    )
+    turn = WorkspaceDirectMcpTurn(state, SimpleNamespace())
+
+    turn._complete_interrupted(
+        RuntimeError(
+            "Streaming response failed: [502] Upstream error from Nvidia: "
+            "Service temporarily overloaded"
+        )
+    )
+
+    assert state.tool_logs == [{
+        "tool": "stream_error",
+        "status": "error",
+        "detail": "当前模型暂不可用，请切换模型或稍后重试。",
+        "error_code": "model_unavailable",
+        "failure_class": "unavailable",
+    }]
+    assert "当前模型暂不可用" in state.final_reply
+    assert "没有自动重启" in state.final_reply
+    assert "Nvidia" not in state.final_reply
+
+
+def test_direct_mcp_retried_schema_skip_stays_in_audit_without_partial_warning() -> None:
+    steps = [
+        SimpleNamespace(
+            project_id="project-1",
+            iteration=3,
+            tool="search_characters",
+            status="skipped",
+        ),
+        SimpleNamespace(
+            project_id="project-1",
+            iteration=3,
+            tool="search_characters",
+            status="ok",
+        ),
+    ]
+    state = SimpleNamespace(
+        local_cli_mcp_enabled=True,
+        project_id="project-1",
+        assistant_run=SimpleNamespace(id="run-1"),
+        workspace=SimpleNamespace(run_steps=lambda _run_id: steps),
+        tool_logs=[],
+    )
+
+    WorkspaceDirectMcpTurn(state, SimpleNamespace())._collect_tool_failures(3)
+
+    assert state.tool_logs == []
+
+
+def test_direct_mcp_execution_error_remains_visible_after_later_success() -> None:
+    steps = [
+        SimpleNamespace(
+            project_id="project-1",
+            iteration=3,
+            tool="search_characters",
+            status="error",
+        ),
+        SimpleNamespace(
+            project_id="project-1",
+            iteration=3,
+            tool="search_characters",
+            status="ok",
+        ),
+    ]
+    state = SimpleNamespace(
+        local_cli_mcp_enabled=True,
+        project_id="project-1",
+        assistant_run=SimpleNamespace(id="run-1"),
+        workspace=SimpleNamespace(run_steps=lambda _run_id: steps),
+        tool_logs=[],
+    )
+
+    WorkspaceDirectMcpTurn(state, SimpleNamespace())._collect_tool_failures(3)
+
+    assert state.tool_logs == [{
+        "tool": "search_characters",
+        "status": "error",
+        "detail": "本机 CLI 工具未完成，请检查工具记录、前置条件与当前项目状态。",
+    }]
+
+
+def test_direct_mcp_short_draft_keeps_actionable_public_retry_counts() -> None:
+    raw_result = {
+        "tool": "save_external_chapter_draft",
+        "status": "needs_confirmation",
+        "detail": "private diagnostic must not be copied",
+        "data": {
+            "reason_code": "draft_below_minimum",
+            "actual_han_characters": 3_202,
+            "minimum_han_characters": 3_400,
+            "missing_han_characters": 999_999,
+        },
+    }
+    step = SimpleNamespace(
+        project_id="project-1",
+        iteration=3,
+        tool="save_external_chapter_draft",
+        status="needs_confirmation",
+        result_json=json.dumps(raw_result, ensure_ascii=False),
+    )
+    state = SimpleNamespace(
+        local_cli_mcp_enabled=True,
+        project_id="project-1",
+        assistant_run=SimpleNamespace(id="run-1"),
+        workspace=SimpleNamespace(run_steps=lambda _run_id: [step]),
+        tool_logs=[],
+    )
+
+    WorkspaceDirectMcpTurn(state, SimpleNamespace())._collect_tool_failures(3)
+
+    assert state.tool_logs == [{
+        "tool": "save_external_chapter_draft",
+        "status": "needs_confirmation",
+        "detail": "正文有 3202 个汉字，低于最低要求 3400 个；至少还差 198 个。为减少反复退回，建议一次补至 3740 个汉字（约再补 538 个）后重试。",
+        "remediation": {
+            "code": "draft_below_minimum",
+            "message": "正文有 3202 个汉字，低于最低要求 3400 个；至少还差 198 个。为减少反复退回，建议一次补至 3740 个汉字（约再补 538 个）后重试。",
+            "retryable": True,
+            "actual_han_characters": 3_202,
+            "minimum_han_characters": 3_400,
+            "missing_han_characters": 198,
+            "recommended_han_characters": 3_740,
+            "recommended_additional_han_characters": 538,
+        },
+    }]
 
 
 def test_failed_step_closure_preserves_concurrent_cancelled_winner() -> None:
@@ -1292,6 +1486,10 @@ def test_direct_pack_is_explicit_and_blocks_prompts_and_unsafe_tools() -> None:
         "create_character",
         "update_character",
         "recall",
+        "prepare_task_context",
+        "search_task_context",
+        "submit_context_evidence",
+        "prepare_external_writing_context",
         "save_external_chapter_draft",
         "save_external_outline_draft",
         "get_external_chapter_draft",
@@ -1305,9 +1503,6 @@ def test_direct_pack_is_explicit_and_blocks_prompts_and_unsafe_tools() -> None:
         "write_project_file",
         "export_project",
         "run_scheduled_task_now",
-        "prepare_external_writing_context",
-        "prepare_task_context",
-        "search_task_context",
         "search_outline_tree",
     }
     executor = AsyncMock()
@@ -1459,6 +1654,298 @@ def test_managed_cataloging_env_cannot_override_explicit_direct_workspace_pack()
         assert denied["result"]["isError"] is True
         executor.assert_not_awaited()
         assert db.query(AssistantRunStep).count() == 0
+    finally:
+        remove_tool_category_state(state_file)
+        db.close()
+
+
+def test_managed_writing_context_chain_produces_only_one_unsaved_draft() -> None:
+    from app.database.models import CatalogingJob, Chapter, ContextManifest, PublicPromptPack
+
+    db = _db()
+    project, conversation, run = _workspace_run(db, "Scoped writing workflow")
+    project.writing_style = "restrained"
+    project.narrative_perspective = "third_person"
+    outline = OutlineNode(project_id=project.id, title="潮声", node_type="chapter", summary="调查档案")
+    db.add(outline)
+    db.commit()
+    state_file = _scoped_state_file(project, conversation, run, categories=["writing_context"])
+    lease_token = _lease(db, run)
+
+    def call(name: str, arguments: dict, call_id: int) -> dict:
+        response = json.loads(handle_message(
+            _tool_call(name, {"project_id": project.id, **arguments}, call_id=call_id),
+            db=db, project_id=project.id, permission_pack="project_management",
+            tool_category_state_file=state_file, direct_mcp_lease_token=lease_token,
+        ))
+        assert response["result"]["isError"] is False, response
+        return json.loads(response["result"]["content"][0]["text"])
+
+    try:
+        baseline = call("prepare_task_context", {
+            "task_type": "writing", "outline_node_id": outline.id,
+        }, 160)
+        manifest_id = baseline["data"]["context_manifest_id"]
+        db.expire_all()
+        assert db.get(ContextManifest, manifest_id).project_id == project.id
+        prepared = call("prepare_external_writing_context", {
+            "outline_node_id": outline.id, "context_manifest_id": manifest_id,
+        }, 161)
+        assert prepared["data"]["context_manifest_id"] == manifest_id
+        assert prepared["data"]["selection_required"] is True
+        searched = call("search_task_context", {
+            "context_manifest_id": manifest_id, "query": "潮声", "source_types": ["outline"],
+        }, 162)
+        assert searched["status"] == "ok"
+        selected = call("submit_context_evidence", {
+            "context_manifest_id": manifest_id, "sources": [],
+        }, 163)
+        token = selected["data"]["context_selection_token"]
+        assert token
+        saved = call("save_external_chapter_draft", {
+            "outline_node_id": outline.id, "context_manifest_id": manifest_id,
+            "context_selection_token": token, "content": "窗外有潮声。林澄将卷宗移到台灯下。",
+        }, 164)
+        draft = db.get(ChapterDraft, saved["data"]["draft_id"])
+        assert draft.project_id == project.id
+        assert draft.status == "pending"
+        detected = local_cli_terminal_draft(db, project.id, run.id, 2)
+        assert detected is not None
+        assert detected[0]["data"]["draft_id"] == draft.id
+        assert db.query(ChapterDraft).count() == 1
+        assert db.query(Chapter).count() == 0
+        assert db.query(CatalogingJob).count() == 0
+        # Project-scoped preparation must not lazily create global prompt packs.
+        assert db.query(PublicPromptPack).count() == 0
+        assert db.query(AssistantRunStep).count() == 5
+    finally:
+        remove_tool_category_state(state_file)
+        db.close()
+
+
+def test_managed_writing_context_withholds_token_until_lossless_pages_are_read() -> None:
+    from app.database.models import Chapter, ContextManifest
+    from app.services.task_context_selection import render_generation_context, selection_state
+    db = _db()
+    project, conversation, run = _workspace_run(db, "Paged writing context gate")
+    outline = OutlineNode(
+        project_id=project.id,
+        title="长上下文",
+        node_type="chapter",
+        summary="核验每一页证据后才能写作",
+    )
+    witness = Character(
+        project_id=project.id,
+        name="分页证人",
+        background="每一段都是必须完整送达的精确角色档案。" * 1000,
+    )
+    db.add_all([outline, witness])
+    db.commit()
+    state_file = _scoped_state_file(project, conversation, run, categories=["writing_context"])
+    lease_token = _lease(db, run)
+    call_id = 200
+
+    def call(name: str, arguments: dict, *, expect_error: bool = False) -> dict:
+        nonlocal call_id
+        call_id += 1
+        response = json.loads(handle_message(
+            _tool_call(name, {"project_id": project.id, **arguments}, call_id=call_id),
+            db=db,
+            project_id=project.id,
+            permission_pack="project_management",
+            tool_category_state_file=state_file,
+            direct_mcp_lease_token=lease_token,
+        ))
+        assert response["result"]["isError"] is expect_error, response
+        return json.loads(response["result"]["content"][0]["text"])
+
+    try:
+        baseline = call("prepare_task_context", {
+            "task_type": "writing",
+            "outline_node_id": outline.id,
+            "requirements": "逐页核验上下文，不得提前生成。",
+        })
+        manifest_id = baseline["data"]["context_manifest_id"]
+        searched = call("search_task_context", {
+            "context_manifest_id": manifest_id,
+            "query": "分页证人 精确角色档案",
+            "source_types": ["character"],
+        })
+        witness_item = next(
+            item for item in searched["data"]["items"]
+            if item["source_id"] == witness.id
+        )
+        selected = call("submit_context_evidence", {
+            "context_manifest_id": manifest_id,
+            "sources": [{"item_id": witness_item["item_id"]}],
+        })
+        assert selected["status"] == "ok"
+        assert selected["data"]["selection_ready"] is True
+        assert selected["data"]["context_page"]["has_more"] is True
+        assert selected["data"]["context_delivery_ready"] is False
+        assert not selected["data"].get("context_selection_token")
+
+        manifest = db.get(ContextManifest, manifest_id)
+        actual_token = selection_state(manifest)["token"]
+        blocked = call("save_external_chapter_draft", {
+            "outline_node_id": outline.id,
+            "context_manifest_id": manifest_id,
+            "context_selection_token": actual_token,
+            "content": "这段正文绝不能在上下文读完前形成草稿。",
+        }, expect_error=True)
+        assert blocked["status"] == "needs_confirmation"
+        assert "not been read completely" in blocked["detail"]
+        assert db.query(ChapterDraft).count() == 0
+        assert db.query(Chapter).count() == 0
+
+        next_arguments = dict(selected["data"]["next_arguments"])
+        wrong_arguments = {**next_arguments, "content_cursor": next_arguments["content_cursor"] + 1}
+        rejected = call("prepare_task_context", wrong_arguments, expect_error=True)
+        assert rejected["status"] == "skipped"
+        assert "out of order" in rejected["detail"]
+
+        parts = [selected["data"]["context_page"]["text"]]
+        final_token = None
+        while next_arguments:
+            page_result = call("prepare_task_context", next_arguments)
+            assert page_result["status"] == "ready"
+            parts.append(page_result["data"]["context_page"]["text"])
+            if page_result["data"]["context_page"]["has_more"]:
+                assert page_result["data"]["context_delivery_ready"] is False
+                assert not page_result["data"].get("context_selection_token")
+                next_arguments = page_result["data"]["next_arguments"]
+            else:
+                assert page_result["data"]["context_delivery_ready"] is True
+                final_token = page_result["data"]["context_selection_token"]
+                next_arguments = None
+
+        assert "".join(parts) == render_generation_context(manifest)
+        assert final_token == actual_token
+        saved = call("save_external_chapter_draft", {
+            "outline_node_id": outline.id,
+            "context_manifest_id": manifest_id,
+            "context_selection_token": final_token,
+            "content": "读完全部证据后，窗外的潮声终于有了准确的刻度。",
+        })
+        assert saved["status"] == "ok"
+        assert db.query(ChapterDraft).count() == 1
+        assert db.query(Chapter).count() == 0
+    finally:
+        remove_tool_category_state(state_file)
+        db.close()
+
+
+@pytest.mark.parametrize("tool_name,argument_kind", [
+    ("prepare_external_writing_context", "outline_node_id"),
+    ("prepare_task_context", "context_manifest_id"),
+    ("search_task_context", "context_manifest_id"),
+    ("submit_context_evidence", "context_manifest_id"),
+])
+def test_managed_context_tools_reject_foreign_project_data(tool_name, argument_kind) -> None:
+    from app.database.models import ContextManifest
+    from app.services.context_orchestrator import ContextOrchestrator
+
+    db = _db()
+    project, conversation, run = _workspace_run(db, "Scoped context owner")
+    foreign = Project(title="Foreign private project")
+    db.add(foreign)
+    db.flush()
+    foreign_outline = OutlineNode(project_id=foreign.id, title="private-foreign-content", node_type="chapter")
+    db.add(foreign_outline)
+    db.flush()
+    manifest = ContextOrchestrator(db).prepare(
+        project_id=foreign.id, task_type="writing", arguments={"outline_node_id": foreign_outline.id},
+    )
+    db.commit()
+    state_file = _scoped_state_file(project, conversation, run, categories=["writing_context"])
+    lease_token = _lease(db, run)
+    args = {"project_id": project.id, "task_type": "writing", "query": "private", "sources": []}
+    args[argument_kind] = foreign_outline.id if argument_kind == "outline_node_id" else manifest.id
+    try:
+        response = json.loads(handle_message(
+            _tool_call(tool_name, args, call_id=165), db=db, project_id=project.id,
+            permission_pack="project_management", tool_category_state_file=state_file,
+            direct_mcp_lease_token=lease_token,
+        ))
+        payload = json.loads(response["result"]["content"][0]["text"])
+        assert payload["status"] in {"skipped", "needs_confirmation"}
+        assert "private-foreign-content" not in json.dumps(payload)
+        assert db.query(ContextManifest).filter(ContextManifest.project_id == project.id).count() == 0
+        assert db.get(ContextManifest, manifest.id).consumed_at is None
+    finally:
+        remove_tool_category_state(state_file)
+        db.close()
+
+
+@pytest.mark.parametrize("tool_name", ["prepare_task_context", "prepare_external_writing_context"])
+@pytest.mark.parametrize("requested_model", [None, "invented:unlimited"])
+def test_managed_context_budget_uses_the_pinned_executing_model(tool_name, requested_model) -> None:
+    from app.database.models import APIConfig, ContextManifest
+
+    db = _db()
+    project, conversation, run = _workspace_run(db, "Pinned context budget")
+    run.model = "opencode_cli:budget-test"
+    outline = OutlineNode(project_id=project.id, title="真实目标", node_type="chapter", summary="核验档案")
+    db.add_all([outline, APIConfig(
+        provider="opencode_cli", default_model="budget-test", api_key_encrypted="test-only",
+        available_models_json=[{
+            "id": "budget-test", "context_window_tokens": 96_000,
+            "max_output_tokens": 8_000, "safety_margin_tokens": 1_024,
+            "capacity_source": "opencode_cli_metadata",
+        }],
+    )])
+    db.commit()
+    state_file = _scoped_state_file(project, conversation, run, categories=["writing_context"])
+    lease_token = _lease(db, run)
+    arguments = {"project_id": project.id, "outline_node_id": outline.id}
+    if tool_name == "prepare_task_context":
+        arguments["task_type"] = "writing"
+    if requested_model:
+        arguments["model"] = requested_model
+    try:
+        response = json.loads(handle_message(
+            _tool_call(tool_name, arguments, call_id=190), db=db, project_id=project.id,
+            permission_pack="project_management", tool_category_state_file=state_file,
+            direct_mcp_lease_token=lease_token,
+        ))
+        assert response["result"]["isError"] is False, response
+        result = json.loads(response["result"]["content"][0]["text"])
+        manifest = db.get(ContextManifest, result["data"]["context_manifest_id"])
+        assert manifest.provider == "opencode_cli"
+        assert manifest.model == "budget-test"
+        assert manifest.context_window_tokens == 96_000
+        assert manifest.input_budget_tokens < 96_000
+        step = db.query(AssistantRunStep).filter_by(run_id=run.id).one()
+        assert json.loads(step.request_json)["model"] == run.model
+    finally:
+        remove_tool_category_state(state_file)
+        db.close()
+
+
+def test_managed_context_preparation_rolls_back_when_lease_is_revoked() -> None:
+    from app.database.models import ContextManifest, ContextManifestItem, PublicPromptPack
+
+    db = _db()
+    project, conversation, run = _workspace_run(db, "Context lease rollback")
+    outline = OutlineNode(project_id=project.id, title="潮声", node_type="chapter")
+    db.add(outline)
+    db.commit()
+    state_file = _scoped_state_file(project, conversation, run, categories=["writing_context"])
+    lease_token = _lease(db, run)
+    try:
+        with patch("app.mcp.server.cas_workspace_direct_mcp_lease", return_value=False):
+            response = json.loads(handle_message(
+                _tool_call("prepare_external_writing_context", {
+                    "project_id": project.id, "outline_node_id": outline.id,
+                }, call_id=166), db=db, project_id=project.id, permission_pack="project_management",
+                tool_category_state_file=state_file, direct_mcp_lease_token=lease_token,
+            ))
+        assert response["result"]["isError"] is True
+        assert db.query(ContextManifest).count() == 0
+        assert db.query(ContextManifestItem).count() == 0
+        assert db.query(PublicPromptPack).count() == 0
+        step = db.query(AssistantRunStep).one()
+        assert step.status == "denied"
     finally:
         remove_tool_category_state(state_file)
         db.close()

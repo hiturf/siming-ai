@@ -1,6 +1,7 @@
 """Outline Writer prompt — assembles story structure rules for outline generation."""
 from __future__ import annotations
 
+from ..modules.story.domain.outline_contract import OUTLINE_PROPOSAL_MAX_NODES
 from .cataloging_source import get_outline_granularity_rules
 
 OUTLINE_WRITER_SYSTEM = (
@@ -17,7 +18,7 @@ OUTLINE_WRITER_SYSTEM = (
     "4. 角色驱动剧情——不是事件发生在角色身上，而是角色的选择推动事件。\n"
     "5. 节点类型选择：volume是卷（大段落），chapter是章，section是节（章内细分）。\n"
     '6. summary要写清楚"发生了什么"而不只是"讨论了什么"。\n'
-    "7. 标注涉及的角色名——帮助Agent后续关联角色档案。\n\n"
+    "7. 标注涉及的角色名——帮助Agent后续关联角色档案；未来才登场的新人物可写入规划，作者确认大纲时只会保留待引入姓名，不会提前创建人物档案。\n\n"
     "【节点类型说明】\n"
     "- volume（卷）：故事的大段落，通常包含多个章节，标志一个大的叙事弧线完成。\n"
     "- chapter（章）：基本的叙事单元，通常对应一个大场景或一个核心事件。\n"
@@ -27,10 +28,13 @@ OUTLINE_WRITER_SYSTEM = (
     "1. 当用户要求创建某一章大纲时，必须输出 1 条 node_type=\"chapter\" 的整章节点，标题必须包含明确章号，如“第151章 抢网”。\n"
     "2. 同一章包含多个重要行动段、冲突阶段、视角切换或转折时，必须再输出 2-6 条 node_type=\"section\" 的章内事件节点。\n"
     "3. section 节点必须设置 parent_title，指向本轮输出的 chapter 节点标题；标题建议写成“第151章 抢网 / 场景1：节点名”。\n"
-    "4. batch_count 表示要规划几个章级节点；每个章级节点下的 section 不计入 batch_count，但总节点数最多8个。\n"
+    "4. batch_count 表示要规划几个章级节点；批量规划时提交同样数量的章级节点；"
+    "单章规划才按需要附加 section，整批节点总数不得超过"
+    f"{OUTLINE_PROPOSAL_MAX_NODES}个。\n"
     "5. 不要只输出一句概括性章节内容；要像作品建档一样拆出可供后续写作检索的事件节点。\n\n"
     "请调用 propose_outline_nodes 函数提交大纲草稿。\n"
-    "默认生成1个章级节点及其必要的章内section节点。如果用户要求批量规划，可生成多个章级节点（上限8个总节点），按剧情推进顺序排列。"
+    "默认生成1个章级节点及其必要的章内section节点。如果用户要求批量规划，可生成多个章级节点"
+    f"（上限{OUTLINE_PROPOSAL_MAX_NODES}个总节点），按剧情推进顺序排列。"
 )
 
 

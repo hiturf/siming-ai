@@ -68,6 +68,14 @@ class ToolDefNewFieldsTest(unittest.TestCase):
                 name,
             )
 
+    def test_task_context_target_uses_one_explicit_flat_contract(self):
+        definition = registry.get("prepare_task_context")
+        self.assertIn("outline_node_id", definition.input_schema)
+        self.assertIn("chapter_id", definition.input_schema)
+        self.assertIn("parent_id", definition.input_schema)
+        self.assertNotIn("arguments", definition.input_schema)
+        self.assertIn("writing 必须提交 outline_node_id", definition.description)
+
     def test_read_tool_defaults(self):
         td = registry.get("list_projects")
         self.assertEqual(td.tool_type, "read")

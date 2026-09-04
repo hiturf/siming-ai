@@ -349,6 +349,10 @@ def begin_workspace_direct_mcp_step(
     if supplied_run_id and supplied_run_id != str(run.id):
         raise WorkspaceDirectMcpRunLogError("Direct MCP 参数试图绑定其他运行记录")
     arguments["project_id"] = str(run.project_id)
+    if tool_name in {"prepare_task_context", "prepare_external_writing_context"} and run.model:
+        # A managed external writer is the pinned assistant model. Its context
+        # budget must not depend on an omitted or model-invented identity.
+        arguments["model"] = str(run.model)
     call_key = _call_key(str(run.id), iteration, call_id)
     natural_request = {
         **arguments,

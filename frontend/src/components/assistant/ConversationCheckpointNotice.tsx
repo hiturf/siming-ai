@@ -5,7 +5,7 @@ import type {
   ConversationCheckpointSemanticNavigation,
   ConversationContextState,
 } from '../../types/conversationContext'
-import { formatAssistantTimestampTitle } from '../../utils/dateTime'
+import { formatApiDateTime } from '../../utils/dateTime'
 import { checkpointIdForState } from '../../services/conversationContext'
 
 const { Paragraph, Text } = Typography
@@ -72,8 +72,8 @@ function sourceRangeLabel(state: ConversationContextState) {
 }
 
 function sourceTimeLabel(state: ConversationContextState) {
-  const started = formatAssistantTimestampTitle(state.source_range?.started_at)
-  const ended = formatAssistantTimestampTitle(state.source_range?.ended_at)
+  const started = formatApiDateTime(state.source_range?.started_at)
+  const ended = formatApiDateTime(state.source_range?.ended_at)
   if (started && ended) return `${started} 至 ${ended}`
   return started || ended || '未提供'
 }

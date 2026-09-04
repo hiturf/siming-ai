@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from app.architecture.tool_definition import ToolDef
+from app.modules.story.domain.outline_contract import OUTLINE_PROPOSAL_MAX_NODES
 from app.modules.story.interfaces.search_tool_definitions import SEARCH_TOOL_DEFINITIONS
 
 TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
@@ -583,7 +584,8 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             },
             "status": {
                 "type": "string",
-                "description": "条目状态：active|archived|draft，默认active",
+                "enum": ["active", "superseded", "archived", "draft"],
+                "description": "条目状态；当前写作只读取 active，默认 active",
             },
             "confidence": {"type": "number", "description": "置信度评分，0-1"},
             "first_seen_chapter_id": {"type": "string", "description": "首次出现的章节ID"},
@@ -609,7 +611,11 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             "dimension": {"type": "string", "description": "更新维度"},
             "content": {"type": "string", "description": "更新正文"},
             "sort_order": {"type": "integer", "description": "更新排序"},
-            "status": {"type": "string", "description": "更新状态：active|archived|draft"},
+            "status": {
+                "type": "string",
+                "enum": ["active", "superseded", "archived", "draft"],
+                "description": "更新状态；superseded 用于保留历史但隔离旧条目",
+            },
             "confidence": {"type": "number", "description": "更新置信度"},
             "first_seen_chapter_id": {"type": "string", "description": "更新首次出现章节ID"},
             "last_updated_chapter_id": {"type": "string", "description": "更新最后更新章节ID"},
@@ -677,8 +683,8 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
             "nodes": {
                 "type": "array",
                 "items": {"type": "object"},
-                "maxItems": 8,
-                "description": "大纲节点列表（最多 8 个），每个节点可包含 title/node_type/summary/status/character_names/parent_id",
+                "maxItems": OUTLINE_PROPOSAL_MAX_NODES,
+                "description": f"大纲节点列表（最多 {OUTLINE_PROPOSAL_MAX_NODES} 个），每个节点可包含 title/node_type/summary/status/character_names/parent_id",
             },
             "parent_id": {"type": "string", "description": "可选，批量节点的默认父节点ID"},
         },
@@ -862,7 +868,7 @@ TOOL_DEFINITIONS: tuple[ToolDef, ...] = (
     ),
     ToolDef(
         name="create_relationship",
-        description="在两个角色之间创建关系。",
+        description="在两个角色之间保存一条有向关系；同一方向已存在时更新现行关系。",
         input_schema={
             "source": {"type": "string", "description": "角色A的名字或ID（也可用 from 字段）"},
             "target": {"type": "string", "description": "角色B的名字或ID（也可用 to 字段）"},

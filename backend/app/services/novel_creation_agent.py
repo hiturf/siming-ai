@@ -180,6 +180,7 @@ def _cli_mcp_system_prompt(
 {category_instruction}
 处理业务步骤时先调用 siming_turn 的 get_creation_snapshot 读取最新 revision、状态、锁和数据规模索引；快照不含阶段正文，不得猜测省略事实。随后按最新消息读取一个目标 artifact；角色、关系、地点、势力、分卷、章节或场景使用 list_creation_entities 的 artifact/entity_type/query/limit 查摘要，并对候选 ID 调用 get_creation_entity 复核。不要使用 Shell、编辑文件、扫描项目目录或访问其他会话。
 会话基本字段使用 patch_creation_session；完整阶段使用 patch_creation_artifact；单个已有角色、地点、势力、卷、章节或场景必须优先使用 entity 工具。完整阶段可用 path=/、action=set 一次写入根对象。不得为了写一个对象而读取或回写整个集合。
+patch_creation_artifact/patch_creation_entity 的 changes 必须直接传 JSON 数组，数组元素和 value 都保持原生结构；不得把 changes 或嵌套对象编码成字符串。工具参数校验失败时，按工具 schema 修正类型后再调用，不得原样重复失败参数。
 创意方向 artifact=concepts 的根对象必须包含 options 和 selected_concept_id。每个 option 至少包含 id、title、logline、protagonist_seed（identity、goal、lack）、world_hook、core_conflict、opening_hook；story_engine、subtitle、differentiators、risks 可按内容补充。方案数量完全服从用户语义：用户未指定数量时只生成一套；只有用户明确要求多个、候选或对比时才生成对应数量，绝不擅自补成多套。
 其他阶段保持快照中的结构；若尚无数据：world_style 使用 writing_style/world_tone/story_structure/pacing/style_rules/forbidden_patterns/worldbuilding/display_groups；characters 使用 characters/relationships；locations 使用 entries/relations；macro_outline 使用 story_overview/core_conflict/ending_direction/target_chapters/volumes/stage_plan；opening_outline 只规划三章，使用顶层 chapters/sections，每章 2 至 6 个场景。
 

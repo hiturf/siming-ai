@@ -113,7 +113,7 @@ class TestWorkspaceOutlineBatch(unittest.TestCase):
 
         nodes = [
             {"node_type": "chapter", "title": f"Chapter {index}"}
-            for index in range(1, 10)
+            for index in range(1, 14)
         ]
         with patch(
             "app.services.workspace.tools.outline.create_outline_node"
@@ -292,6 +292,12 @@ class TestOutlineCRUD(OutlineTestCase):
         first = self.create_character(project_id, "Lin Che")
         second = self.create_character(project_id, "Shen Hong")
         chapter = self.create_node(project_id, "Draft Chapter", "chapter", character_ids=[first["id"]])
+        section = self.create_node(
+            project_id,
+            "Persisted Scene",
+            "section",
+            parent_id=chapter["id"],
+        )
 
         response = self.client.put(
             f"{API_PREFIX}/projects/{project_id}/outline/{chapter['id']}",
@@ -308,6 +314,46 @@ class TestOutlineCRUD(OutlineTestCase):
         self.assertEqual(data["title"], "Storm at the Gate")
         self.assertEqual(data["status"], "in_progress")
         self.assertEqual(data["linked_characters"][0]["name"], "Shen Hong")
+        self.assertEqual([item["id"] for item in data["children"]], [section["id"]])
+
+    def test_http_create_read_and_update_preserve_planned_and_actual_summaries(self):
+        project_id = self.create_project()
+        created_response = self.client.post(
+            f"{API_PREFIX}/projects/{project_id}/outline",
+            json={
+                "title": "Auditable Scene",
+                "node_type": "section",
+                "summary": "Visible summary",
+                "planned_summary": "Author plan",
+                "actual_summary": "Initial actual record",
+                "status": "completed",
+            },
+        )
+        self.assertEqual(created_response.status_code, 200, created_response.text)
+        created = created_response.json()["data"]
+        self.assertEqual(created["planned_summary"], "Author plan")
+        self.assertEqual(created["actual_summary"], "Initial actual record")
+
+        updated_response = self.client.put(
+            f"{API_PREFIX}/projects/{project_id}/outline/{created['id']}",
+            json={
+                "summary": "Author-corrected visible summary",
+                "actual_summary": "Author-corrected actual record",
+            },
+        )
+        self.assertEqual(updated_response.status_code, 200, updated_response.text)
+        updated = updated_response.json()["data"]
+        self.assertEqual(updated["summary"], "Author-corrected visible summary")
+        self.assertEqual(updated["planned_summary"], "Author plan")
+        self.assertEqual(updated["actual_summary"], "Author-corrected actual record")
+
+        listed = self.client.get(
+            f"{API_PREFIX}/projects/{project_id}/outline"
+        ).json()["data"]["flat"]
+        persisted = next(item for item in listed if item["id"] == created["id"])
+        self.assertEqual(persisted["summary"], "Author-corrected visible summary")
+        self.assertEqual(persisted["planned_summary"], "Author plan")
+        self.assertEqual(persisted["actual_summary"], "Author-corrected actual record")
 
     def test_delete_node_cascades_children(self):
         project_id = self.create_project()

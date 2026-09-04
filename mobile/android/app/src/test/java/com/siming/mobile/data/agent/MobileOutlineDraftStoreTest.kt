@@ -8,6 +8,7 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -43,6 +44,9 @@ class MobileOutlineDraftStoreTest {
                 (stored.toJson()["context_selection_digest"] as JsonPrimitive).content,
             )
             assertEquals("outline_planning", recovered.manifest.request.taskType)
+            val node = recovered.nodes.first() as JsonObject
+            assertEquals(JsonPrimitive("冲突升级"), node["planned_summary"])
+            assertEquals(JsonPrimitive(""), node["actual_summary"])
             assertEquals("第二章", recovered.nodes.first().let { it as kotlinx.serialization.json.JsonObject }
                 .let { it["title"] as JsonPrimitive }.content)
         } finally {
@@ -125,6 +129,40 @@ class MobileOutlineDraftStoreTest {
                 MobileOutlineDraftStore(directory).save(invalid)
             }
             assertEquals(null, MobileOutlineDraftStore(directory).latestPending("p1"))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `new generation must match requested count while author may reduce reviewed draft`() = runTest {
+        val directory = createTempDirectory("siming-mobile-outline-").toFile()
+        try {
+            val manifest = manifest().let { it.copy(request = it.request.copy(batchCount = 6)) }
+            val store = MobileOutlineDraftStore(directory)
+            val incomplete = draft("outline-six-chapters", manifest)
+            assertFailsWith<IllegalArgumentException> { store.save(incomplete) }
+            assertEquals(null, store.latestPending("p1"))
+            val complete = incomplete.copy(nodes = JsonArray((4..9).map { index ->
+                buildJsonObject {
+                    put("node_type", "chapter")
+                    put("title", "第${index}章")
+                    put("summary", "未来规划$index")
+                    put("actual_summary", "不能成为已发生的事实")
+                    put("source_chapter_id", "unwritten")
+                    put("cataloging_status", "completed")
+                }
+            }))
+            val saved = store.save(complete)
+            assertEquals(6, saved.nodes.size)
+            saved.nodes.forEach { element ->
+                val node = element as JsonObject
+                assertEquals(JsonPrimitive(""), node["actual_summary"])
+                assertEquals(node["summary"], node["planned_summary"])
+                assertEquals(null, node["source_chapter_id"])
+                assertEquals(null, node["cataloging_status"])
+            }
+            assertEquals(1, store.save(saved.copy(nodes = JsonArray(saved.nodes.take(1)))).nodes.size)
         } finally {
             directory.deleteRecursively()
         }

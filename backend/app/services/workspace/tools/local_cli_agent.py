@@ -8,9 +8,9 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from ....database.models import AgentRun, AgentRunEvent
+from ....modules.story.domain.outline_contract import OUTLINE_PROPOSAL_MAX_NODES
 from ....services.local_cli_agent_worker import start_local_cli_agent_worker
 from ....services.operation_runtime import current_operation_id
-
 
 _TERMINAL_RUN_STATES = {"completed", "failed", "cancelled"}
 
@@ -78,7 +78,10 @@ async def start_local_cli_agent_run(
         "outline_node_id": str(args.get("outline_node_id") or "").strip(),
         "parent_id": str(args.get("parent_id") or "").strip(),
         "insert_after_id": str(args.get("insert_after_id") or "").strip(),
-        "batch_count": max(1, min(8, int(args.get("batch_count") or 1))),
+        "batch_count": max(
+            1,
+            min(OUTLINE_PROPOSAL_MAX_NODES, int(args.get("batch_count") or 1)),
+        ),
         "requirements": user_request,
         "pinned_chunk_ids": args.get("pinned_chunk_ids") if isinstance(args.get("pinned_chunk_ids"), list) else [],
         "pinned_source_ids": args.get("pinned_source_ids") if isinstance(args.get("pinned_source_ids"), list) else [],

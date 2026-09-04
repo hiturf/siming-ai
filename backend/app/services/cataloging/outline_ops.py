@@ -30,6 +30,15 @@ def apply_outline(
     node_type = str(payload.get("node_type") or "chapter")[:20]
     if node_type == "scene":
         node_type = "section"
+    scene_number = None
+    if node_type == "section":
+        try:
+            scene_number = int(payload.get("scene_number"))
+        except (TypeError, ValueError):
+            scene_number = 0
+        if scene_number <= 0:
+            raise ValueError("场景大纲缺少有效的 scene_number，拒绝写入不稳定场景标识")
+        payload["scene_number"] = scene_number
     parent = _resolve_requested_parent(
         db,
         chapter.project_id,
@@ -53,7 +62,15 @@ def apply_outline(
         payload.get("id") or title,
         node_type,
         exact=create,
+        scene_number=scene_number,
     )
+    # A formal chapter outline is author-owned structure. Cataloging may fill
+    # its actual summary and scenes, but it must not move that chapter between
+    # volumes based on an omitted or model-proposed parent. In particular,
+    # chapter titles often contain no ordinal, so the generic volume fallback
+    # would otherwise silently move later-volume chapters into the first one.
+    if node and node_type == "chapter" and not node.source_chapter_id:
+        parent_id = node.parent_id
     old = outline_snapshot(node) if node else None
     if not node:
         node = OutlineNode(
@@ -99,11 +116,15 @@ def apply_outline(
         metadata.update({
             "source": "cataloging",
             "source_chapter_id": chapter.id,
-            "scene_number": payload.get("scene_number"),
+            "scene_number": scene_number,
         })
         node.metadata_json = metadata
 
     if node.node_type == "chapter":
+        # Reaching this writer means a saved chapter version has completed its
+        # archive projection.  Do not leave the author-owned plan marked
+        # "pending" merely because the model omitted a redundant status field.
+        node.status = "completed"
         chapter.outline_node_id = node.id
     elif parent_id and not chapter.outline_node_id:
         chapter.outline_node_id = parent_id
@@ -162,6 +183,7 @@ def _find_outline_for_candidate(
     node_type: str,
     *,
     exact: bool,
+    scene_number: Any = None,
 ) -> OutlineNode | None:
     if node_type == "chapter" and chapter.outline_node_id:
         linked = db.query(OutlineNode).filter(
@@ -176,6 +198,14 @@ def _find_outline_for_candidate(
                 linked,
                 value,
             )
+    if node_type == "section":
+        numbered = _find_cataloged_section_by_scene_number(
+            db,
+            chapter,
+            scene_number,
+        )
+        if numbered:
+            return numbered
     node = (
         _find_exact_outline(db, chapter.project_id, value)
         if exact
@@ -207,6 +237,39 @@ def _find_outline_for_candidate(
         (candidate for candidate in candidates if normalize_lookup(candidate.title) == wanted),
         None,
     )
+
+
+def _find_cataloged_section_by_scene_number(
+    db: Session,
+    chapter: Chapter,
+    scene_number: Any,
+) -> OutlineNode | None:
+    try:
+        wanted = int(scene_number)
+    except (TypeError, ValueError):
+        return None
+    if wanted <= 0:
+        return None
+    rows = (
+        db.query(OutlineNode)
+        .filter(
+            OutlineNode.project_id == chapter.project_id,
+            OutlineNode.node_type == "section",
+            OutlineNode.source_chapter_id == chapter.id,
+            OutlineNode.cataloging_status == "cataloged",
+        )
+        .order_by(OutlineNode.created_at.asc(), OutlineNode.id.asc())
+        .all()
+    )
+    for row in rows:
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        try:
+            observed = int(metadata.get("scene_number"))
+        except (TypeError, ValueError):
+            continue
+        if observed == wanted:
+            return row
+    return None
 
 
 def _repair_legacy_duplicate_chapter_outline(

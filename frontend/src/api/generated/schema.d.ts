@@ -3431,6 +3431,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/projects/{project_id}/chapters/{chapter_id}/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Update Chapter Summary
+         * @description Correct catalog metadata without creating a new body version or re-cataloging.
+         */
+        put: operations["update_chapter_summary_api_v1_projects__project_id__chapters__chapter_id__summary_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/projects/{project_id}/characters": {
         parameters: {
             query?: never;
@@ -3662,6 +3682,30 @@ export interface paths {
         put: operations["update_character_ai_config_api_v1_projects__project_id__characters__character_id__ai_config_put"];
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_id}/characters/{character_id}/appearances/{chapter_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete Character Chapter Appearance
+         * @description Remove an author-rejected chapter/character identity association.
+         *
+         *     Cataloging candidates and facts remain in the audit trail.  Only the
+         *     current creative projection is corrected, including outline links created
+         *     for the same chapter and the character's chapter provenance pointers.
+         */
+        delete: operations["delete_character_chapter_appearance_api_v1_projects__project_id__characters__character_id__appearances__chapter_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -6242,6 +6286,21 @@ export interface components {
             ids?: string[];
         };
         /**
+         * ChapterSummaryUpdate
+         * @description Explicit author correction of cataloged chapter metadata.
+         */
+        ChapterSummaryUpdate: {
+            /**
+             * Expected Version
+             * @description Chapter body version the author reviewed before correcting metadata
+             */
+            expected_version: number;
+            /** Key Events */
+            key_events?: string[];
+            /** Summary Text */
+            summary_text: string;
+        };
+        /**
          * ChapterUpdate
          * @description Schema for saving a chapter.
          */
@@ -7863,6 +7922,10 @@ export interface components {
              * @default false
              */
             auto_confirm: boolean;
+            /** Context Artifacts */
+            context_artifacts?: string[];
+            /** Context Entity Ids */
+            context_entity_ids?: string[];
             /** Entity Count */
             entity_count?: number | null;
             /** Entity Id */
@@ -8445,6 +8508,8 @@ export interface components {
          * @description Schema for creating an outline node.
          */
         OutlineNodeCreate: {
+            /** Actual Summary */
+            actual_summary?: string | null;
             /** Character Ids */
             character_ids?: string[];
             /** Characters */
@@ -8464,6 +8529,8 @@ export interface components {
              * @description Parent outline node ID
              */
             parent_id?: string | null;
+            /** Planned Summary */
+            planned_summary?: string | null;
             /**
              * Sort Order
              * @default 0
@@ -8485,6 +8552,8 @@ export interface components {
          * @description Schema for updating an outline node.
          */
         OutlineNodeUpdate: {
+            /** Actual Summary */
+            actual_summary?: string | null;
             /** Character Ids */
             character_ids?: string[] | null;
             /** Characters */
@@ -8497,6 +8566,8 @@ export interface components {
             node_type?: ("volume" | "chapter" | "section") | null;
             /** Parent Id */
             parent_id?: string | null;
+            /** Planned Summary */
+            planned_summary?: string | null;
             /** Sort Order */
             sort_order?: number | null;
             /** Status */
@@ -9759,6 +9830,8 @@ export interface components {
             dimension?: ("geography" | "history" | "factions" | "power_system" | "races" | "culture") | null;
             /** Sort Order */
             sort_order?: number | null;
+            /** Status */
+            status?: ("active" | "superseded" | "archived" | "draft") | null;
             /** Title */
             title?: string | null;
         };
@@ -15613,7 +15686,10 @@ export interface operations {
     };
     list_cataloging_jobs_api_v1_projects__project_id__cataloging_jobs_get: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
             header?: never;
             path: {
                 project_id: string;
@@ -16755,6 +16831,42 @@ export interface operations {
             };
         };
     };
+    update_chapter_summary_api_v1_projects__project_id__chapters__chapter_id__summary_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                chapter_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChapterSummaryUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_characters_api_v1_projects__project_id__characters_get: {
         parameters: {
             query?: {
@@ -17237,6 +17349,39 @@ export interface operations {
                 "application/json": components["schemas"]["CharacterAIConfigUpdate"];
             };
         };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_character_chapter_appearance_api_v1_projects__project_id__characters__character_id__appearances__chapter_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                character_id: string;
+                chapter_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {
@@ -19943,6 +20088,8 @@ export interface operations {
             query?: {
                 /** @description 按维度过滤 */
                 dimension?: ("geography" | "history" | "factions" | "power_system" | "races" | "culture") | null;
+                /** @description 是否包含已废弃、归档或草稿条目 */
+                include_inactive?: boolean;
             };
             header?: never;
             path: {

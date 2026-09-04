@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -186,7 +187,7 @@ def _first_relevant_line(text: str) -> str:
 
 
 def detect_cli_quota_error(*texts: str) -> str:
-    combined = "\n".join(str(text or "") for text in texts if text)
+    combined = "\n".join(_cli_diagnostic_lines(*texts))
     if not combined:
         return ""
     combined = _ANSI_ESCAPE_RE.sub("", combined)
@@ -198,7 +199,7 @@ def detect_cli_quota_error(*texts: str) -> str:
 
 
 def detect_cli_auth_error(*texts: str) -> str:
-    combined = "\n".join(str(text or "") for text in texts if text)
+    combined = "\n".join(_cli_diagnostic_lines(*texts))
     if not combined:
         return ""
     combined = _ANSI_ESCAPE_RE.sub("", combined)
@@ -214,8 +215,40 @@ def detect_cli_auth_error(*texts: str) -> str:
     return f"本机 CLI 登录凭据无效或已过期{suffix}"
 
 
+def _cli_diagnostic_lines(*texts: str) -> list[str]:
+    """Read CLI diagnostics, never prose or tool arguments inside JSON events.
+
+    A completed tool event may contain quoted permission requests, login text,
+    or quotas as ordinary novel content. Only the native error envelope is a
+    diagnostic. Incomplete JSON lines stay undecided until the next chunk.
+    """
+    diagnostics: list[str] = []
+    for text in texts:
+        for line in _ANSI_ESCAPE_RE.sub("", str(text or "")).splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                event = json.loads(stripped)
+            except (ValueError, TypeError):
+                if not stripped.startswith(("{", "[", '"')):
+                    diagnostics.append(stripped)
+                continue
+            if not isinstance(event, dict):
+                continue
+            kind = event.get("type")
+            if kind in {"error", "turn.failed"} or (
+                kind == "result" and event.get("is_error") is True
+            ) or (not kind and isinstance(event.get("error"), (str, dict))):
+                # Retain diagnostic fields only; input/output payloads may
+                # contain user content even in a failed envelope.
+                detail = {key: event[key] for key in ("error", "message", "code", "result") if key in event}
+                diagnostics.append(json.dumps(detail, ensure_ascii=False))
+    return diagnostics
+
+
 def detect_cli_permission_request(*texts: str) -> str:
-    combined = "\n".join(str(text or "") for text in texts if text)
+    combined = "\n".join(_cli_diagnostic_lines(*texts))
     if not combined:
         return ""
     combined = _ANSI_ESCAPE_RE.sub("", combined)
@@ -446,7 +479,7 @@ class _CLIMonitor:
             self.report(
                 "terminal",
                 {"reason": reason},
-                "终止型草稿已生成，正在停止本次 CLI",
+                "已达到本模型步骤的终止边界，正在停止本次 CLI",
             )
             await terminate_cli_process_tree(self.process)
             raise CLITurnTerminal(reason, stdout=out_text, stderr=err_text)

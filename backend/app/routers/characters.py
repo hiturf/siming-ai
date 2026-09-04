@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from ..core.db_helpers import get_character_or_404, get_project_or_404
 from ..core.exceptions import NotFoundError, ValidationError
 from ..core.response import ApiResponse
+from ..database.models import Chapter, ChapterCharacter, CharacterVersion, OutlineNode, OutlineNodeCharacter
 from ..database.session import get_db
 from ..modules.story.application.commands import StoryCommandContext
 from ..modules.story.domain.content_sync import ContentSyncIntent, ContentSyncTarget
@@ -15,6 +16,7 @@ from ..modules.story.interfaces.dependencies import get_story_command
 from ..modules.story.interfaces.character_dependencies import character_workspace
 from ..schemas.character import (
     CharacterAIConfigUpdate,
+    CharacterChapterAppearanceUpsert,
     CharacterCreate,
     CharacterMergeRequest,
     CharacterUpdate,
@@ -37,6 +39,7 @@ from ..services.character_merge_service import (
     merge_characters,
 )
 from ..services.character_role_types import normalize_character_role_type
+from ..services.planned_character_links import resolve_planned_outline_character_links
 
 router = APIRouter(tags=["characters"])
 
@@ -82,6 +85,7 @@ def create_character(
     )
     db.flush()
     sync_character_aliases(db, character, payload.aliases)
+    resolved_outline_ids = resolve_planned_outline_character_links(db, character)
     command.queue(
         ContentSyncIntent(
             project_id=project_id,
@@ -89,6 +93,10 @@ def create_character(
             entity_id=character.id,
         ),
     )
+    if resolved_outline_ids:
+        command.queue(
+            ContentSyncIntent(project_id=project_id, target=ContentSyncTarget.OUTLINE)
+        )
     command.finish()
     db.refresh(character)
     return ApiResponse.success(data=character_to_dict(character), message="角色创建成功")
@@ -286,6 +294,208 @@ def delete_character(
     return ApiResponse.success(message="角色已删除")
 
 
+@router.delete(
+    "/projects/{project_id}/characters/{character_id}/appearances/{chapter_id}"
+)
+def delete_character_chapter_appearance(
+    project_id: str,
+    character_id: str,
+    chapter_id: str,
+    command: StoryCommandContext = Depends(get_story_command),
+):
+    """Remove an author-rejected chapter/character identity association.
+
+    Cataloging candidates and facts remain in the audit trail.  Only the
+    current creative projection is corrected, including outline links created
+    for the same chapter and the character's chapter provenance pointers.
+    """
+    db = command.session
+    get_project_or_404(db, project_id)
+    character = get_character_or_404(db, project_id, character_id)
+    chapter = (
+        db.query(Chapter)
+        .filter(Chapter.project_id == project_id, Chapter.id == chapter_id)
+        .first()
+    )
+    if chapter is None:
+        raise NotFoundError("章节不存在")
+
+    appearance = (
+        db.query(ChapterCharacter)
+        .filter(
+            ChapterCharacter.chapter_id == chapter_id,
+            ChapterCharacter.character_id == character_id,
+        )
+        .first()
+    )
+    if appearance is None:
+        raise NotFoundError("该角色没有此章节关联")
+    db.delete(appearance)
+
+    chapter_outline_ids = {
+        node_id
+        for (node_id,) in (
+            db.query(OutlineNode.id)
+            .filter(
+                OutlineNode.project_id == project_id,
+                (
+                    (OutlineNode.source_chapter_id == chapter_id)
+                    | (OutlineNode.id == chapter.outline_node_id)
+                ),
+            )
+            .all()
+        )
+    }
+    removed_outline_links = 0
+    if chapter_outline_ids:
+        removed_outline_links = (
+            db.query(OutlineNodeCharacter)
+            .filter(
+                OutlineNodeCharacter.character_id == character_id,
+                OutlineNodeCharacter.outline_node_id.in_(chapter_outline_ids),
+            )
+            .delete(synchronize_session=False)
+        )
+
+    db.flush()
+    if character.last_seen_chapter_id == chapter_id:
+        prior_appearance = (
+            db.query(Chapter)
+            .join(ChapterCharacter, ChapterCharacter.chapter_id == Chapter.id)
+            .filter(
+                Chapter.project_id == project_id,
+                ChapterCharacter.character_id == character_id,
+            )
+            .order_by(Chapter.sort_order.desc(), Chapter.created_at.desc())
+            .first()
+        )
+        character.last_seen_chapter_id = prior_appearance.id if prior_appearance else None
+    if character.last_updated_chapter_id == chapter_id:
+        prior_version = (
+            db.query(CharacterVersion)
+            .filter(
+                CharacterVersion.character_id == character_id,
+                CharacterVersion.source_chapter_id.is_not(None),
+                CharacterVersion.source_chapter_id != chapter_id,
+            )
+            .order_by(CharacterVersion.version_number.desc())
+            .first()
+        )
+        character.last_updated_chapter_id = (
+            prior_version.source_chapter_id if prior_version else None
+        )
+
+    command.queue(
+        ContentSyncIntent(
+            project_id=project_id,
+            target=ContentSyncTarget.CHARACTER,
+            entity_id=character_id,
+        ),
+    )
+    if removed_outline_links:
+        command.queue(
+            ContentSyncIntent(project_id=project_id, target=ContentSyncTarget.OUTLINE),
+        )
+    command.finish()
+    return ApiResponse.success(
+        data={
+            "character_id": character_id,
+            "chapter_id": chapter_id,
+            "removed_chapter_links": 1,
+            "removed_outline_links": removed_outline_links,
+            "last_seen_chapter_id": character.last_seen_chapter_id,
+            "last_updated_chapter_id": character.last_updated_chapter_id,
+        },
+        message="章节角色关联已移除",
+    )
+
+
+@router.put(
+    "/projects/{project_id}/characters/{character_id}/appearances/{chapter_id}"
+)
+def upsert_character_chapter_appearance(
+    project_id: str,
+    character_id: str,
+    chapter_id: str,
+    payload: CharacterChapterAppearanceUpsert,
+    command: StoryCommandContext = Depends(get_story_command),
+):
+    """Create or correct one author-confirmed chapter/person association.
+
+    The chapter and character IDs are validated against the current project.
+    Repeating the same request updates the one existing association instead of
+    creating duplicate rows.
+    """
+    db = command.session
+    get_project_or_404(db, project_id)
+    character = get_character_or_404(db, project_id, character_id)
+    chapter = (
+        db.query(Chapter)
+        .filter(Chapter.project_id == project_id, Chapter.id == chapter_id)
+        .first()
+    )
+    if chapter is None:
+        raise NotFoundError("章节不存在")
+
+    appearance = (
+        db.query(ChapterCharacter)
+        .filter(
+            ChapterCharacter.chapter_id == chapter_id,
+            ChapterCharacter.character_id == character_id,
+        )
+        .first()
+    )
+    created = appearance is None
+    if appearance is None:
+        appearance = ChapterCharacter(
+            chapter_id=chapter_id,
+            character_id=character_id,
+        )
+        db.add(appearance)
+    appearance.appearance_type = payload.appearance_type
+    appearance.description = payload.description
+
+    latest_seen = None
+    if character.last_seen_chapter_id:
+        latest_seen = (
+            db.query(Chapter)
+            .filter(
+                Chapter.project_id == project_id,
+                Chapter.id == character.last_seen_chapter_id,
+            )
+            .first()
+        )
+    if latest_seen is None or (
+        int(chapter.sort_order or 0), chapter.created_at
+    ) >= (
+        int(latest_seen.sort_order or 0), latest_seen.created_at
+    ):
+        character.last_seen_chapter_id = chapter.id
+    db.flush()
+
+    command.queue(
+        ContentSyncIntent(
+            project_id=project_id,
+            target=ContentSyncTarget.CHARACTER,
+            entity_id=character.id,
+        ),
+    )
+    command.finish()
+    return ApiResponse.success(
+        data={
+            "id": appearance.id,
+            "chapter_id": chapter.id,
+            "chapter_title": chapter.title,
+            "character_id": character.id,
+            "character_name": character.name,
+            "appearance_type": appearance.appearance_type,
+            "description": appearance.description,
+            "created": created,
+        },
+        message="章节人物关联已新增" if created else "章节人物关联已更新",
+    )
+
+
 @router.get("/projects/{project_id}/characters/{character_id}/versions")
 def list_character_versions(project_id: str, character_id: str, db: Session = Depends(get_db)):
     """Get character version history."""
@@ -329,6 +539,7 @@ def update_character_relationships(
     get_project_or_404(db, project_id)
     character = get_character_or_404(db, project_id, character_id)
     endpoint_ids: set[str] = set()
+    directed_pairs: set[tuple[str, str]] = set()
     for item in payload.relationships:
         source_id = item.source_character_id or character.id
         target_id = item.target_character_id
@@ -336,6 +547,10 @@ def update_character_relationships(
             raise ValidationError("提交的关系必须连接当前角色")
         if source_id == target_id:
             raise ValidationError("角色不能与自身建立关系")
+        pair = (source_id, target_id)
+        if pair in directed_pairs:
+            raise ValidationError("同一方向的两个角色只能保留一条现行关系")
+        directed_pairs.add(pair)
         endpoint_ids.update({source_id, target_id})
 
     workspace = character_workspace(db)

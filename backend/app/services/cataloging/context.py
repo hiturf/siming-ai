@@ -7,6 +7,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from ...database.models import Chapter, Character, ChapterSummary, OutlineNode, WorldbuildingEntry
+from ...database.query_filters import current_worldbuilding_clause
 
 
 def ordered_chapters(db: Session, project_id: str, chapter_ids: list[str] | None = None) -> list[Chapter]:
@@ -45,7 +46,10 @@ def build_light_context(db: Session, project_id: str, chapter: Chapter) -> dict:
     )
     world_entries = (
         db.query(WorldbuildingEntry)
-        .filter(WorldbuildingEntry.project_id == project_id)
+        .filter(
+            WorldbuildingEntry.project_id == project_id,
+            current_worldbuilding_clause(WorldbuildingEntry.status),
+        )
         .order_by(WorldbuildingEntry.updated_at.desc())
         .limit(120)
         .all()
@@ -96,7 +100,7 @@ def build_light_context(db: Session, project_id: str, chapter: Chapter) -> dict:
         ],
         "character_details": [_character_detail(item) for item in characters[:40]],
         "worldbuilding_index": [
-            {"dimension": item.dimension, "title": item.title}
+            {"id": item.id, "dimension": item.dimension, "title": item.title}
             for item in world_entries
         ],
         "worldbuilding_details": [_worldbuilding_detail(item) for item in world_entries[:50]],
@@ -152,6 +156,7 @@ def _worldbuilding_detail(entry: WorldbuildingEntry) -> dict:
         reverse=True,
     )[:4]
     return {
+        "id": entry.id,
         "dimension": entry.dimension,
         "title": entry.title,
         "status": entry.status,

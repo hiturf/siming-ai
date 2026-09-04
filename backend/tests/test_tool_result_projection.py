@@ -425,6 +425,50 @@ def test_successful_artifact_result_requires_a_persisted_reference() -> None:
         )
 
 
+def test_draft_prerequisite_failure_does_not_require_an_artifact_reference() -> None:
+    tool = registry.get("save_external_chapter_draft")
+    assert tool is not None
+    projected = model_tool_result_projector.project(tool, {
+        "tool": tool.name,
+        "status": "needs_confirmation",
+        "detail": "Prepare task context first and attach its context_manifest_id to the draft.",
+        "data": {"context_manifest_id": "unavailable-manifest"},
+    })
+    assert projected.payload["status"] == "needs_confirmation"
+    assert "Prepare task context first" in projected.payload["detail"]
+    assert "draft_id" not in (projected.payload.get("data") or {})
+
+
+def test_short_draft_projection_keeps_deterministic_retry_receipt() -> None:
+    tool = registry.get("save_external_chapter_draft")
+    assert tool is not None
+    projected = model_tool_result_projector.project(tool, {
+        "tool": tool.name,
+        "status": "needs_confirmation",
+        "detail": "正文低于硬下限；未保存草稿。",
+        "data": {
+            "reason_code": "draft_below_minimum",
+            "context_manifest_id": "manifest-1",
+            "actual_han_characters": 3_202,
+            "minimum_han_characters": 3_400,
+            "missing_han_characters": 198,
+            "draft_stored": False,
+            "context_selection_token_consumed": False,
+            "context_selection_token": "must-not-be-projected",
+        },
+    })
+
+    assert projected.payload["data"] == {
+        "context_manifest_id": "manifest-1",
+        "reason_code": "draft_below_minimum",
+        "actual_han_characters": 3_202,
+        "minimum_han_characters": 3_400,
+        "missing_han_characters": 198,
+        "draft_stored": False,
+        "context_selection_token_consumed": False,
+    }
+
+
 def test_registry_declares_authoritative_policies_for_generators_writes_and_searches() -> None:
     assert registry.get_model_result_contract("chapter_writer").policy is (
         ModelResultPolicy.ARTIFACT_REFERENCE
@@ -444,6 +488,46 @@ def test_registry_declares_authoritative_policies_for_generators_writes_and_sear
     assert registry.get_model_result_contract("search_chapters").policy is (
         ModelResultPolicy.INLINE_BOUNDED
     )
+
+
+def test_cataloging_launch_projection_keeps_idempotent_reuse_receipt() -> None:
+    tool = registry.get_spec("start_cataloging_job")
+    result = {
+        "tool": "start_cataloging_job",
+        "status": "ok",
+        "detail": "当前章节版本已有建档结果，已复用现有任务",
+        "data": {
+            "id": "job-1",
+            "project_id": "project-1",
+            "operation_id": "operation-1",
+            "status": "completed",
+            "started": False,
+            "worker_queued": False,
+            "idempotent_reuse": True,
+            "already_cataloged_chapter_ids": ["chapter-1"],
+            "queued_chapter_ids": [],
+            "reused_job_ids": ["job-1"],
+            "next_action": "already_cataloged",
+            "model": "must-stay-in-audit-only",
+        },
+    }
+
+    projected = model_tool_result_projector.project(tool, result)
+
+    assert projected.payload["data"] == {
+        "id": "job-1",
+        "project_id": "project-1",
+        "operation_id": "operation-1",
+        "status": "completed",
+        "started": False,
+        "worker_queued": False,
+        "idempotent_reuse": True,
+        "already_cataloged_chapter_ids": ["chapter-1"],
+        "queued_chapter_ids": [],
+        "reused_job_ids": ["job-1"],
+        "next_action": "already_cataloged",
+    }
+    assert "model" not in projected.payload["data"]
 
 
 def test_every_registered_write_and_scheduler_has_a_bounded_receipt_projection() -> None:
@@ -769,10 +853,37 @@ def test_all_registered_results_fit_the_admitted_single_result_boundary() -> Non
     }
     assert large_single_step_reads == {
         "read_project_file",
+        "prepare_external_writing_context",
         "prepare_task_context",
         "read_imported_file",
         "search_task_context",
     }
+
+
+def test_external_writing_context_accepts_one_full_chinese_context_page() -> None:
+    tool = registry.get("prepare_external_writing_context")
+    result = {
+        "tool": tool.name,
+        "status": "ok",
+        "detail": "writing context prepared",
+        "data": {
+            "context_manifest_id": "manifest-1",
+            "context_page": {
+                "text": "当前设定与章节锚点。" * 900,
+                "cursor": 0,
+                "next_cursor": 9_000,
+                "has_more": True,
+                "total_chars": 18_000,
+                "sha256": "a" * 64,
+            },
+            "next_tool_suggestions": [{"tool": "prepare_external_writing_context"}],
+        },
+    }
+
+    projected = model_tool_result_projector.project(tool, result)
+
+    assert projected.full_source_delivered is True
+    assert 16 * 1024 < projected.projected_json_bytes <= 32 * 1024
 
 
 def test_search_and_read_schemas_declare_real_page_or_range_boundaries() -> None:
@@ -811,3 +922,47 @@ def test_search_and_read_schemas_declare_real_page_or_range_boundaries() -> None
     assert task_search["limit"]["maximum"] == 10
     assert task_search["cursor"]["default"] == 0
     assert task_search["cursor"]["maximum"] == 20
+
+
+@pytest.mark.parametrize(("name", "status", "receipt"), [
+    ("save_external_cataloging_facts", "skipped", {
+        "validation_errors": ["facts[0].payload must be an object"],
+        "validation_error_count": 1, "validation_errors_has_more": False,
+        "allowed_fact_types": ["chapter_overview"],
+        "next_tool": "save_external_cataloging_facts",
+    }),
+    ("save_external_cataloging_candidates", "ok", {
+        "candidate_set_complete": False,
+        "missing_required_items": ["character_state_update for declared characters (0/1)"],
+        "candidates_saved": 2, "chapter_run_status": "facts_saved",
+        "auto_applied": False, "next_tool": "save_external_cataloging_candidates",
+    }),
+    ("save_external_cataloging_candidates", "ok", {
+        "candidate_set_complete": True, "missing_required_items": [],
+        "chapter_run_status": "completed", "auto_applied": True,
+        "next_tool": "verify_external_cataloging_progress",
+    }),
+])
+def test_cataloging_projection_preserves_actionable_receipts_without_prose(name, status, receipt):
+    tool = registry.get(name)
+    result = {"tool": name, "status": status, "detail": "canonical receipt", "data": {
+        "job_id": "job", "project_id": "project", "chapter_id": "chapter", **receipt,
+        "content": "完整正文不应在写入回执中重复" * 10000,
+    }}
+    projected = model_tool_result_projector.project(tool, result)
+    assert projected.payload["data"] == {
+        "job_id": "job", "project_id": "project", "chapter_id": "chapter", **receipt,
+    }
+    assert projected.projected_json_bytes <= tool.model_result_contract.max_json_bytes
+
+
+def test_cataloging_fact_schema_uses_the_persistence_enum_and_nested_payload():
+    from app.modules.continuity.domain.cataloging_contract import CATALOGING_FACT_TYPES
+    from app.services.workspace.tools.external_cataloging import CANONICAL_FACT_TYPES
+
+    tool = registry.get("save_external_cataloging_facts")
+    record = tool.input_schema["facts"]["items"]
+    assert set(record["properties"]["fact_type"]["enum"]) == CANONICAL_FACT_TYPES
+    assert set(CATALOGING_FACT_TYPES) == CANONICAL_FACT_TYPES
+    assert record["properties"]["payload"]["type"] == "object"
+    assert record["required"] == ["fact_type", "payload"]

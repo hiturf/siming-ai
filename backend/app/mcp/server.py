@@ -234,12 +234,41 @@ def _handle_tools_list(
             "name": controller["name"],
             "description": controller["description"],
             "inputSchema": controller["parameters"],
+            # The controller mutates only the isolated per-turn capability
+            # state.  Keep it reviewable, but declare the remaining MCP safety
+            # hints so clients do not infer destructive or open-world access.
+            "annotations": {
+                "readOnlyHint": False,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
         })
     for t in tools:
+        definition = registry.get(t.name)
+        read_only = bool(
+            definition is not None
+            and not definition.writes_project_data
+            and definition.tool_type in {"read", "analysis", "web"}
+        )
         tool_dicts.append({
             "name": t.name,
             "description": t.description,
             "inputSchema": t.input_schema,
+            "annotations": {
+                "readOnlyHint": read_only,
+                "destructiveHint": bool(
+                    definition is not None
+                    and not read_only
+                    and definition.requires_confirmation
+                ),
+                "idempotentHint": bool(
+                    read_only or (definition is not None and definition.idempotent)
+                ),
+                "openWorldHint": bool(
+                    definition is not None and definition.tool_type == "web"
+                ),
+            },
         })
     return _jsonrpc_result(msg_id, {"tools": tool_dicts})
 

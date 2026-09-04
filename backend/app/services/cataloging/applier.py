@@ -62,6 +62,13 @@ def apply_candidates_for_run(db: Session, job: CatalogingJob, run: CatalogingCha
         try:
             result = apply_candidate(db, candidate)
             _mark_applied(db, job, run, candidate, result)
+            warning = str(result.get("review_warning") or "").strip()
+            if warning and warning not in str(run.review_warning or ""):
+                run.review_warning = "；".join(
+                    value
+                    for value in (str(run.review_warning or "").strip("； "), warning)
+                    if value
+                )[:4000]
             events.append({
                 "type": "candidate_applied",
                 "candidate": candidate_to_dict(candidate),

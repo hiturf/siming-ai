@@ -122,7 +122,8 @@ def workspace_category_instruction(
         )
     labels = "、".join(TOOL_CATEGORY_METADATA[category]["label"] for category in categories)
     return (
-        f"当前开放工具类别：{labels}。直接完成用户最新任务；"
+        f"同一用户回合的上一模型步骤已经选定类别，当前开放工具类别：{labels}。"
+        "本步骤直接调用已经开放的业务工具完成用户最新任务，不必再次选择相同类别；"
         "需要更换能力时调用 set_tool_categories，"
         "调用后立即结束当前模型步骤。"
     )

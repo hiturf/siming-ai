@@ -671,7 +671,7 @@ describe('WorkspaceAssistantChat cancellation and recovery', () => {
       </MemoryRouter>,
     )
 
-    expect(await screen.findByText('本机 CLI 已连接本轮临时 Siming MCP')).toBeInTheDocument()
+    expect(await screen.findByText('本机 CLI 将使用本轮临时 Siming MCP')).toBeInTheDocument()
     expect(screen.getByText(/只开放当前作品范围的工具/)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '授权下一条代理操作' })).not.toBeInTheDocument()
   })

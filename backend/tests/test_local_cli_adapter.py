@@ -154,6 +154,51 @@ class LocalCLIAdapterHelperTestCase(unittest.TestCase):
         self.assertIsNone(launch.stdin_text)
         self.assertIn(prompt, launch.args)
 
+    @patch("app.ai.local_cli_models.subprocess.run")
+    @patch("app.ai.local_cli_models.shutil.which", return_value=r"C:\tools\opencode.exe")
+    def test_opencode_verbose_capacity_survives_configured_name_merge(self, _which, run_mock):
+        run_mock.return_value.returncode = 0
+        run_mock.return_value.stdout = "opencode/big-pickle\n" + json.dumps({
+            "id": "big-pickle", "providerID": "opencode", "name": "Big Pickle",
+            "limit": {"context": 200000, "input": 160000, "output": 32000},
+            "headers": {"Authorization": "must-not-be-exported"},
+        })
+        models = local_cli_model_options(
+            "opencode_cli", "opencode",
+            cli_args='["run","--model","opencode/big-pickle","{prompt}"]',
+        )
+        selected = [item for item in models if item["id"] == "opencode/big-pickle"]
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["context_window_tokens"], 200000)
+        self.assertEqual(selected[0]["max_output_tokens"], 32000)
+        self.assertEqual(selected[0]["capacity_source"], "opencode_cli_metadata")
+        self.assertNotIn("must-not-be-exported", json.dumps(models))
+        self.assertEqual(run_mock.call_args.args[0][-2:], ["models", "--verbose"])
+
+    @patch("app.ai.local_cli_models.subprocess.run")
+    @patch("app.ai.local_cli_models.shutil.which", return_value=r"C:\tools\opencode.exe")
+    def test_opencode_discovery_rejects_wrong_identity_and_invalid_capacity(self, _which, run_mock):
+        run_mock.return_value.returncode = 0
+        run_mock.return_value.stdout = (
+            "opencode/first\n" + json.dumps({
+                "id": "different", "providerID": "opencode",
+                "limit": {"context": 200000, "output": 32000},
+            }) + "\nopencode/second\n" + json.dumps({
+                "id": "second", "providerID": "opencode",
+                "limit": {"context": 2048, "output": 2048},
+            }) + "\nopencode/third\n" + json.dumps({
+                "id": "third", "providerID": "opencode",
+                "limit": {"context": 100000, "output": 10000},
+            })
+        )
+        models = discover_local_cli_models("opencode_cli", "opencode")
+        self.assertEqual([item["id"] for item in models], [
+            "opencode/first", "opencode/second", "opencode/third",
+        ])
+        self.assertNotIn("context_window_tokens", models[0])
+        self.assertNotIn("context_window_tokens", models[1])
+        self.assertEqual(models[2]["context_window_tokens"], 100000)
+
     def test_mimocode_default_args_are_safe(self):
         launch = parse_cli_launch(None, "mimocode_cli", "hello", "mimocode-cli")
         self.assertEqual(
@@ -779,7 +824,7 @@ class LocalCLIAdapterHelperTestCase(unittest.TestCase):
             "app.services.workspace.terminal_draft_detection.local_cli_terminal_draft",
             return_value=detected,
         ) as probe_drafts:
-            probe = LocalCLIAdapter._terminal_draft_probe(runtime_body)
+            probe = LocalCLIAdapter._terminal_turn_probe(runtime_body)
             self.assertIsNotNone(probe)
             self.assertEqual(
                 probe(),
@@ -793,6 +838,51 @@ class LocalCLIAdapterHelperTestCase(unittest.TestCase):
             4,
         )
         session.close.assert_called_once_with()
+
+    def test_category_selection_ends_only_the_pending_model_step(self):
+        from app.services.tool_category_state import (
+            activate_tool_categories,
+            create_tool_category_state,
+            remove_tool_category_state,
+            replace_tool_categories,
+        )
+
+        state_file = create_tool_category_state()
+        try:
+            probe = LocalCLIAdapter._terminal_turn_probe({
+                "local_cli_mcp_authorized": True,
+                "local_cli_mcp_tool_category_state_file": state_file,
+            })
+            self.assertIsNotNone(probe)
+            self.assertIsNone(probe())
+            replace_tool_categories(state_file, ["story_knowledge"])
+            self.assertEqual(probe(), "set_tool_categories:1")
+            activate_tool_categories(state_file)
+            self.assertIsNone(probe())
+            replace_tool_categories(state_file, ["writing_context"])
+            self.assertEqual(probe(), "set_tool_categories:2")
+        finally:
+            remove_tool_category_state(state_file)
+
+    def test_category_probe_requires_managed_mcp_authorization(self):
+        self.assertIsNone(LocalCLIAdapter._terminal_turn_probe({
+            "local_cli_mcp_tool_category_state_file": "not-authorized",
+        }))
+
+    def test_terminal_output_distinguishes_categories_and_draft_types(self):
+        adapter = LocalCLIAdapter(api_key="", base_url="opencode_cli", cli_command="opencode")
+        context = SimpleNamespace(cwd="unused", isolated=False)
+        process = SimpleNamespace(returncode=-1)
+        for reason, expected in (
+            ("set_tool_categories:1", "工具类别已切换，继续下一模型步骤。"),
+            ("save_external_outline_draft:1", "大纲草稿已生成，等待作者确认。"),
+            ("save_external_chapter_draft:1", "章节草稿已生成，等待作者保存。"),
+        ):
+            with self.subTest(reason=reason), patch.object(adapter, "_cleanup_isolated_workspace"):
+                result = asyncio.run(adapter._finalize_run_output(
+                    context, process, b"", b"", reason, "model", {},
+                ))
+                self.assertEqual(result, expected)
 
     def test_runtime_cwd_does_not_fall_back_to_process_cwd(self):
         with patch.dict(

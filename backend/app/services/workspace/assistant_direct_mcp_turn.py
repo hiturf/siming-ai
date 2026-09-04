@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from collections.abc import AsyncGenerator
@@ -19,6 +20,7 @@ from app.services.tool_category_state import (
     read_tool_category_state,
 )
 from app.services.workspace.assistant_public_projection import public_tool_log
+from app.services.workspace.assistant_public_errors import public_model_failure
 from app.services.workspace.assistant_turn_state import WorkspaceAssistantTurnState
 from app.services.workspace.assistant_turn_support import workspace_category_result
 from app.services.workspace.direct_mcp_run_log import issue_workspace_direct_mcp_lease
@@ -26,6 +28,8 @@ from app.services.workspace.terminal_draft_detection import local_cli_terminal_d
 from app.services.workspace.turn_control import terminal_reply as terminal_tool_reply
 
 logger = logging.getLogger(__name__)
+
+_MANAGED_DIRECT_MCP_TIMEOUT_SECONDS = 1_800
 
 
 @dataclass
@@ -59,6 +63,7 @@ class WorkspaceDirectMcpTurn:
         # interval; never let its trailing text or draft probe overwrite the
         # newer turn's status after the MCP dispatch guard has closed tools.
         self.state.require_current_run()
+        self._collect_tool_failures(iteration)
         if self._apply_category_change(iteration):
             for event in self.state.pending_native_events:
                 yield event
@@ -113,6 +118,56 @@ class WorkspaceDirectMcpTurn:
         )
         self.state.loop_action = "break"
 
+    def _collect_tool_failures(self, iteration: int) -> None:
+        """Carry persisted MCP failures into the shared turn finalizer."""
+        state = self.state
+        if not state.local_cli_mcp_enabled:
+            return
+        steps = list(state.workspace.run_steps(str(state.assistant_run.id)))
+        successful_statuses = {"ok", "completed", "success", "succeeded"}
+        for position, step in enumerate(steps):
+            if (
+                str(step.project_id) != state.project_id
+                or int(step.iteration or 0) != iteration
+                or str(step.status or "").lower() not in {
+                    "error", "failed", "denied", "blocked_rebuild", "skipped", "needs_confirmation",
+                }
+            ):
+                continue
+            # A schema/precondition rejection is an expected self-correction
+            # path for an agent. If the same tool succeeds later in this model
+            # step, keep the rejected attempt in the durable RunStep audit but
+            # do not tell the author that finished work is only partial. Real
+            # execution errors and unresolved skips remain visible.
+            if str(step.status or "").lower() == "skipped" and any(
+                str(later.project_id) == state.project_id
+                and int(later.iteration or 0) == iteration
+                and str(later.tool) == str(step.tool)
+                and str(later.status or "").lower() in successful_statuses
+                for later in steps[position + 1 :]
+            ):
+                continue
+            # Provider/tool diagnostics stay in the durable audit record, not
+            # in the public final reply. A CLI's prose cannot erase a failure.
+            raw_result: Any = None
+            try:
+                raw_result = json.loads(str(getattr(step, "result_json", None) or ""))
+            except (TypeError, json.JSONDecodeError):
+                raw_result = None
+            if isinstance(raw_result, dict):
+                projected = public_tool_log(raw_result)
+                if (
+                    projected.get("tool") == str(step.tool)
+                    and projected.get("status") == str(step.status or "").lower()
+                ):
+                    state.tool_logs.append(projected)
+                    continue
+            state.tool_logs.append({
+                "tool": str(step.tool),
+                "status": "error",
+                "detail": "本机 CLI 工具未完成，请检查工具记录、前置条件与当前项目状态。",
+            })
+
     def _bind_run_iteration(self, iteration: int) -> None:
         state = self.state
         if not state.local_cli_mcp_enabled or not state.tool_category_state_file:
@@ -154,7 +209,15 @@ class WorkspaceDirectMcpTurn:
             model=state.payload.model,
             temperature=state.payload.temperature or 0.3,
             max_tokens=state.payload.max_tokens,
-            timeout=300,
+            # One managed CLI step includes many real MCP reads plus prose
+            # generation. Keep a finite deadline without treating that entire
+            # workflow as a single short completion. Stall/cancel monitors and
+            # the no-replay rule remain active throughout.
+            timeout=(
+                _MANAGED_DIRECT_MCP_TIMEOUT_SECONDS
+                if state.local_cli_mcp_enabled
+                else 300
+            ),
             retry=0 if state.local_cli_mcp_enabled else 1,
             resume=0 if state.local_cli_mcp_enabled else 8,
             on_resume=on_resume,
@@ -271,20 +334,22 @@ class WorkspaceDirectMcpTurn:
 
     def _complete_interrupted(self, error: Exception) -> None:
         state = self.state
-        del error
+        failure = public_model_failure(error)
         state.tool_logs.append(
             {
                 "tool": "stream_error",
                 "status": "error",
-                "detail": "模型流式输出中断，本轮已停止。",
+                "detail": failure.message,
+                "error_code": failure.code,
+                "failure_class": failure.failure_class,
             }
         )
         state.final_reply = (
-            "本机 CLI 连接中断。为避免重复执行可能已经提交的 MCP 写入，"
+            f"{failure.message} 为避免重复执行可能已经提交的 MCP 写入，"
             "系统没有自动重启该进程；已提交结果以当前项目数据为准，"
             "下次请求会从真实项目状态继续。"
             if state.local_cli_mcp_enabled
-            else "模型调用中断，本轮未执行写入。"
+            else f"{failure.message} 本轮未执行写入。"
         )
         state.final_model = state.payload.model or ""
         state.final_usage = None

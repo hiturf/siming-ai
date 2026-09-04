@@ -572,7 +572,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun testDirectApi() = launchActivity("正在测试手机直连 API…") {
         val summary = repository.testDirectApi()
         uiState.value = uiState.value.copy(directApi = summary)
-        "${summary.displayName} · ${summary.model} 真实对话成功"
+        "${summary.displayName} · ${summary.model} 基础对话探测成功；" +
+            "长任务仍可能受到临时限流或服务容量影响"
     }
 
     fun clearDirectApi() {

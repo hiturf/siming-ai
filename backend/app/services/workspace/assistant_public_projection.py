@@ -18,6 +18,8 @@ from typing import Any
 from app.architecture.resource_references import public_resource_reference
 from app.architecture.tool_result_policy import ModelResultPolicy, ModelResultPreview
 from app.core.utils import utc_isoformat
+from app.services.chapter_writing_constraints import recommended_han_character_target
+from app.services.workspace.assistant_public_errors import public_model_error_message
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9._:/-]{1,255}$")
 _SUCCESS_STATUSES = frozenset({"ok", "completed", "success", "succeeded"})
@@ -52,6 +54,68 @@ def _stable_step_detail(tool: str | None, status: str) -> str:
     if status in _ERROR_STATUSES:
         return f"{label} 执行失败"
     return f"{label} 状态已更新"
+
+
+def _public_tool_remediation(
+    tool: str | None,
+    status: str,
+    value: Any,
+) -> dict[str, Any] | None:
+    """Project only producer-declared, author-actionable retry information."""
+
+    if (
+        tool != "save_external_chapter_draft"
+        or status != "needs_confirmation"
+        or not isinstance(value, Mapping)
+    ):
+        return None
+    data = value.get("data")
+    if not isinstance(data, Mapping):
+        return None
+    reason_code = _safe_identifier(data.get("reason_code"))
+    messages = {
+        "context_manifest_required": "请先准备本章写作上下文，再用返回的清单与令牌保存草稿。",
+        "context_manifest_unavailable": "写作上下文已不可用，请重新准备上下文后保存草稿。",
+        "context_selection_invalid": "写作上下文令牌无效或已使用，请重新准备上下文后保存草稿。",
+        "writing_constraint_invalid": "本章篇幅约束无效，请重新准备写作上下文后重试。",
+    }
+    if reason_code in messages:
+        return {
+            "code": reason_code,
+            "message": messages[reason_code],
+            "retryable": True,
+        }
+    if reason_code != "draft_below_minimum":
+        return None
+    actual = data.get("actual_han_characters")
+    minimum = data.get("minimum_han_characters")
+    if (
+        not isinstance(actual, int)
+        or isinstance(actual, bool)
+        or actual < 0
+        or not isinstance(minimum, int)
+        or isinstance(minimum, bool)
+        or minimum <= actual
+    ):
+        return None
+    missing = minimum - actual
+    recommended = recommended_han_character_target(minimum)
+    recommended_additional = recommended - actual
+    message = (
+        f"正文有 {actual} 个汉字，低于最低要求 {minimum} 个；至少还差 {missing} 个。"
+        f"为减少反复退回，建议一次补至 {recommended} 个汉字（约再补 "
+        f"{recommended_additional} 个）后重试。"
+    )
+    return {
+        "code": reason_code,
+        "message": message,
+        "retryable": True,
+        "actual_han_characters": actual,
+        "minimum_han_characters": minimum,
+        "missing_han_characters": missing,
+        "recommended_han_characters": recommended,
+        "recommended_additional_han_characters": recommended_additional,
+    }
 
 
 def _safe_reference_audit(value: Any) -> dict[str, Any] | None:
@@ -176,6 +240,10 @@ def public_tool_log(value: Any, *, include_success_data: bool = False) -> dict[s
         "status": status,
         "detail": _stable_step_detail(tool, status),
     }
+    remediation = _public_tool_remediation(tool, status, item)
+    if remediation is not None:
+        projected["detail"] = remediation["message"]
+        projected["remediation"] = remediation
     step_id = _safe_identifier(item.get("step_id") or item.get("stepId"))
     if step_id:
         projected["step_id"] = step_id
@@ -223,7 +291,7 @@ def _stable_public_error_message(code: str) -> str:
     if code == "tool_capability_unavailable":
         return "当前模型不具备可验证的 Agent 工具能力。"
     if code.startswith("model_"):
-        return "模型调用失败，请检查模型状态后重试。"
+        return public_model_error_message(code) or "模型调用失败，请检查模型状态后重试。"
     if code == "workspace_assistant_server_error":
         return "工作台助手处理失败，请稍后重试。"
     return "作品助手任务未完成。"
@@ -442,14 +510,22 @@ def public_step_payload(step: Any, *, can_retry: bool, retry_block_reason: str |
     request_hash, request_bytes = _payload_metadata(step.request_json)
     result_hash, result_bytes = _payload_metadata(step.result_json)
     failed = status in _ERROR_STATUSES
-    return {
+    raw_result: Any = None
+    if step.result_json:
+        try:
+            raw_result = json.loads(step.result_json)
+        except (TypeError, json.JSONDecodeError):
+            raw_result = None
+    remediation = _public_tool_remediation(tool, status, raw_result)
+    detail = remediation["message"] if remediation else _stable_step_detail(tool, status)
+    result = {
         "id": step.id,
         "run_id": step.run_id,
         "step_type": step.step_type,
         "tool": tool,
         "status": status,
         "iteration": step.iteration or 0,
-        "detail": _stable_step_detail(tool, status),
+        "detail": detail,
         "error": _stable_step_detail(tool, status) if failed else None,
         "attempt_no": step.attempt_no or 1,
         "retry_of_step_id": step.retry_of_step_id,
@@ -465,6 +541,9 @@ def public_step_payload(step: Any, *, can_retry: bool, retry_block_reason: str |
         "started_at": utc_isoformat(step.started_at),
         "completed_at": utc_isoformat(step.completed_at),
     }
+    if remediation is not None:
+        result["remediation"] = remediation
+    return result
 
 
 __all__ = [

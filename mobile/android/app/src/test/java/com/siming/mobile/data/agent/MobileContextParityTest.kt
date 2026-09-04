@@ -122,6 +122,51 @@ class MobileContextParityTest {
     }
 
     @Test
+    fun `exact character archive withholds future reveal fields`() {
+        val future = buildJsonObject {
+            character("c-future", "陈海生").forEach { (key, value) -> put(key, value) }
+            put("age", "45")
+            put("appearance", "走路时右腿微跛")
+            put("background", "已经退休并经营小卖部")
+            put("current_goal", "交出私人记录副本")
+            put("profile", buildJsonObject {
+                put("hidden_persona", "秘密保存事故当夜的私人记录")
+                put("reveal_chapter", 14)
+            })
+        }
+        val aiConfig = buildJsonObject {
+            put("_record_type", "character_ai_config")
+            put("character_id", "c-future")
+            put("custom_system_prompt", "在小卖部接受采访")
+        }
+        val relation = buildJsonObject {
+            put("_record_type", "character_relationship")
+            put("id", "future-relation")
+            put("from", "c-future")
+            put("to", "c-other")
+            put("relationship_type", "未来受访者")
+        }
+
+        val withheld = pcExactCharacterArchive(
+            listOf(future, aiConfig, character("c-other", "林澄"), relation),
+            future,
+            targetChapterNumber = 13,
+        )
+        val revealed = pcExactCharacterArchive(
+            listOf(future, aiConfig, character("c-other", "林澄"), relation),
+            future,
+            targetChapterNumber = 14,
+        )
+
+        assertTrue("withheld_until_chapter" in withheld)
+        assertTrue("\"reveal_chapter\":14" in withheld)
+        for (secret in listOf("小卖部", "私人记录", "右腿微跛", "未来受访者")) {
+            assertFalse(secret in withheld)
+            assertTrue(secret in revealed)
+        }
+    }
+
+    @Test
     fun `governance context mirrors PC open statuses and priority ordering`() {
         val fulfilled = buildJsonObject {
             put("_record_type", "foreshadowing")

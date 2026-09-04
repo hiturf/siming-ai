@@ -7,11 +7,13 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from ..architecture.uow import commit_session
-from ..core.exceptions import ValidationError
+from ..core.exceptions import ConflictError, NotFoundError, ValidationError
 from ..core.response import ApiResponse
+from ..database.models import Chapter
 from ..database.session import get_db
 from ..modules.story.application.chapters import ChapterWorkspace
 from ..modules.story.application.commands import StoryCommandContext
+from ..modules.story.domain.content_sync import ContentSyncIntent, ContentSyncTarget
 from ..modules.story.interfaces.chapter_dependencies import get_chapter_workspace
 from ..modules.story.interfaces.dependencies import get_story_command
 from ..schemas.chapter import (
@@ -20,6 +22,7 @@ from ..schemas.chapter import (
     ChapterDeAiPreviewRequest,
     ChapterQualityScoreRequest,
     ChapterReorderRequest,
+    ChapterSummaryUpdate,
     ChapterUpdate,
 )
 from ..services.cataloging.launcher import (
@@ -29,6 +32,7 @@ from ..services.cataloging.launcher import (
 )
 from ..services.chapter_quality import preview_chapter_quality
 from ..services.chapter_revision import preview_de_ai_revision
+from ..services.chapter_summary_service import upsert_chapter_summary_record
 from ..services.workspace.generated_drafts import (
     chapter_draft_result_data,
     discard_chapter_draft,
@@ -62,6 +66,10 @@ def _bind_draft_manifest(values: dict, draft) -> None:
 def _save_message(data: dict) -> str:
     launch = data.get("cataloging_job")
     if isinstance(launch, dict):
+        if launch.get("idempotent_reuse"):
+            if launch.get("next_action") == "already_cataloged":
+                return "章节已保存，当前版本已完成建档"
+            return "章节已保存，当前版本正在建档"
         if launch.get("started"):
             return "章节已保存并启动建档"
         return "章节已保存，但建档启动失败"
@@ -199,6 +207,61 @@ def get_chapter_detail(
     return ApiResponse.success(data=workspace.detail(project_id, chapter_id))
 
 
+@router.put("/projects/{project_id}/chapters/{chapter_id}/summary")
+def update_chapter_summary(
+    project_id: str,
+    chapter_id: str,
+    payload: ChapterSummaryUpdate,
+    command: Annotated[StoryCommandContext, Depends(get_story_command)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """Correct catalog metadata without creating a new body version or re-cataloging."""
+
+    chapter = (
+        db.query(Chapter)
+        .filter(Chapter.project_id == project_id, Chapter.id == chapter_id)
+        .first()
+    )
+    if chapter is None:
+        raise NotFoundError("章节不存在")
+    current_version = int(chapter.current_version or 1)
+    if payload.expected_version != current_version:
+        raise ConflictError(
+            f"章节已从 v{payload.expected_version} 更新为 v{current_version}；"
+            "请重新核对正文后再修正摘要"
+        )
+    try:
+        summary, _old = upsert_chapter_summary_record(
+            db,
+            chapter,
+            summary_text=payload.summary_text,
+            key_events=payload.key_events,
+            source="author",
+        )
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+    command.queue(
+        ContentSyncIntent(
+            project_id=project_id,
+            target=ContentSyncTarget.CHAPTER,
+            entity_id=chapter_id,
+            source="author_summary_update",
+        )
+    )
+    command.finish()
+    return ApiResponse.success(
+        data={
+            "id": summary.id,
+            "chapter_id": chapter_id,
+            "chapter_version": current_version,
+            "summary_text": summary.summary_text,
+            "key_events": payload.key_events,
+            "source": summary.ai_model,
+        },
+        message="章节摘要已按作者复核更新",
+    )
+
+
 @router.put("/projects/{project_id}/chapters/{chapter_id}")
 async def save_chapter(
     project_id: str,
@@ -271,11 +334,17 @@ async def start_chapter_cataloging(
     )
     if not data.get("cataloging_job"):
         raise ValidationError("章节正文为空，无法启动建档")
-    if not data["cataloging_job"].get("started"):
+    launch = data["cataloging_job"]
+    if not launch.get("started") and not launch.get("idempotent_reuse"):
         raise ValidationError(
-            str(data["cataloging_job"].get("error") or "章节建档启动失败")
+            str(launch.get("error") or "章节建档启动失败")
         )
-    return ApiResponse.success(data=data, message="章节建档已启动")
+    message = (
+        "当前章节版本已完成建档，已复用现有结果"
+        if launch.get("next_action") == "already_cataloged"
+        else "章节建档已启动或正在运行"
+    )
+    return ApiResponse.success(data=data, message=message)
 
 
 @router.post("/projects/{project_id}/chapters/{chapter_id}/de-ai-preview")

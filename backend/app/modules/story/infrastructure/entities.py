@@ -15,6 +15,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 
@@ -300,6 +301,15 @@ class CharacterRelationship(Base):
     relationship_type = Column(String(100), nullable=False)  # master/apprentice/enemy/lover/etc.
     description = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "character_a_id",
+            "character_b_id",
+            name="uq_character_relationships_directed_pair",
+        ),
+    )
 
 
 class OutlineNode(Base):

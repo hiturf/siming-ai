@@ -36,11 +36,29 @@ internal class MobileOutlineDraftStore(
             directory.mkdirs()
             val now = Instant.now().toString()
             val normalized = run.copy(
+                nodes = if (run.state == MobileOutlineDraftState.PENDING) {
+                    validatePendingNodes(run.nodes)
+                    JsonArray(run.nodes.map { element ->
+                        val node = element as JsonObject
+                        JsonObject(node.toMutableMap().apply {
+                            put("status", JsonPrimitive("pending"))
+                            put("planned_summary", JsonPrimitive(node.string("summary").trim()))
+                            put("actual_summary", JsonPrimitive(""))
+                            remove("source_chapter_id")
+                            remove("cataloging_status")
+                        })
+                    })
+                } else run.nodes,
                 createdAt = run.createdAt.ifBlank { now },
                 updatedAt = now,
             )
             if (normalized.state == MobileOutlineDraftState.PENDING) {
-                validatePendingNodes(normalized.nodes)
+                if (readLocked(file(normalized.id)) == null) {
+                    val count = normalized.manifest.request.batchCount
+                    require(normalized.nodes.size == count) {
+                        "本次规划要求 $count 个节点，实际提交 ${normalized.nodes.size} 个；请完整提交，不能缩减批次"
+                    }
+                }
                 val conflicting = directory
                     .listFiles { item -> item.isFile && item.extension == "json" }
                     .orEmpty()

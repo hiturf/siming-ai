@@ -32,6 +32,110 @@ import okhttp3.mockwebserver.RecordedRequest
 
 class MobileCreationConversationAgentTest {
     @Test
+    fun `standalone entity refinement replaces only the selected second entity`() {
+        exerciseEntityRefinement(valid = true)
+    }
+
+    @Test
+    fun `standalone entity refinement cannot use the old baseline as a generated result`() {
+        exerciseEntityRefinement(valid = false)
+    }
+
+    private fun exerciseEntityRefinement(valid: Boolean) {
+        val calls = AtomicInteger()
+        val first = buildJsonObject {
+            put("title", "不应变动的条目")
+            put("dimension", "culture")
+            put("content", "保持这条原始内容")
+        }
+        val second = buildJsonObject {
+            put("title", "待修订条目")
+            put("dimension", "culture")
+            put("content", "原始第二条")
+        }
+        val replacement = JsonObject(second.toMutableMap().apply { put("content", JsonPrimitive("经过核验的新内容")) })
+        val world = buildJsonObject {
+            put("writing_style", "克制")
+            put("world_tone", "现实")
+            put("story_structure", "线性")
+            put("pacing", "稳健")
+            put("style_rules", "保持限知")
+            put("forbidden_patterns", "不使用巧合")
+            put("worldbuilding", JsonArray(listOf(first, second)))
+        }
+        val initial = session()
+        val source = JsonObject(initial.toMutableMap().apply {
+            put("draft", JsonObject(initial["draft"]!!.jsonObject.toMutableMap().apply {
+                put("stages", buildJsonObject {
+                    put("world_style", buildJsonObject { put("status", "generated"); put("data", world) })
+                })
+            }))
+        })
+        fun response(message: JsonObject, streaming: Boolean): MockResponse {
+            val body = buildJsonObject {
+                put("choices", JsonArray(listOf(buildJsonObject { put("message", message) })))
+                put("usage", buildJsonObject { put("prompt_tokens", 100); put("completion_tokens", 50) })
+            }.toString()
+            return if (streaming) chatStreamResponse(body) else
+                MockResponse().setHeader("Content-Type", "application/json").setBody(body)
+        }
+        fun toolMessage(name: String, arguments: JsonObject) = buildJsonObject {
+            put("role", "assistant")
+            put("tool_calls", JsonArray(listOf(buildJsonObject {
+                put("id", "call-" + name)
+                put("type", "function")
+                put("function", buildJsonObject { put("name", name); put("arguments", arguments.toString()) })
+            })))
+        }
+        withServer(object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+                val index = calls.getAndIncrement()
+                val message = when (index) {
+                    0 -> toolMessage("set_tool_categories", buildJsonObject {
+                        put("enabled_categories", JsonArray(listOf(JsonPrimitive("creation_flow"))))
+                    })
+                    1 -> toolMessage("refine_creation_artifact", buildJsonObject {
+                        put("artifact", "world_style")
+                        put("entity_id", "world_style:worldbuilding:1")
+                        put("instruction", "修订所选实体")
+                        put("expected_revision", 1)
+                    })
+                    2, 3 -> if (index == 2 || !valid) {
+                        if (index == 2) {
+                            val prompt = body.getValue("messages").jsonArray.last().jsonObject.string("content")
+                            assertTrue(prompt.contains("world_style:worldbuilding:1"))
+                            assertFalse(prompt.contains("保持这条原始内容"))
+                        }
+                        buildJsonObject {
+                            put("role", "assistant")
+                            put("content", buildJsonObject {
+                                put("data", if (valid) buildJsonObject {
+                                    put("worldbuilding", JsonArray(listOf(replacement)))
+                                } else buildJsonObject {
+                                    put("world_style", buildJsonObject { put("worldbuilding", JsonArray(listOf(replacement))) })
+                                })
+                            }.toString())
+                        }
+                    } else buildJsonObject { put("role", "assistant"); put("content", "已完成本轮") }
+                    else -> buildJsonObject { put("role", "assistant"); put("content", "模型格式无效，原资料未修改") }
+                }
+                return response(message, body["stream"]?.jsonPrimitive?.content == "true")
+            }
+        }) { server ->
+            val outcome = runBlocking { agent().run(source, "修订所选实体", config(server)) }
+            val rows = outcome.session["draft"]!!.jsonObject["stages"]!!.jsonObject["world_style"]!!
+                .jsonObject["data"]!!.jsonObject["worldbuilding"]!!.jsonArray
+            assertEquals(first, rows[0])
+            assertEquals(if (valid) replacement else second, rows[1])
+            assertEquals(if (valid) 4 else 5, calls.get())
+            val receipt = outcome.toolResults.map { it.jsonObject }.first { it.string("tool") == "refine_creation_artifact" }
+            assertEquals(if (valid) "ok" else "error", receipt.string("status"))
+            assertEquals(if (valid) 2 else 1, outcome.session["revision"]!!.jsonPrimitive.content.toInt())
+        }
+    }
+
+    @Test
     fun `standalone agent selects categories before reading and preserves complete rounds`() {
         val requests = AtomicInteger()
         withServer(object : Dispatcher() {

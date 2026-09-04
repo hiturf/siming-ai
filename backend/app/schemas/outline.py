@@ -3,6 +3,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from app.modules.story.domain.outline_contract import OUTLINE_PROPOSAL_MAX_NODES
 
 OutlineNodeType = Literal["volume", "chapter", "section"]
 OutlineStatus = Literal["pending", "in_progress", "completed"]
@@ -22,6 +23,8 @@ class OutlineNodeCreate(BaseModel):
     node_type: OutlineNodeType = Field(..., description="volume/chapter/section")
     title: str = Field(..., min_length=1, max_length=200)
     summary: Optional[str] = None
+    actual_summary: Optional[str] = None
+    planned_summary: Optional[str] = None
     status: OutlineStatus = "pending"
     sort_order: int = Field(0, ge=0)
     character_ids: list[str] = Field(default_factory=list)
@@ -36,6 +39,8 @@ class OutlineNodeUpdate(BaseModel):
     node_type: Optional[OutlineNodeType] = None
     title: Optional[str] = Field(None, min_length=1, max_length=200)
     summary: Optional[str] = None
+    actual_summary: Optional[str] = None
+    planned_summary: Optional[str] = None
     status: Optional[OutlineStatus] = None
     sort_order: Optional[int] = Field(None, ge=0)
     character_ids: Optional[list[str]] = None
@@ -80,7 +85,9 @@ class OutlineDraftNode(BaseModel):
 class OutlineDraftUpdate(BaseModel):
     """Author edits to a pending outline proposal."""
 
-    nodes: list[OutlineDraftNode] = Field(..., min_length=1, max_length=8)
+    nodes: list[OutlineDraftNode] = Field(
+        ..., min_length=1, max_length=OUTLINE_PROPOSAL_MAX_NODES
+    )
     design_notes: str = Field("", max_length=20_000)
 
 

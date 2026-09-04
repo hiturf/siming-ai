@@ -14,22 +14,39 @@ from ...database.models import (
     OutlineNodeCharacter,
     WorldbuildingEntry,
 )
+from ...modules.continuity.domain.cataloging_contract import (
+    CHAPTER_CHARACTER_APPEARANCE_TYPES,
+)
 from .lookups import find_character_by_name_or_id
 
 
-def link_chapter_character(db: Session, chapter: Chapter, character: Character, description: str) -> None:
+def link_chapter_character(
+    db: Session,
+    chapter: Chapter,
+    character: Character,
+    *,
+    appearance_type: str,
+    description: str,
+) -> None:
+    normalized_type = str(appearance_type or "").strip()
+    if normalized_type not in CHAPTER_CHARACTER_APPEARANCE_TYPES:
+        raise ValueError(
+            "章节人物关联 appearance_type 必须是："
+            + "、".join(sorted(CHAPTER_CHARACTER_APPEARANCE_TYPES))
+        )
     existing = db.query(ChapterCharacter).filter(
         ChapterCharacter.chapter_id == chapter.id,
         ChapterCharacter.character_id == character.id,
     ).first()
     if existing:
+        existing.appearance_type = normalized_type
         if description:
             existing.description = description[:2000]
         return
     db.add(ChapterCharacter(
         chapter_id=chapter.id,
         character_id=character.id,
-        appearance_type="出场",
+        appearance_type=normalized_type,
         description=description[:2000],
     ))
 

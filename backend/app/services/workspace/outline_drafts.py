@@ -11,6 +11,7 @@ from uuid import uuid4
 from sqlalchemy.exc import IntegrityError
 
 from app.architecture.uow import commit_session
+from app.modules.story.domain.outline_contract import OUTLINE_PROPOSAL_MAX_NODES
 
 
 class PendingOutlineDraftConflict(RuntimeError):
@@ -179,8 +180,12 @@ def _validated_nodes(
     from ...core.exceptions import ValidationError
     from ...database.models import OutlineNode
 
-    if len(nodes) > 8:
-        raise ValidationError("单次大纲草稿最多包含 8 个节点")
+    if not isinstance(nodes, list):
+        raise ValidationError("大纲草稿 nodes 必须是原生数组，不能编码成 JSON 字符串")
+    if len(nodes) > OUTLINE_PROPOSAL_MAX_NODES:
+        raise ValidationError(
+            f"单次大纲草稿最多包含 {OUTLINE_PROPOSAL_MAX_NODES} 个节点"
+        )
     if any(not isinstance(node, dict) for node in nodes):
         raise ValidationError("大纲草稿节点格式无效")
     values = [dict(node) for node in nodes]
@@ -202,6 +207,11 @@ def _validated_nodes(
         node["title"] = title
         node["node_type"] = node_type
         node["status"] = "pending"
+        node["summary"] = str(node.get("summary") or "").strip()
+        node["planned_summary"] = node["summary"]
+        node["actual_summary"] = ""
+        node.pop("source_chapter_id", None)
+        node.pop("cataloging_status", None)
         by_title[title] = node
 
     formal_parent = (
@@ -233,11 +243,22 @@ def _validated_nodes(
         parent_title = str(node.get("parent_title") or "").strip()
         if parent_title:
             draft_parent = by_title.get(parent_title)
-            if draft_parent is None:
+            if draft_parent is None and formal_parent is not None and parent_title in {
+                str(formal_parent.id),
+                str(formal_parent.title),
+            }:
+                # Models naturally repeat the already selected formal parent
+                # on every top-level proposal node. Treat that redundant value
+                # as the explicit parent_id instead of rejecting a valid batch.
+                parent_type = str(formal_parent.node_type)
+                node.pop("parent_title", None)
+                parent_title = ""
+            elif draft_parent is None:
                 raise ValidationError(f"大纲草稿引用了不存在的父标题：{parent_title}")
-            visit(parent_title)
-            parent_type: str | None = str(draft_parent.get("node_type") or "")
-            node["parent_title"] = parent_title
+            else:
+                visit(parent_title)
+                parent_type = str(draft_parent.get("node_type") or "")
+                node["parent_title"] = parent_title
         else:
             parent_type = str(formal_parent.node_type) if formal_parent is not None else None
             node.pop("parent_title", None)
@@ -277,6 +298,46 @@ def _validated_nodes(
     return ordered
 
 
+def outline_proposal_batch_count(manifest: Any) -> int:
+    """Use the model-selected structured request, never infer count from prose."""
+    from ...core.exceptions import ValidationError
+
+    if manifest is None or manifest.task_type != "outline_planning":
+        raise ValidationError("大纲规划上下文不存在或类型不正确，请重新规划")
+    query = manifest.query_json if isinstance(manifest.query_json, dict) else {}
+    arguments = query.get("arguments") if isinstance(query.get("arguments"), dict) else {}
+    count = arguments.get("batch_count", 1)
+    if (
+        type(count) is not int
+        or not 1 <= count <= OUTLINE_PROPOSAL_MAX_NODES
+    ):
+        raise ValidationError(
+            "大纲规划 batch_count 必须为 1 至 "
+            f"{OUTLINE_PROPOSAL_MAX_NODES} 的整数，请重新规划"
+        )
+    return count
+
+
+def validate_generated_outline_proposal(
+    db: Any,
+    *,
+    project_id: str,
+    manifest: Any,
+    parent_id: str | None,
+    insert_after_id: str | None,
+    nodes: Any,
+) -> tuple[str | None, list[dict[str, Any]]]:
+    from ...core.exceptions import ValidationError
+
+    count = outline_proposal_batch_count(manifest)
+    if not isinstance(nodes, list):
+        raise ValidationError("大纲草稿 nodes 必须是原生数组，不能编码成 JSON 字符串")
+    if len(nodes) != count:
+        raise ValidationError(f"本次规划要求 {count} 个节点，实际提交 {len(nodes)} 个；请完整提交，不能缩减批次")
+    resolved_parent_id, _ = _resolve_position(db, project_id, parent_id, insert_after_id)
+    return resolved_parent_id, _validated_nodes(db, project_id, resolved_parent_id, nodes)
+
+
 def store_outline_draft(
     db: Any,
     *,
@@ -289,14 +350,15 @@ def store_outline_draft(
     context_selection_token: str,
 ) -> Any:
     """Persist a proposal without replacing an author-visible pending draft."""
-    from ...database.models import OutlineDraft
+    from ...database.models import ContextManifest, OutlineDraft
 
     commit_session(db)
     _project_lock(db, project_id)
-    resolved_parent_id, _ = _resolve_position(
-        db, project_id, parent_id, insert_after_id
+    manifest = db.query(ContextManifest).filter_by(id=context_manifest_id, project_id=project_id).first()
+    resolved_parent_id, validated_nodes = validate_generated_outline_proposal(
+        db, project_id=project_id, manifest=manifest, parent_id=parent_id,
+        insert_after_id=insert_after_id, nodes=nodes,
     )
-    validated_nodes = _validated_nodes(db, project_id, resolved_parent_id, nodes)
     pending = latest_pending_outline_draft(db, project_id)
     if pending:
         db.rollback()
@@ -398,6 +460,7 @@ async def confirm_outline_draft(db: Any, project_id: str, draft_id: str) -> dict
     from ...core.exceptions import ValidationError
     from ...database.models import OutlineNode
     from .tools.outline import create_outline_nodes
+    from .utils import find_character_by_name_or_id
 
     _project_lock(db, project_id)
     row = find_outline_draft(db, project_id, draft_id)
@@ -454,6 +517,33 @@ async def confirm_outline_draft(db: Any, project_id: str, draft_id: str) -> dict
     prepared: list[dict[str, Any]] = []
     for node in nodes:
         item = dict(node)
+        planned_names = item.get("character_names", [])
+        if not isinstance(planned_names, list):
+            raise ValidationError("大纲草稿的关联角色必须是名称或 ID 列表")
+        linked_names: list[str] = []
+        all_planned_names: list[str] = []
+        unlinked_planned_names: list[str] = []
+        for value in planned_names:
+            submitted_name = str(value or "").strip()
+            if not submitted_name:
+                raise ValidationError("大纲草稿的关联角色名称不能为空")
+            character = find_character_by_name_or_id(db, project_id, submitted_name)
+            canonical_name = str(character.name) if character is not None else submitted_name
+            if canonical_name not in all_planned_names:
+                all_planned_names.append(canonical_name)
+            if character is not None:
+                if canonical_name not in linked_names:
+                    linked_names.append(canonical_name)
+            elif submitted_name not in unlinked_planned_names:
+                unlinked_planned_names.append(submitted_name)
+        metadata = dict(item.get("metadata")) if isinstance(item.get("metadata"), dict) else {}
+        metadata["planned_character_names"] = all_planned_names
+        metadata["unlinked_planned_character_names"] = unlinked_planned_names
+        item["metadata"] = metadata
+        # A reviewed future outline may name people who have not entered the
+        # story yet. Link only existing records; keep the remaining names in
+        # metadata so confirmation never creates speculative character files.
+        item["character_names"] = linked_names
         if not str(item.get("parent_title") or "").strip():
             item["parent_id"] = parent_id
             item["sort_order"] = next_sort

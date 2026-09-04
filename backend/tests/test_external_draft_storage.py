@@ -148,8 +148,13 @@ class SaveExternalDraftTest(unittest.TestCase):
         "app.services.workspace.tools.external_writing._external_draft_manifest_error",
         return_value=None,
     )
+    @patch(
+        "app.services.workspace.tools.external_writing._external_draft_length_error",
+        return_value=None,
+    )
     def test_saves_reviewable_revision_for_explicit_matching_target(
         self,
+        _mock_length,
         _mock_manifest,
         mock_store,
         _mock_pending,
@@ -167,7 +172,10 @@ class SaveExternalDraftTest(unittest.TestCase):
         chapter_query = MagicMock()
         chapter_query.filter.return_value = chapter_query
         chapter_query.first.return_value = chapter
-        db.query.side_effect = [outline_query, chapter_query]
+        manifest_query = MagicMock()
+        manifest_query.filter.return_value = manifest_query
+        manifest_query.first.return_value = None
+        db.query.side_effect = [outline_query, chapter_query, manifest_query]
 
         result = asyncio.run(save_external_chapter_draft(db, "p1", {
             "content": "Review this revision without overwriting prose.",

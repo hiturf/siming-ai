@@ -15,6 +15,7 @@ from ....database.models import (
     OutlineNode,
     WorldbuildingEntry,
 )
+from ....database.query_filters import current_worldbuilding_clause
 from ....services.hot_cache import get_json, project_cache_key, set_json
 
 _CHARACTER_RANGE_FIELDS = frozenset(
@@ -335,6 +336,33 @@ async def search_outline(
     linked_cursor = max(0, int(args.get("linked_cursor") or 0))
     linked_limit = max(1, min(int(args.get("linked_limit") or 2), 2))
 
+    def page_payload(returned_items: int, total_items: int, next_cursor: int | None) -> dict:
+        return {
+            "cursor": cursor,
+            "limit": limit,
+            "returned_items": returned_items,
+            "total_items": total_items,
+            "next_cursor": next_cursor,
+            "has_more": next_cursor is not None,
+        }
+
+    def next_arguments(next_cursor: int | None) -> dict[str, Any] | None:
+        if next_cursor is None:
+            return None
+        result: dict[str, Any] = {
+            "cursor": next_cursor,
+            "limit": limit,
+            "summary_offset_chars": summary_offset,
+            "summary_chars": summary_chars,
+            "linked_cursor": linked_cursor,
+            "linked_limit": linked_limit,
+        }
+        if node_id:
+            result["node_id"] = node_id
+        elif query:
+            result["query"] = query
+        return result
+
     if node_id:
         node = (
             db.query(OutlineNode)
@@ -348,10 +376,13 @@ async def search_outline(
                 "detail": f"未找到大纲节点 {node_id}",
                 "data": [],
             }
+        children_query = db.query(OutlineNode).filter(
+            OutlineNode.project_id == project_id,
+            OutlineNode.parent_id == node.id,
+        )
+        total_items = children_query.count()
         children = (
-            db.query(OutlineNode)
-            .filter(OutlineNode.project_id == project_id, OutlineNode.parent_id == node.id)
-            .order_by(OutlineNode.sort_order)
+            children_query.order_by(OutlineNode.sort_order, OutlineNode.id)
             .offset(cursor)
             .limit(limit + 1)
             .all()
@@ -367,28 +398,44 @@ async def search_outline(
                 children=children,
             )
         ]
-        return {
+        detail = (
+            f"大纲节点 {node.title}：子节点共 {total_items} 个，"
+            f"本页返回 {len(children)} 个"
+        )
+        if next_cursor is not None:
+            detail += f"；尚有未返回子节点，请用 next_cursor={next_cursor} 继续"
+        result = {
             "tool": "search_outline",
             "status": "ok",
-            "detail": f"大纲节点 {node.title}，{len(children)} 个子节点",
+            "detail": detail,
             "data": results,
-            "page": {
-                "cursor": cursor,
-                "next_cursor": next_cursor,
-                "has_more": next_cursor is not None,
-            },
+            "page": page_payload(len(children), total_items, next_cursor),
         }
+        continuation = next_arguments(next_cursor)
+        if continuation is not None:
+            result["next_arguments"] = continuation
+        return result
 
     base = db.query(OutlineNode).filter(OutlineNode.project_id == project_id)
     if query:
         base = base.filter(OutlineNode.title.ilike(f"%{query}%"))
+    total_items = base.count()
     node_page = (
         base.order_by(OutlineNode.sort_order, OutlineNode.id).offset(cursor).limit(limit + 1).all()
     )
     nodes, next_cursor = _page(node_page, cursor=cursor, limit=limit)
     if not nodes:
-        detail = f"未找到匹配「{query}」的大纲节点" if query else "该项目暂无大纲"
-        return {"tool": "search_outline", "status": "ok", "detail": detail, "data": []}
+        if total_items == 0:
+            detail = f"未找到匹配「{query}」的大纲节点" if query else "该项目暂无大纲"
+        else:
+            detail = f"匹配大纲节点共 {total_items} 个，cursor={cursor} 后本页无数据"
+        return {
+            "tool": "search_outline",
+            "status": "ok",
+            "detail": detail,
+            "data": [],
+            "page": page_payload(0, total_items, None),
+        }
 
     results = [
         _outline_search_item(
@@ -400,13 +447,22 @@ async def search_outline(
         )
         for node in nodes
     ]
-    return {
+    detail = f"匹配大纲节点共 {total_items} 个，本页返回 {len(results)} 个"
+    if query:
+        detail += f"（搜索「{query}」）"
+    if next_cursor is not None:
+        detail += f"；尚有未返回节点，请用 next_cursor={next_cursor} 继续"
+    result = {
         "tool": "search_outline",
         "status": "ok",
-        "detail": f"找到 {len(results)} 个大纲节点" + (f"（搜索「{query}」）" if query else ""),
+        "detail": detail,
         "data": results,
-        "page": {"cursor": cursor, "next_cursor": next_cursor, "has_more": next_cursor is not None},
+        "page": page_payload(len(results), total_items, next_cursor),
     }
+    continuation = next_arguments(next_cursor)
+    if continuation is not None:
+        result["next_arguments"] = continuation
+    return result
 
 
 async def search_worldbuilding(
@@ -428,7 +484,10 @@ async def search_worldbuilding(
     cursor = max(0, int(args.get("cursor") or 0))
     content_offset = max(0, int(args.get("content_offset_chars") or 0))
     content_chars = max(1, min(int(args.get("content_chars") or 400), 400))
-    base = db.query(WorldbuildingEntry).filter(WorldbuildingEntry.project_id == project_id)
+    base = db.query(WorldbuildingEntry).filter(
+        WorldbuildingEntry.project_id == project_id,
+        current_worldbuilding_clause(WorldbuildingEntry.status),
+    )
     if query:
         base = base.filter(WorldbuildingEntry.title.ilike(f"%{query}%"))
     if dimension:
@@ -646,7 +705,10 @@ async def list_worldbuilding(
         return cached
     entries = (
         db.query(WorldbuildingEntry)
-        .filter(WorldbuildingEntry.project_id == project_id)
+        .filter(
+            WorldbuildingEntry.project_id == project_id,
+            current_worldbuilding_clause(WorldbuildingEntry.status),
+        )
         .order_by(
             WorldbuildingEntry.dimension, WorldbuildingEntry.sort_order, WorldbuildingEntry.id
         )

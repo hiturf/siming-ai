@@ -3,6 +3,7 @@ import asyncio
 import json
 import unittest
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sqlalchemy import create_engine
@@ -26,6 +27,8 @@ from app.database.models import (
     NovelCreationSession,
     OutlineNode,
     Project,
+    RagChunk,
+    WorldbuildingEntry,
 )
 from app.services.context_orchestrator import TASK_CONTEXT_CONTRACTS, ContextOrchestrator
 from app.services.conversation_context.assembly import resolve_generation_model_binding
@@ -209,6 +212,210 @@ class ContextOrchestratorTestCase(unittest.TestCase):
         )
         self.assertTrue(selected["selection_ready"])
         self.assertEqual(selected["accepted_count"], 25)
+
+    def test_superseded_worldbuilding_cannot_be_pinned_from_a_lingering_rag_chunk(self):
+        active = WorldbuildingEntry(
+            id="world-active",
+            project_id="p1",
+            dimension="history",
+            title="Current record",
+            content="The current verified record.",
+            status="active",
+        )
+        superseded = WorldbuildingEntry(
+            id="world-superseded",
+            project_id="p1",
+            dimension="history",
+            title="Old wrong record",
+            content="A withdrawn and incorrect account.",
+            status="superseded",
+        )
+        self.db.add_all([
+            active,
+            superseded,
+            RagChunk(
+                id="chunk-active",
+                document_id="document-active",
+                project_id="p1",
+                source_type="worldbuilding",
+                source_id=active.id,
+                title=active.title,
+                content=active.content,
+            ),
+            RagChunk(
+                id="chunk-superseded",
+                document_id="document-superseded",
+                project_id="p1",
+                source_type="worldbuilding",
+                source_id=superseded.id,
+                title=superseded.title,
+                content=superseded.content,
+            ),
+        ])
+        self.db.commit()
+
+        manifest = self.service.prepare(
+            project_id="p1",
+            task_type="writing",
+            model="openai:test",
+            arguments={"outline_node_id": "o1"},
+            pinned_source_ids=[active.id, superseded.id],
+        )
+
+        pinned = [item for item in manifest.items if item.category == "pinned"]
+        self.assertEqual([item.source_id for item in pinned], [active.id])
+        self.assertNotIn(superseded.content, manifest.rendered_context)
+        self.assertEqual(manifest.coverage_json["pinned"]["item_count"], 1)
+
+    def test_semantic_search_hides_superseded_worldbuilding_lingering_chunks(self):
+        active = WorldbuildingEntry(
+            id="world-active",
+            project_id="p1",
+            dimension="history",
+            title="Current record",
+            content="The current verified record.",
+            status="active",
+        )
+        superseded = WorldbuildingEntry(
+            id="world-superseded",
+            project_id="p1",
+            dimension="history",
+            title="Old wrong record",
+            content="A withdrawn and incorrect account.",
+            status="superseded",
+        )
+        self.db.add_all([
+            active,
+            superseded,
+            RagChunk(
+                id="chunk-active",
+                document_id="document-active",
+                project_id="p1",
+                source_type="worldbuilding",
+                source_id=active.id,
+                title=active.title,
+                content=active.content,
+            ),
+            RagChunk(
+                id="chunk-superseded",
+                document_id="document-superseded",
+                project_id="p1",
+                source_type="worldbuilding",
+                source_id=superseded.id,
+                title=superseded.title,
+                content=superseded.content,
+            ),
+        ])
+        self.db.commit()
+
+        with (
+            patch(
+                "app.services.context_orchestrator.search_chunks",
+                return_value=[],
+            ),
+            patch.object(
+                self.service,
+                "_semantic_scores",
+                return_value={"chunk-active": 0.5, "chunk-superseded": 1.0},
+            ),
+        ):
+            results = self.service._hybrid_candidates("p1", "record", {})
+
+        self.assertEqual([item.source_id for item in results], [active.id])
+
+    def test_task_search_returns_each_authoritative_source_only_once(self):
+        manifest = self.service.prepare(
+            project_id="p1",
+            task_type="writing",
+            model="openai:test",
+            arguments={"outline_node_id": "o1"},
+        )
+
+        def candidate(source_id: str, chunk_id: str, score: float):
+            return SimpleNamespace(
+                source_type="character",
+                source_id=source_id,
+                chunk_id=chunk_id,
+                source_hash=f"hash-{source_id}",
+                title=f"角色 {source_id}",
+                content=f"角色 {source_id} 的候选片段 {chunk_id}",
+                lexical_score=score,
+                semantic_score=None,
+                recency_score=None,
+                structural_score=None,
+                final_score=score,
+            )
+
+        with patch.object(
+            self.service,
+            "_hybrid_candidates",
+            return_value=[
+                candidate("chen", "chen-1", 1.0),
+                candidate("chen", "chen-2", 0.9),
+                candidate("chen", "chen-3", 0.8),
+                candidate("zhou", "zhou-1", 0.7),
+            ],
+        ):
+            results = self.service.search_task_context(
+                manifest,
+                query="陈海生",
+                source_types=["character"],
+            )
+
+        self.assertEqual([item["source_id"] for item in results], ["chen", "zhou"])
+        self.assertEqual(results[0]["chunk_id"], "chen-1")
+
+    def test_task_search_preview_hydrates_current_worldbuilding_not_stale_rag_text(self):
+        entry = WorldbuildingEntry(
+            id="world-current",
+            project_id="p1",
+            dimension="culture",
+            title="通信签收表",
+            content="当前权威内容：呼叫栏18:50；旧结论已经撤回。",
+            status="active",
+        )
+        self.db.add(entry)
+        self.db.commit()
+        manifest = self.service.prepare(
+            project_id="p1",
+            task_type="writing",
+            model="openai:test",
+            arguments={"outline_node_id": "o1"},
+        )
+        exact = TaskContextSourceResolver(self.db).exact_identity_source(
+            manifest,
+            "worldbuilding",
+            entry.id,
+        )
+        self.assertIsNotNone(exact)
+        stale = SimpleNamespace(
+            source_type="worldbuilding",
+            source_id=entry.id,
+            chunk_id="stale-world-chunk",
+            source_hash=exact.source_hash,
+            title="通信签收表（旧索引）",
+            content="旧索引错误：18:38值班员口头报时已经证实。",
+            lexical_score=1.0,
+            semantic_score=None,
+            recency_score=1.0,
+            structural_score=0.25,
+            final_score=0.9,
+        )
+
+        with patch.object(self.service, "_hybrid_candidates", return_value=[stale]):
+            results = self.service.search_task_context(
+                manifest,
+                query="签收",
+                source_types=["worldbuilding"],
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["title"], "通信签收表")
+        self.assertIn("呼叫栏18:50", results[0]["excerpt"])
+        self.assertNotIn("18:38值班员口头报时", results[0]["excerpt"])
+        stored = next(item for item in manifest.items if item.category == "agent_search")
+        self.assertIn("当前权威内容", stored.content_excerpt)
+        self.assertNotIn("旧索引错误", stored.content_excerpt)
 
     def test_selected_exact_source_is_not_cut_by_a_fixed_character_limit(self):
         marker = "正文末尾不可丢失标记"
@@ -1024,6 +1231,77 @@ class ContextOrchestratorTestCase(unittest.TestCase):
         self.assertEqual(result["accepted_count"], 0)
         self.assertIn("verified result", result["rejected"][0]["reason"])
 
+    def test_writing_selection_uses_only_documented_exact_reference_forms(self):
+        self.db.add(Character(
+            id="selector-witness",
+            project_id="p1",
+            name="Selector Witness",
+            personality="selector evidence",
+        ))
+        self.db.commit()
+
+        def searched_manifest():
+            manifest = self.service.prepare(
+                project_id="p1",
+                task_type="writing",
+                model="openai:test",
+                arguments={"outline_node_id": "o1"},
+            )
+            item = ContextManifestItem(
+                manifest_id=manifest.id,
+                project_id="p1",
+                category="agent_search",
+                source_type="character",
+                source_id="selector-witness",
+                chunk_id=f"selector-chunk-{manifest.id}",
+                source_hash="pending",
+                title="Selector Witness",
+                content_excerpt="Verified selector candidate",
+                sort_order=100,
+            )
+            exact = TaskContextSourceResolver(self.db).exact_source(manifest, item)
+            self.assertIsNotNone(exact)
+            item.source_hash = exact.source_hash
+            manifest.items.append(item)
+            self.db.flush()
+            return manifest, item
+
+        for selector in ("item_id", "chunk_id", "source"):
+            with self.subTest(selector=selector):
+                manifest, item = searched_manifest()
+                if selector == "item_id":
+                    reference = {"item_id": item.id}
+                elif selector == "chunk_id":
+                    reference = {"chunk_id": item.chunk_id}
+                else:
+                    reference = {
+                        "source_type": item.source_type,
+                        "source_id": item.source_id,
+                        "source_hash": item.source_hash,
+                    }
+                result = self.service.submit_evidence(manifest, [reference])
+                self.assertTrue(result["selection_ready"])
+                self.assertEqual(result["accepted_count"], 1)
+
+        manifest, item = searched_manifest()
+        mixed = self.service.submit_evidence(
+            manifest,
+            [{"item_id": item.id}, {"id": item.id}],
+        )
+        self.assertFalse(mixed["selection_ready"])
+        self.assertEqual(mixed["accepted_count"], 0)
+        self.assertNotIn("context_selection_token", mixed)
+        self.assertIn("must include", mixed["rejected"][0]["reason"])
+
+        manifest, item = searched_manifest()
+        conflicting = self.service.submit_evidence(
+            manifest,
+            [{"item_id": item.id, "source_id": "another-source"}],
+        )
+        self.assertFalse(conflicting["selection_ready"])
+        self.assertEqual(conflicting["accepted_count"], 0)
+        self.assertIn("verified result", conflicting["rejected"][0]["reason"])
+
     def test_rebuild_is_resumable_and_does_not_require_semantic_runtime(self):
         job = self.service.create_rebuild_job(requested_by="test")
         self.assertEqual(job.status, "queued")
@@ -1060,12 +1338,12 @@ class ContextOrchestratorTestCase(unittest.TestCase):
         first = asyncio.run(prepare_task_context(self.db, "p1", {
             "task_type": "cataloging",
             "run_id": run.id,
-            "arguments": {"chapter_id": first_chapter.id},
+            "chapter_id": first_chapter.id,
         }))
         second = asyncio.run(prepare_task_context(self.db, "p1", {
             "task_type": "cataloging",
             "run_id": run.id,
-            "arguments": {"chapter_id": second_chapter.id},
+            "chapter_id": second_chapter.id,
         }))
 
         first_id = first["data"]["manifest_id"]
@@ -1091,7 +1369,7 @@ class ContextOrchestratorTestCase(unittest.TestCase):
         prepared = asyncio.run(prepare_task_context(self.db, "p1", {
             "task_type": "writing",
             "run_id": run.id,
-            "arguments": {"outline_node_id": "o1"},
+            "outline_node_id": "o1",
         }))
         manifest_id = prepared["data"]["context_manifest_id"]
         self.assertEqual(run.context_manifest_id, manifest_id)
@@ -1103,6 +1381,22 @@ class ContextOrchestratorTestCase(unittest.TestCase):
         }))
         self.assertNotEqual(submitted["detail"], "Context manifest not found")
         self.assertEqual(submitted["data"]["manifest_id"], manifest_id)
+
+    def test_missing_writing_target_returns_actionable_receipt_without_phantom_manifest(self):
+        from app.services.workspace.tools.context_governance import prepare_task_context
+
+        before = self.db.query(ContextManifest).count()
+        result = asyncio.run(prepare_task_context(self.db, "p1", {
+            "task_type": "writing",
+        }))
+
+        self.assertEqual(result["status"], "needs_confirmation")
+        self.assertEqual(result["data"]["reason"], "missing_task_anchor")
+        self.assertEqual(result["data"]["required_arguments"], ["outline_node_id"])
+        self.assertEqual(result["data"]["next_tool"], "prepare_task_context")
+        self.assertNotIn("context_manifest_id", result["data"])
+        self.assertNotIn("manifest_id", result["data"])
+        self.assertEqual(self.db.query(ContextManifest).count(), before)
 
     def test_mcp_ready_manifest_is_committed_and_bound_to_run(self):
         from app.mcp.adapter import execute_tool
@@ -1119,7 +1413,7 @@ class ContextOrchestratorTestCase(unittest.TestCase):
                 "task_type": "writing",
                 "run_id": run.id,
                 "execution_route": "external_mcp",
-                "arguments": {"outline_node_id": "o1"},
+                "outline_node_id": "o1",
             },
             allowed_tiers={"readonly"},
         ))

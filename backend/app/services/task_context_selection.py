@@ -11,6 +11,10 @@ from sqlalchemy.orm import Session
 
 from ..database.models import ContextManifest, ContextManifestItem
 from .rag.context_packer import estimate_tokens
+from .task_context_delivery import (
+    context_delivery_ready,
+    set_context_delivery_state,
+)
 from .task_context_sources import (
     ExactTaskContextSource,
     TaskContextSourceResolver,
@@ -118,6 +122,7 @@ class TaskContextSelector:
         }
         manifest.coverage_json = coverage
         manifest.consumed_at = None
+        set_context_delivery_state(manifest, None)
         set_selection_state(
             manifest,
             {
@@ -143,10 +148,14 @@ class TaskContextSelector:
         manifest: ContextManifest,
         sources: Sequence[dict[str, Any]],
     ) -> tuple[list[tuple[ContextManifestItem, ExactTaskContextSource]], list[dict[str, Any]]]:
-        by_id = {item.id: item for item in manifest.items}
-        by_chunk = {item.chunk_id: item for item in manifest.items if item.chunk_id}
+        search_items = [item for item in manifest.items if item.category == "agent_search"]
+        by_id: dict[str, list[ContextManifestItem]] = {}
+        by_chunk: dict[str, list[ContextManifestItem]] = {}
         by_source: dict[tuple[str, str], list[ContextManifestItem]] = {}
-        for item in manifest.items:
+        for item in search_items:
+            by_id.setdefault(item.id, []).append(item)
+            if item.chunk_id:
+                by_chunk.setdefault(item.chunk_id, []).append(item)
             if item.source_id:
                 by_source.setdefault((item.source_type, item.source_id), []).append(item)
         chosen: list[tuple[ContextManifestItem, ExactTaskContextSource]] = []
@@ -156,25 +165,42 @@ class TaskContextSelector:
             if not isinstance(source, dict):
                 rejected.append({"source": source, "reason": "Evidence must be an object."})
                 continue
-            item_id = str(source.get("item_id") or source.get("id") or "").strip()
-            chunk_id = str(source.get("chunk_id") or "").strip()
-            source_type = str(source.get("source_type") or "").strip()
-            source_id = str(source.get("source_id") or "").strip()
-            source_hash = str(source.get("source_hash") or "").strip()
-            item = by_id.get(item_id) if item_id else None
-            if item is None and chunk_id:
-                item = by_chunk.get(chunk_id)
-            if item is None and source_type and source_id:
-                item = next(
-                    (
-                        candidate
-                        for candidate in by_source.get((source_type, source_id), [])
-                        if candidate.category == "agent_search"
-                        and (not source_hash or candidate.source_hash == source_hash)
-                    ),
-                    None,
+            def field(name: str, current_source: dict[str, Any] = source) -> str:
+                value = current_source.get(name)
+                return value.strip() if isinstance(value, str) else ""
+
+            item_id = field("item_id")
+            chunk_id = field("chunk_id")
+            source_type = field("source_type")
+            source_id = field("source_id")
+            source_hash = field("source_hash")
+            if not item_id and not chunk_id and not (source_type and source_id):
+                rejected.append(
+                    {
+                        "item_id": item_id or None,
+                        "source_id": source_id or None,
+                        "reason": (
+                            "Source must include item_id, chunk_id, or both "
+                            "source_type and source_id from search_task_context."
+                        ),
+                    }
                 )
-            if item is None or item.category != "agent_search":
+                continue
+
+            if item_id:
+                matches = list(by_id.get(item_id, []))
+            elif chunk_id:
+                matches = list(by_chunk.get(chunk_id, []))
+            else:
+                matches = list(by_source.get((source_type, source_id), []))
+            matches = [
+                item
+                for item in matches
+                if (not chunk_id or item.chunk_id == chunk_id)
+                and (not source_type or item.source_type == source_type)
+                and (not source_id or item.source_id == source_id)
+            ]
+            if not matches:
                 rejected.append(
                     {
                         "item_id": item_id or None,
@@ -183,15 +209,28 @@ class TaskContextSelector:
                     }
                 )
                 continue
-            if source_hash and item.source_hash and source_hash != item.source_hash:
+            if source_hash:
+                hash_matches = [item for item in matches if item.source_hash == source_hash]
+                if not hash_matches:
+                    rejected.append(
+                        {
+                            "item_id": matches[0].id,
+                            "source_id": matches[0].source_id,
+                            "reason": "Source hash does not match the verified search result.",
+                        }
+                    )
+                    continue
+                matches = hash_matches
+            if len(matches) != 1:
                 rejected.append(
                     {
-                        "item_id": item.id,
-                        "source_id": item.source_id,
-                        "reason": "Source hash does not match the verified search result.",
+                        "item_id": item_id or None,
+                        "source_id": source_id or None,
+                        "reason": "Source reference is ambiguous; submit its unique item_id.",
                     }
                 )
                 continue
+            item = matches[0]
             identity = (item.source_type, str(item.source_id or item.id))
             if identity in seen:
                 continue
@@ -389,6 +428,12 @@ class TaskContextSelector:
                 "context_selection_token is missing or stale; use the token returned by "
                 "submit_context_evidence.",
             )
+        if not context_delivery_ready(manifest, expected_token):
+            return (
+                False,
+                "Selected context pages have not been read completely in order; continue "
+                "with prepare_task_context and its exact next_arguments before generation.",
+            )
         if manifest.task_type != task_type:
             return False, "The context manifest task does not match the requested generator."
         if task_type == "writing":
@@ -439,6 +484,27 @@ class TaskContextSelector:
         retrieval_types = [value for value in effective if value != "narrative_governance"]
         if retrieval_types:
             candidates.extend(hybrid_search(retrieval_types))
+        # Selection expands a chosen result to the complete authoritative
+        # source, so several RAG chunks from the same entity are not distinct
+        # evidence choices.  Collapse them before pagination; otherwise one
+        # character or chapter can occupy most of a search page and hide other
+        # relevant entities.
+        unique_candidates: list[Any] = []
+        seen_sources: set[tuple[str, str]] = set()
+        for candidate in candidates:
+            source_type = str(getattr(candidate, "source_type", "") or "")
+            source_id = str(getattr(candidate, "source_id", "") or "")
+            identity = (
+                source_type,
+                source_id
+                or str(getattr(candidate, "chunk_id", "") or "")
+                or str(getattr(candidate, "source_hash", "") or ""),
+            )
+            if identity in seen_sources:
+                continue
+            seen_sources.add(identity)
+            unique_candidates.append(candidate)
+        candidates = unique_candidates
         page_size = max(1, min(limit, TASK_CONTEXT_SEARCH_PAGE_LIMIT))
         page_offset = max(0, min(offset, TASK_CONTEXT_SEARCH_MAX_CURSOR))
         fetch_size = page_size + int(include_next_probe)
@@ -451,6 +517,22 @@ class TaskContextSelector:
         next_order = max((item.sort_order for item in manifest.items), default=-1) + 1
         payload: list[dict[str, Any]] = []
         for candidate in candidates:
+            candidate_title = candidate.title
+            candidate_content = candidate.content
+            # RAG is a discovery index, never the authority shown to the Agent.
+            # A committed entity edit can race an index refresh; presenting the
+            # old chunk here would leak superseded character/world/chapter data
+            # into the model conversation even though evidence submission later
+            # expands the current record. Hydrate every mutable search hit from
+            # its authoritative source before persisting or returning a preview.
+            exact_preview = self.source_resolver.exact_identity_source(
+                manifest,
+                candidate.source_type,
+                candidate.source_id,
+            )
+            if exact_preview and exact_preview.source_hash == candidate.source_hash:
+                candidate_title = exact_preview.title
+                candidate_content = exact_preview.content
             key = (
                 candidate.source_type,
                 candidate.source_id,
@@ -467,8 +549,8 @@ class TaskContextSelector:
                     source_id=candidate.source_id,
                     chunk_id=getattr(candidate, "chunk_id", None),
                     source_hash=candidate.source_hash,
-                    title=candidate.title,
-                    content_excerpt=candidate.content,
+                    title=candidate_title,
+                    content_excerpt=candidate_content,
                     tier=4,
                     lexical_score=getattr(candidate, "lexical_score", None),
                     semantic_score=getattr(candidate, "semantic_score", None),
@@ -476,7 +558,7 @@ class TaskContextSelector:
                     structural_score=getattr(candidate, "structural_score", None),
                     final_score=float(getattr(candidate, "final_score", 0) or 0),
                     selection_reason="Verified Agent task-context search result.",
-                    estimated_tokens=estimate_tokens(candidate.content),
+                    estimated_tokens=estimate_tokens(candidate_content),
                     sort_order=next_order,
                 )
                 next_order += 1

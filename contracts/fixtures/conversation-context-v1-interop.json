@@ -48,7 +48,7 @@
       "search_worldbuilding": 16384,
       "prepare_task_context": 32768,
       "search_task_context": 32768,
-      "submit_context_evidence": 8192,
+      "submit_context_evidence": 24576,
       "update_project_info": 4096,
       "create_character": 4096,
       "update_character": 4096,

@@ -1688,7 +1688,7 @@ function WorkspaceAssistantChat({
           className="workspace-assistant-cli-permission"
           type="info"
           showIcon
-          message="本机 CLI 已连接本轮临时 Siming MCP"
+          message="本机 CLI 将使用本轮临时 Siming MCP"
           description={isOpenCodeCliModel
             ? '只开放当前作品范围的工具；本地路径仍需另行确认并只提供临时只读快照。'
             : '只开放当前作品范围的工具，启动参数已预先批准本轮 MCP；不会修改 CLI 的全局配置。'}

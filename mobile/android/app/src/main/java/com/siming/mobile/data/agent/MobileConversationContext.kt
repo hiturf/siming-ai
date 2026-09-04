@@ -846,7 +846,7 @@ internal object MobileNativeToolBudgetContract {
     private const val ARTIFACT_REFERENCE_RESULT_BYTES = 16 * 1024
     private const val STANDARD_RESULT_BYTES = 16 * 1024
     private const val LARGE_READ_RESULT_BYTES = 32 * 1024
-    private const val CONTEXT_SELECTION_RECEIPT_BYTES = 8 * 1024
+    private const val CONTEXT_SELECTION_RECEIPT_BYTES = 24 * 1024
 
     private val resultBytesByTool = mapOf(
         "set_tool_categories" to STATUS_ONLY_RESULT_BYTES,

@@ -30,6 +30,7 @@ from app.services.tool_category_state import (
     read_tool_category_events,
     read_tool_category_state,
     remove_tool_category_state,
+    replace_tool_categories,
 )
 from app.services.workspace.registry import registry
 
@@ -132,6 +133,39 @@ def test_process_scoped_mcp_activates_categories_at_next_step_boundary():
         names = _mcp_names(state_file)
         assert "patch_creation_session" in names
         assert "finalize_creation_session" not in names
+    finally:
+        remove_tool_category_state(state_file)
+
+
+def test_reselecting_active_categories_does_not_restart_the_model_step():
+    state_file = create_tool_category_state()
+    try:
+        replace_tool_categories(state_file, ["story_knowledge", "writing_context"])
+        activated = activate_tool_categories(state_file)
+        version = activated["version"]
+
+        repeated = json.loads(handle_message(
+            json.dumps({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": TOOL_CATEGORY_CONTROLLER,
+                    "arguments": {
+                        "enabled_categories": ["story_knowledge", "writing_context"]
+                    },
+                },
+            }),
+            permission_pack="creation_session",
+            tool_category_state_file=state_file,
+        ))
+
+        assert repeated["result"]["isError"] is True
+        assert "不要重复选择" in json.dumps(repeated, ensure_ascii=False)
+        state = read_tool_category_state(state_file)
+        assert state["version"] == version
+        assert state["active_version"] == version
+        assert state["active_categories"] == ["story_knowledge", "writing_context"]
     finally:
         remove_tool_category_state(state_file)
 

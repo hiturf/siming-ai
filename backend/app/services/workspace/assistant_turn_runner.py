@@ -420,7 +420,7 @@ class WorkspaceAssistantTurnRunner:
                     {
                         "type": "status",
                         "message": (
-                            "本机 CLI 已连接当前作品范围的临时 Siming MCP，可自行选择项目读写工具。"
+                            "正在启动本机 CLI 和当前作品范围的临时 Siming MCP，等待模型调用工具。"
                         ),
                         "tool": "local_cli_mcp_mode",
                     }
@@ -460,7 +460,7 @@ class WorkspaceAssistantTurnRunner:
     @staticmethod
     def _direct_mcp_contract() -> str:
         return (
-            "当前进程已连接仅限本轮、仅限当前作品的 Siming MCP 服务器 siming_turn。"
+            "当前进程配置了仅限本轮、仅限当前作品的 Siming MCP 服务器 siming_turn。"
             "项目数据的读取和修改必须直接调用该服务器中的工具；"
             "不要输出工具 JSON，不要启动另一个 CLI，不要修改任何全局 MCP 配置。"
             "请依据用户最新消息和真实项目数据自行判断任务、选择目标与工具。"

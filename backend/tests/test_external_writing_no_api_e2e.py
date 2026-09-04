@@ -51,14 +51,16 @@ class ExternalWritingNoApiE2ETest(unittest.TestCase):
                 prepare_external_writing_context(
                     db,
                     project.id,
-                    {"outline_node_id": outline.id},
+                    {"outline_node_id": outline.id, "include_prompt_pack": False},
                 )
             )
             self.assertEqual(context_result["status"], "ok")
             manifest_id = context_result["data"]["context_manifest_id"]
             self.assertTrue(manifest_id)
-            self.assertIn("Governed Task Context", context_result["data"]["baseline_context"])
-            self.assertEqual(context_result["data"]["task_context"], "")
+            self.assertIn("Governed Task Context", context_result["data"]["context_page"]["text"])
+            self.assertFalse(context_result["data"]["context_page"]["has_more"])
+            self.assertNotIn("baseline_context", context_result["data"])
+            self.assertNotIn("task_context", context_result["data"])
             selection_result = asyncio.run(submit_context_evidence(
                 db,
                 project.id,
@@ -108,6 +110,95 @@ class ExternalWritingNoApiE2ETest(unittest.TestCase):
 
         # This read-only context tool must remain usable without the internal gateway.
         self.assertTrue(callable(prepare_external_writing_context))
+
+    def test_structured_han_minimum_rejects_short_draft_without_consuming_token(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from app.database.models import Base, ChapterDraft, ContextManifest, OutlineNode, Project
+        from app.services.workspace.tools.context_governance import submit_context_evidence
+        from app.services.workspace.tools.external_writing import (
+            prepare_external_writing_context,
+            save_external_chapter_draft,
+        )
+
+        engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+        Base.metadata.create_all(engine)
+        db = sessionmaker(bind=engine)()
+        try:
+            project = Project(id="p-min", title="Length guard", writing_style="natural")
+            outline = OutlineNode(
+                id="o-min",
+                project_id=project.id,
+                title="长度边界",
+                node_type="chapter",
+                summary="写一段达到明确长度下限的正文。",
+            )
+            db.add_all([project, outline])
+            db.commit()
+
+            prepared = asyncio.run(prepare_external_writing_context(
+                db,
+                project.id,
+                {
+                    "outline_node_id": outline.id,
+                    "include_prompt_pack": False,
+                    "requirements": "保持克制。",
+                    "minimum_han_characters": 5,
+                },
+            ))
+            self.assertEqual(prepared["status"], "ok")
+            self.assertEqual(
+                prepared["data"]["writing_constraints"]["minimum_han_characters"],
+                5,
+            )
+            self.assertIn("at least 5 Han characters", prepared["data"]["context_page"]["text"])
+            manifest_id = prepared["data"]["context_manifest_id"]
+            selected = asyncio.run(submit_context_evidence(
+                db,
+                project.id,
+                {"context_manifest_id": manifest_id, "sources": []},
+            ))
+            token = selected["data"]["context_selection_token"]
+
+            short = asyncio.run(save_external_chapter_draft(
+                db,
+                project.id,
+                {
+                    "content": "潮痕三字",
+                    "outline_node_id": outline.id,
+                    "context_manifest_id": manifest_id,
+                    "context_selection_token": token,
+                },
+            ))
+            self.assertEqual(short["status"], "needs_confirmation")
+            self.assertEqual(short["data"]["actual_han_characters"], 4)
+            self.assertFalse(short["data"]["context_selection_token_consumed"])
+            self.assertEqual(db.query(ChapterDraft).count(), 0)
+            self.assertIsNone(db.get(ContextManifest, manifest_id).consumed_at)
+
+            with patch(
+                "app.services.workspace.generated_drafts.store_chapter_draft",
+                return_value="draft-min",
+            ):
+                accepted = asyncio.run(save_external_chapter_draft(
+                    db,
+                    project.id,
+                    {
+                        "content": "潮痕三字够",
+                        "outline_node_id": outline.id,
+                        "context_manifest_id": manifest_id,
+                        "context_selection_token": token,
+                    },
+                ))
+            self.assertEqual(accepted["status"], "ok")
+            self.assertEqual(accepted["data"]["draft_id"], "draft-min")
+            self.assertEqual(accepted["data"]["han_character_count"], 5)
+            self.assertIsNotNone(db.get(ContextManifest, manifest_id).consumed_at)
+        finally:
+            db.close()
+            Base.metadata.drop_all(engine)
+            engine.dispose()
 
 
 if __name__ == "__main__":

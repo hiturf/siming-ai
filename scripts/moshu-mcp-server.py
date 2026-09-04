@@ -75,6 +75,9 @@ def _prepare_data_environment() -> Path:
 
 
 def main() -> None:
+    # Help/errors are part of the CLI surface too. Configure before argparse
+    # can exit, otherwise Windows emits GBK while MCP clients expect UTF-8.
+    _configure_stdio_utf8()
     parser = argparse.ArgumentParser(
         prog="moshu-mcp-server",
         description="Siming MCP Server — exposes Siming workspace tools over stdio.",
@@ -121,7 +124,6 @@ def main() -> None:
         help="Enable verbose logging to stderr.",
     )
     args = parser.parse_args()
-    _configure_stdio_utf8()
 
     # ── Logging ──────────────────────────────────────────────────────────
     import logging

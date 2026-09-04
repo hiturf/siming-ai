@@ -23,6 +23,7 @@ from ...database.models import (
     RagDocument,
     WorldbuildingEntry,
 )
+from ...database.query_filters import is_current_worldbuilding_status
 from ..character_archive import character_archive_payload, character_archive_text
 
 # ---------------------------------------------------------------------------
@@ -262,6 +263,10 @@ def _get_or_create_document(
         indexed_at=datetime.utcnow(),
     )
     db.add(doc)
+    # Production sessions disable autoflush. Persist the parent inside this
+    # transaction before chunks reference it; raw IDs alone do not establish
+    # ORM insertion ordering. The caller still owns commit/rollback.
+    db.flush([doc])
     return doc
 
 
@@ -441,7 +446,8 @@ def _index_worldbuilding(db: Session, project_id: str, entry_id: str) -> int:
     entry = db.query(WorldbuildingEntry).filter(
         WorldbuildingEntry.id == entry_id, WorldbuildingEntry.project_id == project_id,
     ).first()
-    if not entry:
+    if not entry or not is_current_worldbuilding_status(entry.status):
+        delete_source_index(db, project_id, "worldbuilding", entry_id)
         return 0
     content = entry.content or ""
     if not content.strip():
@@ -610,7 +616,23 @@ def reindex_project_types(
             total += count
 
     if should_index("outline"):
-        for node in db.query(OutlineNode).filter(OutlineNode.project_id == project_id).all():
+        nodes = db.query(OutlineNode).filter(OutlineNode.project_id == project_id).all()
+        current_ids = {node.id for node in nodes}
+        stale_source_ids = {
+            source_id
+            for (source_id,) in (
+                db.query(RagDocument.source_id)
+                .filter(
+                    RagDocument.project_id == project_id,
+                    RagDocument.source_type == "outline",
+                )
+                .all()
+            )
+            if source_id not in current_ids
+        }
+        for source_id in stale_source_ids:
+            delete_source_index(db, project_id, "outline", source_id)
+        for node in nodes:
             count = _index_outline(db, project_id, node.id)
             stats["outline"] = stats.get("outline", 0) + count
             total += count
@@ -760,7 +782,11 @@ def _get_source_content_hash(db: Session, source_type: str, source_id: str) -> s
         return _content_hash("\n".join(event_lines))
     elif source_type == "worldbuilding":
         obj = db.query(WorldbuildingEntry).filter(WorldbuildingEntry.id == source_id).first()
-        return _content_hash(obj.content or "") if obj else ""
+        return (
+            _content_hash(obj.content or "")
+            if obj and is_current_worldbuilding_status(obj.status)
+            else ""
+        )
     elif source_type == "assistant_memory":
         obj = db.query(AssistantMemory).filter(AssistantMemory.id == source_id).first()
         return _content_hash(obj.value or "") if obj else ""

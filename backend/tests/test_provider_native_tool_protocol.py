@@ -475,6 +475,65 @@ def test_codex_and_claude_direct_mcp_launch_is_process_scoped(
     )
 
 
+def test_codex_direct_mcp_uses_auto_review_and_replaces_conflicting_flags() -> None:
+    adapter = LocalCLIAdapter(api_key="", base_url="codex_cli", cli_command="codex")
+    launch = adapter._launch("inspect project", "test-model")
+    launch.args[-1:-1] = [
+        "--sandbox", "read-only",
+        "--ask-for-approval", "never",
+        "--dangerously-bypass-approvals-and-sandbox",
+    ]
+    server = {
+        "command": "python",
+        "args": ["moshu-mcp-server.py", "--project-id", "project-1"],
+        "cwd": "/siming",
+    }
+    managed_env = {
+        "DATABASE_URL": "sqlite:///C:/siming/novel_agent.db",
+        "SIMING_CONTENT_ROOT": "C:/siming/projects",
+        "SIMING_KEY_FILE": "C:/siming/.crypto_key",
+        "SIMING_HOME": "C:/siming",
+        "MOSHU_HOME": "C:/siming",
+        "NOVEL_AGENT_HOME": "C:/siming",
+    }
+    with tempfile.TemporaryDirectory() as directory, patch(
+        "app.ai.local_cli_prompt.resolve_siming_mcp_server",
+        return_value=server,
+    ), patch(
+        "app.ai.local_cli_prompt.managed_mcp_environment",
+        return_value=managed_env,
+    ):
+        prepared, _env = prepare_direct_mcp_launch(
+            adapter,
+            launch,
+            cwd=directory,
+            env={
+                "SIMING_MANAGED_AGENT_KIND": "cataloging",
+                "SIMING_MANAGED_CATALOGING_JOB_ID": "job-1",
+                "MOSHU_MANAGED_CATALOGING_JOB_ID": "job-1",
+                "UNRELATED_SECRET": "must-not-reach-mcp",
+            },
+            permission_pack="project_management",
+            project_id="project-1",
+        )
+
+    assert "--approve-for-me" in prepared.args
+    assert "--sandbox" not in prepared.args
+    assert "--ask-for-approval" not in prepared.args
+    assert "--dangerously-bypass-approvals-and-sandbox" not in prepared.args
+    config_value = prepared.args[prepared.args.index("-c") + 1]
+    assert 'default_tools_approval_mode="writes"' in config_value
+    assert "required=true" in config_value
+    assert 'DATABASE_URL="sqlite:///C:/siming/novel_agent.db"' in config_value
+    assert 'SIMING_CONTENT_ROOT="C:/siming/projects"' in config_value
+    assert 'SIMING_HOME="C:/siming"' in config_value
+    assert 'SIMING_MANAGED_AGENT_KIND="cataloging"' in config_value
+    assert 'SIMING_MANAGED_CATALOGING_JOB_ID="job-1"' in config_value
+    assert 'MOSHU_MANAGED_CATALOGING_JOB_ID="job-1"' in config_value
+    assert 'SIMING_LOCAL_CLI_MCP_SCOPE="one_turn"' in config_value
+    assert "UNRELATED_SECRET" not in config_value
+
+
 def test_opencode_direct_mcp_launch_exposes_only_the_turn_scoped_server() -> None:
     adapter = LocalCLIAdapter(
         api_key="",

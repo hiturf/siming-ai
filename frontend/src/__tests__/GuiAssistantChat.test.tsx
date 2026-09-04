@@ -234,6 +234,29 @@ describe('GuiAssistantChat new-book handoff', () => {
     mockPatch.mockResolvedValue({ data: { data: {} } })
   })
 
+  it('starts new-book input without navigating back to the same assistant or sending it', async () => {
+    const user = userEvent.setup()
+    render(<MemoryRouter><GuiAssistantChat /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: /开始新书立项/ }))
+    const input = screen.getByRole('textbox', { name: '给司命的消息' })
+    expect(input).toHaveValue('我想创作一本新小说，请先和我确认题材、故事构想与篇幅。')
+    await waitFor(() => expect(input).toHaveFocus())
+    expect(mockNavigate).not.toHaveBeenCalled()
+    expect(mockPost).not.toHaveBeenCalled()
+    expect(mockAgentTurn).not.toHaveBeenCalled()
+  })
+
+  it('keeps an author-entered brief when starting a new book from the welcome screen', async () => {
+    const user = userEvent.setup()
+    render(<MemoryRouter><GuiAssistantChat /></MemoryRouter>)
+    const button = await screen.findByRole('button', { name: /开始新书立项/ })
+    const input = screen.getByRole('textbox', { name: '给司命的消息' })
+    await user.type(input, '海边修复师调查潮汐录音')
+    await user.click(button)
+    expect(input).toHaveValue('海边修复师调查潮汐录音')
+    expect(mockAgentTurn).not.toHaveBeenCalled()
+  })
+
   it('persists project assistant turns in the canonical project-scoped conversation', async () => {
     localStorage.setItem('siming.gui.assistant.projectId', 'project-1')
     mockGet.mockImplementation((url: string) => {

@@ -134,6 +134,7 @@ class LocalCLIAgentWorkerTestCase(unittest.TestCase):
         self.assertIn(str(chapter_file), task)
         self.assertIn('phase="facts"', task)
         self.assertIn("save_external_cataloging_facts", task)
+        self.assertIn("`facts` 必须直接传原生 JSON 数组", task)
         self.assertNotIn(chapter.content, task)
         self.assertEqual(_turn_stage(run, "auto"), "facts")
 

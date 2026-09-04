@@ -54,6 +54,7 @@ from ..database.models import (
     RagChunkEmbedding,
     WorldbuildingEntry,
 )
+from ..database.query_filters import current_worldbuilding_clause
 from ..modules.context.application.runtime import (
     ActiveContextManifest as ActiveContextManifest,
 )
@@ -365,6 +366,40 @@ def _source_recency(db: Session, source_type: str, source_id: str | None) -> flo
         updated = updated.replace(tzinfo=UTC)
     age_days = max(0.0, (datetime.now(UTC) - updated).total_seconds() / 86_400)
     return max(0.05, min(1.0, 1.0 / (1.0 + age_days / 180)))
+
+
+def _current_context_chunks(
+    db: Session,
+    project_id: str,
+    chunks: Sequence[RagChunk],
+) -> list[RagChunk]:
+    """Exclude stale worldbuilding even when an old RAG chunk still exists."""
+
+    worldbuilding_ids = {
+        str(chunk.source_id)
+        for chunk in chunks
+        if chunk.source_type == "worldbuilding" and chunk.source_id
+    }
+    if not worldbuilding_ids:
+        return list(chunks)
+    current_ids = {
+        str(row[0])
+        for row in (
+            db.query(WorldbuildingEntry.id)
+            .filter(
+                WorldbuildingEntry.project_id == project_id,
+                WorldbuildingEntry.id.in_(worldbuilding_ids),
+                current_worldbuilding_clause(WorldbuildingEntry.status),
+            )
+            .all()
+        )
+    }
+    return [
+        chunk
+        for chunk in chunks
+        if chunk.source_type != "worldbuilding"
+        or str(chunk.source_id or "") in current_ids
+    ]
 
 
 def _project_id_for_related_source(session: Session, model: type[Any], source_id: str | None) -> str | None:
@@ -959,6 +994,13 @@ class ContextOrchestrator:
 
     def _collect_author_requirement(self, add, coverage: dict[str, Any], arguments: dict[str, Any]) -> None:
         text = str(arguments.get("requirements") or arguments.get("instruction") or arguments.get("request") or "").strip()
+        minimum_han_characters = arguments.get("minimum_han_characters")
+        if minimum_han_characters:
+            structured_constraint = (
+                "Hard structured length constraint: the chapter body must contain at least "
+                f"{minimum_han_characters} Han characters. The save boundary counts and enforces it."
+            )
+            text = "\n".join(part for part in (text, structured_constraint) if part)
         if not text:
             coverage["user_requirement"] = {"required": False, "status": "not_applicable", "item_count": 0}
             return
@@ -1107,7 +1149,7 @@ class ContextOrchestrator:
         found = 0
         for chunk_id in dict.fromkeys(str(value).strip() for value in pinned_chunk_ids if str(value).strip()):
             chunk = self.db.query(RagChunk).filter(RagChunk.project_id == project_id, RagChunk.id == chunk_id).first()
-            if not chunk:
+            if not chunk or not _current_context_chunks(self.db, project_id, [chunk]):
                 continue
             found += 1
             add(ManifestCandidate(
@@ -1132,6 +1174,7 @@ class ContextOrchestrator:
                 .limit(3)
                 .all()
             )
+            chunks = _current_context_chunks(self.db, project_id, chunks)
             for chunk in chunks:
                 found += 1
                 add(ManifestCandidate(
@@ -1209,7 +1252,7 @@ class ContextOrchestrator:
         )
         if normalized_source_types:
             chunk_query = chunk_query.filter(RagChunk.source_type.in_(normalized_source_types))
-        chunks = chunk_query.all()
+        chunks = _current_context_chunks(self.db, project_id, chunk_query.all())
         target_sources = {
             str(arguments.get("outline_node_id") or ""),
             str(arguments.get("chapter_id") or ""),
@@ -1716,7 +1759,11 @@ class ContextOrchestrator:
         status = self.semantic_status()
         if not status["available"]:
             return {"available": False, "indexed": 0, "reason": status["reason"]}
-        chunks = self.db.query(RagChunk).filter(RagChunk.project_id == project_id).all()
+        chunks = _current_context_chunks(
+            self.db,
+            project_id,
+            self.db.query(RagChunk).filter(RagChunk.project_id == project_id).all(),
+        )
         if not chunks:
             return {"available": True, "indexed": 0, "reason": "No RAG chunks."}
         current_by_chunk = {

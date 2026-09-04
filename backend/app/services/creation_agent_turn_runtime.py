@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
@@ -43,6 +45,7 @@ from app.services.creation_agent_turn_records import (
     validate_creation_runtime_snapshot,
 )
 from app.services.novel_creation_agent import run_creation_agent
+from app.services.model_readiness import sanitize_readiness_message
 from app.services.observability.run_events import classify_failure
 from app.services.persistence.assistant_workspace import SqlAlchemyAssistantWorkspace
 from app.services.workspace.registry import registry
@@ -57,6 +60,7 @@ TurnProducer = Callable[[TurnPublisher], Awaitable[None]]
 
 _TURN_RETENTION_SECONDS = 15 * 60
 _HEARTBEAT_SECONDS = 10
+logger = logging.getLogger(__name__)
 
 
 class CreationTurnScopeError(RuntimeError):
@@ -745,6 +749,14 @@ async def _persist_turn_error(
 ) -> None:
     context.db.rollback()
     safe_message, safe_error_data = safe_creation_agent_error(exc)
+    error_id = uuid4().hex
+    safe_error_data["error_id"] = error_id
+    if safe_error_data.get("failure_class") == "unknown":
+        safe_message = f"{safe_message}；错误编号：{error_id}"
+    logger.error(
+        "Creation turn failed error_id=%s error_type=%s detail=%s",
+        error_id, type(exc).__name__, sanitize_readiness_message(exc, limit=2000),
+    )
     if context.conversation_id and context.assistant_message_id:
         try:
             context.conversations.finish_turn(

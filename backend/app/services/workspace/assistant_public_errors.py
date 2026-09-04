@@ -53,6 +53,23 @@ _RETRYABLE_FALSE = {
     ConversationContextErrorCode.TOOL_CAPABILITY_UNAVAILABLE,
     ConversationContextErrorCode.REQUIRED_STATE_OVER_CAPACITY,
 }
+_MODEL_FAILURE_RESPONSES: dict[str, tuple[str, str, bool]] = {
+    "quota_or_rate_limit": (
+        "model_quota_or_rate_limit",
+        "模型额度已耗尽或请求受限，请稍后重试或切换模型。",
+        True,
+    ),
+    "auth": (
+        "model_authentication_failed",
+        "模型授权已失效，请在模型设置中重新验证凭据。",
+        False,
+    ),
+    "timeout": ("model_timeout", "模型响应超时，请稍后重试。", True),
+    "network": ("model_network_error", "模型网络连接中断，请稍后重试。", True),
+    "unavailable": ("model_unavailable", "当前模型暂不可用，请切换模型或稍后重试。", True),
+    "empty_response": ("model_empty_response", "模型没有返回有效内容，请重试。", True),
+    "invalid_response": ("model_invalid_response", "模型返回格式无法解析，请重试。", True),
+}
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9._:/-]{1,200}$")
 _SAFE_REASON = re.compile(r"^[a-z0-9_]{1,100}$")
 _NUMERIC_FIELDS = {
@@ -102,23 +119,7 @@ def public_context_failure(error: ConversationContextError) -> PublicAssistantFa
 
 def public_model_failure(error: Exception) -> PublicAssistantFailure:
     failure_class = classify_failure(str(error)) or "unknown"
-    code, message, retryable = {
-        "quota_or_rate_limit": (
-            "model_quota_or_rate_limit",
-            "模型额度已耗尽或请求受限，请稍后重试或切换模型。",
-            True,
-        ),
-        "auth": (
-            "model_authentication_failed",
-            "模型授权已失效，请在模型设置中重新验证凭据。",
-            False,
-        ),
-        "timeout": ("model_timeout", "模型响应超时，请稍后重试。", True),
-        "network": ("model_network_error", "模型网络连接中断，请稍后重试。", True),
-        "unavailable": ("model_unavailable", "当前模型暂不可用，请切换模型或稍后重试。", True),
-        "empty_response": ("model_empty_response", "模型没有返回有效内容，请重试。", True),
-        "invalid_response": ("model_invalid_response", "模型返回格式无法解析，请重试。", True),
-    }.get(
+    code, message, retryable = _MODEL_FAILURE_RESPONSES.get(
         failure_class,
         ("model_request_failed", "模型调用失败，请检查模型状态后重试。", True),
     )
@@ -128,6 +129,17 @@ def public_model_failure(error: Exception) -> PublicAssistantFailure:
         details={"failure_class": failure_class, "retryable": retryable},
         failure_class=failure_class,
     )
+
+
+def public_model_error_message(code: str) -> str | None:
+    """Return the allowlisted message for a persisted model error code."""
+
+    for candidate_code, message, _retryable in _MODEL_FAILURE_RESPONSES.values():
+        if candidate_code == code:
+            return message
+    if code == "model_request_failed":
+        return "模型调用失败，请检查模型状态后重试。"
+    return None
 
 
 def public_server_failure(error_id: str) -> PublicAssistantFailure:

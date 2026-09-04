@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,6 +20,136 @@ from app.services.workspace.assistant_public_projection import (
     public_tool_log,
 )
 from app.services.workspace.run_log import mark_assistant_run, run_payload
+
+_SUCCESS_TOOL_STATUSES = frozenset({"ok", "completed", "success", "succeeded"})
+_TERMINAL_DRAFT_TOOLS = frozenset({
+    "save_external_chapter_draft",
+    "save_external_outline_draft",
+})
+_TERMINAL_CONTEXT_PREREQUISITES = frozenset({
+    "prepare_task_context",
+    "search_task_context",
+    "submit_context_evidence",
+})
+
+
+@dataclass(frozen=True)
+class WorkspaceFailureResolution:
+    unresolved: list[dict]
+    recovered: list[dict]
+    terminal_draft_tool: str | None = None
+
+
+def _durable_terminal_draft_tool(applied_actions: list[dict]) -> str | None:
+    """Return the terminal tool only when its durable draft receipt is present."""
+    for action in reversed(applied_actions):
+        tool = str(action.get("tool") or "")
+        status = str(action.get("status") or "").lower()
+        data = action.get("data")
+        if (
+            tool in _TERMINAL_DRAFT_TOOLS
+            and status in _SUCCESS_TOOL_STATUSES
+            and isinstance(data, dict)
+            and str(data.get("draft_id") or "").strip()
+            and str(data.get("draft_status") or "").lower() == "pending"
+        ):
+            return tool
+    return None
+
+
+def _resolve_workspace_failures(
+    tool_logs: list[dict],
+    applied_actions: list[dict],
+) -> WorkspaceFailureResolution:
+    """Separate still-relevant errors from prerequisites proven by a saved draft.
+
+    A successful terminal draft tool ends the model turn. Its durable receipt,
+    together with a context manifest, proves that the context gate completed.
+    Earlier failures in that exact prerequisite chain therefore describe a
+    corrected attempt rather than an uncertain final write.
+    """
+    failed = [
+        log for log in tool_logs
+        if str(log.get("status") or "").lower() in {"error", "needs_confirmation"}
+    ]
+    terminal_tool = _durable_terminal_draft_tool(applied_actions)
+    if not terminal_tool:
+        return WorkspaceFailureResolution(unresolved=failed, recovered=[])
+
+    terminal_action = next(
+        action
+        for action in reversed(applied_actions)
+        if str(action.get("tool") or "") == terminal_tool
+        and str(action.get("status") or "").lower() in _SUCCESS_TOOL_STATUSES
+        and isinstance(action.get("data"), dict)
+        and str(action["data"].get("draft_id") or "").strip()
+        and str(action["data"].get("draft_status") or "").lower() == "pending"
+    )
+    has_context_receipt = bool(
+        str(terminal_action["data"].get("context_manifest_id") or "").strip()
+    )
+    recovered_tools = {terminal_tool}
+    if has_context_receipt:
+        recovered_tools.update(_TERMINAL_CONTEXT_PREREQUISITES)
+    recovered = [log for log in failed if str(log.get("tool") or "") in recovered_tools]
+    unresolved = [log for log in failed if log not in recovered]
+    return WorkspaceFailureResolution(
+        unresolved=unresolved,
+        recovered=recovered,
+        terminal_draft_tool=terminal_tool,
+    )
+
+
+def _append_workspace_failure_notice(
+    reply: str,
+    resolution: WorkspaceFailureResolution,
+) -> str:
+    notices: list[str] = []
+    terminal_label = (
+        "章节草稿"
+        if resolution.terminal_draft_tool == "save_external_chapter_draft"
+        else "大纲草稿"
+    )
+    recovered_length_checks = [
+        log
+        for log in resolution.recovered
+        if str(log.get("tool") or "") == "save_external_chapter_draft"
+        and str(log.get("status") or "").lower() == "needs_confirmation"
+        and isinstance(log.get("remediation"), dict)
+        and str(log["remediation"].get("code") or "") == "draft_below_minimum"
+    ]
+    other_recovered = [
+        log for log in resolution.recovered if log not in recovered_length_checks
+    ]
+    if recovered_length_checks:
+        notices.append(
+            f"补充：本轮经过 {len(recovered_length_checks)} 次篇幅校验与补写，"
+            f"最终{terminal_label}已达到要求并成功暂存。"
+        )
+    if other_recovered:
+        notices.append(
+            f"补充：本轮有 {len(other_recovered)} 次前序工具调用未通过，"
+            f"后续流程已纠正；{terminal_label}已成功生成并暂存。"
+        )
+    if resolution.unresolved:
+        failed_text = "；".join(
+            f"{projected['tool']}: {projected['detail']}"
+            for log in resolution.unresolved[:3]
+            if (projected := public_tool_log(log))
+        )
+        if resolution.terminal_draft_tool:
+            notices.append(
+                f"注意：{terminal_label}已成功生成并暂存；本轮另有工具执行失败，"
+                f"相关附加操作可能未完成：{failed_text}"
+            )
+        else:
+            notices.append(
+                f"注意：本轮有工具执行失败，相关数据可能未保存：{failed_text}"
+            )
+    if not notices:
+        return reply
+    notice_text = "\n\n".join(notices)
+    return f"{reply}\n\n{notice_text}".strip()
 
 
 def _workspace_result_summary(result: dict) -> str:
@@ -201,22 +332,28 @@ def finalize_workspace_assistant_turn(
         except Exception:
             existing_payload = {}
     reference_context_audit = existing_payload.get("reference_context_audit")
-    failed_logs = [log for log in tool_logs if str(log.get("status") or "").lower() == "error"]
+    failure_resolution = _resolve_workspace_failures(tool_logs, applied_actions)
+    failed_logs = failure_resolution.unresolved
+    persisted_model_error = next(
+        (
+            f"{code}: {str(log.get('detail') or '')[:500]}"
+            for log in failed_logs
+            if (code := str(log.get("error_code") or ""))
+            and code.startswith("model_")
+            and re.fullmatch(r"[a-z0-9_]{1,100}", code)
+        ),
+        None,
+    )
     final_reply_for_save = _build_workspace_final_reply(
         final_reply,
         applied_actions=applied_actions,
         tool_logs=tool_logs,
         searched_context=searched_context,
     )
-    if failed_logs:
-        failed_text = "；".join(
-            f"{projected['tool']}: {projected['detail']}"
-            for log in failed_logs[:3]
-            if (projected := public_tool_log(log))
-        )
-        final_reply_for_save = (
-            f"{final_reply_for_save}\n\n注意：本轮有工具执行失败，相关数据可能未保存：{failed_text}"
-        ).strip()
+    final_reply_for_save = _append_workspace_failure_notice(
+        final_reply_for_save,
+        failure_resolution,
+    )
     outcome = _workspace_outcome(
         final_reply,
         applied_actions=applied_actions,
@@ -256,6 +393,7 @@ def finalize_workspace_assistant_turn(
         assistant_run,
         status="error" if outcome == "failed" else "completed",
         phase="error" if outcome == "failed" else outcome,
+        error=persisted_model_error if outcome == "failed" else None,
         final_reply=final_reply_for_save,
         outcome=outcome,
     )

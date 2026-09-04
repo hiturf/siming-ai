@@ -541,6 +541,38 @@ def replace_tool_categories(path: str, value: Any) -> dict[str, Any]:
         raise ValueError("工具类别状态文件无效")
     state = read_tool_category_state(path)
     categories = normalize_tool_categories(value)
+    active_categories = normalize_tool_categories(state.get("active_categories") or [])
+    requested_categories = normalize_tool_categories(
+        state.get("requested_categories") or []
+    )
+    category_change_pending = int(state.get("active_version") or 0) < int(
+        state.get("version") or 0
+    )
+    if categories == active_categories and not category_change_pending:
+        labels = [TOOL_CATEGORY_METADATA[category]["label"] for category in categories]
+        return {
+            "tool": TOOL_CATEGORY_CONTROLLER,
+            "status": "skipped",
+            "detail": (
+                f"{'、'.join(labels)}能力已经开放；不要重复选择，"
+                "请直接调用当前业务工具完成任务"
+                if labels
+                else "业务工具已经关闭；如无需工具，请直接回复作者"
+            ),
+            "data": {
+                "enabled_categories": list(categories),
+                "labels": labels,
+                "reason": "categories_already_active",
+            },
+        }
+    if categories == requested_categories and category_change_pending:
+        labels = [TOOL_CATEGORY_METADATA[category]["label"] for category in categories]
+        return {
+            "tool": TOOL_CATEGORY_CONTROLLER,
+            "status": "ok",
+            "detail": f"已准备{'、'.join(labels)}能力" if labels else "已关闭全部业务工具",
+            "data": {"enabled_categories": list(categories), "labels": labels},
+        }
     state["version"] = int(state.get("version") or 0) + 1
     state["requested_categories"] = list(categories)
     _write_state(state_path, state)

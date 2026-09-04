@@ -11,6 +11,20 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from ....core.utils import count_words
+from ....services.chapter_writing_constraints import (
+    check_chapter_length,
+    manifest_minimum_han_characters,
+    normalize_writing_arguments,
+    recommended_han_character_target,
+)
+from ....services.task_context_delivery import (
+    build_context_page,
+    context_delivery_ready,
+    context_delivery_state,
+    context_delivery_status,
+    context_page_arguments,
+    deliver_next_context_page,
+)
 from ....services.task_context_selection import (
     TASK_CONTEXT_SOFT_TARGET_TOKENS,
     render_generation_context,
@@ -67,6 +81,51 @@ def _external_writing_context_result(
     selection = manifest_payload.get("selection") or {}
     selection_ready = selection.get("status") == "ready" and bool(selection.get("token"))
     safe_task_context = render_generation_context(manifest)
+    # Before evidence selection this endpoint also carries the writing prompt
+    # pack.  Once evidence is selected, however, every model-visible entrypoint
+    # must page the same canonical generation document used by
+    # submit_context_evidence.  Otherwise an Agent could obtain a token from
+    # this legacy wrapper without reading the selected source pages.
+    document = (
+        safe_task_context
+        if selection_ready
+        else "\n\n".join(
+            part
+            for part in (
+                str((prompt_pack or {}).get("system_prompt") or ""),
+                safe_task_context,
+            )
+            if part
+        )
+    )
+    selection_token = str(selection.get("token") or "")
+    delivery_state = context_delivery_state(manifest)
+    try:
+        if selection_ready:
+            page, delivery_state = deliver_next_context_page(
+                manifest,
+                document,
+                args,
+                selection_token,
+            )
+        else:
+            page = build_context_page(document, args)
+    except ValueError as error:
+        return {"tool": "prepare_external_writing_context", "status": "skipped", "detail": str(error),
+                "data": {"context_manifest_id": manifest.id}}
+    db.flush()
+    delivery_ready = selection_ready and context_delivery_ready(manifest, selection_token)
+    page_arguments = context_page_arguments(manifest.id, "writing", page)
+    if not selection_ready:
+        # Pre-selection pages include the prompt pack and therefore remain on
+        # this endpoint. Selected evidence pages use prepare_task_context's
+        # canonical document and argument contract.
+        page_arguments.update({
+            "outline_node_id": target_outline.id,
+            "include_prompt_pack": args.get("include_prompt_pack", True),
+        })
+        if target_chapter:
+            page_arguments["target_chapter_id"] = target_chapter.id
     detail = (
         f"Compact writing anchors prepared: {manifest.estimated_input_tokens}/"
         f"{manifest.input_budget_tokens} available input tokens; "
@@ -79,6 +138,11 @@ def _external_writing_context_result(
         )
     elif not selection_ready:
         detail += ". The Agent must now search and finalize exact evidence before drafting."
+    elif not delivery_ready:
+        detail += (
+            ". Exact evidence was selected, but its remaining pages must be read in order; "
+            "the selection token is withheld until the final page."
+        )
     next_tools = [
         {
             "tool": "search_task_context",
@@ -89,7 +153,13 @@ def _external_writing_context_result(
             "description": "Finalize only the exact sources needed for this chapter.",
         },
     ]
-    if selection_ready:
+    if page["has_more"]:
+        next_tools = [{"tool": (
+                           "prepare_task_context" if selection_ready
+                           else "prepare_external_writing_context"
+                       ), "arguments": page_arguments,
+                       "description": "Read the remaining context pages; source text has not been truncated."}]
+    if delivery_ready:
         next_tools.append({
             "tool": "save_external_chapter_draft",
             "description": (
@@ -111,18 +181,22 @@ def _external_writing_context_result(
                     int(target_chapter.current_version or 1) if target_chapter else None
                 ),
             },
-            "requirements": str(args.get("requirements") or "").strip(),
-            "prompt_pack": prompt_pack,
+            "prompt_pack": {key: value for key, value in prompt_pack.items() if key != "system_prompt"} if prompt_pack else None,
             "context_manifest_id": manifest.id,
             "context_manifest_status": manifest.status,
             "requires_author_confirmation": status == "needs_confirmation",
             "context_budget": manifest_payload["budget"],
             "context_coverage": manifest_payload["coverage"],
-            "baseline_sources": manifest_payload["items"],
-            "baseline_context": safe_task_context,
+            "context_page": page,
             "selection_required": not selection_ready,
-            "context_selection_token": selection.get("token") if selection_ready else None,
-            "task_context": safe_task_context if selection_ready else "",
+            "context_selection_token": selection_token if delivery_ready else None,
+            "context_delivery_ready": delivery_ready,
+            "context_delivery": context_delivery_status(delivery_state),
+            "writing_constraints": {
+                "minimum_han_characters": manifest_minimum_han_characters(manifest),
+                "metric": "cjk_unified_ideographs",
+                "enforced_before_draft_storage": True,
+            },
             "warnings": list(dict.fromkeys(warnings)),
             "workflow_boundaries": {
                 "current_task": "chapter_revision" if target_chapter else "base_chapter_writing",
@@ -142,9 +216,16 @@ async def prepare_external_writing_context(
     """Prepare one governed, API-free context package for chapter writing."""
     from app.database.models import Chapter, OutlineNode, Project
     from app.services.context_orchestrator import ContextOrchestrator
-    from app.services.prompt_packs.seed import ensure_builtin_packs
 
-    ensure_builtin_packs(db)
+    try:
+        args = normalize_writing_arguments(args)
+    except ValueError as error:
+        return {
+            "tool": "prepare_external_writing_context",
+            "status": "skipped",
+            "detail": str(error),
+            "data": None,
+        }
 
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -243,7 +324,7 @@ async def prepare_external_writing_context(
         return {
             "tool": "prepare_external_writing_context",
             "status": "blocked_rebuild",
-            "detail": "Context indexes are rebuilding. External writes are paused.",
+            "detail": "Context index rebuild is incomplete; check the project context status before retrying.",
             "data": {
                 "context_manifest_id": manifest.id,
                 "context_manifest_status": manifest.status,
@@ -276,7 +357,7 @@ def _external_draft_manifest_error(
             "tool": "save_external_chapter_draft",
             "status": "needs_confirmation",
             "detail": "Prepare task context first and attach its context_manifest_id to the draft.",
-            "data": None,
+            "data": {"reason_code": "context_manifest_required"},
         }
 
     from ....services.context_orchestrator import ContextOrchestrator
@@ -288,7 +369,10 @@ def _external_draft_manifest_error(
             "tool": "save_external_chapter_draft",
             "status": "needs_confirmation",
             "detail": "The supplied context manifest is unavailable for this project.",
-            "data": {"context_manifest_id": context_manifest_id},
+            "data": {
+                "reason_code": "context_manifest_unavailable",
+                "context_manifest_id": context_manifest_id,
+            },
         }
     selection_token = str(args.get("context_selection_token") or "").strip()
     usable, detail = orchestrator.validate_task_selection(
@@ -310,8 +394,67 @@ def _external_draft_manifest_error(
         "status": "needs_confirmation",
         "detail": detail,
         "data": {
+            "reason_code": "context_selection_invalid",
             "context_manifest_id": context_manifest_id,
             "outline_node_id": outline_node_id,
+        },
+    }
+
+
+def _external_draft_length_error(
+    db: Session,
+    project_id: str,
+    context_manifest_id: str | None,
+    outline_node_id: str,
+    content: str,
+) -> dict[str, Any] | None:
+    """Reject a short draft before consuming its one-use evidence token."""
+    if not context_manifest_id:
+        return None
+
+    from ....services.context_orchestrator import ContextOrchestrator
+
+    manifest = ContextOrchestrator(db).get_manifest(context_manifest_id, project_id)
+    if not manifest:
+        return None
+    try:
+        check = check_chapter_length(content, manifest)
+    except ValueError as error:
+        return {
+            "tool": "save_external_chapter_draft",
+            "status": "needs_confirmation",
+            "detail": f"The prepared writing constraint is invalid: {error}",
+            "data": {
+                "reason_code": "writing_constraint_invalid",
+                "context_manifest_id": context_manifest_id,
+            },
+        }
+    if check.accepted:
+        return None
+    minimum = int(check.minimum_han_characters or 0)
+    missing = minimum - check.actual_han_characters
+    recommended = recommended_han_character_target(minimum)
+    recommended_additional = recommended - check.actual_han_characters
+    return {
+        "tool": "save_external_chapter_draft",
+        "status": "needs_confirmation",
+        "detail": (
+            f"正文只有 {check.actual_han_characters} 个汉字，低于已绑定的硬下限 "
+            f"{minimum}；未保存草稿，也未消耗上下文令牌。至少还差 {missing} 个；"
+            f"为减少反复退回，建议一次补至 {recommended} 个汉字（约再补 "
+            f"{recommended_additional} 个），再用同一清单和令牌重试。"
+        ),
+        "data": {
+            "reason_code": "draft_below_minimum",
+            "context_manifest_id": context_manifest_id,
+            "outline_node_id": outline_node_id,
+            "actual_han_characters": check.actual_han_characters,
+            "minimum_han_characters": minimum,
+            "missing_han_characters": missing,
+            "recommended_han_characters": recommended,
+            "recommended_additional_han_characters": recommended_additional,
+            "draft_stored": False,
+            "context_selection_token_consumed": False,
         },
     }
 
@@ -427,6 +570,7 @@ async def save_external_chapter_draft(
         find_blocking_chapter_cataloging_job,
         find_cataloging_required_chapter,
     )
+    from app.services.context_orchestrator import ContextOrchestrator
     from app.services.workspace.generated_drafts import (
         ChapterDraftOutlineConflict,
         ChapterDraftTargetConflict,
@@ -474,6 +618,16 @@ async def save_external_chapter_draft(
     )
     if required_chapter:
         return cataloging_required_block_result("save_external_chapter_draft", required_chapter)
+
+    length_error = _external_draft_length_error(
+        db,
+        project_id,
+        context_manifest_id,
+        outline_node_id,
+        content,
+    )
+    if length_error:
+        return length_error
 
     manifest_error = _external_draft_manifest_error(
         db,
@@ -526,6 +680,10 @@ async def save_external_chapter_draft(
             "data": {"target_chapter_id": conflict.target_chapter_id},
         }
 
+    length_check = check_chapter_length(
+        content,
+        ContextOrchestrator(db).get_manifest(context_manifest_id, project_id),
+    )
     return apply_turn_directive({
         "tool": "save_external_chapter_draft",
         "status": "ok",
@@ -543,6 +701,8 @@ async def save_external_chapter_draft(
             "base_chapter_version": base_chapter_version,
             "next_actions": ["save_and_catalog", "save_only"],
             "word_count": count_words(content),
+            "han_character_count": length_check.actual_han_characters,
+            "minimum_han_characters": length_check.minimum_han_characters,
             "source_agent": source_agent,
         },
     }, AssistantTurnDirective.END_AFTER_DRAFT)
@@ -555,13 +715,14 @@ async def save_external_outline_draft(
 ) -> dict[str, Any]:
     """Persist an external Agent's reviewed-context outline proposal."""
     from ....services.context_orchestrator import ContextOrchestrator
-    from ....services.story_granularity import normalize_outline_batch
+    from ....core.exceptions import ValidationError
     from ..outline_drafts import (
         PendingOutlineDraftConflict,
         latest_pending_outline_draft,
         outline_draft_result_data,
         pending_outline_draft_block_result,
         store_outline_draft,
+        validate_generated_outline_proposal,
     )
     from ..turn_control import AssistantTurnDirective, apply_turn_directive
 
@@ -598,6 +759,16 @@ async def save_external_outline_draft(
             "detail": detail,
             "data": {"context_manifest_id": manifest.id},
         }
+    try:
+        _, nodes = validate_generated_outline_proposal(
+            db, project_id=project_id, manifest=manifest, parent_id=parent_id,
+            insert_after_id=insert_after_id, nodes=args.get("nodes"),
+        )
+    except ValidationError as exc:
+        return {
+            "tool": "save_external_outline_draft", "status": "error",
+            "detail": str(exc), "data": {"context_manifest_id": manifest.id},
+        }
     if not orchestrator.mark_consumed(manifest):
         return {
             "tool": "save_external_outline_draft",
@@ -608,26 +779,6 @@ async def save_external_outline_draft(
     from app.architecture.uow import commit_session
 
     commit_session(db)
-    raw_nodes = args.get("nodes") if isinstance(args.get("nodes"), list) else []
-    if len(raw_nodes) > 8 or any(not isinstance(node, dict) for node in raw_nodes):
-        return {
-            "tool": "save_external_outline_draft",
-            "status": "error",
-            "detail": "Outline proposal must contain one to eight valid node objects.",
-            "data": {},
-        }
-    nodes = normalize_outline_batch(
-        [dict(node) for node in raw_nodes]
-    )
-    if not nodes:
-        return {
-            "tool": "save_external_outline_draft",
-            "status": "skipped",
-            "detail": "Outline proposal contains no valid nodes.",
-            "data": {},
-        }
-    for node in nodes:
-        node["status"] = "pending"
     try:
         draft = store_outline_draft(
             db,
@@ -644,6 +795,11 @@ async def save_external_outline_draft(
             "save_external_outline_draft",
             conflict.draft,
         )
+    except ValidationError as exc:
+        return {
+            "tool": "save_external_outline_draft", "status": "error",
+            "detail": str(exc), "data": {"context_manifest_id": manifest.id},
+        }
     return apply_turn_directive(
         {
             "tool": "save_external_outline_draft",

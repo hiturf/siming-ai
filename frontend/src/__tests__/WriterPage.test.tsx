@@ -118,6 +118,28 @@ describe('WriterPage manual writing actions', () => {
     }))
   })
 
+  it('shows an API UTC chapter update as labelled local time across midnight', async () => {
+    const NativeFormatter = Intl.DateTimeFormat
+    vi.spyOn(Intl, 'DateTimeFormat').mockImplementation((locales, options) => (
+      new NativeFormatter(locales, { ...options, timeZone: 'Asia/Shanghai' })
+    ))
+    const saved = { ...chapter, updated_at: '2026-08-31T19:57:53.428588' }
+    api.get.mockImplementation((url: string) => {
+      if (url.endsWith('/chapter-drafts/pending')) return Promise.resolve(response({ items: [], total: 0 }))
+      if (url.endsWith('/outline')) return Promise.resolve(response({ items: [], flat: [], total: 0 }))
+      if (url.endsWith('/chapters')) return Promise.resolve(response({ items: [saved], total: 1 }))
+      if (url.endsWith('/snapshots')) return Promise.resolve(response({ items: [], total: 0 }))
+      if (url.endsWith('/chapters/chapter-1')) return Promise.resolve(response(saved))
+      throw new Error(`Unexpected GET ${url}`)
+    })
+
+    render(<WriterPage projectId="project-1" />)
+    fireEvent.click(await screen.findByRole('button', { name: '打开章节：第一章' }))
+    expect(await screen.findByText(/最近更新（本地时间）：2026\/09\/01 03:57:53/)).toBeInTheDocument()
+    expect(api.put).not.toHaveBeenCalled()
+    expect(api.post).not.toHaveBeenCalled()
+  })
+
   it('reorders正文 independently from outline links', async () => {
     const secondChapter = {
       ...chapter,
@@ -157,6 +179,43 @@ describe('WriterPage manual writing actions', () => {
       { ids: ['chapter-2', 'chapter-1'] },
     ))
     expect(await screen.findByText('正文顺序已更新')).toBeInTheDocument()
+  })
+
+  it('restores cataloging retry after a background failure without replacing editor text', async () => {
+    const saved = { ...chapter, cataloging_required: true }
+    let resolveStatus!: (value: ReturnType<typeof response<{ items: Array<Record<string, unknown>> }>>) => void
+    const status = new Promise<ReturnType<typeof response<{ items: Array<Record<string, unknown>> }>>>((resolve) => {
+      resolveStatus = resolve
+    })
+    api.get.mockImplementation((url: string) => {
+      if (url.endsWith('/chapter-drafts/pending')) return Promise.resolve(response(null))
+      if (url.endsWith('/outline')) return Promise.resolve(response({ items: [], flat: [], total: 0 }))
+      if (url.endsWith('/chapters')) return Promise.resolve(response({ items: [saved], total: 1 }))
+      if (url.endsWith('/snapshots')) return Promise.resolve(response({ items: [], total: 0 }))
+      if (url.endsWith('/chapters/chapter-1')) return Promise.resolve(response(saved))
+      if (url.endsWith('/cataloging/jobs')) return status
+      throw new Error(`Unexpected GET ${url}`)
+    })
+    api.post.mockResolvedValue(response({
+      ...saved,
+      cataloging_job: { started: true, job_id: 'job-1', status: 'running' },
+    }))
+    render(<WriterPage projectId="project-1" />)
+    const start = await screen.findByRole('button', { name: /开始建档/ }, { timeout: 5000 })
+    fireEvent.click(start)
+    await waitFor(() => expect(start).toBeDisabled())
+    const editor = screen.getByRole('textbox', { name: '正文' })
+    const authorEdit = source + '作者在建档期间继续修改了这一句。'
+    fireEvent.change(editor, { target: { value: authorEdit } })
+    await act(async () => resolveStatus(response({ items: [{
+      id: 'job-1', status: 'paused_on_failure', current_chapter_id: chapter.id,
+      error: '临时 MCP 连接失败',
+    }] })))
+    expect(await screen.findByText('正文已保存，建档未完成')).toBeInTheDocument()
+    expect(editor).toHaveValue(authorEdit)
+    await waitFor(() => expect(screen.getByRole('button', { name: /保存并建档/ })).toBeEnabled(), { timeout: 5000 })
+    expect(api.put).not.toHaveBeenCalled()
+    expect(api.post).toHaveBeenCalledTimes(1)
   })
 
   it('keeps even a legacy targeted draft separate and saves it as a new chapter', async () => {

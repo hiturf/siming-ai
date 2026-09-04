@@ -493,6 +493,7 @@ class ProjectPackageImporter:
         self._restore_outline_nodes()
         self._insert_collection("chapters")
         self._restore_outline_chapter_references()
+        self._restore_outline_cataloging_ownership()
         for key in (
             "characters",
             "worldbuilding_entries",
@@ -674,6 +675,45 @@ class ProjectPackageImporter:
             outline = self.db.get(OutlineNode, self.identifier_map[row["id"]])
             if outline is not None:
                 outline.source_chapter_id = self.identifier_map.get(source_chapter_id)
+        self.db.flush()
+
+    def _restore_outline_cataloging_ownership(self) -> None:
+        """Rebuild catalog-owned outline state omitted by package v1.
+
+        ``cataloging_status`` was intentionally absent from the original
+        author-data allowlist, but the outline runtime uses ``cataloged`` to
+        distinguish generated scene projections from author-owned planning
+        nodes.  A full package already contains enough durable evidence to
+        restore that state without trusting a new archive field: a chapter
+        summary proves the chapter completed cataloging, the chapter's bound
+        outline is its author-owned catalog projection, and nodes carrying the
+        same source chapter are catalog-generated descendants.
+        """
+
+        if self.package.profile != "full":
+            return
+        summarized_chapters = {
+            str(row.get("chapter_id"))
+            for row in self.package.rows.get("chapter_summaries", [])
+            if row.get("chapter_id")
+        }
+        if not summarized_chapters:
+            return
+        cataloged_outline_ids = {
+            str(row.get("outline_node_id"))
+            for row in self.package.rows.get("chapters", [])
+            if row.get("id") in summarized_chapters and row.get("outline_node_id")
+        }
+        cataloged_outline_ids.update(
+            str(row.get("id"))
+            for row in self.package.rows.get("outline_nodes", [])
+            if row.get("source_chapter_id") in summarized_chapters
+        )
+        for source_id in cataloged_outline_ids:
+            mapped_id = self.identifier_map.get(source_id)
+            outline = self.db.get(OutlineNode, mapped_id) if mapped_id else None
+            if outline is not None:
+                outline.cataloging_status = "cataloged"
         self.db.flush()
 
     def _insert_collection(self, key: str) -> None:

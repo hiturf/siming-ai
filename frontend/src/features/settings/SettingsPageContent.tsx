@@ -1,3 +1,4 @@
+import { formatApiDateTime } from '../../utils/dateTime'
 import { useState, useCallback, useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import {
@@ -791,7 +792,9 @@ function SettingsPage({ embedded = false }: SettingsPageProps = {}) {
       const protocolLabel = protocol === 'responses' ? 'Responses API' : 'Chat Completions'
       setConnectionTestResult({
         success: true,
-        message: isCli ? '本机 CLI 真实对话成功' : `模型真实回复成功（${protocolLabel}）`,
+        message: isCli
+          ? '本机 CLI 基础对话探测成功；长任务仍可能受到临时限流或服务容量影响'
+          : `模型基础对话探测成功（${protocolLabel}）；长任务仍可能受到临时限流或服务容量影响`,
       })
     } catch (err: any) {
       setConnectionTestResult({ success: false, message: err.message || '连接失败' })
@@ -806,7 +809,10 @@ function SettingsPage({ embedded = false }: SettingsPageProps = {}) {
       const response = await apiClient.post<{ code: number; message: string; data: { became_global_default: boolean } }>(
         `/config/models/${provider}/verify`,
       )
-      message.success(response.data.message || '模型已经通过真实对话测试')
+      message.success(
+        response.data.message
+        || '模型已通过基础对话探测；长任务仍可能受到临时限流或服务容量影响',
+      )
       await fetchConfigs()
     } catch (err: any) {
       message.error(err.message || '真实对话测试失败')
@@ -879,7 +885,7 @@ function SettingsPage({ embedded = false }: SettingsPageProps = {}) {
           <Text type="secondary" className="settings-readiness-message">{record.readiness_message}</Text>
           {record.last_tested_at && (
             <Text type="secondary" className="settings-readiness-time">
-              上次验证：{new Date(record.last_tested_at).toLocaleString('zh-CN')}
+              上次验证：{(formatApiDateTime(record.last_tested_at) || '时间未记录')}
             </Text>
           )}
         </Space>

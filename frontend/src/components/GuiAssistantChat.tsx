@@ -54,7 +54,7 @@ import { useModelOptions } from '../hooks/useModelOptions'
 import { createLatestRequestGate } from '../shared/latestRequest'
 import { motionAwareScrollBehavior } from '../utils/motion'
 import { extractExplicitLocalPaths } from '../utils/localCliPathGrant'
-import { apiDateTimeMs } from '../utils/dateTime'
+import { apiDateTimeMs, formatApiDateTime } from '../utils/dateTime'
 import { AssistantMessageTime } from './assistant/MessageTime'
 import { ReasoningDisclosure } from './assistant/ReasoningDisclosure'
 import {
@@ -1386,6 +1386,13 @@ function GuiAssistantChat() {
   const guideCreationCheckpointRetry = () => {
     setCreationCheckpointModalOpen(false)
     message.info('请发送一条新消息；系统会结合最新立项任务按需重新整理较早上下文。')
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLTextAreaElement>('.gui-chat-composer textarea')?.focus()
+    })
+  }
+
+  const beginNovelCreation = () => {
+    setInputValue((current) => current || '我想创作一本新小说，请先和我确认题材、故事构想与篇幅。')
     window.requestAnimationFrame(() => {
       document.querySelector<HTMLTextAreaElement>('.gui-chat-composer textarea')?.focus()
     })
@@ -3596,7 +3603,7 @@ function GuiAssistantChat() {
                 不需要先创建作品。你可以直接说"我想写1000章，克苏鲁+修仙+规则怪谈"，我会生成新书方案，并在你确认后创建作品。
               </Paragraph>
               <Space wrap className="gui-chat-welcome-actions">
-                <Button type="primary" icon={<PlusOutlined />} size="large" onClick={() => navigate('/novel-creation')}>
+                <Button type="primary" icon={<PlusOutlined />} size="large" onClick={beginNovelCreation}>
                   开始新书立项
                 </Button>
                 <Button size="large" onClick={() => setInputValue('我想写一本新的小说，先和我聊聊想法')}>
@@ -3812,7 +3819,7 @@ function GuiAssistantChat() {
                   {index === 0 && <Tag color="success">当前</Tag>}
                 </span>
                 <span>{version.source || 'unknown'} · {version.change_type}</span>
-                <span>{version.created_at ? new Date(version.created_at).toLocaleString('zh-CN') : '时间未记录'}</span>
+                <span>{version.created_at ? (formatApiDateTime(version.created_at) || '时间未记录') : '时间未记录'}</span>
               </button>
             ))}
           </div>

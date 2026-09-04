@@ -211,6 +211,8 @@ class NovelCreationStageRunRequest(BaseModel):
         "world_relation", "volume", "chapter_outline", "scene_outline",
     ] | None = None
     entity_count: int | None = Field(default=None, ge=1, le=20)
+    context_entity_ids: list[str] = Field(default_factory=list, max_length=24)
+    context_artifacts: list[str] = Field(default_factory=list, max_length=6)
 
     @field_validator("operation", mode="before")
     @classmethod

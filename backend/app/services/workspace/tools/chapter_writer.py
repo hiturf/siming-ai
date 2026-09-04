@@ -24,6 +24,10 @@ from ....services.cataloging.launcher import (
     find_cataloging_required_chapter,
 )
 from ....services.context_orchestrator import ContextOrchestrator
+from ....services.chapter_writing_constraints import (
+    check_chapter_length,
+    recommended_han_character_target,
+)
 from ..generated_drafts import (
     ChapterDraftOutlineConflict,
     ChapterDraftTargetConflict,
@@ -329,6 +333,33 @@ async def chapter_writer(
     content = generated.content
     outline_title = target_outline.title or ""
     manifest_id = manifest.id
+    try:
+        length_check = check_chapter_length(content, manifest)
+    except ValueError as error:
+        return _writer_result(
+            "needs_confirmation",
+            f"写作上下文中的结构化正文长度约束无效：{error}",
+            {"context_manifest_id": manifest_id},
+        )
+    if not length_check.accepted:
+        minimum = int(length_check.minimum_han_characters or 0)
+        recommended = recommended_han_character_target(minimum)
+        return _writer_result(
+            "needs_confirmation",
+            (
+                f"模型正文只有 {length_check.actual_han_characters} 个汉字，低于作者明确的 "
+                f"{minimum} 汉字硬下限；未创建待审草稿。为减少反复退回，"
+                f"请重新建立上下文并以至少 {recommended} 个汉字为重试目标。"
+            ),
+            {
+                "context_manifest_id": manifest_id,
+                "outline_node_id": outline_node_id,
+                "actual_han_characters": length_check.actual_han_characters,
+                "minimum_han_characters": minimum,
+                "recommended_han_characters": recommended,
+                "draft_stored": False,
+            },
+        )
 
     try:
         draft_id = store_chapter_draft(
@@ -378,6 +409,8 @@ async def chapter_writer(
             "base_chapter_version": base_chapter_version,
             "next_actions": ["save_and_catalog", "save_only"],
             "word_count": count_words(content),
+            "han_character_count": length_check.actual_han_characters,
+            "minimum_han_characters": length_check.minimum_han_characters,
             "model": generated.model_result.get("model", ""),
             "context_manifest_id": manifest_id,
             "context_snapshot": generated.context_snapshot,

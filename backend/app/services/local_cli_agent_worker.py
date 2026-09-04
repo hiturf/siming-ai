@@ -105,7 +105,7 @@ def _workflow_section(task_type: str) -> str:
 3. Call `get_prompt_pack` with `pack_id="cataloging_external_no_api"`.
 4. Call `start_external_cataloging_job`.
 5. Process chapters strictly in `chapter_order` through facts, candidates, apply, and verification.
-6. Facts: `get_next_external_cataloging_chapter(phase="facts", include_content=false)` -> `prepare_task_context(task_type="cataloging", arguments={"chapter_id": ...})` -> read only the current chapter -> `submit_context_evidence` -> `save_external_cataloging_facts`.
+6. Facts: `get_next_external_cataloging_chapter(phase="facts", include_content=false)` -> `prepare_task_context(task_type="cataloging", chapter_id=...)` -> read only the current chapter -> `submit_context_evidence` -> `save_external_cataloging_facts`.
 7. Candidates: `get_next_external_cataloging_chapter(phase="candidates", include_content=false)` -> `list_cataloging_facts` -> read the current archive mirror -> `save_external_cataloging_candidates` -> `apply_pending_cataloging` -> `verify_external_cataloging_progress`.
 8. Finish applying and verifying the current chapter before fetching the next chapter.
 9. Never call `start_cataloging_job` unless the user explicitly allows Siming internal API usage.
@@ -118,19 +118,21 @@ def _workflow_section(task_type: str) -> str:
 3. Call `prepare_external_writing_context` to establish compact target/style/request anchors.
 4. Choose focused queries and call `search_task_context`; do not enumerate or read every role or setting.
 5. Review candidates and call `submit_context_evidence` with only necessary item IDs. If the selection exceeds budget, narrow it and resubmit.
-6. Only after observing the returned exact `task_context` and `context_selection_token`, write the chapter and pass both manifest ID and token to `save_external_chapter_draft`.
-7. Stop immediately after the draft is saved. Do not write formal chapters or derived archives in this turn.
+6. `submit_context_evidence` returns the first exact `context_page`. If it has more pages, copy its `next_arguments` exactly into `prepare_task_context`; do not skip, reorder, change page size, or generate yet. The `context_selection_token` is withheld until the final page.
+7. Only after observing every exact context page and the token returned with the final page, write the chapter and pass both manifest ID and token to `save_external_chapter_draft`.
+8. Stop immediately after the draft is saved. Do not write formal chapters or derived archives in this turn.
 """
     if task_type == "outline_planning":
         return """
 ## Required Workflow: Outline Proposal
 1. Call `get_mcp_permission_status` and `report_agent_plan`.
 2. Resolve the real parent and insertion anchor from current project data.
-3. Call `prepare_task_context(task_type="outline_planning", arguments={...})`.
+3. Call `prepare_task_context(task_type="outline_planning", parent_id=..., insert_after_id=..., batch_count=..., requirements=...)`.
 4. Choose focused queries and call `search_task_context`; do not enumerate every role, chapter, or setting.
 5. Review candidates and call `submit_context_evidence`; an empty selection is valid when anchors suffice.
-6. Use only the returned exact `task_context` to propose nodes, then call `save_external_outline_draft` with the manifest and selection token.
-7. Stop immediately. Do not create formal outline nodes or start chapter writing in this turn.
+6. Read every returned `context_page` in order by copying `next_arguments` into `prepare_task_context`; the selection token appears only with the final page.
+7. Use only the complete exact context to propose nodes, then call `save_external_outline_draft` with the manifest and selection token.
+8. Stop immediately. Do not create formal outline nodes or start chapter writing in this turn.
 """
     return """
 ## Required Workflow: General Project Work

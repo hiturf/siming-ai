@@ -50,6 +50,18 @@ class ChapterCatalogingRequest(BaseModel):
     model: str | None = Field(None, max_length=300)
 
 
+class ChapterSummaryUpdate(BaseModel):
+    """Explicit author correction of cataloged chapter metadata."""
+
+    summary_text: str = Field(..., min_length=1, max_length=20_000)
+    key_events: list[str] = Field(default_factory=list, max_length=12)
+    expected_version: int = Field(
+        ...,
+        ge=1,
+        description="Chapter body version the author reviewed before correcting metadata",
+    )
+
+
 class ChapterReorderRequest(BaseModel):
     """Replace the reading order of all chapters in one project."""
 

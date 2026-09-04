@@ -176,6 +176,9 @@ REMOTE_ANDROID_AUTHORING_PATHS: dict[str, frozenset[str]] = {
     "/api/v1/projects/{project_id}/characters/{character_id}": frozenset(
         {"GET", "PUT", "DELETE"}
     ),
+    "/api/v1/projects/{project_id}/characters/{character_id}/appearances/{chapter_id}": frozenset(
+        {"PUT", "DELETE"}
+    ),
     "/api/v1/projects/{project_id}/characters/{character_id}/relationships": frozenset(
         {"PUT"}
     ),

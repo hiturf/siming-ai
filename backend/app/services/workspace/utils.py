@@ -14,6 +14,7 @@ from ...database.models import (
     OutlineNodeCharacter,
     WorldbuildingEntry,
 )
+from ...database.query_filters import current_worldbuilding_clause
 from ..outline_service import replace_character_links
 
 
@@ -96,10 +97,23 @@ def find_worldbuilding_by_title_or_id(
     text = str(value or "").strip()
     if not text:
         return None
+    by_id = (
+        db.query(WorldbuildingEntry)
+        .filter(
+            WorldbuildingEntry.project_id == project_id,
+            WorldbuildingEntry.id == text,
+        )
+        .first()
+    )
+    if by_id:
+        return by_id
     return (
         db.query(WorldbuildingEntry)
-        .filter(WorldbuildingEntry.project_id == project_id)
-        .filter((WorldbuildingEntry.id == text) | (WorldbuildingEntry.title == text))
+        .filter(
+            WorldbuildingEntry.project_id == project_id,
+            WorldbuildingEntry.title == text,
+            current_worldbuilding_clause(WorldbuildingEntry.status),
+        )
         .first()
     )
 

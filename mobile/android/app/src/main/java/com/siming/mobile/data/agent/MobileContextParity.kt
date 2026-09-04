@@ -132,6 +132,7 @@ internal fun pcCharacterDetails(
 internal fun pcExactCharacterArchive(
     allRecords: List<JsonObject>,
     character: JsonObject,
+    targetChapterNumber: Int? = null,
 ): String {
     val characterId = character.string("id")
     val names = allRecords
@@ -194,6 +195,36 @@ internal fun pcExactCharacterArchive(
         ),
         "relationships" to JsonArray(relationships),
     )
+    val profile = character["profile"] as? JsonObject ?: JsonObject(emptyMap())
+    val revealChapter = profile.intValue("reveal_chapter")
+    if (
+        targetChapterNumber != null && targetChapterNumber > 0 &&
+        revealChapter != null && revealChapter > targetChapterNumber
+    ) {
+        archive["aliases"] = JsonArray(emptyList())
+        archive["age"] = JsonPrimitive("")
+        archive["appearance"] = JsonPrimitive("")
+        archive["personality"] = JsonPrimitive("")
+        archive["background"] = JsonPrimitive("")
+        archive["abilities"] = JsonArray(emptyList())
+        archive["state"] = JsonObject(
+            state.keys.associateWith { JsonPrimitive("") },
+        )
+        archive["profile"] = JsonObject(
+            PC_CHARACTER_PROFILE_FIELDS.associateWith { field ->
+                if (field == "reveal_chapter") JsonPrimitive(revealChapter) else JsonPrimitive("")
+            },
+        )
+        archive["ai_config"] = JsonNull
+        archive["relationships"] = JsonArray(emptyList())
+        archive["disclosure"] = JsonObject(
+            linkedMapOf(
+                "status" to JsonPrimitive("withheld_until_chapter"),
+                "target_chapter_number" to JsonPrimitive(targetChapterNumber),
+                "reveal_chapter" to JsonPrimitive(revealChapter),
+            ),
+        )
+    }
     return canonicalMobileJson(JsonObject(archive))
 }
 
@@ -298,3 +329,15 @@ private fun importance(value: String): Int = IMPORTANCE_WEIGHT[value] ?: 2
 
 private val OPEN_STATUSES = setOf("open", "deferred", "pending_review", "stale")
 private val IMPORTANCE_WEIGHT = mapOf("critical" to 4, "high" to 3, "medium" to 2, "low" to 1)
+private val PC_CHARACTER_PROFILE_FIELDS = listOf(
+    "core_motivation",
+    "inner_lack",
+    "core_belief",
+    "public_persona",
+    "hidden_persona",
+    "reveal_chapter",
+    "moral_taboo",
+    "voice",
+    "action_habit",
+    "trauma_trigger",
+)

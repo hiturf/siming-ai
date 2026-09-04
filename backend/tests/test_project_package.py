@@ -105,6 +105,7 @@ def _seed_project(db: Session, root: Path, *, project_id: str = "source-project"
         summary="开篇结构",
         actual_summary=SUMMARY_SENTINEL,
         status="in_progress",
+        cataloging_status="cataloged",
     )
     chapter = Chapter(
         id="chapter-1",
@@ -480,6 +481,8 @@ def test_full_roundtrip_cross_database_restores_author_data_and_rebuilds_indexes
         assert chapter.id == str(uuid.uuid5(PACKAGE_ID_NAMESPACE, f"{key}:chapters:chapter-1"))
         assert destination.query(ChapterSnapshot).one().content == SNAPSHOT_SENTINEL
         assert destination.query(ChapterSummary).one().summary_text == SUMMARY_SENTINEL
+        restored_outline = destination.query(OutlineNode).filter_by(project_id=project_id).one()
+        assert restored_outline.cataloging_status == "cataloged"
         draft = destination.query(ChapterDraft).one()
         assert draft.content == DRAFT_SENTINEL
         assert draft.saved_chapter_id is None
@@ -547,7 +550,9 @@ def test_real_fastapi_routes_stream_export_and_idempotently_import(seeded):
             headers={"Idempotency-Key": key},
         )
         assert first.status_code == 200, first.text
-        project_id = first.json()["data"]["project_id"]
+        first_payload = first.json()
+        project_id = first_payload["data"]["project_id"]
+        assert first_payload["message"] == "项目包导入成功：已创建作品「API 导入副本」"
         replay = client.post(
             "/api/v1/projects/project-package/import",
             files=files,
@@ -555,8 +560,12 @@ def test_real_fastapi_routes_stream_export_and_idempotently_import(seeded):
             headers={"Idempotency-Key": key},
         )
         assert replay.status_code == 200
-        assert replay.json()["data"]["project_id"] == project_id
-        assert replay.json()["data"]["replayed"] is True
+        replay_payload = replay.json()
+        assert replay_payload["data"]["project_id"] == project_id
+        assert replay_payload["data"]["replayed"] is True
+        assert replay_payload["message"] == (
+            "项目包导入成功：已复用此前导入的作品「API 导入副本」"
+        )
         conflict = client.post(
             "/api/v1/projects/project-package/import",
             files=files,

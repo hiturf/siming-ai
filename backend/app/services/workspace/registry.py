@@ -46,6 +46,7 @@ from ...modules.model_runtime.interfaces.tool_definitions import (
 from ...modules.operations.interfaces.tool_definitions import (
     TOOL_DEFINITIONS as OPERATIONS_TOOL_DEFINITIONS,
 )
+from ...modules.story.domain.outline_contract import OUTLINE_PROPOSAL_MAX_NODES
 from ...modules.story.interfaces.tool_definitions import (
     TOOL_DEFINITIONS as STORY_TOOL_DEFINITIONS,
 )
@@ -100,6 +101,38 @@ _STATUS_ONLY_CONTRACT = ModelResultContract(
     data_fields=_STATUS_RECEIPT_DATA_FIELDS,
 )
 
+_CATALOGING_LAUNCH_RECEIPT_CONTRACT = ModelResultContract(
+    policy=ModelResultPolicy.STATUS_ONLY,
+    max_json_bytes=8 * 1024,
+    data_fields=(
+        "id",
+        "job_id",
+        "project_id",
+        "operation_id",
+        "status",
+        "execution_mode",
+        "execution_backend",
+        "total_chapters",
+        "completed_chapters",
+        "failed_chapters",
+        "started",
+        "worker_queued",
+        "existing_worker",
+        "trigger_source",
+        "idempotent_reuse",
+        "requested_chapter_ids",
+        "already_cataloged_chapter_ids",
+        "in_progress_chapter_ids",
+        "queued_chapter_ids",
+        "deferred_chapter_ids",
+        "reused_job_ids",
+        "superseded_job_ids",
+        "next_action",
+        "error",
+        "review_warning",
+    ),
+)
+
 _CHAPTER_DRAFT_RESULT_CONTRACT = ModelResultContract(
     policy=ModelResultPolicy.ARTIFACT_REFERENCE,
     max_json_bytes=16 * 1024,
@@ -114,6 +147,15 @@ _CHAPTER_DRAFT_RESULT_CONTRACT = ModelResultContract(
         "next_actions",
         "word_count",
         "context_manifest_id",
+        # A rejected short draft is not an artifact, but the model and author
+        # still need the deterministic retry receipt.  Keep only the declared
+        # counts and booleans; prose and tokens remain outside the projection.
+        "reason_code",
+        "actual_han_characters",
+        "minimum_han_characters",
+        "missing_han_characters",
+        "draft_stored",
+        "context_selection_token_consumed",
     ),
     reference_fields=("draft_id", "content_ref"),
     preview=ModelResultPreview(
@@ -153,11 +195,18 @@ _OUTLINE_DRAFT_RESULT_CONTRACT = ModelResultContract(
             "character_names",
             "status",
         ),
-        max_items=8,
+        max_items=OUTLINE_PROPOSAL_MAX_NODES,
     ),
 )
 
 _MODEL_RESULT_CONTRACTS_BY_NAME: dict[str, ModelResultContract] = {
+    # REST, native-agent and CLI/MCP callers must be able to distinguish a
+    # newly queued job from an idempotently reused current-version result.
+    # Hiding these launch fields makes repeated catalog clicks look like fresh
+    # work on the CLI surface even though the shared launcher did the right
+    # thing underneath.
+    "start_cataloging_job": _CATALOGING_LAUNCH_RECEIPT_CONTRACT,
+    "start_external_cataloging_job": _CATALOGING_LAUNCH_RECEIPT_CONTRACT,
     # These generators persist their complete author-review product before
     # returning. The model receives the durable reference plus a declared
     # preview; the public projection uses the same declaration to build the
@@ -219,23 +268,55 @@ _MODEL_RESULT_CONTRACTS_BY_NAME: dict[str, ModelResultContract] = {
     "read_project_file": ModelResultContract(max_json_bytes=32 * 1024),
     "search_context": ModelResultContract(max_json_bytes=16 * 1024),
     "prepare_task_context": ModelResultContract(max_json_bytes=32 * 1024),
+    # The external wrapper delivers the same lossless 20 KiB context pages as
+    # prepare_task_context, plus target and MCP workflow metadata. Keeping the
+    # default 16 KiB read contract makes a valid Chinese page fail projection
+    # once a real project has enough current context.
+    "prepare_external_writing_context": ModelResultContract(max_json_bytes=32 * 1024),
     # Twelve 600-character evidence previews plus stable IDs/hashes fit this
     # single-call envelope. Two maximum pages must be requested in separate
     # model steps so the native result batch remains bounded.
     "search_task_context": ModelResultContract(max_json_bytes=32 * 1024),
     "submit_context_evidence": ModelResultContract(
         policy=ModelResultPolicy.STATUS_ONLY,
-        max_json_bytes=8 * 1024,
+        # The success receipt includes the first lossless context page.  Its
+        # page body may use 20 KiB, so reserve a complete 24 KiB envelope.
+        max_json_bytes=24 * 1024,
         data_fields=(
             "manifest_id",
             "accepted_count",
             "selection_ready",
             "context_selection_token",
+            "context_delivery_ready",
+            "context_delivery",
             "estimated_input_tokens",
             "input_budget_tokens",
             "soft_target_tokens",
             "soft_target_exceeded",
             "warnings",
+            "context_page", "next_tool", "next_arguments",
+            "validation_errors", "validation_error_count", "validation_errors_has_more",
+        ),
+    ),
+    "save_external_cataloging_facts": ModelResultContract(
+        policy=ModelResultPolicy.STATUS_ONLY,
+        max_json_bytes=8 * 1024,
+        data_fields=(
+            "job_id", "project_id", "chapter_id", "facts_saved", "chapter_run_status",
+            "candidate_generation_allowed", "candidate_gate_note", "blocking_run",
+            "validation_errors", "validation_error_count", "validation_errors_has_more",
+            "allowed_fact_types", "next_tool", "next_arguments",
+        ),
+    ),
+    "save_external_cataloging_candidates": ModelResultContract(
+        policy=ModelResultPolicy.STATUS_ONLY,
+        max_json_bytes=16 * 1024,
+        data_fields=(
+            "job_id", "project_id", "chapter_id", "candidates_saved", "duplicates_skipped",
+            "candidates_total", "candidate_set_complete", "missing_required_items",
+            "chapter_run_status", "auto_applied", "apply_status", "coverage",
+            "candidate_generation_allowed", "blocking_run", "next_tool", "next_arguments",
+            "validation_errors", "validation_error_count", "validation_errors_has_more",
         ),
     ),
     "list_imported_files": ModelResultContract(max_json_bytes=16 * 1024),
@@ -257,7 +338,7 @@ def _model_result_contract_for(tool_def: ToolDef) -> ModelResultContract:
                         source_field="nodes",
                         output_field="nodes",
                         item_fields=("id", "parent_id", "node_type", "title", "status"),
-                        max_items=8,
+                        max_items=OUTLINE_PROPOSAL_MAX_NODES,
                     ),
                 ),
             )
@@ -423,7 +504,6 @@ class ToolRegistry(ToolSpecRegistryMixin):
                 "verify_external_cataloging_progress",
                 "get_cataloging_control_state",
                 "list_cataloging_facts",
-                "apply_pending_cataloging",
             }
             return [
                 td

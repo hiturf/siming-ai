@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database.models import Base, Character, OutlineDraft, OutlineNode, Project
 from app.services.context_orchestrator import ContextOrchestrator
+from app.services.workspace.outline_drafts import confirm_outline_draft
 from app.services.workspace.tools.external_writing import save_external_outline_draft
 from app.services.workspace.tools.outline_writer import outline_writer
 
@@ -46,7 +47,7 @@ class OutlineDraftGenerationTestCase(unittest.TestCase):
         self.db.close()
         self.engine.dispose()
 
-    def planning_context(self):
+    def planning_context(self, batch_count=1):
         orchestrator = ContextOrchestrator(self.db)
         manifest = orchestrator.prepare(
             project_id="p1",
@@ -54,7 +55,7 @@ class OutlineDraftGenerationTestCase(unittest.TestCase):
             model="openai:test",
             arguments={
                 "insert_after_id": "o1",
-                "batch_count": 1,
+                "batch_count": batch_count,
                 "requirements": "Plan the next chapter.",
             },
         )
@@ -124,6 +125,8 @@ class OutlineDraftGenerationTestCase(unittest.TestCase):
         draft = self.db.query(OutlineDraft).filter_by(project_id="p1").one()
         self.assertEqual(result["data"]["draft_id"], draft.id)
         self.assertEqual(draft.nodes_json[0]["title"], "Chapter Two")
+        self.assertEqual(draft.nodes_json[0]["planned_summary"], "The second gate falls.")
+        self.assertEqual(draft.nodes_json[0]["actual_summary"], "")
         self.assertEqual(
             draft.context_selection_digest,
             hashlib.sha256(token.encode("utf-8")).hexdigest(),
@@ -298,6 +301,220 @@ class OutlineDraftGenerationTestCase(unittest.TestCase):
         self.assertEqual(result["turn_directive"], "end_after_outline_draft")
         self.assertEqual(self.db.query(OutlineNode).filter_by(project_id="p1").count(), 1)
         self.assertEqual(self.db.query(OutlineDraft).filter_by(project_id="p1").count(), 1)
+
+    def test_external_top_level_nodes_may_repeat_the_formal_parent_title(self) -> None:
+        volume = OutlineNode(
+            id="volume-two",
+            project_id="p1",
+            title="Second Volume",
+            node_type="volume",
+            sort_order=1000,
+        )
+        self.db.add(volume)
+        chapter = self.db.query(OutlineNode).filter_by(id="o1").one()
+        chapter.parent_id = volume.id
+        self.db.commit()
+
+        orchestrator = ContextOrchestrator(self.db)
+        manifest = orchestrator.prepare(
+            project_id="p1",
+            task_type="outline_planning",
+            model="openai:test",
+            arguments={
+                "parent_id": volume.id,
+                "insert_after_id": chapter.id,
+                "batch_count": 1,
+                "requirements": "Plan one chapter in the second volume.",
+            },
+        )
+        selected = orchestrator.submit_evidence(manifest, [])
+
+        result = asyncio.run(
+            save_external_outline_draft(
+                self.db,
+                "p1",
+                {
+                    "context_manifest_id": manifest.id,
+                    "context_selection_token": selected["context_selection_token"],
+                    "parent_id": volume.id,
+                    "insert_after_id": chapter.id,
+                    "nodes": [
+                        {
+                            "title": "Chapter Two",
+                            "node_type": "chapter",
+                            "summary": "Continue inside the selected formal volume.",
+                            "parent_title": volume.title,
+                            "character_names": [],
+                        }
+                    ],
+                },
+            )
+        )
+
+        self.assertEqual(result["status"], "ok")
+        draft = self.db.query(OutlineDraft).one()
+        self.assertEqual(draft.parent_id, volume.id)
+        self.assertEqual(draft.insert_after_id, chapter.id)
+        self.assertNotIn("parent_title", draft.nodes_json[0])
+
+    def test_confirm_links_existing_characters_and_preserves_future_names_without_creating_them(self) -> None:
+        manifest, token = self.planning_context()
+        saved = asyncio.run(
+            save_external_outline_draft(
+                self.db,
+                "p1",
+                {
+                    "context_manifest_id": manifest.id,
+                    "context_selection_token": token,
+                    "insert_after_id": "o1",
+                    "nodes": [
+                        {
+                            "title": "Chapter Two",
+                            "node_type": "chapter",
+                            "summary": "An existing ally meets a person who has not entered the story yet.",
+                            "character_names": ["Never Auto Load Me", "Future New Role"],
+                            "metadata": {"author_note": "Keep this note."},
+                        }
+                    ],
+                },
+            )
+        )
+        draft = self.db.query(OutlineDraft).filter_by(id=saved["data"]["draft_id"]).one()
+
+        confirmed = asyncio.run(confirm_outline_draft(self.db, "p1", draft.id))
+
+        self.assertEqual(confirmed["draft_status"], "confirmed")
+        self.assertEqual(self.db.query(Character).filter_by(project_id="p1").count(), 1)
+        self.assertIsNone(
+            self.db.query(Character).filter_by(project_id="p1", name="Future New Role").first()
+        )
+        formal = self.db.query(OutlineNode).filter_by(project_id="p1", title="Chapter Two").one()
+        self.assertEqual(
+            [link.character.name for link in formal.linked_characters],
+            ["Never Auto Load Me"],
+        )
+        self.assertEqual(formal.metadata_json["author_note"], "Keep this note.")
+        self.assertEqual(
+            formal.metadata_json["planned_character_names"],
+            ["Never Auto Load Me", "Future New Role"],
+        )
+        self.assertEqual(
+            formal.metadata_json["unlinked_planned_character_names"],
+            ["Future New Role"],
+        )
+        self.assertEqual(
+            confirmed["nodes"][0]["metadata"],
+            formal.metadata_json,
+        )
+
+        from app.services.planned_character_links import resolve_planned_outline_character_links
+
+        future = Character(project_id="p1", name="Future New Role", role_type="supporting")
+        self.db.add(future)
+        self.db.flush()
+
+        resolved = resolve_planned_outline_character_links(self.db, future)
+        self.db.flush()
+        self.db.refresh(formal)
+
+        self.assertEqual(resolved, [formal.id])
+        self.assertEqual(
+            [link.character.name for link in formal.linked_characters],
+            ["Never Auto Load Me", "Future New Role"],
+        )
+        self.assertEqual(
+            formal.metadata_json["unlinked_planned_character_names"],
+            [],
+        )
+
+    def test_external_invalid_batch_can_be_corrected_without_consuming_context(self):
+        manifest, token = self.planning_context(batch_count=6)
+        nodes = [
+            {"title": f"第{index}章 新线索", "node_type": "chapter", "summary": f"未来规划{index}",
+             "actual_summary": "尚未发生，不能写入事实", "source_chapter_id": "unwritten",
+             "cataloging_status": "completed", "character_names": []}
+            for index in range(4, 10)
+        ]
+        args = {"context_manifest_id": manifest.id, "context_selection_token": token,
+                "insert_after_id": "o1"}
+        for invalid in (json.dumps(nodes), nodes[:2], ["not an object"] * 6):
+            result = asyncio.run(save_external_outline_draft(self.db, "p1", {**args, "nodes": invalid}))
+            self.db.refresh(manifest)
+            self.assertEqual(result["status"], "error")
+            self.assertIsNone(manifest.consumed_at)
+            self.assertEqual(self.db.query(OutlineDraft).count(), 0)
+        result = asyncio.run(save_external_outline_draft(self.db, "p1", {**args, "nodes": nodes}))
+        self.assertEqual(result["status"], "ok")
+        draft = self.db.query(OutlineDraft).one()
+        self.assertEqual(len(draft.nodes_json), 6)
+        for node in draft.nodes_json:
+            self.assertEqual(node["actual_summary"], "")
+            self.assertEqual(node["planned_summary"], node["summary"])
+            self.assertNotIn("source_chapter_id", node)
+            self.assertNotIn("cataloging_status", node)
+        asyncio.run(confirm_outline_draft(self.db, project_id="p1", draft_id=draft.id))
+        formal = self.db.query(OutlineNode).filter(OutlineNode.id != "o1").all()
+        self.assertEqual({node.title for node in formal}, {node["title"] for node in nodes})
+        for node in formal:
+            self.assertFalse(node.actual_summary)
+            self.assertEqual(node.planned_summary, node.summary)
+            self.assertIsNone(node.source_chapter_id)
+            self.assertIsNone(node.cataloging_status)
+
+    def test_external_agent_can_save_eleven_node_request_without_contract_drift(self):
+        manifest, token = self.planning_context(batch_count=11)
+        position = next(
+            item for item in manifest.items if item.category == "outline_position"
+        )
+        self.assertIn('"batch_count": 11', position.content_excerpt)
+        nodes = [
+            {
+                "title": f"Future Chapter {index}",
+                "node_type": "chapter",
+                "summary": f"Plan {index}.",
+                "character_names": [],
+            }
+            for index in range(2, 13)
+        ]
+
+        result = asyncio.run(
+            save_external_outline_draft(
+                self.db,
+                "p1",
+                {
+                    "context_manifest_id": manifest.id,
+                    "context_selection_token": token,
+                    "insert_after_id": "o1",
+                    "nodes": nodes,
+                },
+            )
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(result["data"]["nodes"]), 11)
+        draft = self.db.query(OutlineDraft).one()
+        self.assertEqual(len(draft.nodes_json), 11)
+
+        confirmed = asyncio.run(confirm_outline_draft(self.db, "p1", draft.id))
+
+        self.assertEqual(len(confirmed["chapter_outline_node_ids"]), 11)
+        self.assertEqual(
+            self.db.query(OutlineNode).filter_by(project_id="p1").count(), 12
+        )
+
+    @patch("app.services.workspace.tools.outline_writer.LLMGateway.local_cli_extra_body", return_value={})
+    @patch("app.services.workspace.tools.outline_writer.LLMGateway.chat_completion", new_callable=AsyncMock)
+    def test_internal_writer_does_not_accept_a_shortened_batch(self, completion, _extra):
+        manifest, token = self.planning_context(batch_count=6)
+        completion.return_value = {"content": "", "tool_calls": [{"id": "short-outline", "type": "function",
+            "function": {"name": "propose_outline_nodes", "arguments": json.dumps({"nodes": [
+                {"title": "Only one", "node_type": "chapter", "summary": "Incomplete proposal", "character_names": []}
+            ], "design_notes": ""})}}]}
+        result = asyncio.run(outline_writer(self.db, "p1", {"context_manifest_id": manifest.id,
+            "context_selection_token": token, "insert_after_id": "o1", "batch_count": 6}))
+        self.assertEqual(result["status"], "error")
+        self.assertIn("6", result["detail"])
+        self.assertEqual(self.db.query(OutlineDraft).count(), 0)
 
 
 if __name__ == "__main__":

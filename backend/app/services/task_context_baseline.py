@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from ..database.models import Chapter, OutlineNode
+from ..modules.story.domain.outline_contract import OUTLINE_PROPOSAL_MAX_NODES
 from .rag.context_packer import estimate_tokens
 
 
@@ -79,7 +80,9 @@ def outline_position_text(
         {
             "parent_id": parent_id or None,
             "insert_after_id": insert_after_id or None,
-            "batch_count": max(1, min(8, int(batch_count or 1))),
+            "batch_count": max(
+                1, min(OUTLINE_PROPOSAL_MAX_NODES, int(batch_count or 1))
+            ),
         },
         ensure_ascii=False,
         sort_keys=True,

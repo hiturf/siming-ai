@@ -11,17 +11,19 @@ from app.ai.capabilities import (
     TOOL_CAPABILITY_UNAVAILABLE_MESSAGE,
 )
 from app.architecture.uow import commit_session
+from app.modules.story.domain.outline_contract import OUTLINE_PROPOSAL_MAX_NODES
 
+from ....core.exceptions import ValidationError
 from ....database.models import Project
 from ....modules.model_runtime.application.execution import model_executor as LLMGateway
 from ....prompts.outline_writer_prompts import build_outline_writer_messages
 from ....services.context_orchestrator import ContextOrchestrator
-from ....services.story_granularity import extract_chapter_number, normalize_outline_batch
 from ....services.task_context_selection import render_generation_context
 from ..outline_drafts import (
     PendingOutlineDraftConflict,
     latest_pending_outline_draft,
     outline_draft_result_data,
+    outline_proposal_batch_count,
     pending_outline_draft_block_result,
     store_outline_draft,
 )
@@ -42,7 +44,7 @@ OUTLINE_PROPOSAL_TOOL = {
                 "nodes": {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": 8,
+                    "maxItems": OUTLINE_PROPOSAL_MAX_NODES,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -53,11 +55,13 @@ OUTLINE_PROPOSAL_TOOL = {
                             },
                             "summary": {"type": "string"},
                             "parent_title": {"type": "string"},
-                            "actual_summary": {"type": "string"},
-                            "planned_summary": {"type": "string"},
                             "character_names": {
                                 "type": "array",
                                 "items": {"type": "string"},
+                                "description": (
+                                    "本节点未来会涉及的人物名。尚未建立人物档案的新人物可在这里规划；"
+                                    "作者确认草稿时只保留待引入姓名，不会自动创建人物档案。"
+                                ),
                             },
                             "status": {"type": "string", "enum": ["pending"]},
                         },
@@ -76,24 +80,6 @@ OUTLINE_PROPOSAL_TOOL = {
         },
     },
 }
-
-
-def _normalize_generated_nodes(
-    nodes: list[Any],
-    requirements: str,
-) -> list[dict[str, Any]]:
-    normalized = normalize_outline_batch(
-        [item for item in nodes[:8] if isinstance(item, dict)],
-        chapter_number=extract_chapter_number(requirements),
-    )
-    for node in normalized:
-        if "character_names" not in node and isinstance(
-            node.get("related_characters"), list
-        ):
-            node["character_names"] = node.get("related_characters")
-        node.pop("related_characters", None)
-        node["status"] = "pending"
-    return normalized
 
 
 def _result(
@@ -165,8 +151,6 @@ async def outline_writer(
 
     parent_id = str(args.get("parent_id") or "").strip() or None
     insert_after_id = str(args.get("insert_after_id") or "").strip() or None
-    requirements = str(args.get("requirements") or "").strip()
-    batch_count = max(1, min(8, int(args.get("batch_count") or 1)))
     manifest_id = str(args.get("context_manifest_id") or "").strip()
     selection_token = str(args.get("context_selection_token") or "").strip()
     if not manifest_id:
@@ -203,6 +187,12 @@ async def outline_writer(
                 ),
             },
         )
+    try:
+        batch_count = outline_proposal_batch_count(manifest)
+    except ValidationError as exc:
+        return _result("needs_confirmation", str(exc))
+    if "batch_count" in args and args["batch_count"] != batch_count:
+        return _result("needs_confirmation", "batch_count 与已审阅的规划上下文不一致，请重新规划")
     model, capability_error = _native_model_binding(args, manifest)
     if capability_error is not None:
         return capability_error
@@ -259,13 +249,15 @@ async def outline_writer(
     raw_nodes = parsed.get("nodes", [])
     if (
         not isinstance(raw_nodes, list)
-        or len(raw_nodes) > 8
+        or len(raw_nodes) > OUTLINE_PROPOSAL_MAX_NODES
         or any(not isinstance(node, dict) for node in raw_nodes)
     ):
-        return _result("error", "大纲生成结果必须包含 1 至 8 个有效节点")
-    nodes = _normalize_generated_nodes(raw_nodes, requirements)
-    if not nodes:
-        return _result("error", "大纲生成结果没有有效节点")
+        return _result(
+            "error",
+            "大纲生成结果必须包含 1 至 "
+            f"{OUTLINE_PROPOSAL_MAX_NODES} 个有效节点",
+        )
+    nodes = raw_nodes
 
     usable, detail = orchestrator.validate(manifest)
     if not usable:
@@ -290,6 +282,8 @@ async def outline_writer(
             "outline_writer",
             conflict.draft,
         )
+    except ValidationError as exc:
+        return _result("error", str(exc), {"context_manifest_id": manifest.id})
 
     return apply_turn_directive(
         _result(

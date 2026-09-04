@@ -841,6 +841,19 @@ async def verify_saved_model_config(provider: str, db: Session = Depends(get_db)
     )
     try:
         test_result = await test_connection(payload, db)
+        if provider == "opencode_cli":
+            # Writing also needs capacity; a short connection probe alone
+            # cannot make a newly configured model ready for its first turn.
+            models = await get_model_verification().list_models(ModelProbeRequest(
+                provider=provider,
+                api_key="",
+                base_url="",
+                cli_command=config.cli_command,
+                cli_args=config.cli_args,
+            ))
+            config.available_models_json = _normalized_model_options(
+                provider, models, default_model=config.default_model,
+            )
     except Exception as exc:
         if not mark_model_verification_failure(config, exc, source="manual_verify"):
             mark_model_verification_unavailable(config, exc, source="manual_verify")
@@ -856,7 +869,10 @@ async def verify_saved_model_config(provider: str, db: Session = Depends(get_db)
         config.base_url_override = resolved_base_url
     ready_message = None
     if detected_protocol:
-        ready_message = f"真实对话成功，使用 {_protocol_label(detected_protocol)}"
+        ready_message = (
+            f"基础对话探测成功，使用 {_protocol_label(detected_protocol)}；"
+            "长任务仍可能受到临时限流或服务容量影响"
+        )
     mark_model_ready(config, source="manual_verify", message=ready_message)
     became_global = crud.make_global_if_no_ready_default(config)
     commit_session(db)
@@ -868,9 +884,11 @@ async def verify_saved_model_config(provider: str, db: Session = Depends(get_db)
             "became_global_default": became_global,
         },
         message=(
-            f"{_provider_label(provider)} 已验证并设为全局默认模型"
+            f"{_provider_label(provider)} 已完成基础对话探测并设为全局默认模型；"
+            "长任务仍可能受到临时限流或服务容量影响"
             if became_global
-            else f"{_provider_label(provider)} 已验证，可以用于创作"
+            else f"{_provider_label(provider)} 已完成基础对话探测，可以发起创作；"
+            "长任务仍可能受到临时限流或服务容量影响"
         ),
     )
 

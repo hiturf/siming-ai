@@ -865,6 +865,7 @@ internal class MobileWorkspaceAgent(
 
     private suspend fun listWorldbuilding(projectId: String): JsonObject {
         val items = records(projectId, "world")
+            .filter { it.payload.isCurrentWorldbuildingEntry() }
             .sortedWith(compareBy<LocalRecord> { it.payload.string("dimension") }.thenBy { it.payload.int("sort_order") })
             .take(200)
             .map { item -> select(item.payload, "id", "title", "dimension") }
@@ -922,32 +923,69 @@ internal class MobileWorkspaceAgent(
     }
 
     private suspend fun searchOutline(projectId: String, args: JsonObject): JsonObject {
-        val all = records(projectId, "outline")
+        val records = records(projectId)
+        val all = records.filter { it.entity.entityType == "outline" }
+        val characterNamesById = records.asSequence()
+            .filter { it.entity.entityType == "character" }
+            .associate { it.entity.entityId to it.payload.string("name") }
+        val limit = args.limit(2, 2)
+        val cursor = args.int("cursor").coerceAtLeast(0)
         val nodeId = args.string("node_id")
         if (nodeId.isNotBlank()) {
             val node = all.firstOrNull { it.entity.entityId == nodeId }
                 ?: return ok("search_outline", "未找到大纲节点 $nodeId", JsonArray(emptyList()))
-            val children = all.filter { it.payload.string("parent_id") == nodeId }
-                .sortedBy { it.payload.int("sort_order") }
-                .map { select(it.payload, "id", "node_type", "title", "summary", "status") }
-            val result = buildJsonObject {
-                outlinePayload(node.payload).forEach { (key, value) -> put(key, value) }
-                put("children", JsonArray(children))
-            }
-            return ok("search_outline", "大纲节点 ${node.payload.string("title")}，${children.size} 个子节点", JsonArray(listOf(result)))
+            val page = mobileOutlinePage(
+                all.filter { it.payload.string("parent_id") == nodeId }
+                    .map { it.payload.withDerived("id", JsonPrimitive(it.entity.entityId)) },
+                cursor = cursor,
+                limit = limit,
+            )
+            val result = mobileOutlineSearchItem(
+                payload = node.payload.withDerived("id", JsonPrimitive(node.entity.entityId)),
+                args = args,
+                characterNamesById = characterNamesById,
+                children = page.items,
+            )
+            var detail = "大纲节点 ${node.payload.string("title")}：子节点共 ${page.totalItems} 个，本页返回 ${page.items.size} 个"
+            page.nextCursor?.let { detail += "；尚有未返回子节点，请用 next_cursor=$it 继续" }
+            return mobileOutlineSearchResult(
+                detail = detail,
+                data = JsonArray(listOf(result)),
+                page = page,
+                args = args,
+                nodeId = nodeId,
+            )
         }
         val query = args.string("query")
-        val items = all
+        if (query.length > 200) return skipped("search_outline", "大纲查询超过200字符，请缩小范围", JsonArray(emptyList()))
+        val page = mobileOutlinePage(
+            all
             .filter { query.isBlank() || it.payload.string("title").contains(query, ignoreCase = true) }
-            .sortedBy { it.payload.int("sort_order") }
-            .take(args.limit(10, 60))
-            .map { outlinePayload(it.payload) }
-        val detail = if (items.isEmpty()) {
-            if (query.isBlank()) "该项目暂无大纲" else "未找到匹配「$query」的大纲节点"
+                .map { it.payload.withDerived("id", JsonPrimitive(it.entity.entityId)) },
+            cursor = cursor,
+            limit = limit,
+        )
+        val items = page.items.map { mobileOutlineSearchItem(it, args, characterNamesById) }
+        var detail = if (items.isEmpty()) {
+            if (page.totalItems > 0) {
+                "匹配大纲节点共 ${page.totalItems} 个，cursor=${page.cursor} 后本页无数据"
+            } else if (query.isBlank()) {
+                "该项目暂无大纲"
+            } else {
+                "未找到匹配「$query」的大纲节点"
+            }
         } else {
-            "找到 ${items.size} 个大纲节点" + if (query.isBlank()) "" else "（搜索「$query」）"
+            "匹配大纲节点共 ${page.totalItems} 个，本页返回 ${items.size} 个" +
+                if (query.isBlank()) "" else "（搜索「$query」）"
         }
-        return ok("search_outline", detail, JsonArray(items))
+        page.nextCursor?.let { detail += "；尚有未返回节点，请用 next_cursor=$it 继续" }
+        return mobileOutlineSearchResult(
+            detail = detail,
+            data = JsonArray(items),
+            page = page,
+            args = args,
+            query = query,
+        )
     }
 
     private suspend fun searchOutlineTree(projectId: String, args: JsonObject): JsonObject {
@@ -968,7 +1006,8 @@ internal class MobileWorkspaceAgent(
         val dimension = args.string("dimension")
         val items = records(projectId, "world")
             .filter {
-                (query.isBlank() || it.payload.string("title").contains(query, ignoreCase = true)) &&
+                it.payload.isCurrentWorldbuildingEntry() &&
+                    (query.isBlank() || it.payload.string("title").contains(query, ignoreCase = true)) &&
                     (dimension.isBlank() || it.payload.string("dimension") == dimension)
             }
             .sortedBy { it.payload.int("sort_order") }
@@ -996,29 +1035,88 @@ internal class MobileWorkspaceAgent(
         val rawPayloads = rawRecords(projectId).map(LocalRecord::payload)
         val project = all.firstOrNull { it.entity.entityType == "project" }?.payload
             ?: return skipped("prepare_task_context", "项目不存在", JsonObject(emptyMap()))
-        val taskType = args.string("task_type").ifBlank { "writing" }
+        val existingId = args.string("context_manifest_id").ifBlank { args.string("manifest_id") }
+        val existing = existingId.takeIf(String::isNotBlank)?.let(contextManifests::get)
+        if (existingId.isNotBlank() && (existing == null || existing.projectId != projectId)) {
+            return skipped("prepare_task_context", "context_manifest_id 不存在或不属于当前项目")
+        }
+        val taskType = existing?.request?.taskType ?: args.string("task_type").ifBlank { "writing" }
         if (taskType !in setOf("writing", "outline_planning")) {
             return skipped("prepare_task_context", "手机独立模式不支持该上下文任务：$taskType")
         }
-        val taskArguments = args["arguments"] as? JsonObject ?: args
-        val request = MobileContextRequest.fromArgs(taskType, taskArguments)
+        val request = existing?.request ?: MobileContextRequest.fromArgs(taskType, args)
+        if (existing == null && taskType == "writing" && request.outlineNodeId.isBlank()) {
+            return result(
+                "prepare_task_context",
+                "needs_confirmation",
+                "writing requires outline_node_id on the prepare_task_context call; no manifest was created.",
+                buildJsonObject {
+                    put("reason", "missing_task_anchor")
+                    put("task_type", taskType)
+                    put("required_arguments", buildJsonArray { add(JsonPrimitive("outline_node_id")) })
+                    put("next_tool", "prepare_task_context")
+                },
+            )
+        }
         val taskConfig = contextTaskConfig(config, taskType)
         val inputs = manifestInputs(projectId, taskConfig.model, request, project, all, rawPayloads)
-        val manifest = contextEngine(taskType).prepare(inputs)
+        var manifest = existing ?: contextEngine(taskType).prepare(inputs)
+        if (manifest.status != "ready") {
+            return result(
+                "prepare_task_context",
+                "needs_confirmation",
+                "Task context anchors are invalid or incomplete; no reusable manifest ID was issued.",
+                buildJsonObject {
+                    put("reason", "invalid_task_anchor")
+                    put("task_type", taskType)
+                    put("next_tool", "prepare_task_context")
+                },
+            )
+        }
+        val selectionReady = !manifest.selectionToken.isNullOrBlank()
+        val delivery = try {
+            if (selectionReady) {
+                deliverMobileNextContextPage(manifest, manifest.renderedContext(), args)
+            } else {
+                null
+            }
+        } catch (error: IllegalArgumentException) {
+            return skipped("prepare_task_context", error.message.orEmpty())
+        }
+        val page = delivery?.page ?: try { mobileContextPage(manifest.renderedContext(), args) }
+        catch (error: IllegalArgumentException) { return skipped("prepare_task_context", error.message.orEmpty()) }
+        manifest = delivery?.manifest ?: manifest
         cacheManifest(manifest)
+        val hasMore = page["next_cursor"] != JsonNull
+        val needsSelection = manifest.selectionToken.isNullOrBlank()
+        val deliveryReady = selectionReady && mobileContextDeliveryReady(
+            manifest,
+            manifest.selectionToken.orEmpty(),
+        )
         val data = buildJsonObject {
             put("manifest_id", manifest.id)
             put("context_manifest_id", manifest.id)
-            put("context_manifest", manifest.toJson(includeContent = false))
-            put("baseline_context", manifest.renderedContext())
-            put("selection_required", true)
+            put("context_manifest", compactMobileContextManifest(manifest))
+            put("context_page", page)
+            if (deliveryReady) put("context_selection_token", manifest.selectionToken.orEmpty())
+            put("context_delivery_ready", deliveryReady)
+            put("context_delivery", mobileContextDeliveryStatus(manifest.contextDelivery))
+            put("selection_required", needsSelection)
             put("next_tools", buildJsonArray {
-                add(JsonPrimitive("search_task_context"))
-                add(JsonPrimitive("submit_context_evidence"))
+                if (hasMore) add(JsonPrimitive("prepare_task_context"))
+                else if (needsSelection) {
+                    add(JsonPrimitive("search_task_context"))
+                    add(JsonPrimitive("submit_context_evidence"))
+                }
             })
+            if (hasMore) put("next_arguments", mobileContextPageArguments(manifest, page))
         }
         val taskLabel = if (taskType == "writing") "写章" else "大纲规划"
-        val detail = if (manifest.status == "ready") {
+        val detail = if (deliveryReady) {
+            "已按顺序读完全部精确上下文；可使用末页返回的选择令牌执行$taskLabel"
+        } else if (selectionReady) {
+            "精确上下文尚未读完；必须原样复制 next_arguments 继续读取，末页才返回选择令牌"
+        } else if (manifest.status == "ready") {
             "已建立精简$taskLabel 基线；请由模型检索并复核本任务需要的资料"
         } else {
             "$taskLabel 基线缺少必选位置、目标或文风锚点"
@@ -1114,36 +1212,72 @@ internal class MobileWorkspaceAgent(
                 buildJsonObject { put("manifest_id", manifest.id) },
             )
         }
-        val sources = (args["sources"] as? JsonArray).orEmpty()
-            .mapNotNull { it as? JsonObject }
-        val itemIds = sources.mapNotNull { source ->
-            source.string("item_id").ifBlank { source.string("id") }.takeIf(String::isNotBlank)
+        val rawSources = args["sources"] as? JsonArray
+            ?: return skipped("submit_context_evidence", "sources must be a JSON array of objects, not an encoded string")
+        if (rawSources.any { it !is JsonObject }) {
+            return skipped("submit_context_evidence", "sources must contain only objects")
         }
-        val selection = engine.select(validation.current, inputs, itemIds)
-        cacheManifest(selection.manifest)
+        val sources = rawSources.map { it as JsonObject }
+        val references = resolveMobileContextEvidenceSources(validation.current, sources)
+        val selection = engine.select(
+            validation.current,
+            inputs,
+            references.itemIds,
+            references.rejected,
+        )
+        val firstPage = if (selection.ready) {
+            mobileContextPage(selection.manifest.renderedContext())
+        } else {
+            null
+        }
+        val deliveredManifest = if (firstPage != null) {
+            beginMobileContextDelivery(selection.manifest, firstPage)
+        } else {
+            selection.manifest
+        }
+        cacheManifest(deliveredManifest)
+        val deliveryReady = selection.ready && mobileContextDeliveryReady(
+            deliveredManifest,
+            deliveredManifest.selectionToken.orEmpty(),
+        )
         val data = buildJsonObject {
-            put("manifest_id", selection.manifest.id)
+            put("manifest_id", deliveredManifest.id)
             put("accepted_count", selection.accepted.size)
             put("accepted", JsonArray(selection.accepted.map { it.toJson(includeContent = false) }))
             put("rejected", JsonArray(selection.rejected.map(::JsonPrimitive)))
+            if (selection.rejected.isNotEmpty()) {
+                mobileContextSelectionDiagnostics(selection.rejected).forEach { (key, value) -> put(key, value) }
+            }
             put("selection_ready", selection.ready)
             if (selection.ready) {
-                put("context_selection_token", selection.manifest.selectionToken.orEmpty())
-                put("task_context", selection.manifest.renderedContext())
-                put("estimated_input_tokens", selection.manifest.estimatedInputTokens)
-                put("input_budget_tokens", selection.manifest.inputBudgetTokens)
-                put("soft_target_tokens", selection.manifest.softInputTargetTokens)
+                if (deliveryReady) {
+                    put("context_selection_token", deliveredManifest.selectionToken.orEmpty())
+                }
+                put("context_delivery_ready", deliveryReady)
+                put("context_delivery", mobileContextDeliveryStatus(deliveredManifest.contextDelivery))
+                put("context_page", firstPage!!)
+                if (firstPage["next_cursor"] != JsonNull) {
+                    put("next_tool", "prepare_task_context")
+                    put("next_arguments", mobileContextPageArguments(deliveredManifest, firstPage))
+                }
+                put("estimated_input_tokens", deliveredManifest.estimatedInputTokens)
+                put("input_budget_tokens", deliveredManifest.inputBudgetTokens)
+                put("soft_target_tokens", deliveredManifest.softInputTargetTokens)
                 put(
                     "soft_target_exceeded",
-                    selection.manifest.estimatedInputTokens > selection.manifest.softInputTargetTokens,
+                    deliveredManifest.estimatedInputTokens > deliveredManifest.softInputTargetTokens,
                 )
-                put("warnings", JsonArray(selection.manifest.warnings.map(::JsonPrimitive)))
+                put("warnings", JsonArray(deliveredManifest.warnings.map(::JsonPrimitive)))
             }
         }
         return if (selection.ready) {
             ok(
                 "submit_context_evidence",
-                "已复核并精确载入 ${selection.accepted.size} 个来源；请在下一模型步骤携带选择令牌执行任务",
+                if (deliveryReady) {
+                    "已复核 ${selection.accepted.size} 个完整来源并送达全部上下文；可使用返回的选择令牌执行任务"
+                } else {
+                    "已复核 ${selection.accepted.size} 个完整来源；选择令牌暂不返回，必须按 next_arguments 逐页读到末页"
+                },
                 data,
             )
         } else {
@@ -1272,6 +1406,20 @@ internal class MobileWorkspaceAgent(
             )
         }
         val selectedManifest = validation.current
+        if (
+            !selectedManifest.selectionToken.isNullOrBlank() &&
+            !mobileContextDeliveryReady(selectedManifest, selectedManifest.selectionToken)
+        ) {
+            return result(
+                "chapter_writer",
+                "needs_confirmation",
+                "所选上下文页面尚未按顺序完整读取；请继续使用上一页的精确 next_arguments",
+                buildJsonObject {
+                    put("context_manifest_id", selectedManifest.id)
+                    put("next_tool", "prepare_task_context")
+                },
+            )
+        }
         if (
             selectedManifest.selectionToken.isNullOrBlank() ||
             selectionToken.isBlank() ||
@@ -1436,6 +1584,27 @@ internal class MobileWorkspaceAgent(
             )
             return errorResult("chapter_writer", "生成的章节正文为空")
         }
+        val actualHanCharacters = countHanCharacters(content)
+        val minimumHanCharacters = request.minimumHanCharacters
+        if (minimumHanCharacters != null && actualHanCharacters < minimumHanCharacters) {
+            chapterWriteStore.transition(
+                checkpointRun.copy(content = content),
+                MobileChapterWriteState.FAILED,
+                error = "正文只有 $actualHanCharacters 个汉字，低于 $minimumHanCharacters 个汉字的硬下限",
+            )
+            return result(
+                "chapter_writer",
+                "needs_confirmation",
+                "模型正文只有 $actualHanCharacters 个汉字，低于作者明确的 $minimumHanCharacters 个汉字硬下限；未创建待审草稿，请重新建立上下文后重试。",
+                buildJsonObject {
+                    put("context_manifest_id", manifest.id)
+                    put("outline_node_id", request.outlineNodeId)
+                    put("actual_han_characters", actualHanCharacters)
+                    put("minimum_han_characters", minimumHanCharacters)
+                    put("draft_stored", false)
+                },
+            )
+        }
         val generated = chapterWriteStore.save(
             checkpointRun.copy(
                 content = content,
@@ -1483,6 +1652,8 @@ internal class MobileWorkspaceAgent(
             put("context_manifest_id", run.manifest.id)
             put("content", run.content)
             put("word_count", countWords(run.content))
+            put("han_character_count", countHanCharacters(run.content))
+            request.minimumHanCharacters?.let { put("minimum_han_characters", it) }
             put("model", run.model)
             put("write_run_state", run.state)
             put("draft_status", "pending")
@@ -1610,6 +1781,20 @@ internal class MobileWorkspaceAgent(
         }
         val selectedManifest = validation.current
         if (
+            !selectedManifest.selectionToken.isNullOrBlank() &&
+            !mobileContextDeliveryReady(selectedManifest, selectedManifest.selectionToken)
+        ) {
+            return result(
+                "outline_writer",
+                "needs_confirmation",
+                "所选上下文页面尚未按顺序完整读取；请继续使用上一页的精确 next_arguments",
+                buildJsonObject {
+                    put("context_manifest_id", selectedManifest.id)
+                    put("next_tool", "prepare_task_context")
+                },
+            )
+        }
+        if (
             selectedManifest.selectionToken.isNullOrBlank() ||
             selectionToken.isBlank() ||
             selectionToken != selectedManifest.selectionToken
@@ -1621,9 +1806,12 @@ internal class MobileWorkspaceAgent(
                 buildJsonObject { put("next_tool", "submit_context_evidence") },
             )
         }
+        val batchCount = request.batchCount.coerceIn(1, OUTLINE_PROPOSAL_MAX_NODES)
+        if (args["batch_count"] != null && args["batch_count"] != JsonPrimitive(batchCount)) {
+            return errorResult("outline_writer", "batch_count 与已审阅的规划上下文不一致，请重新规划")
+        }
         val manifest = selectedManifest.copy(selectionToken = null)
         cacheManifest(manifest)
-        val batchCount = request.batchCount.coerceIn(1, 8)
         val turn = directApi.agentTurn(
             config = config,
             messages = listOf(
@@ -1647,6 +1835,9 @@ internal class MobileWorkspaceAgent(
             ?: return errorResult("outline_writer", "大纲生成结果缺少 nodes")
         if (nodes.isEmpty()) return errorResult("outline_writer", "大纲生成结果没有可审阅节点")
         if (nodes.size > 8) return errorResult("outline_writer", "单次大纲草稿最多包含 8 个节点")
+        if (nodes.size != batchCount) {
+            return errorResult("outline_writer", "本次规划要求 $batchCount 个节点，实际提交 ${nodes.size} 个；请完整提交，不能缩减批次")
+        }
         if (nodes.any { element -> element !is JsonObject }) {
             return errorResult("outline_writer", "大纲生成结果包含无效节点")
         }
@@ -1992,13 +2183,6 @@ internal class MobileWorkspaceAgent(
         if (entityType != "project") put("project_id", projectId)
     }
 
-    private fun outlinePayload(payload: JsonObject): JsonObject = select(
-        payload,
-        "id", "parent_id", "node_type", "title", "summary", "status", "sort_order",
-        "source_chapter_id", "actual_summary", "planned_summary", "cataloging_status", "metadata",
-        "character_names", "character_ids", "characters",
-    )
-
     private fun outlineTree(all: List<LocalRecord>, parentId: String, visited: Set<String>): JsonArray = buildJsonArray {
         all.filter { it.payload.string("parent_id") == parentId && it.entity.entityId !in visited }
             .sortedBy { it.payload.int("sort_order") }
@@ -2125,6 +2309,25 @@ internal class MobileWorkspaceAgent(
 
     private fun countWords(content: String): Int = content.count { !it.isWhitespace() }
 
+    private fun countHanCharacters(content: String): Int {
+        var count = 0
+        var index = 0
+        while (index < content.length) {
+            val codePoint = Character.codePointAt(content, index)
+            if (
+                codePoint in 0x3400..0x4DBF ||
+                codePoint in 0x4E00..0x9FFF ||
+                codePoint in 0xF900..0xFAFF ||
+                codePoint in 0x20000..0x2FA1F ||
+                codePoint in 0x30000..0x323AF
+            ) {
+                count += 1
+            }
+            index += Character.charCount(codePoint)
+        }
+        return count
+    }
+
     private data class LocalRecord(val entity: ReplicaEntity, val payload: JsonObject)
 
     companion object {
@@ -2176,11 +2379,19 @@ internal class MobileWorkspaceAgent(
             "accepted_count",
             "selection_ready",
             "context_selection_token",
+            "context_delivery_ready",
+            "context_delivery",
             "estimated_input_tokens",
             "input_budget_tokens",
             "soft_target_tokens",
             "soft_target_exceeded",
             "warnings",
+            "context_page",
+            "next_tool",
+            "next_arguments",
+            "validation_errors",
+            "validation_error_count",
+            "validation_errors_has_more",
         )
         private val WORLD_DIMENSIONS = setOf("geography", "history", "factions", "power_system", "races", "culture")
         private val LOCATOR_FIELDS = setOf(
@@ -2208,3 +2419,197 @@ internal fun existingMobileChapterIdForOutline(
     return (chapter["id"] as? JsonPrimitive)?.contentOrNull?.takeIf(String::isNotBlank)
         ?: "linked-chapter"
 }
+
+internal data class MobileOutlinePage(
+    val items: List<JsonObject>,
+    val cursor: Int,
+    val limit: Int,
+    val totalItems: Int,
+    val nextCursor: Int?,
+)
+
+internal fun mobileOutlinePage(
+    values: List<JsonObject>,
+    cursor: Int,
+    limit: Int,
+): MobileOutlinePage {
+    val safeCursor = cursor.coerceAtLeast(0)
+    val safeLimit = limit.coerceIn(1, 2)
+    val ordered = values.sortedWith(
+        compareBy<JsonObject> { it.mobileOutlineInt("sort_order") }
+            .thenBy { it.mobileOutlineString("id") },
+    )
+    val visible = ordered.drop(safeCursor).take(safeLimit)
+    val nextCursor = (safeCursor + visible.size).takeIf { it < ordered.size }
+    return MobileOutlinePage(
+        items = visible,
+        cursor = safeCursor,
+        limit = safeLimit,
+        totalItems = ordered.size,
+        nextCursor = nextCursor,
+    )
+}
+
+internal fun mobileOutlineSearchResult(
+    detail: String,
+    data: JsonArray,
+    page: MobileOutlinePage,
+    args: JsonObject,
+    nodeId: String = "",
+    query: String = "",
+): JsonObject = buildJsonObject {
+    put("tool", "search_outline")
+    put("status", "ok")
+    put("detail", detail)
+    put("data", data)
+    put("page", buildJsonObject {
+        put("cursor", page.cursor)
+        put("limit", page.limit)
+        put("returned_items", page.items.size)
+        put("total_items", page.totalItems)
+        if (page.nextCursor == null) put("next_cursor", JsonNull)
+        else put("next_cursor", page.nextCursor)
+        put("has_more", page.nextCursor != null)
+    })
+    page.nextCursor?.let { nextCursor ->
+        put("next_arguments", buildJsonObject {
+            put("cursor", nextCursor)
+            put("limit", page.limit)
+            put("summary_offset_chars", args.mobileOutlineInt("summary_offset_chars").coerceAtLeast(0))
+            put("summary_chars", args.mobileOutlineInt("summary_chars", 100).coerceIn(1, 100))
+            put("linked_cursor", args.mobileOutlineInt("linked_cursor").coerceAtLeast(0))
+            put("linked_limit", args.mobileOutlineInt("linked_limit", 2).coerceIn(1, 2))
+            if (nodeId.isNotBlank()) put("node_id", nodeId)
+            else if (query.isNotBlank()) put("query", query)
+        })
+    }
+}
+
+internal fun mobileOutlineSearchItem(
+    payload: JsonObject,
+    args: JsonObject,
+    characterNamesById: Map<String, String> = emptyMap(),
+    children: List<JsonObject>? = null,
+): JsonObject {
+    val summaryOffset = args.mobileOutlineInt("summary_offset_chars").coerceAtLeast(0)
+    val summaryChars = args.mobileOutlineInt("summary_chars", 100).coerceIn(1, 100)
+    val linkedCursor = args.mobileOutlineInt("linked_cursor").coerceAtLeast(0)
+    val linkedLimit = args.mobileOutlineInt("linked_limit", 2).coerceIn(1, 2)
+    val (summary, summaryRange) = mobileOutlineTextRange(
+        payload.mobileOutlineString("summary"),
+        summaryOffset,
+        summaryChars,
+    )
+    val (actualSummary, actualSummaryRange) = mobileOutlineTextRange(
+        payload.mobileOutlineString("actual_summary"),
+        summaryOffset,
+        summaryChars,
+    )
+    val (plannedSummary, plannedSummaryRange) = mobileOutlineTextRange(
+        payload.mobileOutlineString("planned_summary"),
+        summaryOffset,
+        summaryChars,
+    )
+    val linked = mobileOutlineLinkedCharacters(payload, characterNamesById)
+    val linkedVisible = linked.drop(linkedCursor).take(linkedLimit)
+    val linkedNextCursor = (linkedCursor + linkedVisible.size).takeIf { it < linked.size }
+    return buildJsonObject {
+        put("id", payload.mobileOutlineString("id"))
+        put("parent_id", payload["parent_id"] ?: JsonNull)
+        put("node_type", payload.mobileOutlineString("node_type"))
+        put("title", payload.mobileOutlineString("title"))
+        put("summary", summary)
+        put("summary_range", summaryRange)
+        put("status", payload.mobileOutlineString("status"))
+        put("sort_order", payload.mobileOutlineInt("sort_order"))
+        put("source_chapter_id", payload["source_chapter_id"] ?: JsonNull)
+        put("actual_summary", actualSummary)
+        put("actual_summary_range", actualSummaryRange)
+        put("planned_summary", plannedSummary)
+        put("planned_summary_range", plannedSummaryRange)
+        put("cataloging_status", payload["cataloging_status"] ?: JsonNull)
+        put("linked_characters", JsonArray(linkedVisible))
+        put("linked_page", buildJsonObject {
+            put("cursor", linkedCursor)
+            if (linkedNextCursor == null) put("next_cursor", JsonNull)
+            else put("next_cursor", linkedNextCursor)
+            put("has_more", linkedNextCursor != null)
+        })
+        children?.let { childRows ->
+            put("children", JsonArray(childRows.map { child ->
+                buildJsonObject {
+                    put("id", child.mobileOutlineString("id"))
+                    put("node_type", child.mobileOutlineString("node_type"))
+                    put("title", child.mobileOutlineString("title"))
+                    put(
+                        "summary",
+                        mobileOutlineTextRange(
+                            child.mobileOutlineString("summary"),
+                            summaryOffset,
+                            summaryChars,
+                        ).first,
+                    )
+                    put("status", child.mobileOutlineString("status"))
+                }
+            }))
+        }
+    }
+}
+
+private fun mobileOutlineTextRange(
+    value: String,
+    offset: Int,
+    maximum: Int,
+): Pair<String, JsonObject> {
+    val safeOffset = offset.coerceAtLeast(0)
+    val safeMaximum = maximum.coerceAtLeast(1)
+    val end = (safeOffset + safeMaximum).coerceAtMost(value.length)
+    val visible = if (safeOffset >= value.length) "" else value.substring(safeOffset, end)
+    return visible to buildJsonObject {
+        put("offset_chars", safeOffset)
+        put("returned_chars", visible.length)
+        if (end < value.length) put("next_offset_chars", end) else put("next_offset_chars", JsonNull)
+        put("has_more", end < value.length)
+        put("total_chars", value.length)
+    }
+}
+
+private fun mobileOutlineLinkedCharacters(
+    payload: JsonObject,
+    characterNamesById: Map<String, String>,
+): List<JsonObject> {
+    val rows = (payload["linked_characters"] as? JsonArray)
+        ?: (payload["characters"] as? JsonArray)
+    val structured = rows.orEmpty().mapNotNull { raw ->
+        val item = raw as? JsonObject ?: return@mapNotNull null
+        val id = item.mobileOutlineString("character_id")
+            .ifBlank { item.mobileOutlineString("id") }
+        if (id.isBlank()) return@mapNotNull null
+        buildJsonObject {
+            put("id", id)
+            put("name", item.mobileOutlineString("name").ifBlank { characterNamesById[id].orEmpty() })
+            put("role_in_scene", item.mobileOutlineString("role_in_scene"))
+        }
+    }
+    if (structured.isNotEmpty()) return structured
+
+    val ids = (payload["character_ids"] as? JsonArray).orEmpty().mapNotNull {
+        (it as? JsonPrimitive)?.contentOrNull?.takeIf(String::isNotBlank)
+    }
+    val names = (payload["character_names"] as? JsonArray).orEmpty().map {
+        (it as? JsonPrimitive)?.contentOrNull.orEmpty()
+    }
+    return ids.mapIndexed { index, id ->
+        buildJsonObject {
+            put("id", id)
+            put("name", names.getOrNull(index).orEmpty().ifBlank { characterNamesById[id].orEmpty() })
+            put("role_in_scene", "")
+        }
+    }
+}
+
+private fun JsonObject.mobileOutlineString(name: String): String =
+    (get(name) as? JsonPrimitive)?.contentOrNull.orEmpty()
+
+private fun JsonObject.mobileOutlineInt(name: String, fallback: Int = 0): Int =
+    (get(name) as? JsonPrimitive)?.intOrNull ?: fallback

@@ -1315,11 +1315,13 @@ def test_creation_unexpected_error_never_persists_or_streams_raw_exception():
         asyncio.run(produce_creation_agent_turn(request, publish))
 
     error_event = next(event for event in events if event["type"] == "error")
-    assert error_event["message"] == "立项助手处理失败"
+    error_id = error_event["data"]["error_id"]
+    assert error_event["message"] == f"立项助手处理失败；错误编号：{error_id}"
     assert error_event["data"] == {
         "error_type": "RuntimeError",
         "failure_class": "unknown",
         "next_action": "请检查模型状态后重试本轮。",
+        "error_id": error_id,
     }
     assert "SECRET" not in json.dumps(error_event, ensure_ascii=False)
     db.expire_all()
@@ -1329,7 +1331,8 @@ def test_creation_unexpected_error_never_persists_or_streams_raw_exception():
         if message["id"] == assistant_message_id
     )
     persisted = assistant["payload"]["creation_agent_error"]
-    assert persisted["message"] == "立项助手处理失败"
+    assert persisted["message"] == error_event["message"]
+    assert persisted["error_id"] == error_id
     assert "SECRET" not in json.dumps(persisted, ensure_ascii=False)
 
 

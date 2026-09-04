@@ -370,6 +370,26 @@ class HandleMessageToolsCallTest(unittest.TestCase):
         exposed = write_tools & names
         self.assertEqual(exposed, set(), f"Write tools exposed: {exposed}")
 
+    def test_tools_list_marks_read_and_write_safety_for_cli_approval(self):
+        msg = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "tools/list",
+            "params": {},
+        })
+        resp = json.loads(handle_message(
+            msg,
+            db=None,
+            project_id="p1",
+            permission_pack="project_management",
+        ))
+        tools = {item["name"]: item for item in resp["result"]["tools"]}
+
+        self.assertTrue(tools["search_chapters"]["annotations"]["readOnlyHint"])
+        self.assertTrue(tools["search_chapters"]["annotations"]["idempotentHint"])
+        self.assertFalse(tools["search_chapters"]["annotations"]["openWorldHint"])
+        self.assertFalse(tools["update_project_info"]["annotations"]["readOnlyHint"])
+
     def test_initialize_still_works(self):
         msg = json.dumps({
             "jsonrpc": "2.0",

@@ -896,12 +896,30 @@ class LocalCLIAdapter(BaseAdapter):
         return value if value > 0 else float(DEFAULT_LOCAL_CLI_TIMEOUT)
 
     @staticmethod
-    def _terminal_draft_probe(runtime_body: dict[str, Any]) -> Callable[[], Any] | None:
+    def _terminal_turn_probe(runtime_body: dict[str, Any]) -> Callable[[], Any] | None:
         from ..services.workspace.terminal_draft_detection import (
             local_cli_terminal_draft_probe,
         )
 
-        return local_cli_terminal_draft_probe(runtime_body)
+        draft_probe = local_cli_terminal_draft_probe(runtime_body)
+        category_file = str(
+            runtime_body.get("local_cli_mcp_tool_category_state_file") or ""
+        ).strip() if runtime_body.get("local_cli_mcp_authorized") else ""
+        if not category_file:
+            return draft_probe
+
+        def probe() -> str | None:
+            from ..services.tool_category_state import read_tool_category_state
+
+            state = read_tool_category_state(category_file)
+            if state["version"] > state["active_version"]:
+                # The model has committed a replacement category set. Its
+                # current process cannot see the next step's tools, so stop
+                # now instead of waiting for misleading trailing model text.
+                return f"set_tool_categories:{state['version']}"
+            return draft_probe() if draft_probe is not None else None
+
+        return probe
 
     @staticmethod
     def _creation_revision_activity_probe(
@@ -1183,7 +1201,7 @@ class LocalCLIAdapter(BaseAdapter):
         context: CLIRunContext,
         process: asyncio.subprocess.Process,
         runtime_body: dict[str, Any],
-    ) -> tuple[bytes, bytes, bool]:
+    ) -> tuple[bytes, bytes, str | None]:
         stdin_bytes = (
             context.launch.stdin_text.encode("utf-8")
             if context.launch.stdin_text is not None else None
@@ -1195,7 +1213,7 @@ class LocalCLIAdapter(BaseAdapter):
                 timeout_seconds=context.request_timeout,
                 operation_id=context.operation_id,
                 external_activity_probe=self._creation_revision_activity_probe(runtime_body),
-                terminal_probe=self._terminal_draft_probe(runtime_body),
+                terminal_probe=self._terminal_turn_probe(runtime_body),
                 quiet_seconds=self._activity_window(
                     runtime_body,
                     "local_cli_quiet_seconds",
@@ -1210,12 +1228,12 @@ class LocalCLIAdapter(BaseAdapter):
                 ),
                 stop_on_permission_request=not context.mcp_authorized,
             )
-            return stdout, stderr, False
+            return stdout, stderr, None
         except CLITurnTerminal as exc:
             return (
                 exc.stdout.encode("utf-8"),
                 exc.stderr.encode("utf-8"),
-                True,
+                str(exc),
             )
         except CLIPermissionRequiredError:
             raise
@@ -1241,7 +1259,7 @@ class LocalCLIAdapter(BaseAdapter):
         process: asyncio.subprocess.Process,
         stdout: bytes,
         stderr: bytes,
-        terminal_reached: bool,
+        terminal_reason: str | None,
         model: str,
         runtime_body: dict[str, Any],
     ) -> str:
@@ -1250,14 +1268,22 @@ class LocalCLIAdapter(BaseAdapter):
         event_error = extract_cli_error(out_text)
         auth_error = (
             None
-            if terminal_reached
+            if terminal_reason
             else detect_cli_auth_error(err_text, event_error, out_text)
         )
         if auth_error:
             raise LLMError(auth_error)
-        if terminal_reached:
+        if terminal_reason:
             self._cleanup_isolated_workspace(context.cwd, context.isolated)
-            return "章节草稿已生成，等待作者保存。"
+            kind = terminal_reason.partition(":")[0]
+            messages = {
+                "set_tool_categories": "工具类别已切换，继续下一模型步骤。",
+                "save_external_chapter_draft": "章节草稿已生成，等待作者保存。",
+                "save_external_outline_draft": "大纲草稿已生成，等待作者确认。",
+            }
+            if kind not in messages:
+                raise LLMError("本机 CLI 返回了未知的回合终止边界")
+            return messages[kind]
         if file_text := self._codex_file_result(context, process.returncode):
             self._cleanup_isolated_workspace(context.cwd, context.isolated)
             return file_text
@@ -1321,7 +1347,7 @@ class LocalCLIAdapter(BaseAdapter):
         context = self._prepare_run_context(prompt, model, runtime_body)
         try:
             process = await self._spawn_run_process(context)
-            stdout, stderr, terminal_reached = await self._collect_run_output(
+            stdout, stderr, terminal_reason = await self._collect_run_output(
                 context,
                 process,
                 runtime_body,
@@ -1331,7 +1357,7 @@ class LocalCLIAdapter(BaseAdapter):
                 process,
                 stdout,
                 stderr,
-                terminal_reached,
+                terminal_reason,
                 model,
                 runtime_body,
             )

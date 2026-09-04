@@ -102,6 +102,14 @@ _DIAGNOSTIC_DETAILS = {
     "cancelled": "工具执行已取消。",
     "canceled": "工具执行已取消。",
 }
+_DIAGNOSTIC_REASON_DETAILS = {
+    "native_tool_contract_invalid": (
+        "工具参数不符合当前 JSON Schema，本次未执行。请核对必填字段及类型；"
+        "对象和数组必须直接传入，不能编码成 JSON 字符串。修正后再调用。"
+    ),
+    "revision_conflict": "资料版本已经变化，本次未写入。请读取最新内容和 revision 后再决定修改。",
+    "tool_result_over_capacity": "工具结果超过当前模型可见容量。请缩小读取范围或使用分页；不要原样重复调用。",
+}
 # Diagnostic payloads are an untrusted boundary: many legacy handlers catch an
 # arbitrary provider/database exception and put ``str(exc)`` in ``detail`` or
 # ``data``.  Only deterministic protocol codes produced by this repository may
@@ -125,6 +133,7 @@ _SAFE_DIAGNOSTIC_REASONS = frozenset({
     "tool_result_over_capacity",
 })
 _SAFE_DIAGNOSTIC_NUMERIC_FIELDS = frozenset({
+    "current_revision",
     "actual_bytes",
     "batch_call_count",
     "call_count",
@@ -496,7 +505,9 @@ def sanitize_diagnostic_tool_result(
     return {
         "tool": tool_name,
         "status": status,
-        "detail": _DIAGNOSTIC_DETAILS[status],
+        "detail": _DIAGNOSTIC_REASON_DETAILS.get(
+            safe_data.get("reason"), _DIAGNOSTIC_DETAILS[status],
+        ),
         "data": safe_data or None,
     }
 
@@ -690,7 +701,6 @@ class ModelToolResultProjector:
         # must use the declared projection.  Only true diagnostic outcomes keep
         # their original error envelope.
         diagnostic_status = status in _DIAGNOSTIC_STATUSES
-        projectable_status = not diagnostic_status
         if diagnostic_status:
             # Handler-returned failures are not trusted. Legacy tools may have
             # copied provider bodies, database exceptions, arguments or secrets
@@ -714,7 +724,10 @@ class ModelToolResultProjector:
             )
 
             if contract.policy is ModelResultPolicy.ARTIFACT_REFERENCE:
-                if projectable_status and (
+                # A blocked/preparation result has no artifact yet. Require a
+                # durable reference only when the handler claims completion;
+                # otherwise preserve its declared prerequisite information.
+                if status in {"ok", "ready", "success", "succeeded", "completed"} and (
                     not isinstance(source_data, Mapping)
                     or not any(source_data.get(field) for field in contract.reference_fields)
                 ):
