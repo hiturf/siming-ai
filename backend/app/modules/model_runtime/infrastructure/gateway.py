@@ -14,8 +14,10 @@ from uuid import uuid4
 from app.ai.anthropic_adapter import AnthropicAdapter
 from app.ai.base import BaseAdapter
 from app.ai.capabilities import (
+    is_thinking_rejection,
     normalize_retry_count,
     provider_capabilities,
+    provider_thinking_disable_body,
     request_meta,
     sanitize_tool_request,
     should_retry_without_tool_choice,
@@ -575,43 +577,54 @@ class LLMGateway:
         )
         attempts = normalize_retry_count(retry)
 
-        async def _call() -> dict:
+        thinking_disable_body = provider_thinking_disable_body(provider)
+
+        async def _call_with(extra_body_value: dict | None, choice: str | dict | None) -> dict:
             return await adapter.chat_completion(
                 messages=messages,
                 model=model_name,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                extra_body=call_extra_body,
+                extra_body=extra_body_value,
                 tools=safe_tools,
-                tool_choice=safe_tool_choice,
+                tool_choice=choice,
             )
+
+        def _disabled_thinking_body() -> dict | None:
+            if thinking_disable_body is None:
+                return None
+            merged = dict(call_extra_body or {})
+            merged.update(thinking_disable_body)
+            return merged
 
         try:
             result = await cls._call_with_retry(
                 attempts=attempts,
                 timeout_seconds=wait_timeout_seconds,
-                call_factory=_call,
+                call_factory=lambda: _call_with(call_extra_body, safe_tool_choice),
             )
         except LLMError as exc:
-            if safe_tool_choice is not None and should_retry_without_tool_choice(exc):
+            remove_tool_choice = (
+                safe_tool_choice is not None and should_retry_without_tool_choice(exc)
+            )
+            disable_thinking = bool(
+                _disabled_thinking_body() is not None and is_thinking_rejection(exc)
+            )
+            if not remove_tool_choice and not disable_thinking:
+                raise
+            choice = None if remove_tool_choice else safe_tool_choice
+            extra_body_value = _disabled_thinking_body() if disable_thinking else call_extra_body
+            if remove_tool_choice:
                 notes.append("接口拒绝 tool_choice，已自动去掉该参数重试")
-                try:
-                    result = await cls._call_with_retry(
-                        attempts=1,
-                        timeout_seconds=wait_timeout_seconds,
-                        call_factory=lambda: adapter.chat_completion(
-                            messages=messages,
-                            model=model_name,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            extra_body=call_extra_body,
-                            tools=safe_tools,
-                            tool_choice=None,
-                        ),
-                    )
-                except LLMError:
-                    raise
-            else:
+            if disable_thinking:
+                notes.append("模型思考模式请求被上游拒绝，已自动关闭思考模式重试一次")
+            try:
+                result = await cls._call_with_retry(
+                    attempts=1,
+                    timeout_seconds=wait_timeout_seconds,
+                    call_factory=lambda: _call_with(extra_body_value, choice),
+                )
+            except LLMError:
                 raise
 
         result.setdefault("model", model_name)
@@ -816,6 +829,8 @@ class LLMGateway:
         )
         raw_retries_remaining = attempts - 1
         resume_attempt = 0
+        thinking_retry_used = False
+        thinking_disable_body = provider_thinking_disable_body(provider)
         last_error: BaseException | None = None
         committed_parts: list[str] = []
         request_messages = messages
@@ -893,14 +908,36 @@ class LLMGateway:
                 last_error = exc
                 error_cause = exc
                 if (
-                    safe_tool_choice is not None
+                    not raw_produced
+                    and safe_tool_choice is not None
                     and should_retry_without_tool_choice(exc)
-                    and not raw_produced
                 ):
                     notes.append("接口拒绝 tool_choice，已自动去掉该参数重试")
                     safe_tool_choice = None
+                elif (
+                    not raw_produced
+                    and not thinking_retry_used
+                    and thinking_disable_body is not None
+                    and is_thinking_rejection(exc)
+                ):
+                    # DeepSeek V4 thinking mode rejects requests whose replayed
+                    # assistant messages carry no reasoning_content.  Retry the
+                    # exact same logical step once with thinking disabled.
+                    thinking_retry_used = True
+                    notes.append("模型思考模式请求被上游拒绝，已自动关闭思考模式重试一次")
+                    call_extra_body = dict(call_extra_body or {})
+                    call_extra_body.update(thinking_disable_body)
+                    last_error = None
+                    continue
                 else:
-                    non_retryable = _is_non_retryable(exc)
+                    non_retryable = _is_non_retryable(exc) or (
+                        thinking_retry_used and is_thinking_rejection(exc)
+                    )
+                    if thinking_retry_used and is_thinking_rejection(exc):
+                        last_error = LLMError(
+                            "模型思考模式请求被上游拒绝，已自动关闭思考模式重试一次，"
+                            "重试仍被拒绝；请新建对话或改用非思考模式模型后重试。"
+                        )
             except Exception as exc:
                 last_error = LLMError(f"流式调用失败: {exc}")
                 error_cause = exc
